@@ -34,6 +34,11 @@ import type {
   HostedVersion,
   HostedVersionList,
   JobLogs,
+  OptionRunDetail,
+  OptionRunList,
+  OptionRunRepairActionPayload,
+  OptionRunRepairActionResult,
+  OptionRunRepairAssessment,
   PlanDetail,
   ReconciliationAction,
   ReconciliationInspection,
@@ -368,5 +373,47 @@ export async function fetchHostedPositions(
   const search = new URLSearchParams({ environment });
   return apiFetch<HostedPositionList>(
     `${BASE}/${encodeURIComponent(strategyId)}/positions?${search.toString()}`,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// B2.6a: owner-facing option-run operations
+// ---------------------------------------------------------------------------
+
+export async function fetchOptionRuns(strategyId: string): Promise<OptionRunList> {
+  return apiFetch<OptionRunList>(`${BASE}/${encodeURIComponent(strategyId)}/option-runs`);
+}
+
+export async function fetchOptionRun(
+  strategyId: string,
+  optionRunId: string,
+): Promise<OptionRunDetail> {
+  return apiFetch<OptionRunDetail>(
+    `${BASE}/${encodeURIComponent(strategyId)}/option-runs/${encodeURIComponent(optionRunId)}`,
+  );
+}
+
+export async function fetchOptionRunRepair(
+  strategyId: string,
+  optionRunId: string,
+): Promise<OptionRunRepairAssessment> {
+  return apiFetch<OptionRunRepairAssessment>(
+    `${BASE}/${encodeURIComponent(strategyId)}/option-runs/${encodeURIComponent(optionRunId)}/repair`,
+  );
+}
+
+/**
+ * Apply one governed repair, pinned to the digest the operator read from the
+ * assessment. A 409 names the refusal (e.g. the evidence changed underneath
+ * the operator); the caller re-reads the assessment after either outcome.
+ */
+export async function submitOptionRunRepair(
+  strategyId: string,
+  optionRunId: string,
+  payload: OptionRunRepairActionPayload,
+): Promise<OptionRunRepairActionResult> {
+  return apiFetch<OptionRunRepairActionResult>(
+    `${BASE}/${encodeURIComponent(strategyId)}/option-runs/${encodeURIComponent(optionRunId)}/repair`,
+    { method: "POST", json: payload },
   );
 }

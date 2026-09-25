@@ -25,6 +25,9 @@ import {
   fetchHostedStrategy,
   fetchHostedVersions,
   fetchOperatorCalendar,
+  fetchOptionRun,
+  fetchOptionRunRepair,
+  fetchOptionRuns,
   fetchPlan,
   inspectHostedReconciliation,
   issueExecutionGrant,
@@ -37,6 +40,7 @@ import {
   setAuthorizationMode,
   setHostedScheduleEnabled,
   stopHostedJob,
+  submitOptionRunRepair,
   updateHostedStrategy,
 } from "@/lib/hosted-strategies/api";
 
@@ -377,6 +381,47 @@ export function useSetHostedScheduleEnabled(strategyId: string) {
     onSuccess: () => {
       void client.invalidateQueries({ queryKey: hostedKeys.schedule(strategyId) });
       void client.invalidateQueries({ queryKey: hostedKeys.scheduleOccurrences(strategyId) });
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// B2.6a: owner-facing option-run operations
+// ---------------------------------------------------------------------------
+
+export function useOptionRuns(strategyId: string | null) {
+  return useQuery({
+    queryKey: hostedKeys.optionRuns(strategyId ?? ""),
+    queryFn: () => fetchOptionRuns(strategyId as string),
+    enabled: Boolean(strategyId),
+  });
+}
+
+export function useOptionRun(strategyId: string | null, optionRunId: string | null) {
+  return useQuery({
+    queryKey: hostedKeys.optionRun(strategyId ?? "", optionRunId ?? ""),
+    queryFn: () => fetchOptionRun(strategyId as string, optionRunId as string),
+    enabled: Boolean(strategyId && optionRunId),
+  });
+}
+
+export function useOptionRunRepairAssessment(strategyId: string | null, optionRunId: string | null) {
+  return useQuery({
+    queryKey: hostedKeys.optionRunRepair(strategyId ?? "", optionRunId ?? ""),
+    queryFn: () => fetchOptionRunRepair(strategyId as string, optionRunId as string),
+    enabled: Boolean(strategyId && optionRunId),
+  });
+}
+
+export function useSubmitOptionRunRepair(strategyId: string, optionRunId: string) {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (payload: Parameters<typeof submitOptionRunRepair>[2]) =>
+      submitOptionRunRepair(strategyId, optionRunId, payload),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: hostedKeys.optionRunRepair(strategyId, optionRunId) });
+      void client.invalidateQueries({ queryKey: hostedKeys.optionRun(strategyId, optionRunId) });
+      void client.invalidateQueries({ queryKey: hostedKeys.optionRuns(strategyId) });
     },
   });
 }

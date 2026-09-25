@@ -24,4 +24,9 @@ export const hostedKeys = {
     ["hosted", "positions", strategyId, environment] as const,
   calendar: (exchange: string, segment: string) =>
     ["hosted", "calendar", exchange, segment] as const,
+  optionRuns: (strategyId: string) => ["hosted", "option-runs", strategyId] as const,
+  optionRun: (strategyId: string, optionRunId: string) =>
+    ["hosted", "option-run", strategyId, optionRunId] as const,
+  optionRunRepair: (strategyId: string, optionRunId: string) =>
+    ["hosted", "option-run-repair", strategyId, optionRunId] as const,
 };

@@ -42,6 +42,7 @@ import {
 import { HostedAuthorizationPanel } from "@/features/strategies/components/hosted-authorization-panel";
 import { HostedExposurePanel } from "@/features/strategies/components/hosted-exposure-panel";
 import { HostedExecutionRequestsPanel } from "@/features/strategies/components/hosted-execution-requests-panel";
+import { HostedOptionsPanel } from "@/features/strategies/components/hosted-options-panel";
 import {
   HostedParamInputs,
   useHostedParamValues,
@@ -495,6 +496,19 @@ export function HostedStrategyDetailPage({ strategyId }: Readonly<{ strategyId: 
         </CardHeader>
         <CardContent>
           <HostedSchedulePanel strategy={strategy} versions={versions} options={optionsQuery.data} />
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Options</CardTitle>
+          <CardDescription>
+            Option runs this strategy owns, their frozen policies and refusals, governed repair for
+            stranded runs, and the separated controls for stopping, cancelling, exiting or flattening.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <HostedOptionsPanel strategyId={strategyId} />
         </CardContent>
       </Card>
 

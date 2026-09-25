@@ -633,3 +633,149 @@ export type HostedPositionList = {
   environment: string;
   positions: HostedPositionRow[];
 };
+
+// ---------------------------------------------------------------------------
+// B2.6a: owner-facing option-run operations
+// ---------------------------------------------------------------------------
+
+/** `"unknown"` coverage means the list is NOT complete; never read it as empty. */
+export type OptionCoverage = "known" | "unknown";
+
+export type OptionRunLeg = {
+  leg_id: string;
+  tradingsymbol: string;
+  side: "BUY" | "SELL" | string;
+  role: "hedge" | "short" | "naked" | null;
+  ratio: number;
+  /** Frozen target quantity. */
+  quantity: number;
+  /** Signed, from the run's OWN confirmed fills; null if unreadable. */
+  own_open_quantity: number | null;
+  state: "open" | "pending" | "failed" | "flat" | string;
+};
+
+export type OptionRunStatus =
+  | "created"
+  | "entry_previewed"
+  | "entering"
+  | "entered"
+  | "partial_entry"
+  | "cleanup_required"
+  | "adjusting"
+  | "exit_previewed"
+  | "exiting"
+  | "partial_exit"
+  | "exited"
+  | "settled"
+  | "unknown";
+
+export type OptionRun = {
+  option_run_id: string;
+  status: OptionRunStatus | string;
+  structure_generation: number;
+  structure_digest: string;
+  underlying: string;
+  expiry: string;
+  product: string;
+  protective_exit_unresolved: boolean;
+  coverage: OptionCoverage | string;
+  legs: OptionRunLeg[];
+  /** status in partial_entry|partial_exit|cleanup_required|adjusting */
+  repairable: boolean;
+  /** Placeholder until B2.4; the UI shows "protection owner: not yet available". */
+  protection_owner: string | null;
+};
+
+export type OptionRunList = {
+  strategy_id: string;
+  coverage: OptionCoverage | string;
+  coverage_reason: string;
+  runs: OptionRun[];
+};
+
+export type OptionRunEdge = {
+  plan_id: string;
+  phase: "entry" | "adjust" | "exit" | string;
+  created_at: string | null;
+};
+
+export type OptionRunFrozen = {
+  protection_policy: Record<string, unknown> | null;
+  max_loss: Record<string, unknown> | null;
+  expiry_policy: string | null;
+};
+
+export type OptionRunRefusal = {
+  request_id: string;
+  plan_id: string;
+  refusal_code: string;
+  stage: string;
+  detail: Record<string, unknown>;
+  at: string | null;
+};
+
+export type OptionRunGreeks = {
+  available: boolean;
+  reason: string | null;
+  delta: number | null;
+  gamma: number | null;
+  theta: number | null;
+  vega: number | null;
+};
+
+export type OptionRunPnl = {
+  available: boolean;
+  reason: string | null;
+  premium: number | null;
+  mtm: number | null;
+};
+
+export type OptionRunDetail = {
+  run: OptionRun;
+  /** entry|adjust|exit, oldest first. */
+  edges: OptionRunEdge[];
+  frozen: OptionRunFrozen;
+  /** newest first, max 20. */
+  refusals: OptionRunRefusal[];
+  greeks: OptionRunGreeks;
+  pnl: OptionRunPnl;
+};
+
+/** One bounded, risk-reducing close action the repair would submit. */
+export type OptionRunRepairPlanLeg = {
+  tradingsymbol: string;
+  transaction_type: string;
+  quantity: number;
+  exchange?: string | null;
+  product?: string | null;
+  order_type?: string | null;
+};
+
+export type OptionRunRepairState = "flat" | "residual" | "ambiguous" | "not_repairable" | string;
+
+export type OptionRunRepairAssessment = {
+  option_run_id: string;
+  status: string;
+  state: OptionRunRepairState;
+  reason_code: string | null;
+  reasons: string[];
+  evidence_digest: string;
+  close_plan: OptionRunRepairPlanLeg[];
+  evidence: Record<string, unknown>;
+  detail: Record<string, unknown>;
+};
+
+export type OptionRunRepairActionPayload = {
+  action: "close_flat" | "close_residual";
+  evidence_digest: string;
+};
+
+export type OptionRunRepairActionResult = {
+  option_run_id: string;
+  action: string;
+  state: string;
+  run_status: string;
+  evidence_digest: string;
+  audit_id: string | null;
+  submission: Record<string, unknown>;
+};

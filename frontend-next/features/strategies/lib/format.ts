@@ -126,6 +126,29 @@ const ERROR_COPY: Record<string, string> = {
   PAYLOAD_INVALID: "The proposal payload was missing or malformed.",
   AUTHORITY_MISMATCH:
     "The proposal's strategy or account did not match this run's own binding, so it was refused.",
+  // B2.6a: owner-facing option-run refusals.
+  OPTION_STRUCTURE_ALREADY_OPEN:
+    "This strategy already owns an open option structure; a new entry is refused until it resolves.",
+  OPTION_STRUCTURE_UNRESOLVED:
+    "This strategy's option run is not provably finished, so a new entry is refused until it resolves.",
+  OPTION_ADJUSTMENT_STALE_BASIS:
+    "This adjustment was computed against a basis that is no longer current. Re-check the run and retry.",
+  OPTION_ADJUSTMENT_WOULD_UNHEDGE:
+    "This adjustment would leave a short leg without its hedge, so it was refused.",
+  OPTION_ADJUSTMENT_PROTECTION_ACTIVE:
+    "An active protective order owns this run's risk right now, so the adjustment was refused.",
+  OPTION_RUN_ADJUST_IN_FLIGHT: "An adjustment is still in flight for this run, so this request was refused.",
+  OPTION_PROTECTIVE_EXIT_UNRESOLVED: "A protective exit for this run has not resolved yet.",
+  OPTION_RUN_REPAIR_AMBIGUOUS:
+    "The platform cannot explain this run's own holdings well enough to repair it automatically; it needs manual review.",
+  OPTION_RUN_REPAIR_EVIDENCE_CHANGED:
+    "This run's evidence changed since this repair was assessed. Re-check before repairing.",
+  OPTION_RUN_REPAIR_LIVE_UNSUPPORTED: "A live residual close has no governed submission path yet.",
+  OPTION_RUN_NOT_REPAIRABLE: "This run's status is not one the repair path covers.",
+  OPTION_RUN_REPAIR_ACTION_MISMATCH: "That repair action is not supported for this run.",
+  OPTION_RUN_REPAIR_STATE_CHANGED:
+    "This run's state changed before the repair could commit. Re-check before repairing.",
+  OPTION_RUN_REPAIR_AUDIT_UNAVAILABLE: "This run has no hosted job to record the repair against.",
 };
 
 function withCopy(code: string): string {
@@ -353,6 +376,84 @@ export function scheduleCadenceLabel(schedule: {
  * still unresolved, and how late a missed run may still fire. Reported from the
  * server's own values.
  */
+// ---------------------------------------------------------------------------
+// B2.6a: owner-facing option-run operations
+// ---------------------------------------------------------------------------
+
+export const OPTION_RUN_STATUS_LABELS: Record<string, string> = {
+  created: "Created",
+  entry_previewed: "Entry previewed",
+  entering: "Entering",
+  entered: "Entered",
+  partial_entry: "Partial entry",
+  cleanup_required: "Cleanup required",
+  adjusting: "Adjusting",
+  exit_previewed: "Exit previewed",
+  exiting: "Exiting",
+  partial_exit: "Partial exit",
+  exited: "Exited",
+  settled: "Settled",
+  unknown: "Unknown",
+};
+
+export function optionRunStatusLabel(status: string | null | undefined): string {
+  const key = String(status ?? "").trim();
+  return OPTION_RUN_STATUS_LABELS[key] ?? (key ? key : "Unknown");
+}
+
+/** Tailwind classes for an option-run status badge. Text always carries the label too. */
+export function optionRunStatusTone(status: string | null | undefined): string {
+  switch (String(status ?? "")) {
+    case "entered":
+    case "exited":
+    case "settled":
+      return "border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400";
+    case "created":
+    case "entry_previewed":
+    case "entering":
+    case "exit_previewed":
+    case "exiting":
+      return "border-sky-500/40 bg-sky-500/10 text-sky-600 dark:text-sky-400";
+    case "adjusting":
+      return "border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400";
+    case "partial_entry":
+    case "partial_exit":
+      return "border-orange-500/40 bg-orange-500/10 text-orange-600 dark:text-orange-400";
+    case "cleanup_required":
+      return "border-destructive/40 bg-destructive/10 text-destructive";
+    case "unknown":
+    default:
+      return "border-border bg-muted/40 text-muted-foreground";
+  }
+}
+
+export const OPTION_LEG_STATE_LABELS: Record<string, string> = {
+  open: "Open",
+  pending: "Pending",
+  failed: "Failed",
+  flat: "Flat",
+};
+
+export function optionLegStateLabel(state: string | null | undefined): string {
+  const key = String(state ?? "").trim();
+  return OPTION_LEG_STATE_LABELS[key] ?? (key ? key : "Unknown");
+}
+
+export function optionLegStateTone(state: string | null | undefined): string {
+  switch (String(state ?? "")) {
+    case "open":
+      return "text-emerald-600 dark:text-emerald-400";
+    case "pending":
+      return "text-amber-600 dark:text-amber-400";
+    case "failed":
+      return "text-destructive";
+    case "flat":
+      return "text-muted-foreground";
+    default:
+      return "text-muted-foreground";
+  }
+}
+
 export function schedulePolicyCopy(schedule: {
   misfire_grace_seconds: number;
   overlap_policy: string;
