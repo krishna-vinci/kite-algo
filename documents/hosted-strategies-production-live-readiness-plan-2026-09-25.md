@@ -167,9 +167,14 @@ notifications. Record in `documents/hosted-strategies-rollout-<lane>-<date>.md`.
 | B2.4 design | accepted | `4976679` |
 | B2.5 risk policy | done, reviewed | `0e02f39` |
 | B2.6a options view + repair UI | done, reviewed | `4679956` |
-| B2.2 hardening (review findings) | in progress | |
+| B2.2 hardening (review findings) | done, reviewed | `a279059`, `bd5b0b0` |
 | B2.5 follow-up (roll pricing) | done, reviewed | `6dc3fd3` |
 | C1.1 design | accepted | `dbfe46e` |
 | B2.4 S1 owner row | done, reviewed | `df5d29d` |
 | B2.4 S2a loop + safety gate | done, reviewed | `d32d1d1` |
-| B2.6b owner actions | design | |
+| B2.4 S2b+S4 owner gates + policy version | done, reviewed | `c270a70` |
+| B2.4 S3 handover + protected continuation | done, reviewed | `965ca05` |
+| C1.1 S1+S2 live staged CNC financing | done, reviewed | `61f9c46`, `be0a94e` |
+| B2.6b design | accepted | `2dc0143` |
+| B2.6b S1 cancel + dead-submission | in review | |
+| Independent review: C1.1 + B2.4 | running | |
