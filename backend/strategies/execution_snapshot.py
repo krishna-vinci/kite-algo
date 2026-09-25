@@ -137,6 +137,29 @@ def _run_legs_contradict_binding(
     return comparable
 
 
+def _run_legs_match_any_bound_edge(
+    state_legs: Sequence[Mapping[str, Any]],
+    *,
+    plan_ids: Sequence[str],
+    plan_by_id: Mapping[str, Any],
+) -> bool:
+    """Whether ANY plan bound to this run recognizes the legs the run holds NOW.
+
+    A generation-advancing adjust rewrites the run's legs - a resize changes their
+    size, an expiry roll moves them onto a different contract set - so the plan that
+    ORIGINALLY opened the run cannot describe what it holds afterwards. The scoping
+    question is therefore "does no edge of this run's own binding set recognize the
+    run's current legs?", not "does the originating edge?". A run whose legs no
+    bound edge recognizes is still reported as a mis-scoped read.
+    """
+    for plan_id in plan_ids:
+        plan = plan_by_id.get(str(plan_id))
+        resolved = dict(getattr(plan, "resolved_plan", None) or {}) if plan is not None else {}
+        if not _run_legs_contradict_binding(state_legs, list(resolved.get("legs") or [])):
+            return True
+    return False
+
+
 def _protective_exit_unresolved(orders: Any) -> bool:
     """Whether a run's own durable records still own an unresolved exit stage.
 
@@ -724,12 +747,26 @@ class OwnedWorkSnapshotService:
                 missing_state = True
             state_legs = list((state or {}).get("legs") or [])
             frozen_legs = list(resolved.get("legs") or [])
-            if state is not None and _run_legs_contradict_binding(state_legs, frozen_legs):
+            if state is not None and not _run_legs_match_any_bound_edge(
+                state_legs,
+                plan_ids=list(edge.get("plan_ids") or []),
+                plan_by_id=plan_by_id,
+            ):
                 # The run row is reachable through this strategy's binding but its
-                # legs are not the frozen legs of that edge. Trusting either side
-                # would attribute a foreign structure to this strategy, so the
-                # whole read is unknown rather than silently mis-scoped.
+                # legs are not the frozen legs of ANY edge that binds it. Trusting
+                # either side would attribute a foreign structure to this strategy,
+                # so the whole read is unknown rather than silently mis-scoped.
                 identity_mismatch = True
+            # The expiry the run HOLDS: its own legs are authoritative once an
+            # adjust has rewritten them (an expiry roll moves the whole structure),
+            # and the originating plan's frozen expiry is only the fallback.
+            held_expiries = {
+                str(leg.get("expiry_key") or "").strip()
+                for leg in state_legs
+                if isinstance(leg, Mapping)
+            }
+            held_expiries.discard("")
+            held_expiry = held_expiries.pop() if len(held_expiries) == 1 else ""
             rows.append(
                 {
                     "option_run_id": option_run_id,
@@ -739,7 +776,7 @@ class OwnedWorkSnapshotService:
                     "phase": edge["phase"],
                     "worker_run_id": edge["worker_run_id"],
                     "underlying": str(resolved.get("underlying") or ""),
-                    "expiry": str(resolved.get("expiry") or ""),
+                    "expiry": held_expiry or str(resolved.get("expiry") or ""),
                     "structure_id": str(resolved.get("structure_id") or ""),
                     # The structure identity the run HOLDS NOW: the shape this run
                     # records once an adjust has rewritten its legs, and otherwise

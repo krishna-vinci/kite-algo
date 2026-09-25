@@ -276,3 +276,227 @@ def test_a_deferral_scenario_passes_only_without_requests_and_a_named_reason():
     result = module.assert_scenario("deferral", spec, evidence, SUPERVISOR)
     assert result["ok"] is False
     assert any("must not submit anything" in failure for failure in result["failures"])
+
+
+# ---------------------------------------------------------------------------
+# the dynamic (resize + roll) option facts
+# ---------------------------------------------------------------------------
+
+
+DYNAMIC_SPEC = {
+    "expected_edges": {"entry": 1, "adjust": 2, "exit": 1},
+    "expected_generations": [1, 2, 3, 3],
+    "expected_units_by_generation": {1: 1, 2: 2, 3: 2},
+    "entered_after_adjust": [1, 2],
+    "expected_final_status": "exited",
+    "initial_expiry": "2026-10-29",
+    "rolled_expiry": "2026-11-26",
+    "duplicate_entry_refusal": "OPTION_STRUCTURE_ALREADY_OPEN",
+    "stale_basis_refusal": "OPTION_ADJUSTMENT_STALE_BASIS",
+}
+
+_OLD_LEG_IDS = ("entry-plan:1", "entry-plan:2", "entry-plan:3", "entry-plan:4")
+_HELD_LEG_IDS = ("roll-plan:1", "roll-plan:2", "roll-plan:3", "roll-plan:4")
+
+
+def _dynamic_facts(**overrides):
+    facts = {
+        "run_count": 1,
+        "edges": [{"phase": "entry"}, {"phase": "adjust"}, {"phase": "adjust"}, {"phase": "exit"}],
+        "checkpoints": [
+            {
+                "phase": "entry",
+                "status": "entered",
+                "generation": 1,
+                "leg_units": [1, 1, 1, 1],
+                "expiry": "2026-10-29",
+            },
+            {
+                "phase": "resize",
+                "status": "entered",
+                "generation": 2,
+                "leg_units": [2, 2, 2, 2],
+                "expiry": "2026-10-29",
+            },
+            {
+                "phase": "roll",
+                "status": "entered",
+                "generation": 3,
+                "leg_units": [2, 2, 2, 2],
+                "expiry": "2026-11-26",
+            },
+            {
+                "phase": "exit",
+                "status": "exited",
+                "generation": 3,
+                "leg_units": [2, 2, 2, 2],
+                "expiry": "2026-11-26",
+            },
+        ],
+        "final": {
+            "status": "exited",
+            "generation": 3,
+            "leg_units": [2, 2, 2, 2],
+            "leg_expiries": ["2026-11-26"] * 4,
+            # The run's own ledger after the roll: the new legs held, the old flat.
+            "open_by_leg": {
+                **{leg_id: 0 for leg_id in _OLD_LEG_IDS},
+                **{leg_id: 0 for leg_id in _HELD_LEG_IDS},
+            },
+            "released_leg_ids": list(_OLD_LEG_IDS),
+            "held_leg_ids": list(_HELD_LEG_IDS),
+        },
+        "refusals": [
+            {
+                "request_id": "r-probe",
+                "status": "refused",
+                "refusal_code": "OPTION_STRUCTURE_ALREADY_OPEN",
+                "decision_kind": "",
+                "stage": "request",
+            },
+            {
+                "request_id": "r-stale",
+                "status": "refused",
+                "refusal_code": "OPTION_ADJUSTMENT_STALE_BASIS",
+                "decision_kind": "",
+                "stage": "request",
+            },
+        ],
+    }
+    facts.update(overrides)
+    return facts
+
+
+def test_the_dynamic_options_scenario_passes_on_platform_facts():
+    module = _load_assertions()
+    result = module.assert_option_dynamic(_dynamic_facts(), DYNAMIC_SPEC)
+    assert result["ok"] is True, result["failures"]
+    assert result["axes"]["generations"] == [1, 2, 3, 3]
+    assert result["axes"]["held_expiry"] == ["2026-11-26"]
+    assert result["axes"]["duplicate_entry_refusals"] == 1
+    assert result["axes"]["stale_basis_refusals"] == 1
+
+
+def test_a_second_option_run_is_a_failure():
+    module = _load_assertions()
+    result = module.assert_option_dynamic(_dynamic_facts(run_count=2), DYNAMIC_SPEC)
+    assert result["ok"] is False
+    assert any("exactly 1 is owed" in failure for failure in result["failures"])
+
+
+def test_a_generation_that_never_advanced_is_a_failure():
+    module = _load_assertions()
+    facts = _dynamic_facts()
+    facts["checkpoints"][2]["generation"] = 2  # the roll never landed
+    result = module.assert_option_dynamic(facts, DYNAMIC_SPEC)
+    assert result["ok"] is False
+    assert any("generations are" in failure for failure in result["failures"])
+
+
+def test_an_adjustment_that_did_not_return_to_entered_is_a_failure():
+    module = _load_assertions()
+    facts = _dynamic_facts()
+    facts["checkpoints"][1]["status"] = "adjusting"
+    result = module.assert_option_dynamic(facts, DYNAMIC_SPEC)
+    assert result["ok"] is False
+    assert any("instead of 'entered'" in failure for failure in result["failures"])
+
+
+def test_a_leg_size_that_disagrees_with_the_units_is_a_failure():
+    module = _load_assertions()
+    facts = _dynamic_facts()
+    facts["checkpoints"][1]["leg_units"] = [2, 2, 2, 1]
+    result = module.assert_option_dynamic(facts, DYNAMIC_SPEC)
+    assert result["ok"] is False
+    assert any("leg units" in failure for failure in result["failures"])
+
+
+def test_missing_leg_size_evidence_is_a_failure():
+    """A key the harness forgot to read must not read as a pass."""
+    module = _load_assertions()
+    facts = _dynamic_facts()
+    facts["checkpoints"][1].pop("leg_units")
+    result = module.assert_option_dynamic(facts, DYNAMIC_SPEC)
+    assert result["ok"] is False
+    assert any("no leg size evidence" in failure for failure in result["failures"])
+
+    facts = _dynamic_facts()
+    facts["final"].pop("leg_units")
+    result = module.assert_option_dynamic(facts, DYNAMIC_SPEC)
+    assert result["ok"] is False
+    assert any("no leg size evidence" in failure for failure in result["failures"])
+
+
+def test_a_roll_whose_old_legs_are_still_open_is_a_failure():
+    module = _load_assertions()
+    facts = _dynamic_facts()
+    facts["final"]["open_by_leg"]["entry-plan:3"] = 100
+    result = module.assert_option_dynamic(facts, DYNAMIC_SPEC)
+    assert result["ok"] is False
+    assert any("still holds" in failure for failure in result["failures"])
+
+
+def test_a_roll_whose_old_legs_are_still_the_held_legs_is_a_failure():
+    module = _load_assertions()
+    facts = _dynamic_facts()
+    facts["final"]["held_leg_ids"] = ["entry-plan:1", "roll-plan:2"]
+    result = module.assert_option_dynamic(facts, DYNAMIC_SPEC)
+    assert result["ok"] is False
+    assert any("still the run's held legs" in failure for failure in result["failures"])
+
+
+def test_a_missing_duplicate_entry_refusal_is_a_failure():
+    module = _load_assertions()
+    facts = _dynamic_facts(refusals=[])
+    result = module.assert_option_dynamic(facts, DYNAMIC_SPEC)
+    assert result["ok"] is False
+    assert any("duplicate entry probe" in failure for failure in result["failures"])
+    assert any("stale-basis adjustment" in failure for failure in result["failures"])
+
+
+def test_a_stale_basis_refusal_after_approval_is_a_failure():
+    """The whole point: the platform refuses it BEFORE the owner is asked."""
+    module = _load_assertions()
+    facts = _dynamic_facts()
+    facts["refusals"][1]["decision_kind"] = "manual"
+    result = module.assert_option_dynamic(facts, DYNAMIC_SPEC)
+    assert result["ok"] is False
+    assert any("after approval" in failure for failure in result["failures"])
+
+
+def test_a_stale_basis_refusal_at_the_execution_stage_is_a_failure():
+    module = _load_assertions()
+    facts = _dynamic_facts()
+    facts["refusals"][1]["stage"] = "preparation"
+    result = module.assert_option_dynamic(facts, DYNAMIC_SPEC)
+    assert result["ok"] is False
+    assert any("instead of 'request'" in failure for failure in result["failures"])
+
+
+def test_a_refusal_that_never_reached_a_terminal_outcome_is_a_failure():
+    module = _load_assertions()
+    facts = _dynamic_facts()
+    facts["refusals"][0]["status"] = "awaiting_approval"
+    result = module.assert_option_dynamic(facts, DYNAMIC_SPEC)
+    assert result["ok"] is False
+    assert any("never reached a terminal outcome" in failure for failure in result["failures"])
+
+
+def test_the_self_cleared_block_is_the_continuation_proof():
+    """A healthy continuation answers HOSTED_JOB_NOT_BLOCKED; anything else is a
+    failure, because it means a human was needed."""
+    module = _load_assertions()
+    spec = dict(OPTIONS_SPEC, expects_self_cleared_block=True)
+    evidence = _options_evidence(reconciliation={"status": "not_blocked"})
+    result = module.assert_scenario("options_adjustment", spec, evidence, SUPERVISOR)
+    assert result["ok"] is True, result["failures"]
+    assert result["axes"]["reconciliation"] == "not_blocked"
+
+    result = module.assert_scenario(
+        "options_adjustment",
+        spec,
+        _options_evidence(reconciliation={"status": "reconciled"}),
+        SUPERVISOR,
+    )
+    assert result["ok"] is False
+    assert any("clear its own block" in failure for failure in result["failures"])

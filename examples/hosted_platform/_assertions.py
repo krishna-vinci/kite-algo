@@ -274,6 +274,18 @@ def assert_scenario(
         elif int(before) != 0:
             failures.append(f"{before} paper order(s) existed before the owner decision")
 
+    # -- a healthy continuation clears its own block ------------------------
+    reconciliation = dict(evidence.get("reconciliation") or {})
+    if spec.get("expects_self_cleared_block"):
+        # The proof is the platform's own answer: the operator reconciliation route
+        # refuses because the evaluation's completion already released the block.
+        # An operator being REQUIRED would mean the strategy needed a human.
+        if str(reconciliation.get("status") or "") != "not_blocked":
+            failures.append(
+                "the healthy continuation did not clear its own block "
+                f"(operator reconciliation answered {reconciliation.get('status')!r})"
+            )
+
     settlement_overall = None
     if isinstance(evidence.get("settlement"), Mapping):
         settlement_overall = evidence["settlement"].get("overall")
@@ -302,6 +314,7 @@ def assert_scenario(
         "child_outcome": outcome,
         "child_exit_code": exit_code,
         "orders_before_approval": evidence.get("orders_before_approval"),
+        "reconciliation": reconciliation.get("status"),
     }
     return {"label": label, "ok": not failures, "failures": failures, "axes": axes_out}
 
@@ -341,3 +354,165 @@ def assert_recovery(scenario: Mapping[str, Any]) -> Dict[str, Any]:
     if int(scenario.get("still_dispatching") or 0) != 0:
         failures.append("an abandoned claim is still in 'dispatching'")
     return {"ok": not failures, "failures": failures}
+
+
+def assert_option_dynamic(facts: Mapping[str, Any], spec: Mapping[str, Any]) -> Dict[str, Any]:
+    """The B2.2 dynamic facts that make a resize-and-roll run prove something.
+
+    ``facts`` is read from the PLATFORM's own rows by the harness, never from a
+    child's self-report:
+
+    * ``run_count`` - distinct option runs this strategy owns;
+    * ``edges`` - ``{"phase": ...}`` per plan->run binding, in creation order;
+    * ``checkpoints`` - one ``{"phase", "status", "generation", "leg_units",
+      "expiry"}`` per supervised evaluation, in order;
+    * ``final`` - the run's own terminal state: ``status``, ``generation``,
+      ``expiry``, ``leg_units``, ``leg_expiries``, ``open_by_leg`` and the
+      ``released_leg_ids`` the run has closed;
+    * ``refusals`` - the terminal request rows the platform refused.
+
+    What it refuses to accept as a pass: more than one structure, a generation
+    that did not advance in order, an adjustment that did not return the run to
+    ``entered``, a leg size that disagrees with the declared units, a roll whose
+    old legs are not flat, a duplicate entry the platform did not refuse, and a
+    stale-basis adjustment the platform refused only AFTER asking the owner.
+    """
+    failures: List[str] = []
+    checkpoints = [dict(row) for row in list(facts.get("checkpoints") or [])]
+    final = dict(facts.get("final") or {})
+    refusals = [dict(row) for row in list(facts.get("refusals") or [])]
+    phases = [str((row or {}).get("phase") or "") for row in list(facts.get("edges") or [])]
+
+    # -- exactly one structure, managed through the declared edges -----------
+    if int(facts.get("run_count") or 0) != 1:
+        failures.append(
+            f"{facts.get('run_count')} option runs exist for one structure; exactly 1 is owed"
+        )
+    for phase, wanted in dict(spec.get("expected_edges") or {}).items():
+        seen = phases.count(str(phase))
+        if seen != int(wanted):
+            failures.append(f"{seen} {phase} edge(s) exist instead of {wanted}")
+
+    # -- the generation sequence, in order ----------------------------------
+    generations = [int(row.get("generation") or 0) for row in checkpoints]
+    expected_generations = [int(value) for value in list(spec.get("expected_generations") or [])]
+    if expected_generations and generations != expected_generations:
+        failures.append(
+            f"the run's generations are {generations} instead of {expected_generations}"
+        )
+
+    # -- every adjustment returned the run to a held, entered structure -----
+    units_by_generation = {
+        int(generation): int(units)
+        for generation, units in dict(spec.get("expected_units_by_generation") or {}).items()
+    }
+    entered_after = {int(value) for value in list(spec.get("entered_after_adjust") or [])}
+    for index, row in enumerate(checkpoints[:-1] if checkpoints else []):
+        generation = int(row.get("generation") or 0)
+        status = str(row.get("status") or "")
+        if index in entered_after and status != "entered":
+            failures.append(
+                f"generation {generation} is {status!r} after its adjustment instead of 'entered'"
+            )
+        leg_units = [int(value) for value in list(row.get("leg_units") or [])]
+        wanted_units = units_by_generation.get(generation)
+        if wanted_units is not None:
+            # Missing size evidence is NOT a pass: an unread leg set would
+            # otherwise satisfy "the sizes match".
+            if not leg_units:
+                failures.append(f"generation {generation} carries no leg size evidence")
+            elif any(value != wanted_units for value in leg_units):
+                failures.append(
+                    f"generation {generation} holds leg units {leg_units} instead of {wanted_units}"
+                )
+
+    # -- the final structure: the rolled expiry, the declared size, flat old legs
+    final_generation = int(final.get("generation") or 0)
+    final_status = str(final.get("status") or "")
+    expected_final_status = str(spec.get("expected_final_status") or "exited")
+    if final_status != expected_final_status:
+        failures.append(f"the run is {final_status!r} at the end instead of {expected_final_status!r}")
+    rolled_expiry = str(spec.get("rolled_expiry") or "")
+    initial_expiry = str(spec.get("initial_expiry") or "")
+    leg_expiries = {str(value) for value in list(final.get("leg_expiries") or []) if str(value)}
+    if rolled_expiry and leg_expiries and leg_expiries != {rolled_expiry}:
+        failures.append(
+            f"the held legs are on {sorted(leg_expiries)} instead of the rolled expiry {rolled_expiry}"
+        )
+    if rolled_expiry and rolled_expiry == initial_expiry:
+        failures.append("the scenario rolled onto the expiry it already held")
+    final_units = [int(value) for value in list(final.get("leg_units") or [])]
+    wanted_final_units = units_by_generation.get(final_generation)
+    if wanted_final_units is not None:
+        if not final_units:
+            failures.append("the final generation carries no leg size evidence")
+        elif any(value != wanted_final_units for value in final_units):
+            failures.append(
+                f"the final generation holds leg units {final_units} instead of "
+                f"{wanted_final_units}"
+            )
+    open_by_leg = {
+        str(leg_id): int(quantity)
+        for leg_id, quantity in dict(final.get("open_by_leg") or {}).items()
+    }
+    released = {str(value) for value in list(final.get("released_leg_ids") or [])}
+    still_open = sorted(leg_id for leg_id in released if open_by_leg.get(leg_id, 0) != 0)
+    if still_open:
+        failures.append(
+            f"the roll released leg(s) {still_open} that the run's own ledger still holds"
+        )
+    held_leg_ids = {str(value) for value in list(final.get("held_leg_ids") or [])}
+    reissued = sorted(released & held_leg_ids)
+    if reissued:
+        failures.append(f"the released leg(s) {reissued} are still the run's held legs")
+
+    # -- the platform's own refusals ---------------------------------------
+    duplicate_code = str(spec.get("duplicate_entry_refusal") or "OPTION_STRUCTURE_ALREADY_OPEN")
+    stale_code = str(spec.get("stale_basis_refusal") or "OPTION_ADJUSTMENT_STALE_BASIS")
+    duplicate = [row for row in refusals if str(row.get("refusal_code") or "") == duplicate_code]
+    stale = [row for row in refusals if str(row.get("refusal_code") or "") == stale_code]
+    if len(duplicate) != 1:
+        failures.append(
+            f"the platform refused {len(duplicate)} duplicate entry probe(s) "
+            f"({duplicate_code}); exactly one was owed"
+        )
+    if len(stale) != 1:
+        failures.append(
+            f"the platform refused {len(stale)} stale-basis adjustment(s) "
+            f"({stale_code}); exactly one was owed"
+        )
+    for row in duplicate + stale:
+        if str(row.get("status") or "") != "refused":
+            failures.append(
+                f"refusal {row.get('refusal_code')} ended {row.get('status')!r} instead of 'refused'"
+            )
+    for row in stale:
+        # Refused BEFORE an owner decision: the request never waited for approval,
+        # and the refusal is recorded at the request stage.
+        if str(row.get("decision_kind") or ""):
+            failures.append(
+                "a stale-basis adjustment carried an owner decision, so it was refused "
+                "after approval instead of before it"
+            )
+        if str(row.get("stage") or "") != "request":
+            failures.append(
+                f"the stale-basis refusal stage is {row.get('stage')!r} instead of 'request'"
+            )
+    waited = [
+        str(row.get("request_id") or "")
+        for row in refusals
+        if str(row.get("status") or "") in {"awaiting_approval", "queued", "dispatching"}
+    ]
+    if waited:
+        failures.append(f"request(s) {waited} never reached a terminal outcome")
+
+    axes = {
+        "option_runs": int(facts.get("run_count") or 0),
+        "edge_phases": phases,
+        "generations": generations,
+        "final_status": final_status,
+        "held_expiry": sorted(leg_expiries),
+        "duplicate_entry_refusals": len(duplicate),
+        "stale_basis_refusals": len(stale),
+    }
+    return {"ok": not failures, "failures": failures, "axes": axes}

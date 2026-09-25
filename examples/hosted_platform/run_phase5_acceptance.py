@@ -44,7 +44,7 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 from datetime import time as time_of_day
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 REPO = Path(__file__).resolve().parents[2]
 EXAMPLES = Path(__file__).resolve().parent
@@ -58,6 +58,7 @@ sys.path.insert(0, str(REPO))
 # with the earlier acceptance driver instead of being duplicated.
 from examples.hosted_acceptance import run_acceptance as acc  # noqa: E402
 from examples.hosted_platform._assertions import (  # noqa: E402
+    assert_option_dynamic,
     assert_recovery,
     assert_scenario,
 )
@@ -101,8 +102,12 @@ STORAGE: Dict[str, Any] = {
     #: falling one. Quotes are derived from the candle tail plus this premium.
     "index_premium": 40.0,
     "option_underlying": "NIFTY",
-    "option_expiry": "2026-10-29",
     "option_strikes": [22400, 22450, 22500, 22550, 22600, 22650, 22700, 22750],
+    # Two expiries: the front month, and the NEXT one a governed expiry roll moves
+    # the structure onto. Both are real catalog rows with their own broker tokens,
+    # so a roll acquires a different instrument rather than the same one renamed.
+    "option_expiries": ["2026-10-29", "2026-11-26"],
+    #: ``(expiry, strike) -> {"ce": token, "pe": token}``.
     "option_tokens": {},
 }
 
@@ -373,6 +378,20 @@ def _synthetic_candles() -> List[Dict[str, Any]]:
     return rows
 
 
+#: The NFO symbol month codes, spelled out so a fixture symbol never depends on
+#: the process locale.
+_MONTH_CODES = (
+    "JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+    "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
+)
+
+
+def _option_expiry_code(expiry: str) -> str:
+    """``2026-10-29`` -> ``26OCT``: the symbol code for one fixture expiry."""
+    parsed = date.fromisoformat(str(expiry))
+    return f"{str(parsed.year)[2:]}{_MONTH_CODES[parsed.month - 1]}"
+
+
 class SyntheticMarket:
     """The market-data boundary: deterministic quotes, candles and one chain."""
 
@@ -383,15 +402,17 @@ class SyntheticMarket:
         # book so an unrelated scenario can never be handed a momentum payload by
         # accident.
         self.momentum = MomentumFixture()
-        for index, strike in enumerate(STORAGE["option_strikes"]):
-            STORAGE["option_tokens"][strike] = {"ce": 50000 + index * 2, "pe": 50001 + index * 2}
+        for expiry_index, expiry in enumerate(STORAGE["option_expiries"]):
+            for index, strike in enumerate(STORAGE["option_strikes"]):
+                base = 50000 + expiry_index * 1000 + index * 2
+                STORAGE["option_tokens"][(expiry, strike)] = {"ce": base, "pe": base + 1}
 
     def set_momentum(self, fixture: "MomentumFixture") -> None:
         self.momentum = fixture
 
     def option_price(self, token: int) -> float:
         spot = float(STORAGE["prices"][256265])
-        for strike, tokens in STORAGE["option_tokens"].items():
+        for (_expiry, strike), tokens in STORAGE["option_tokens"].items():
             distance = abs(float(strike) - spot)
             base = max(5.0, 250.0 - distance)
             if token == tokens["ce"]:
@@ -432,15 +453,34 @@ class SyntheticMarket:
 
     def option_snapshot(self, underlying: str) -> Dict[str, Any]:
         spot = float(STORAGE["prices"][256265])
+        per_expiry = {
+            expiry: {
+                "atm_strike": 22500,
+                "rows": self._expiry_rows(expiry, spot=spot),
+                "forward": spot,
+                "sigma_expiry": 0.14,
+            }
+            for expiry in STORAGE["option_expiries"]
+        }
+        return {
+            "underlying": underlying.upper(),
+            "spot_ltp": spot,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "expiries": list(STORAGE["option_expiries"]),
+            "per_expiry": per_expiry,
+        }
+
+    def _expiry_rows(self, expiry: str, *, spot: float) -> List[Dict[str, Any]]:
+        code = _option_expiry_code(expiry)
         rows = []
         for strike in STORAGE["option_strikes"]:
-            tokens = STORAGE["option_tokens"][strike]
+            tokens = STORAGE["option_tokens"][(expiry, strike)]
             rows.append(
                 {
                     "strike": strike,
                     "CE": {
                         "token": tokens["ce"],
-                        "tsym": f"NIFTY26OCT{strike}CE",
+                        "tsym": f"NIFTY{code}{strike}CE",
                         "ltp": self.option_price(tokens["ce"]),
                         "oi": 1200,
                         "iv": 0.14,
@@ -452,7 +492,7 @@ class SyntheticMarket:
                     },
                     "PE": {
                         "token": tokens["pe"],
-                        "tsym": f"NIFTY26OCT{strike}PE",
+                        "tsym": f"NIFTY{code}{strike}PE",
                         "ltp": self.option_price(tokens["pe"]),
                         "oi": 1300,
                         "iv": 0.15,
@@ -464,20 +504,7 @@ class SyntheticMarket:
                     },
                 }
             )
-        return {
-            "underlying": underlying.upper(),
-            "spot_ltp": spot,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-            "expiries": [STORAGE["option_expiry"]],
-            "per_expiry": {
-                STORAGE["option_expiry"]: {
-                    "atm_strike": 22500,
-                    "rows": rows,
-                    "forward": spot,
-                    "sigma_expiry": 0.14,
-                }
-            },
-        }
+        return rows
 
 
 class SyntheticOptionManager:
@@ -704,9 +731,9 @@ def seed_catalog(session_factory) -> None:
                     "gen": generation,
                 },
             )
-        for strike, tokens in STORAGE["option_tokens"].items():
+        for (expiry, strike), tokens in STORAGE["option_tokens"].items():
             for kind, token in (("CE", tokens["ce"]), ("PE", tokens["pe"])):
-                symbol = f"NIFTY26OCT{strike}{kind}"
+                symbol = f"NIFTY{_option_expiry_code(expiry)}{strike}{kind}"
                 instrument_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"phase5:{symbol}"))
                 public_key = f"NFO:{symbol}"
                 session.execute(
@@ -726,7 +753,7 @@ def seed_catalog(session_factory) -> None:
                         "sym": symbol,
                         "gen": generation,
                         "kind": kind,
-                        "expiry": STORAGE["option_expiry"],
+                        "expiry": expiry,
                         "strike": strike,
                         "opt": kind,
                     },
@@ -820,9 +847,12 @@ SCENARIOS: Dict[str, Dict[str, Any]] = {
         "requires_option_close": True,
         "final_marker": "structure closed with no outstanding work",
         # The options lane keeps its own book, so its settlement axes are the
-        # evidence: quiescence is proven by the operator reconciliation, the
-        # equity attribution stays flat (an option structure writes no equity leg),
-        # the domain state is terminal and no evaluation authority remains.
+        # evidence: quiescence is proven by the CONTINUATION itself clearing the
+        # attempt's block (the operator route answers HOSTED_JOB_NOT_BLOCKED,
+        # because there is nothing left to reconcile), the equity attribution
+        # stays flat (an option structure writes no equity leg), the domain state
+        # is terminal and no evaluation authority remains.
+        "expects_self_cleared_block": True,
         "expected_settlement_axes": {
             "attribution_scoped_flatness": "satisfied",
             "terminal_domain_state": "satisfied",
@@ -871,6 +901,63 @@ SCENARIOS: Dict[str, Dict[str, Any]] = {
             "expiry_policy": "exit_before_cutoff",
             "deadline_seconds": 240,
         },
+    },
+    "options_dynamic_resize_roll": {
+        # Phase B2.2 S5: ONE persistent delta-neutral straddle with protective
+        # wings, managed across four supervised evaluations against the SAME
+        # durable option run. Job 1 ENTERS at one unit; job 2 RESIZES to two
+        # units (and asks whether a duplicate entry, and an adjustment frozen
+        # against the previous generation, would be admitted - neither is); job 3
+        # ROLLS the same legs and roles onto the next expiry; job 4 EXITS. Every
+        # job is a fresh supervised child process, and every fact the acceptance
+        # asserts is read from the platform's own rows.
+        "source": "options_dynamic_straddle.py",
+        "schema": "options_dynamic_straddle.schema.json",
+        "option_dynamic": True,
+        "autonomous": False,
+        "expects_manual": True,
+        # The harness's broker boundary prices every option leg at its synthetic
+        # flat quote, so a two-leg acquire over a still-held generation needs real
+        # paper margin: the resize holds ~675k and the roll's overlap peaks near
+        # 1.35m. The scenario therefore STARTS this account with 2.5m rather than
+        # discovering the shortfall at fill time (which is C1.2's live problem,
+        # and is deliberately not papered over here).
+        "paper_starting_balance": 2500000.0,
+        "recurring_jobs": [
+            {"phase": "entry", "params": {}},
+            {
+                "phase": "resize",
+                "params": {
+                    "resize_units": 2,
+                    "force_resize": True,
+                    "duplicate_entry_probe": True,
+                    "stale_basis_probe": True,
+                },
+            },
+            {"phase": "roll", "params": {"roll_to_expiry": "2026-11-26"}},
+            {"phase": "exit", "params": {"exit_position": True}},
+        ],
+        "params": {
+            "underlying": "NIFTY",
+            "product": "NRML",
+            "expiry_policy": "exit_before_cutoff",
+            "short_offset_points": 0,
+            # The fixture ladder is 22400..22750, so a 100-point wing is the
+            # widest the harness can freeze. The declared width is a parameter,
+            # and the example refuses by name when the chain cannot provide it.
+            "wing_width_points": 100,
+            "base_units": 1,
+            "deadline_seconds": 240,
+        },
+        # The run's own generations: entry 1, resized 2, rolled 3, exited 3.
+        "expected_generations": [1, 2, 3, 3],
+        "expected_units_by_generation": {1: 1, 2: 2, 3: 2},
+        "entered_after_adjust": [1, 2],
+        "expected_final_status": "exited",
+        "expected_edges": {"entry": 1, "adjust": 2, "exit": 1},
+        "initial_expiry": "2026-10-29",
+        "rolled_expiry": "2026-11-26",
+        "option_lot_size": 50,
     },
     "universe_equal_weight": {
         "source": "index_universe_equal_weight.py",
@@ -1275,6 +1362,11 @@ def run_scenario(
     # follows a finished attempt, never a kill of a running child. An attempt that
     # still HOLDS exposure is refused by name (OPEN_EXPOSURE) - that refusal is the
     # platform working, not a harness error, and it is recorded as evidence.
+    #
+    # B2.1's continuation clears its OWN block once the evaluation proved
+    # quiescence, so for a scenario that declares ``expects_self_cleared_block``
+    # the operator route is EXPECTED to answer HOSTED_JOB_NOT_BLOCKED. That answer
+    # is the continuation proof - the assertion below, not an error to swallow.
     reconciliation: Dict[str, Any] = {}
     try:
         reconciliation = {
@@ -1284,9 +1376,20 @@ def run_scenario(
                 json={"attempt": attempt},
             ),
         }
+        if spec.get("expects_self_cleared_block"):
+            reconciliation = {"status": "error", "reason": "the attempt was still blocked"}
+            fail(
+                f"{label}_reconcile",
+                AssertionError(
+                    "the healthy continuation did not clear its own block: the operator "
+                    "route reconciled instead of answering HOSTED_JOB_NOT_BLOCKED"
+                ),
+            )
     except Exception as exc:  # noqa: BLE001 - classified below, never hidden
         text = str(exc)
-        if "OPEN_EXPOSURE" in text and spec.get("expects_open_exposure"):
+        if "HOSTED_JOB_NOT_BLOCKED" in text and spec.get("expects_self_cleared_block"):
+            reconciliation = {"status": "not_blocked", "reason": "HOSTED_JOB_NOT_BLOCKED"}
+        elif "OPEN_EXPOSURE" in text and spec.get("expects_open_exposure"):
             reconciliation = {"status": "refused", "reason": "OPEN_EXPOSURE"}
         elif "blocking_reasons" in text:
             reconciliation = {"status": "refused", "reason": text[:400]}
@@ -2549,6 +2652,480 @@ def run_options_recurring_scenario(
     return scenario
 
 
+def _option_run_state_row(session_factory, option_run_id: str) -> Dict[str, Any]:
+    """One option run's OWN durable row: status, held legs, metadata, trades.
+
+    ``jsonb`` arrives decoded on PostgreSQL, but the harness normalises either
+    shape so a "no legs" read can never be a list of characters.
+    """
+    from sqlalchemy import text
+
+    with session_factory() as session:
+        row = (
+            session.execute(
+                text(
+                    "SELECT status, legs, completed_legs, trades, metadata"
+                    "  FROM public.option_run_states WHERE strategy_run_id = :r"
+                ),
+                {"r": str(option_run_id)},
+            )
+            .mappings()
+            .first()
+        )
+    if row is None:
+        return {}
+    state = dict(row)
+    for key in ("legs", "completed_legs", "trades", "metadata"):
+        value = state.get(key)
+        if isinstance(value, str):
+            try:
+                state[key] = json.loads(value)
+            except ValueError:
+                state[key] = [] if key != "metadata" else {}
+    for key in ("legs", "completed_legs", "trades"):
+        if not isinstance(state.get(key), list):
+            state[key] = []
+    if not isinstance(state.get("metadata"), dict):
+        state["metadata"] = {}
+    return state
+
+
+def _run_open_by_leg(state: Mapping[str, Any]) -> Dict[str, int]:
+    """The run's own confirmed open per leg id, from its recorded trades only."""
+    open_by_leg: Dict[str, int] = {}
+    for trade in list(state.get("trades") or []):
+        leg_id = str((trade or {}).get("leg_id") or "")
+        quantity = int((trade or {}).get("quantity") or 0)
+        side = str((trade or {}).get("transaction_type") or "").upper()
+        open_by_leg[leg_id] = open_by_leg.get(leg_id, 0) + (quantity if side == "BUY" else -quantity)
+    return open_by_leg
+
+
+def _leg_units(state: Mapping[str, Any]) -> List[int]:
+    """Each held leg's size in structure units (quantity floored by its lot)."""
+    units: List[int] = []
+    for leg in list(state.get("legs") or []):
+        lot = int((leg or {}).get("lot_size") or 0)
+        quantity = abs(int((leg or {}).get("quantity") or 0))
+        units.append(quantity // lot if lot > 0 else 0)
+    return units
+
+
+def _run_generation(state: Mapping[str, Any]) -> int:
+    try:
+        generation = int((state.get("metadata") or {}).get("structure_generation") or 1)
+    except (TypeError, ValueError):
+        return 1
+    return generation if generation >= 1 else 1
+
+
+def _option_run_checkpoint(session_factory, option_run_id: str) -> Dict[str, Any]:
+    """The platform's own view of the run after one supervised evaluation."""
+    state = _option_run_state_row(session_factory, option_run_id)
+    expiries = {
+        str((leg or {}).get("expiry_key") or "")
+        for leg in list(state.get("legs") or [])
+        if str((leg or {}).get("expiry_key") or "")
+    }
+    return {
+        "status": str(state.get("status") or "unknown"),
+        "generation": _run_generation(state),
+        "leg_units": _leg_units(state),
+        "expiry": expiries.pop() if len(expiries) == 1 else "",
+    }
+
+
+def _option_run_facts(session_factory, strategy_id: str, option_run_id: str) -> Dict[str, Any]:
+    """The final facts about one run: its own legs, its ledger, its generations."""
+    state = _option_run_state_row(session_factory, option_run_id)
+    legs = [dict(leg) for leg in list(state.get("legs") or []) if isinstance(leg, dict)]
+    held_ids = {str(leg.get("leg_id") or "") for leg in legs}
+    released: set = set()
+    for generation in list((state.get("metadata") or {}).get("structure_generation_history") or []):
+        for leg in list((generation or {}).get("legs") or []):
+            if isinstance(leg, dict) and leg.get("leg_id"):
+                released.add(str(leg["leg_id"]))
+    from sqlalchemy import text
+
+    with session_factory() as session:
+        phases = [
+            str(row[0])
+            for row in session.execute(
+                text(
+                    "SELECT phase FROM public.strategy_plan_option_runs"
+                    " WHERE option_run_id = :r ORDER BY created_at, plan_id"
+                ),
+                {"r": str(option_run_id)},
+            )
+        ]
+        runs = [
+            str(row[0])
+            for row in session.execute(
+                text(
+                    "SELECT DISTINCT option_run_id FROM public.strategy_plan_option_runs"
+                    " WHERE strategy_id = :sid"
+                ),
+                {"sid": strategy_id},
+            )
+        ]
+    return {
+        "run_count": len([value for value in runs if value]),
+        "edges": [{"phase": phase} for phase in phases],
+        "final": {
+            "status": str(state.get("status") or "unknown"),
+            "generation": _run_generation(state),
+            "leg_units": _leg_units(state),
+            "leg_expiries": [
+                str(leg.get("expiry_key") or "")
+                for leg in legs
+                if str(leg.get("expiry_key") or "")
+            ],
+            "open_by_leg": _run_open_by_leg(state),
+            "released_leg_ids": sorted(released),
+            "held_leg_ids": sorted(value for value in held_ids if value),
+        },
+    }
+
+
+def _option_request_rows(session_factory, strategy_id: str) -> List[Dict[str, Any]]:
+    """This strategy's durable execution requests with their refusal detail."""
+    from sqlalchemy import text
+
+    with session_factory() as session:
+        return [
+            dict(row)
+            for row in session.execute(
+                text(
+                    "SELECT request_id, plan_id, status, authorization_mode, decision_kind,"
+                    " refusal_code, refusal_detail, execution_detail"
+                    "  FROM hosted_execution_requests WHERE strategy_id = :sid ORDER BY created_at"
+                ),
+                {"sid": strategy_id},
+            ).mappings()
+        ]
+
+
+def _fund_paper_account(app: Any, account_scope: str, starting_balance: Any) -> None:
+    """Give ONE scenario's simulated paper account a declared starting balance.
+
+    The harness's broker boundary is the paper runtime, whose starting capital is
+    the harness's own choice. A scenario that carries a structure through a roll's
+    OVERLAP window (both generations held at once) needs more free paper margin
+    than the default, and the production service's own ``ensure_account`` is how
+    that account is created - no balance is inflated mid-run to make an assertion
+    pass.
+    """
+    if starting_balance is None:
+        return
+    service = getattr(app.state, "paper_runtime_service", None)
+    if service is None:
+        raise RuntimeError("the harness app has no paper runtime service to fund")
+    from decimal import Decimal
+
+    asyncio.run(
+        service.ensure_account(
+            str(account_scope), starting_balance=Decimal(str(starting_balance))
+        )
+    )
+
+
+def run_options_dynamic_scenario(
+    label: str,
+    spec: Dict[str, Any],
+    *,
+    app: Any,  # noqa: ANN001
+    session_factory,
+    operator,
+    base_url: str,
+    port: int,
+    timeout: float,
+) -> Dict[str, Any]:
+    """ONE persistent option structure across entry / resize / roll / exit (B2.2).
+
+    Each evaluation is a fresh supervised child process against the SAME durable
+    strategy and version, so "a restart between evaluations" is the normal path
+    rather than a special one. The child discovers its own run from
+    ``owned_work()["option_runs"]`` and submits ONE desired state per evaluation;
+    the platform owns validation, admission, sequencing, the hedge gate and the
+    run's lifecycle.
+
+    The evidence is the platform's own (``option_run_states``,
+    ``strategy_plan_option_runs`` and ``hosted_execution_requests``): one run, the
+    generations in order, leg sizes that match the declared units, the old
+    generation flat after the roll, and the named refusals. Nothing here is
+    asserted from a child's self-report.
+    """
+    source = (EXAMPLES / spec["source"]).read_text()
+    schema = json.loads((EXAMPLES / spec["schema"]).read_text())
+    account = account_for(label)
+    _fund_paper_account(app, account, spec.get("paper_starting_balance"))
+
+    created = operator.post(
+        "/api/strategies",
+        json={
+            "name": f"options dynamic {label}",
+            "description": "entry, resize, expiry roll and exit of one structure",
+            "execution_mode": "paper",
+            "job_kind": "finite",
+            "account_scope": account,
+            "max_duration_s": 1800,
+            "progress_deadline_s": 900,
+            "stale_exit_policy": "none",
+        },
+    )
+    strategy_id = str(created["strategy_id"])
+    version = operator.post(
+        f"/api/strategies/{strategy_id}/versions",
+        json={
+            "source": source,
+            "parameters_schema": schema,
+            "capabilities": {"trade": True, "data": True},
+        },
+    )
+    version_id = str(version["version_id"])
+    operator.put(
+        f"/api/strategies/{strategy_id}/admission-policy",
+        json={"allocation_inr": float(spec.get("allocation_inr") or 500000.0)},
+    )
+
+    failures: List[str] = []
+    phases: List[Dict[str, Any]] = []
+    option_run_id = ""
+    checkpoints: List[Dict[str, Any]] = []
+    job_specs = list(spec.get("recurring_jobs") or [])
+
+    for job_index, job_spec in enumerate(job_specs):
+        phase = str(job_spec.get("phase") or f"job{job_index}")
+        params = dict(spec["params"])
+        params.update(dict(job_spec.get("params") or {}))
+
+        # The production rebuild is what makes the previous evaluation's fills
+        # visible to this one, and what makes the attributed book authoritative.
+        _publish_positions(operator, strategy_id)
+        requests_before = len(_option_request_rows(session_factory, strategy_id))
+        orders_before = len(_paper_orders(session_factory, account))
+
+        try:
+            job = operator.post(
+                f"/api/strategies/{strategy_id}/jobs",
+                json={
+                    "version_id": version_id,
+                    "job_kind": "finite",
+                    "execution_mode": "paper",
+                    "params": dict(params),
+                    "idempotency_key": f"options-dynamic-job-{uuid.uuid4().hex[:8]}",
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - a blocked strategy is a named failure
+            failures.append(f"{phase}: the platform refused a new evaluation ({str(exc)[:200]})")
+            break
+        body = job.get("job") if isinstance(job.get("job"), dict) else job
+        job_id = str(body.get("job_id") or body.get("id") or "")
+        if not job_id:
+            fail(f"{label}_{phase}_job", AssertionError("the operator API returned no job id"))
+            break
+        step(f"{label}_{phase}_job_created", job_index=job_index, job_id=job_id)
+
+        supervisor_result: Dict[str, Any] = {}
+
+        def _supervise() -> None:
+            try:
+                supervisor_result.update(
+                    acc.run_supervisor(base_url, port, WORKSPACE / f"{label}-{phase}", job_id)
+                )
+            except BaseException as exc:  # noqa: BLE001 - reported in the evidence
+                fail(f"{label}_{phase}_supervisor", exc)
+                supervisor_result["error"] = repr(exc)
+
+        thread = threading.Thread(target=_supervise, daemon=True)
+        thread.start()
+
+        deadline = time.monotonic() + timeout
+        child_exited = False
+        approvals_while_child_alive = 0
+        orders_before_approval: Optional[int] = None
+        requests_at_child_exit: List[Dict[str, Any]] = []
+        while time.monotonic() < deadline:
+            for row in _option_request_rows(session_factory, strategy_id):
+                status = str(row["status"])
+                if status == "awaiting_approval":
+                    if orders_before_approval is None:
+                        orders_before_approval = len(_paper_orders(session_factory, account))
+                    # The owner's decision goes through the REAL HTTP route while
+                    # the attempt that waits for it is still alive.
+                    try:
+                        operator.post(
+                            f"/api/strategies/{strategy_id}/execution-requests/"
+                            f"{row['request_id']}/approve",
+                            json={"reason": "phase5 dynamic options approval"},
+                        )
+                        approvals_while_child_alive += 1
+                    except Exception as exc:  # noqa: BLE001 - reported, not hidden
+                        fail(f"{label}_{phase}_approve", exc)
+                elif status == "queued":
+                    _dispatch_once(app)
+                    _publish_positions(operator, strategy_id)
+            if supervisor_result:
+                child_exited = True
+                requests_at_child_exit = _option_request_rows(session_factory, strategy_id)
+                break
+            time.sleep(0.5)
+
+        attempt = _job_attempt(session_factory, job_id)
+        if not child_exited:
+            try:
+                operator.post(
+                    f"/api/strategies/{strategy_id}/jobs/{job_id}/stop",
+                    json={"attempt": attempt},
+                )
+            except Exception as exc:  # noqa: BLE001
+                fail(f"{label}_{phase}_stop", exc)
+            failures.append(f"{phase}: the supervised child never exited within {timeout}s")
+        thread.join(timeout=30)
+        # The continuation path must clear the finished attempt by itself: an
+        # operator reconciliation being REQUIRED would mean the held structure (or
+        # its adjustment) needed a human.
+        try:
+            operator.post(
+                f"/api/strategies/{strategy_id}/jobs/{job_id}/reconciliation",
+                json={"attempt": attempt},
+            )
+            failures.append(
+                f"{phase}: an operator reconciliation was required, so the healthy "
+                "completion did not clear its own block"
+            )
+        except Exception as exc:  # noqa: BLE001 - expected: HOSTED_JOB_NOT_BLOCKED
+            if "HOSTED_JOB_NOT_BLOCKED" not in str(exc):
+                failures.append(f"{phase}: unexpected reconciliation answer {str(exc)[:200]}")
+        try:
+            acc.wait_for_terminal_job(session_factory, job_id, deadline_s=60.0)
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f"{phase}: the job never reached a terminal state ({exc})")
+
+        outcome = str(supervisor_result.get("outcome") or "")
+        exit_code = supervisor_result.get("exit_code")
+        if outcome != "exited" or int(exit_code if exit_code is not None else -1) != 0:
+            failures.append(
+                f"{phase}: the child did not exit 0 on its own "
+                f"(outcome={outcome!r}, exit={exit_code!r})"
+            )
+        pending = [
+            str(row["status"])
+            for row in _option_request_rows(session_factory, strategy_id)
+            if str(row["status"]) not in {"executed", "refused", "rejected"}
+        ]
+        if child_exited and pending:
+            failures.append(f"{phase}: the child exited with non-terminal requests {pending!r}")
+        if not approvals_while_child_alive:
+            failures.append(
+                f"{phase}: no owner approval reached the platform while the "
+                "attempt that waited for it was alive"
+            )
+        if orders_before_approval != orders_before:
+            failures.append(
+                f"{phase}: orders existed before the owner's decision "
+                f"({(orders_before_approval or 0) - orders_before} new since this "
+                "evaluation started)"
+            )
+
+        # The run this structure lives in, resolved from the strategy's own edge.
+        if not option_run_id:
+            runs = _option_run_ids(session_factory, strategy_id)
+            if len(runs) == 1:
+                option_run_id = runs[0]
+        checkpoint = (
+            _option_run_checkpoint(session_factory, option_run_id) if option_run_id else {}
+        )
+        checkpoints.append({"phase": phase, **checkpoint})
+        job_requests = _option_request_rows(session_factory, strategy_id)[requests_before:]
+        log_path = WORKSPACE / f"{label}-{phase}" / "logs" / f"{job_id}.log"
+        phases.append(
+            {
+                "phase": phase,
+                "job_id": job_id,
+                "job_index": job_index,
+                "child_exited": child_exited,
+                "params": dict(params),
+                "requests": job_requests,
+                "orders": _paper_orders(session_factory, account)[orders_before:],
+                "checkpoint": checkpoint,
+                "child_log_tail": (
+                    log_path.read_text()[-2000:] if log_path.exists() else ""
+                ),
+                "supervisor": dict(supervisor_result),
+            }
+        )
+
+    if not option_run_id:
+        failures.append("no option run exists for this strategy after the evaluations")
+    facts: Dict[str, Any] = {}
+    if option_run_id:
+        facts = _option_run_facts(session_factory, strategy_id, option_run_id)
+    facts["checkpoints"] = checkpoints
+    facts["refusals"] = [
+        {
+            "request_id": str(row.get("request_id") or ""),
+            "status": str(row.get("status") or ""),
+            "refusal_code": str(row.get("refusal_code") or ""),
+            "decision_kind": str(row.get("decision_kind") or ""),
+            # A pre-execution refusal records its stage beside the code
+            # (``refusal_detail``); a dispatch-time refusal records it in the
+            # execution detail. Both are read so "refused before approval" is a
+            # fact about the platform's own row, not about which route wrote it.
+            "stage": str(
+                dict(row.get("refusal_detail") or {}).get("stage")
+                or dict(row.get("execution_detail") or {}).get("stage")
+                or ""
+            ),
+        }
+        for row in _option_request_rows(session_factory, strategy_id)
+        if row.get("refusal_code")
+    ]
+    acceptance = assert_option_dynamic(facts, spec)
+    for failure in acceptance["failures"]:
+        failures.append(failure)
+    for failure in failures:
+        fail(f"{label}_acceptance", AssertionError(failure))
+
+    scenario = {
+        "strategy_id": strategy_id,
+        "autonomous": False,
+        "option_run_id": option_run_id,
+        "phases": phases,
+        "checkpoints": checkpoints,
+        "facts": facts,
+        "requests": _option_request_rows(session_factory, strategy_id),
+        "acceptance": {"ok": not failures, "failures": failures, **acceptance},
+    }
+    RESULT["scenarios"][label] = scenario
+    step(
+        f"{label}_finished",
+        evaluations=len(phases),
+        generations=[row.get("generation") for row in checkpoints],
+        option_runs=int(facts.get("run_count") or 0),
+    )
+    return scenario
+
+
+def _option_run_ids(session_factory, strategy_id: str) -> List[str]:
+    """Every option run this strategy's plan edges point at, de-duplicated."""
+    from sqlalchemy import text
+
+    with session_factory() as session:
+        return sorted(
+            {
+                str(row[0])
+                for row in session.execute(
+                    text(
+                        "SELECT option_run_id FROM public.strategy_plan_option_runs"
+                        " WHERE strategy_id = :sid"
+                    ),
+                    {"sid": str(strategy_id)},
+                )
+            }
+        )
+
+
 def _paper_available_funds(session_factory, account_id: str) -> Optional[float]:
     """The paper account's OWN free cash, straight from its durable row.
 
@@ -3288,7 +3865,18 @@ def main(argv: Optional[List[str]] = None) -> int:
                 step(f"{label}_not_scored", reason=str(spec["not_scored"]))
                 continue
             try:
-                if spec.get("options_recurring"):
+                if spec.get("option_dynamic"):
+                    run_options_dynamic_scenario(
+                        label,
+                        spec,
+                        app=app,
+                        session_factory=session_factory,
+                        operator=operator,
+                        base_url=base_url,
+                        port=port,
+                        timeout=args.timeout,
+                    )
+                elif spec.get("options_recurring"):
                     run_options_recurring_scenario(
                         label,
                         spec,

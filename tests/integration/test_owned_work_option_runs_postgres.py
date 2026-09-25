@@ -427,6 +427,96 @@ class OptionRunDiscoveryTests(_PgTestCase):
         assert coverage["coverage"] == "unknown"
         assert coverage["reason"] == "option_run_identity_mismatch"
 
+    def test_a_generation_advancing_edge_is_recognised_as_the_runs_own(self):
+        """A resize or roll rewrites the run's legs, so the ORIGINATING edge is
+        obsolete by design.
+
+        The run is still this strategy's own structure: a NEWER edge of the same
+        run's binding set recognizes the legs it holds now, so the read is known -
+        and it reports the expiry the run holds, not the one the entry froze.
+        """
+        sf = self.make_db()
+        sid = f"stg-{uuid.uuid4().hex[:8]}"
+        _generation(sf)
+        _strategy(sf, strategy_id=sid)
+        _binding(sf, run_id="run-current", strategy_id=sid)
+        entry_plan = _plan(
+            sf,
+            strategy_id=sid,
+            account=ACCOUNT,
+            run_id="run-current",
+            legs=[{"instrument_id": "inst-oct", "tradingsymbol": "NIFTY26OCT22500CE"}],
+        )
+        roll_plan = _plan(
+            sf,
+            strategy_id=sid,
+            account=ACCOUNT,
+            run_id="run-current",
+            legs=[{"instrument_id": "inst-nov", "tradingsymbol": "NIFTY26NOV22500CE"}],
+        )
+        _option_run(
+            sf,
+            option_run_id="opt-rolled",
+            legs=[
+                _default_run_leg(
+                    tradingsymbol="NIFTY26NOV22500CE",
+                    expiry_key="2026-11-26",
+                    metadata={"instrument_id": "inst-nov"},
+                )
+            ],
+        )
+        _option_edge(
+            sf, plan_id=entry_plan, option_run_id="opt-rolled", strategy_id=sid,
+            account=ACCOUNT, phase="entry",
+        )
+        _option_edge(
+            sf, plan_id=roll_plan, option_run_id="opt-rolled", strategy_id=sid,
+            account=ACCOUNT, phase="adjust",
+        )
+
+        snapshot = _snapshot(sf, strategy_id=sid)
+
+        assert snapshot["option_runs_coverage"]["coverage"] == "known"
+        row = snapshot["option_runs"][0]
+        assert row["expiry"] == "2026-11-26"
+        assert row["legs"][0]["tradingsymbol"] == "NIFTY26NOV22500CE"
+
+    def test_a_run_whose_legs_no_bound_edge_recognizes_is_still_unknown(self):
+        """The scoping rule still fails closed: a run whose legs match NO edge of
+        its own binding set is a mis-scoped read, not evidence."""
+        sf = self.make_db()
+        sid = f"stg-{uuid.uuid4().hex[:8]}"
+        _generation(sf)
+        _strategy(sf, strategy_id=sid)
+        _binding(sf, run_id="run-current", strategy_id=sid)
+        _option_run(
+            sf,
+            option_run_id="opt-foreign",
+            legs=[
+                _default_run_leg(
+                    tradingsymbol="NIFTY26DEC99999CE",
+                    metadata={"instrument_id": "inst-foreign"},
+                )
+            ],
+        )
+        for index, symbol in enumerate(("NIFTY26OCT22500CE", "NIFTY26NOV22500CE")):
+            plan_id = _plan(
+                sf,
+                strategy_id=sid,
+                account=ACCOUNT,
+                run_id="run-current",
+                legs=[{"instrument_id": f"inst-{index}", "tradingsymbol": symbol}],
+            )
+            _option_edge(
+                sf, plan_id=plan_id, option_run_id="opt-foreign", strategy_id=sid,
+                account=ACCOUNT, phase="entry" if index == 0 else "adjust",
+            )
+
+        snapshot = _snapshot(sf, strategy_id=sid)
+        coverage = snapshot["option_runs_coverage"]
+        assert coverage["coverage"] == "unknown"
+        assert coverage["reason"] == "option_run_identity_mismatch"
+
     def test_a_run_leg_matching_on_symbol_alone_is_not_a_contradiction(self):
         """A durable run leg carries its identity under metadata; a leg without
         one must match its frozen counterpart on the symbol rather than being

@@ -233,6 +233,19 @@ def plan_exposure(
         account_id=account_id,
         execution_environment=execution_environment,
     )
+    # An option ADJUST's frozen desired state IS the post-plan book: the engine
+    # releases every leg the run holds that the target does not name (the release
+    # half of a roll, and a removal). Leaving those coordinates at "held
+    # unchanged" would keep a generation the plan is about to empty in the
+    # post-plan book, where it has no reference price of its own - so a legitimate
+    # roll would be refused POSITION_VALUATION_UNAVAILABLE for a book the plan
+    # closes. Their target is flat, so the release is visible as a reduction and
+    # the post-plan book is exactly what the run will hold.
+    if str((resolved.get("option_run") or {}).get("phase") or "") == "adjust":
+        for key in current:
+            if key not in targets:
+                targets[key] = 0
+                lots.setdefault(key, 1)
     for raw_key in unresolved_facts:
         unvalued.append(
             {

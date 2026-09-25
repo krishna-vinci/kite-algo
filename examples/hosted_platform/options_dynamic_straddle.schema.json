@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Options: dynamic delta-neutral short straddle with protective wings",
+  "description": "A short ATM call and put, each covered by an out-of-the-money long wing, managed across evaluations by one declared desired state (entry, resize, expiry roll or exit). Legs are resolved to real broker tokens before any proposal exists.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "underlying": {
+      "type": "string",
+      "default": "NIFTY",
+      "description": "Index ticker the option chain belongs to (for example NIFTY or BANKNIFTY)."
+    },
+    "product": {
+      "type": "string",
+      "enum": ["NRML", "MIS"],
+      "default": "NRML",
+      "description": "Frozen product for the option legs."
+    },
+    "expiry_policy": {
+      "type": "string",
+      "enum": ["exit_before_cutoff", "allow_cash_settlement"],
+      "default": "exit_before_cutoff",
+      "description": "Frozen expiry policy. Physical settlement needs separate capability evidence and is not offered here."
+    },
+    "short_offset_points": {
+      "type": "number",
+      "minimum": -500,
+      "maximum": 500,
+      "default": 0,
+      "description": "Points from spot for the SHORT straddle strikes (0 = at the money, the delta-neutral default)."
+    },
+    "wing_width_points": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 2000,
+      "default": 250,
+      "description": "Points from the short strike for the protective LONG wings. The nearest available strikes at or beyond this width are used, so the structure is never naked."
+    },
+    "base_units": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 10,
+      "default": 1,
+      "description": "Structure units opened by the entry."
+    },
+    "resize_units": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 10,
+      "description": "Structure units a resize moves to. Declaring it enables the resize; without it this example never resizes."
+    },
+    "resize_delta_threshold": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 100,
+      "default": 0.5,
+      "description": "Absolute net structure delta at or above which the declared resize fires."
+    },
+    "force_resize": {
+      "type": "boolean",
+      "default": false,
+      "description": "Acceptance-harness lever: fire the declared resize without waiting for the delta threshold, so a deterministic evaluation sequence can exercise it. It does not let this example submit anything it could not submit anyway."
+    },
+    "roll_days_to_expiry": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 60,
+      "default": 3,
+      "description": "Days to expiry at or below which the structure rolls to the nearest later expiry. Omit to never roll on the calendar."
+    },
+    "roll_to_expiry": {
+      "type": "string",
+      "description": "Explicit expiry to roll onto (ISO date). Declaring it makes the roll deterministic; it must be an expiry the chain actually lists."
+    },
+    "exit_position": {
+      "type": "boolean",
+      "default": false,
+      "description": "Explicit exit: close the structure this strategy holds instead of managing it."
+    },
+    "deadline_seconds": {
+      "type": "number",
+      "minimum": 0,
+      "default": 120,
+      "description": "How long this evaluation waits for a request to reach an authoritative outcome."
+    },
+    "quote_max_age_seconds": {
+      "type": "number",
+      "minimum": 0,
+      "default": 300,
+      "description": "Maximum age of the chain/Greeks read this evaluation will trade against."
+    },
+    "duplicate_entry_probe": {
+      "type": "boolean",
+      "default": false,
+      "description": "Once, ask the platform whether a SECOND entry for the structure this strategy already holds would be admitted, and report the answer. The probe submits no order."
+    },
+    "stale_basis_probe": {
+      "type": "boolean",
+      "default": false,
+      "description": "Once, ask the platform whether an adjustment frozen against the PREVIOUS leg generation would be admitted, and report the answer. The probe submits no order and is skipped while the run is still on its first generation."
+    }
+  },
+  "required": ["underlying"]
+}

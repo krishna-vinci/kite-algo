@@ -738,6 +738,89 @@ class OptionalAxisTests(AdmissionTestCase):
             self.service.evaluate(self.plan(), now=NOW, margin_evidence=self.margin()).admitted
         )
 
+    # -- option adjustments own their whole post-plan book ------------------
+
+    def _option_adjust_plan(self, *, new_price=100.0):
+        """An ADJUST whose desired state is one NEW coordinate, not the held one."""
+        new_leg = {
+            "instrument_id": "inst-NEW",
+            "exchange": "NFO",
+            "tradingsymbol": "NIFTY26NOV22500CE",
+            "product": "NRML",
+            "signed_quantity": -50,
+            "reference_price": new_price,
+            "lot_size": 50,
+            "strike": 22500.0,
+            "option_type": "CE",
+        }
+        return self.plan(
+            plan_kind="option_structure",
+            resolved_plan={
+                "legs": [new_leg],
+                "option_run": {"phase": "adjust", "option_run_id": "run-opt", "based_on_generation": 1},
+            },
+        )
+
+    def _book_option_leg(self, canonical_id, quantity):
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT INTO strategy_position_projection "
+                    "(account_id, strategy_id, execution_environment, identity_kind, identity_key, "
+                    " canonical_instrument_id, product, instrument_token, exchange, tradingsymbol, "
+                    " net_quantity, projection_version) "
+                    "VALUES ('kite:A', 'stg-A', 'live', 'canonical', :key, :key, 'NRML', 700, "
+                    " 'NFO', 'NIFTY26OCT22500CE', :qty, 1)"
+                ),
+                {"key": canonical_id, "qty": int(quantity)},
+            )
+            session.commit()
+
+    def test_an_option_adjust_releases_the_legs_its_target_does_not_name(self):
+        """A roll's OLD generation is released, not 'held unchanged'.
+
+        Leaving it in the post-plan book made the roll refuse
+        POSITION_VALUATION_UNAVAILABLE: the released legs carry no reference price
+        in the plan that closes them.
+        """
+        self.policy(allocation_inr=100000.0)
+        self._book_option_leg("inst-OLD", -50)
+        self.publish_state()
+        plan = self._option_adjust_plan()
+
+        exposure = self.service.plan_exposure(plan, execution_environment="live")
+
+        assert exposure["unvalued"] == []
+        released = [
+            row for row in exposure["per_instrument"] if row["coordinate"][0] == "inst-OLD"
+        ]
+        assert released, exposure["per_instrument"]
+        assert released[0]["target_quantity"] == 0
+        assert released[0]["order_quantity"] == 50
+        assert released[0]["increases_exposure"] is False
+        # Only the leg the target names survives into the post-plan book.
+        assert exposure["post_instruments"] == 1
+        verdict = self.service.evaluate(plan, now=NOW, margin_evidence=self.margin())
+        assert verdict.admitted, verdict.detail
+
+    def test_an_option_adjust_that_names_the_held_coordinate_keeps_it(self):
+        """The release rule zeroes only the coordinates the target OMITS: a
+        coordinate the desired state names is still the resize the plan describes."""
+        self.policy(allocation_inr=100000.0)
+        self._book_option_leg("inst-OLD", -50)
+        self.publish_state()
+        plan = self._option_adjust_plan()
+        plan["resolved_plan"]["legs"][0]["instrument_id"] = "inst-OLD"
+
+        exposure = self.service.plan_exposure(plan, execution_environment="live")
+
+        held = [
+            row for row in exposure["per_instrument"] if row["coordinate"][0] == "inst-OLD"
+        ]
+        assert held and held[0]["target_quantity"] == -50
+        assert held[0]["order_quantity"] == 0
+        assert exposure["post_instruments"] == 1
+
 
 class FailClosedTests(AdmissionTestCase):
     def test_live_daily_loss_budget_refuses_as_unavailable(self):
