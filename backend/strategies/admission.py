@@ -23,7 +23,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
@@ -53,6 +53,7 @@ ADMISSION_REFUSALS = (
     "DAILY_LOSS_BUDGET_UNAVAILABLE",
     "STRATEGY_RISK_POLICY_MISSING",
     "OPTION_STRUCTURE_FAMILY_NOT_ALLOWED",
+    "OPTION_EXPIRY_POLICY_NOT_ALLOWED",
     "OPTION_NAKED_NOT_PERMITTED",
     "OPTION_MAX_LOSS_EXCEEDED",
     "STRATEGY_NOTIONAL_LIMIT_EXCEEDED",
@@ -132,6 +133,7 @@ class AdmissionService:
         session_factory: Optional[Callable[[], Any]] = None,
         *,
         margin_engine: Any = None,
+        option_run_store: Any = None,
     ) -> None:
         if session_factory is None:
             from backend.app.database import SessionLocal
@@ -139,6 +141,7 @@ class AdmissionService:
             session_factory = SessionLocal
         self.session_factory = session_factory
         self._margin_engine = margin_engine
+        self._option_run_store = option_run_store
 
     # -- policy -------------------------------------------------------------
 
@@ -439,6 +442,7 @@ class AdmissionService:
         notional: Mapping[str, Any],
         detail: Dict[str, Any],
         margin_evidence: Optional[Mapping[str, Any]],
+        execution_environment: str,
     ) -> Optional[AdmissionVerdict]:
         """Enforce the effective per-strategy risk policy (B2.5).
 
@@ -502,8 +506,22 @@ class AdmissionService:
 
         notional_limit = effective.get("notional_limit_inr")
         if notional_limit is not None:
+            released_valuations = self._value_released_legs(
+                plan, exposure=exposure, execution_environment=execution_environment
+            )
+            sources = [
+                {
+                    "coordinate": list(key),
+                    "valuation_source": released_valuations.get(
+                        key, ("", "unavailable")
+                    )[1],
+                }
+                for key in self._released_leg_keys(exposure)
+            ]
             target_notional, peak_notional, peak_unknown = self._risk_notionals(
-                exposure=exposure, notional=notional
+                exposure=exposure,
+                notional=notional,
+                released_valuations=released_valuations,
             )
             enforced_notional = (
                 target_notional
@@ -517,6 +535,7 @@ class AdmissionService:
                     "strategy_roll_peak_notional_inr": peak_notional,
                     "strategy_roll_peak_unavailable": peak_unknown,
                     "strategy_enforced_notional_inr": enforced_notional,
+                    "released_leg_valuation_sources": sources,
                 }
             )
 
@@ -559,7 +578,7 @@ class AdmissionService:
             if frozen_expiry_policy not in set(allowed_expiry):
                 return AdmissionVerdict(
                     False,
-                    "OPTION_STRUCTURE_FAMILY_NOT_ALLOWED",
+                    "OPTION_EXPIRY_POLICY_NOT_ALLOWED",
                     {
                         **detail,
                         "allowed_expiry_policies": list(allowed_expiry),
@@ -686,31 +705,220 @@ class AdmissionService:
         return None
 
     @staticmethod
+    def _released_leg_keys(exposure: Mapping[str, Any]) -> Set[Tuple[str, str]]:
+        return {
+            tuple(row.get("coordinate") or ())
+            for row in exposure.get("per_instrument") or []
+            if int(row.get("current_quantity") or 0) != 0
+            and int(row.get("target_quantity") or 0) == 0
+        }
+
+    def _value_released_legs(
+        self,
+        plan: Mapping[str, Any],
+        *,
+        exposure: Mapping[str, Any],
+        execution_environment: str,
+    ) -> Dict[Tuple[str, str], Tuple[float, str]]:
+        """Price released roll legs from the platform's own durable evidence.
+
+        Confirmed fills win; the unique binding to the entry plan is the fallback.
+        Absent keys remain unknown and fail closed at the notional check.
+        """
+        released_keys = self._released_leg_keys(exposure)
+        if not released_keys:
+            return {}
+        strategy_id = str(plan.get("strategy_id") or "")
+        account_id = str(plan.get("account_id") or "")
+        resolved = plan.get("resolved_plan")
+        option_run = (
+            dict(resolved.get("option_run") or {})
+            if isinstance(resolved, Mapping) and isinstance(resolved.get("option_run"), Mapping)
+            else {}
+        )
+        option_run_id = str(option_run.get("option_run_id") or "")
+        if not strategy_id or not account_id or not option_run_id:
+            return {}
+
+        from backend.strategies.attribution_models import (
+            StrategyPlan,
+            StrategyPlanOptionRun,
+        )
+
+        own_prices = self._own_fill_prices(option_run_id, released_keys=released_keys)
+        with self.session_factory() as session:
+            opening_row = session.execute(
+                select(StrategyPlan.resolved_plan)
+                .join(
+                    StrategyPlanOptionRun,
+                    StrategyPlanOptionRun.plan_id == StrategyPlan.plan_id,
+                )
+                .where(
+                    StrategyPlanOptionRun.option_run_id == option_run_id,
+                    StrategyPlanOptionRun.phase == "entry",
+                    StrategyPlanOptionRun.strategy_id == strategy_id,
+                    StrategyPlanOptionRun.account_id == account_id,
+                    StrategyPlanOptionRun.execution_environment
+                    == str(execution_environment),
+                )
+                .order_by(StrategyPlanOptionRun.created_at, StrategyPlanOptionRun.plan_id)
+                .limit(1)
+            ).first()
+
+        opening_legs: List[Mapping[str, Any]] = []
+        if opening_row is not None and isinstance(opening_row[0], Mapping):
+            opening_legs = [
+                leg
+                for leg in (opening_row[0].get("legs") or [])
+                if isinstance(leg, Mapping)
+            ]
+        opening_prices = self._opening_plan_prices(opening_legs, released_keys)
+
+        valuations: Dict[Tuple[str, str], Tuple[float, str]] = {}
+        for key in released_keys:
+            if key in own_prices:
+                valuations[key] = (own_prices[key], "own_fills")
+            elif key in opening_prices:
+                valuations[key] = (opening_prices[key], "opening_plan")
+        return valuations
+
+    def _own_fill_prices(
+        self,
+        option_run_id: str,
+        *,
+        released_keys: Set[Tuple[str, str]],
+    ) -> Dict[Tuple[str, str], float]:
+        """The volume-weighted average of each named leg's confirmed fills."""
+        store = self._option_run_store
+        if store is None:
+            from backend.options.execution.durable_store import DurableOptionRunStore
+
+            store = DurableOptionRunStore(session_factory=self.session_factory)
+        try:
+            with self.session_factory() as session:
+                run = store.get_run_in_session(session, option_run_id)
+        except (KeyError, SQLAlchemyError, TypeError, ValueError):
+            return {}
+
+        leg_keys: Dict[str, Tuple[str, str]] = {}
+        symbols: Dict[str, Tuple[str, str]] = {}
+        for leg in getattr(run, "legs", []) or []:
+            if not isinstance(leg, Mapping):
+                continue
+            metadata = (
+                leg.get("metadata")
+                if isinstance(leg.get("metadata"), Mapping)
+                else {}
+            )
+            identity = str(
+                metadata.get("instrument_id")
+                or leg.get("instrument_id")
+                or leg.get("tradingsymbol")
+                or ""
+            )
+            key = (identity, str(leg.get("product") or "").upper())
+            leg_id = str(leg.get("leg_id") or "")
+            symbol = str(leg.get("tradingsymbol") or "").upper()
+            if leg_id:
+                leg_keys[leg_id] = key
+            if symbol:
+                symbols[symbol] = key
+
+        totals: Dict[Tuple[str, str], Tuple[float, float]] = {}
+        for trade in getattr(run, "trades", []) or []:
+            if not isinstance(trade, Mapping):
+                continue
+            key = leg_keys.get(str(trade.get("leg_id") or ""))
+            if key is None:
+                key = symbols.get(str(trade.get("tradingsymbol") or "").upper())
+            if key not in released_keys:
+                continue
+            quantity = _as_float(trade.get("quantity") or trade.get("filled_quantity"))
+            price = _as_float(
+                trade.get("price")
+                or trade.get("fill_price")
+                or trade.get("average_price")
+            )
+            if quantity is None or price is None or quantity <= 0 or price <= 0:
+                continue
+            value, filled = totals.get(key, (0.0, 0.0))
+            totals[key] = (
+                value + abs(quantity) * abs(price),
+                filled + abs(quantity),
+            )
+        return {
+            key: value / filled for key, (value, filled) in totals.items() if filled > 0
+        }
+
+    @staticmethod
+    def _opening_plan_prices(
+        legs: Sequence[Mapping[str, Any]],
+        released_keys: Set[Tuple[str, str]],
+    ) -> Dict[Tuple[str, str], float]:
+        prices: Dict[Tuple[str, str], float] = {}
+        for leg in legs:
+            identity = str(
+                leg.get("instrument_id")
+                or leg.get("canonical_instrument_id")
+                or leg.get("tradingsymbol")
+                or ""
+            )
+            key = (identity, str(leg.get("product") or "").upper())
+            if key not in released_keys:
+                continue
+            price = _as_float(leg.get("reference_price"))
+            if price is not None and price > 0:
+                prices[key] = abs(price)
+        return prices
+
+    @staticmethod
+    def _valued_current_held(
+        exposure: Mapping[str, Any],
+        released_prices: Mapping[Tuple[str, str], float],
+    ) -> Tuple[float, bool]:
+        """Value the pre-plan book; released legs may come from durable evidence."""
+        total = 0.0
+        unknown = False
+        for row in exposure.get("per_instrument") or []:
+            quantity = int(row.get("current_quantity") or 0)
+            if quantity == 0:
+                continue
+            target = int(row.get("target_quantity") or 0)
+            notional = _as_float(row.get("notional_inr"))
+            if target != 0 and notional is not None:
+                total += abs(quantity) * float(notional) / abs(target)
+                continue
+            price = released_prices.get(tuple(row.get("coordinate") or ()))
+            if price is None:
+                unknown = True
+            else:
+                total += abs(quantity) * float(price)
+        return total, unknown
+
     def _risk_notionals(
-        *, exposure: Mapping[str, Any], notional: Mapping[str, Any]
+        self,
+        *,
+        exposure: Mapping[str, Any],
+        notional: Mapping[str, Any],
+        released_valuations: Optional[Mapping[Tuple[str, str], Tuple[float, str]]] = None,
     ) -> Tuple[float, Optional[float], bool]:
-        """The frozen target's notional, the roll's overlap PEAK, and whether that
-        peak is UNKNOWN because a held coordinate the plan does not price cannot
-        be valued.
+        """The frozen target's notional and the overlap peak held during a roll.
 
-        The peak is what the strategy actually holds during the plan: the current
-        book plus the legs the target OPENS on coordinates the book does not
-        already carry. It is deliberately not the post-plan book, which has
-        already released the old generation - checking against that would let a
-        roll's overlap window through unseen.
-
-        The released generation carries no price of its own (the plan that closes
-        it never names it), so the peak is reported as unknown rather than
-        quietly valued at zero. The caller refuses a configured limit on unknown
-        evidence; it never reads "unpriceable" as "nothing".
+        The peak is the pre-plan book plus coordinates the target opens fresh.
+        A released leg absent from the roll plan is valued only from the run's
+        confirmed fills or its opening plan; without one of those, the peak is
+        UNKNOWN rather than zero.
         """
         target_notional = float(notional["total_notional_inr"] or 0.0)
-        held = exposure["current_exposure_inr"]
+        released_prices = {
+            key: value[0] for key, value in (released_valuations or {}).items()
+        }
+        held, held_unknown = self._valued_current_held(exposure, released_prices)
         opens_new = any(
             row.get("increases_exposure") and int(row.get("current_quantity") or 0) == 0
             for row in exposure["per_instrument"]
         )
-        if held is None:
+        if held_unknown:
             return target_notional, None, opens_new
         opening = 0.0
         for row in exposure["per_instrument"]:
@@ -721,7 +929,7 @@ class AdmissionService:
             if row.get("notional_inr") is None:
                 return target_notional, None, True
             opening += float(row["notional_inr"])
-        return target_notional, float(held) + opening, False
+        return target_notional, held + opening, False
 
     @staticmethod
     def _frozen_max_loss(resolved: Mapping[str, Any]) -> Optional[float]:
@@ -1024,6 +1232,7 @@ class AdmissionService:
             notional=notional,
             detail=detail,
             margin_evidence=margin_evidence,
+            execution_environment=environment,
         )
         if risk_refusal is not None:
             return risk_refusal

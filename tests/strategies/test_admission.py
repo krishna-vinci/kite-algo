@@ -77,6 +77,7 @@ class AdmissionTestCase(unittest.TestCase):
             StrategyAdmissionPolicy,
             StrategyApproval,
             StrategyPlan,
+            StrategyPlanOptionRun,
             StrategyPositionProjection,
             StrategyProjectionState,
             StrategyProposal,
@@ -95,6 +96,7 @@ class AdmissionTestCase(unittest.TestCase):
                 Strategy.__table__,
                 StrategyProposal.__table__,
                 StrategyPlan.__table__,
+                StrategyPlanOptionRun.__table__,
                 StrategyAdmissionPolicy.__table__,
                 StrategyReservation.__table__,
                 StrategyReservationEvent.__table__,
@@ -162,8 +164,11 @@ class AdmissionTestCase(unittest.TestCase):
 
     def _service(self):
         from backend.strategies.admission import AdmissionService
+        from backend.options.execution.store import OptionRunStore
 
-        return AdmissionService(session_factory=self.factory)
+        return AdmissionService(
+            session_factory=self.factory, option_run_store=OptionRunStore()
+        )
 
     # -- fixtures -----------------------------------------------------------
 
@@ -1162,6 +1167,83 @@ class StrategyRiskPolicyTests(AdmissionTestCase):
             }
         return self.plan(plan_kind="option_structure", resolved_plan=resolved, plan_id=plan_id)
 
+    def _roll_plan(self, *, old_instrument_id="inst-OLD-25000CE"):
+        rolled = [
+            self._option_leg(
+                side="SELL", option_type="CE", strike=25000, quantity=75,
+                price=100.0, instrument_id="inst-NOV-25000CE",
+            ),
+            self._option_leg(
+                side="BUY", option_type="CE", strike=26000, quantity=75,
+                price=80.0, instrument_id="inst-NOV-26000CE",
+            ),
+        ]
+        return self._option_plan(
+            rolled, phase="adjust", option_run_id="run-opt", generation=1
+        )
+
+    def _seed_option_run(self, old_instrument_id, *, trades=None):
+        from backend.options.execution.models import OptionRunState
+
+        run = OptionRunState(
+            strategy_run_id="run-opt",
+            strategy_name="A",
+            product="NRML",
+            legs=[
+                {
+                    "leg_id": "plan-open:0",
+                    "tradingsymbol": "NIFTY26OCT25000CE",
+                    "transaction_type": "SELL",
+                    "quantity": 75,
+                    "product": "NRML",
+                    "metadata": {"instrument_id": old_instrument_id},
+                }
+            ],
+            trades=list(trades or []),
+        )
+        self.service._option_run_store.save_run(run)
+
+    def _seed_opening_plan(self, *, old_instrument_id, price):
+        resolved = {
+            "legs": [
+                {
+                    "instrument_id": old_instrument_id,
+                    "tradingsymbol": "NIFTY26OCT25000CE",
+                    "product": "NRML",
+                    "reference_price": float(price),
+                }
+            ]
+        }
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT OR IGNORE INTO strategy_proposals "
+                    "(proposal_id, strategy_id, account_id, evaluation_id, evaluation_kind, "
+                    " strategy_run_id, target_kind, payload, payload_sha256, status) "
+                    "VALUES ('prop-plan-open', 'stg-A', 'kite:A', 'plan-open', 'run_now', "
+                    " 'run-1', 'option_structure', '{}', 'sha', 'validated')"
+                )
+            )
+            session.execute(
+                text(
+                    "INSERT OR IGNORE INTO strategy_plans "
+                    "(plan_id, proposal_id, strategy_id, account_id, plan_kind, plan_hash, "
+                    " logical_plan, resolved_plan, pinned_catalog_generation) "
+                    "VALUES ('plan-open', 'prop-plan-open', 'stg-A', 'kite:A', "
+                    " 'option_structure', 'h', '{}', :resolved, :gen)"
+                ),
+                {"resolved": json.dumps(resolved), "gen": G1},
+            )
+            session.execute(
+                text(
+                    "INSERT INTO strategy_plan_option_runs "
+                    "(plan_id, option_run_id, strategy_id, account_id, "
+                    " execution_environment, phase) "
+                    "VALUES ('plan-open', 'run-opt', 'stg-A', 'kite:A', 'live', 'entry')"
+                )
+            )
+            session.commit()
+
     def _admitted(self, plan, **kwargs):
         verdict = self.service.evaluate(
             plan, now=NOW, margin_evidence=self.margin(usable=1000000.0), **kwargs
@@ -1205,6 +1287,18 @@ class StrategyRiskPolicyTests(AdmissionTestCase):
             {"allowed_structure_families": ["vertical_spread", "custom"]}
         )
         self._admitted(self._option_plan(self._vertical()))
+
+    def test_an_expiry_policy_outside_the_allow_list_is_refused_by_name(self):
+        self.policy(allocation_inr=1000000.0)
+        self.declare_risk_policy({"expiry_policy": ["allow_cash_settlement"]})
+        verdict = self._refused(
+            self._option_plan(self._vertical()),
+            "OPTION_EXPIRY_POLICY_NOT_ALLOWED",
+        )
+        self.assertEqual(verdict.detail["expiry_policy"], "exit_before_cutoff")
+        self.assertEqual(
+            verdict.detail["allowed_expiry_policies"], ["allow_cash_settlement"]
+        )
 
     # -- naked exposure -----------------------------------------------------
 
@@ -1343,6 +1437,87 @@ class StrategyRiskPolicyTests(AdmissionTestCase):
         )
         self._admitted(self._option_plan(self._vertical()))
 
+    def test_a_roll_with_own_fills_within_the_limit_is_admitted(self):
+        self.policy(allocation_inr=1000000.0)
+        self.declare_risk_policy(
+            {
+                "allowed_structure_families": ["vertical_spread"],
+                "notional_limit_inr": 21500.0,
+            }
+        )
+        old_instrument_id = "inst-OLD-25000CE"
+        self._seed_option_run(
+            old_instrument_id,
+            trades=[
+                {"leg_id": "plan-open:0", "quantity": 50, "price": 100.0},
+                {"leg_id": "plan-open:0", "quantity": 25, "price": 120.0},
+            ],
+        )
+        self.book_option_leg(old_instrument_id, -75)
+        self.publish_state()
+
+        verdict = self._admitted(self._roll_plan())
+        self.assertEqual(verdict.detail["strategy_roll_peak_notional_inr"], 21500.0)
+        self.assertEqual(
+            verdict.detail["released_leg_valuation_sources"],
+            [
+                {
+                    "coordinate": [old_instrument_id, "NRML"],
+                    "valuation_source": "own_fills",
+                }
+            ],
+        )
+
+    def test_a_roll_with_own_fills_over_the_limit_is_refused(self):
+        self.policy(allocation_inr=1000000.0)
+        self.declare_risk_policy(
+            {
+                "allowed_structure_families": ["vertical_spread"],
+                "notional_limit_inr": 21499.0,
+            }
+        )
+        old_instrument_id = "inst-OLD-25000CE"
+        self._seed_option_run(
+            old_instrument_id,
+            trades=[
+                {"leg_id": "plan-open:0", "quantity": 50, "price": 100.0},
+                {"leg_id": "plan-open:0", "quantity": 25, "price": 120.0},
+            ],
+        )
+        self.book_option_leg(old_instrument_id, -75)
+        self.publish_state()
+
+        verdict = self._refused(
+            self._roll_plan(), "STRATEGY_NOTIONAL_LIMIT_EXCEEDED"
+        )
+        self.assertEqual(verdict.detail["strategy_roll_peak_notional_inr"], 21500.0)
+
+    def test_a_roll_without_fills_uses_the_opening_plan_reference(self):
+        self.policy(allocation_inr=1000000.0)
+        self.declare_risk_policy(
+            {
+                "allowed_structure_families": ["vertical_spread"],
+                "notional_limit_inr": 22500.0,
+            }
+        )
+        old_instrument_id = "inst-OLD-25000CE"
+        self._seed_option_run(old_instrument_id)
+        self._seed_opening_plan(old_instrument_id=old_instrument_id, price=120.0)
+        self.book_option_leg(old_instrument_id, -75)
+        self.publish_state()
+
+        verdict = self._admitted(self._roll_plan())
+        self.assertEqual(verdict.detail["strategy_roll_peak_notional_inr"], 22500.0)
+        self.assertEqual(
+            verdict.detail["released_leg_valuation_sources"],
+            [
+                {
+                    "coordinate": [old_instrument_id, "NRML"],
+                    "valuation_source": "opening_plan",
+                }
+            ],
+        )
+
     def test_a_roll_overlap_is_never_checked_against_the_post_plan_book(self):
         """A roll holds BOTH generations; the post-plan book holds only one.
 
@@ -1378,6 +1553,15 @@ class StrategyRiskPolicyTests(AdmissionTestCase):
         verdict = self._refused(plan, "REFERENCE_PRICE_UNAVAILABLE")
         self.assertTrue(verdict.detail["strategy_roll_peak_unavailable"])
         self.assertIsNone(verdict.detail["strategy_roll_peak_notional_inr"])
+        self.assertEqual(
+            verdict.detail["released_leg_valuation_sources"],
+            [
+                {
+                    "coordinate": ["inst-OLD-25000CE", "NRML"],
+                    "valuation_source": "unavailable",
+                }
+            ],
+        )
 
     # -- risk reduction is never blocked ------------------------------------
 
