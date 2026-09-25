@@ -27,6 +27,7 @@ import {
   fetchHostedStrategy,
   fetchHostedVersions,
   fetchOperatorCalendar,
+  fetchOptionExit,
   fetchOptionRun,
   fetchOptionRunRepair,
   fetchOptionRuns,
@@ -44,6 +45,7 @@ import {
   setAuthorizationMode,
   setHostedScheduleEnabled,
   stopHostedJob,
+  submitOptionExit,
   submitOptionRunRepair,
   updateHostedStrategy,
 } from "@/lib/hosted-strategies/api";
@@ -478,6 +480,39 @@ export function useResolveDeadSubmission(strategyId: string, planId: string, ste
       resolveDeadSubmission(strategyId, planId, stepNo, payload),
     onSuccess: () => {
       void client.invalidateQueries({ queryKey: hostedKeys.deadSubmission(strategyId, planId, stepNo) });
+      void client.invalidateQueries({ queryKey: hostedKeys.optionRuns(strategyId) });
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// B2.6b S2: owner-facing single-run governed exit
+// ---------------------------------------------------------------------------
+
+/**
+ * The owner-exit assessment. `enabled` lets the caller defer the GET until
+ * the exit dialog actually opens, rather than loading it eagerly.
+ */
+export function useOptionExitAssessment(
+  strategyId: string | null,
+  optionRunId: string | null,
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: hostedKeys.optionExit(strategyId ?? "", optionRunId ?? ""),
+    queryFn: () => fetchOptionExit(strategyId as string, optionRunId as string),
+    enabled: Boolean(strategyId && optionRunId) && enabled,
+  });
+}
+
+export function useSubmitOptionExit(strategyId: string, optionRunId: string) {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (payload: Parameters<typeof submitOptionExit>[2]) =>
+      submitOptionExit(strategyId, optionRunId, payload),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: hostedKeys.optionExit(strategyId, optionRunId) });
+      void client.invalidateQueries({ queryKey: hostedKeys.optionRun(strategyId, optionRunId) });
       void client.invalidateQueries({ queryKey: hostedKeys.optionRuns(strategyId) });
     },
   });

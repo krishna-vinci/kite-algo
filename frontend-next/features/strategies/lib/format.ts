@@ -172,6 +172,14 @@ const ERROR_COPY: Record<string, string> = {
   FLATTEN_EVALUATION_ACTIVE: "An active evaluation could not be proven stopped, so flatten was refused.",
   FLATTEN_LIVE_NONOPTION_UNSUPPORTED:
     "Live flatten for non-option positions is not supported yet; option work already completed is still reported as done.",
+  OPTION_OWNER_EXIT_LIVE_UNAVAILABLE:
+    "Live discretionary exit has no available execution boundary right now, so this stays refused rather than guessing.",
+  OPTION_RUN_EXIT_EVIDENCE_CHANGED:
+    "The run changed since this exit plan was shown. Refresh to see the current close plan.",
+  OPTION_RUN_EXIT_NOT_APPLICABLE:
+    "This run is not in a state that an owner exit can act on.",
+  OPTION_EXIT_BEFORE_ENTRY:
+    "This structure has not been entered yet, so there is nothing to exit.",
 };
 
 function withCopy(code: string): string {

@@ -1,6 +1,6 @@
-"""Owner actions for one hosted strategy (B2.6b S1).
+"""Owner actions for one hosted strategy (B2.6b S1 and S2).
 
-Four routes, two of them mutations:
+Five routes, three of them mutations:
 
 * ``GET  /api/strategies/{strategy_id}/owner-actions/pending-work`` - the
   strategy's own pending ENTRY work, with a stable ``evidence_digest`` and a
@@ -11,6 +11,10 @@ Four routes, two of them mutations:
   - the platform's own evidence about ONE unanswered plan step, and which
   terminal dispositions it supports;
 * ``POST .../dead-submission`` - apply one of those dispositions.
+* ``GET/POST /api/strategies/{strategy_id}/option-runs/{option_run_id}/exit`` -
+  the owner-authorized discretionary exit of ONE option run (S2), which submits
+  one stage of the STAGED structure exit derived from the run's own confirmed
+  fills.
 
 Authorization is uniform: the owner comes from ``require_strategy_owner`` (never
 a caller value), the account/environment scope is derived server-side exactly
@@ -22,6 +26,7 @@ module is the HTTP mapping and nothing else.
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -33,6 +38,10 @@ from backend.api.schemas.strategy_owner_actions import (
     DeadSubmissionResponse,
     OwnerActionItemResponse,
     OwnerActionResponse,
+    OptionRunExitActionResponse,
+    OptionRunExitItemResponse,
+    OptionRunExitRequest,
+    OptionRunExitResponse,
     PendingWorkItemResponse,
     PendingWorkResponse,
 )
@@ -43,6 +52,25 @@ from backend.api.services.owner_actions import (
     OwnerActionsService,
     live_broker_cancel,
     owner_action_scope,
+)
+from backend.api.services.option_run_repair import (
+    build_option_run_repair_service,
+    option_run_repair_scope,
+    owner_exit_gates,
+    owner_exit_refusal,
+    owner_exit_stage_items,
+    owner_exit_submission_refusal,
+    owner_exit_view,
+    record_owner_exit_audit,
+    require_owner_exit_boundary,
+    submit_owner_exit_stage,
+)
+from backend.options.execution.repair import (
+    ACTION_OWNER_EXIT,
+    STATE_FLAT,
+    STATE_RESIDUAL,
+    TERMINAL_RUN_STATUSES,
+    OptionRunRepairRefusal,
 )
 from backend.strategies.repository import SqlAlchemyStrategyRepository
 
@@ -116,6 +144,18 @@ def _plan_for(
         raise HTTPException(status_code=404, detail="Plan not found")
     authorize_account_scope(str(plan["account_id"]))
     return plan
+
+
+def _repair_service(
+    request: Request, session_factory: Any = Depends(_owner_actions_db)
+):
+    """The repair machinery in its owner-exit view.
+
+    One engine, not two: the exit reads the run through the SAME durable store,
+    the SAME ``StagedStructureExit`` and the SAME run CAS the governed repair
+    close does.
+    """
+    return build_option_run_repair_service(request, session_factory)
 
 
 def _item(row: Any) -> OwnerActionItemResponse:
@@ -208,6 +248,139 @@ async def cancel_pending_work(
         items=[_item(row) for row in (result.get("items") or [])],
         refusal=result.get("refusal"),
         audit_id=result.get("audit_id"),
+    )
+
+
+@router.get(
+    "/{strategy_id}/option-runs/{option_run_id}/exit",
+    response_model=OptionRunExitResponse,
+)
+async def inspect_option_run_exit(
+    strategy_id: str,
+    option_run_id: str,
+    request: Request,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_owner_actions_db),
+    service: Any = Depends(_repair_service),
+):
+    """The staged structure exit of ONE option run, and what it would submit.
+
+    Nothing is moved: the verdict is derived from the run's own confirmed fills
+    (shorts first, a hedge only once its short is proven closed) and the returned
+    ``evidence_digest`` is what a POST must still match.
+    """
+    _ = request
+    option_run_repair_scope(repo, owner, strategy_id, option_run_id, session_factory)
+    try:
+        view = owner_exit_view(service, option_run_id)
+    except OptionRunRepairRefusal as exc:
+        mapped = owner_exit_refusal(exc)
+        raise HTTPException(
+            status_code=mapped.status_code, detail=mapped.as_detail()
+        ) from exc
+    return OptionRunExitResponse(**view)
+
+
+@router.post(
+    "/{strategy_id}/option-runs/{option_run_id}/exit",
+    response_model=OptionRunExitActionResponse,
+)
+async def exit_option_run(
+    strategy_id: str,
+    option_run_id: str,
+    request: Request,
+    payload: OptionRunExitRequest,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_owner_actions_db),
+    service: Any = Depends(_repair_service),
+):
+    """Owner-authorized discretionary exit of ONE option run.
+
+    The server alone decides what the run holds, and the run's own transition is
+    the ownership token: exactly one caller takes ``entered`` / ``exiting`` and
+    submits ONE stage of the derived close plan. Nothing is submitted when a gate
+    refuses, and the run is never marked ``exited`` merely because a broker
+    accepted a stage - completion is the run's own fills proving it flat.
+    """
+    enforce_same_origin(request)
+    scope = option_run_repair_scope(repo, owner, strategy_id, option_run_id, session_factory)
+    # The specific gates are asked on a fresh read BEFORE the transition: an
+    # unresolved stage or an unfinished adjust outranks "your evidence is stale"
+    # as the explanation, and nothing has moved yet either way.
+    try:
+        owner_exit_gates(service.assessment(option_run_id, owner_exit=True))
+    except OptionRunRepairRefusal as exc:
+        raise HTTPException(
+            status_code=exc.status_code, detail=exc.as_detail()
+        ) from exc
+    try:
+        next_run, assessment = service.plan(
+            option_run_id=option_run_id,
+            action=ACTION_OWNER_EXIT,
+            evidence_digest=str(payload.evidence_digest or ""),
+            owner_exit=True,
+        )
+    except OptionRunRepairRefusal as exc:
+        mapped = owner_exit_refusal(exc)
+        raise HTTPException(
+            status_code=mapped.status_code, detail=mapped.as_detail()
+        ) from exc
+    state = str(assessment.get("state") or "")
+    observed_status = str(assessment.get("status") or "")
+    # Everything that can refuse happens BEFORE the run moves: an unavailable
+    # live boundary must never leave a claimed stage that nothing can send.
+    boundary = None
+    if state == STATE_RESIDUAL:
+        boundary = await require_owner_exit_boundary(request, scope=scope, run=next_run)
+    if state == STATE_FLAT and observed_status in TERMINAL_RUN_STATUSES:
+        # Already past the exit: report it complete, do not write the same
+        # terminal status again.
+        committed = next_run
+    else:
+        try:
+            committed = service.commit(next_run, allowed_from=observed_status)
+        except OptionRunRepairRefusal as exc:
+            mapped = owner_exit_refusal(exc, status=observed_status)
+            raise HTTPException(
+                status_code=mapped.status_code, detail=mapped.as_detail()
+            ) from exc
+    action_id = str(uuid.uuid4())
+    submission: Any = {}
+    if boundary is not None:
+        submission = await submit_owner_exit_stage(
+            request, session_factory, run=committed, scope=scope, boundary=boundary
+        )
+    refusal = None if state == STATE_FLAT else owner_exit_submission_refusal(submission)
+    if state == STATE_FLAT:
+        status = "complete"
+    elif refusal is None and submission.get("submitted"):
+        status = "accepted"
+    else:
+        status = "blocked"
+    audit_id = record_owner_exit_audit(
+        session_factory,
+        repo,
+        strategy_id=str(strategy_id),
+        run=committed,
+        action_id=action_id,
+        assessment=assessment,
+        submission=submission,
+        reason=str(payload.reason or ""),
+        actor=str(owner),
+    )
+    return OptionRunExitActionResponse(
+        status=status,
+        action_id=action_id,
+        option_run_id=str(committed.strategy_run_id),
+        run_status=str(committed.status),
+        state=state,
+        evidence_digest=str(assessment.get("evidence_digest") or ""),
+        items=[OptionRunExitItemResponse(**row) for row in owner_exit_stage_items(submission)],
+        refusal=refusal,
+        audit_id=audit_id,
+        submission=dict(submission or {}),
     )
 
 

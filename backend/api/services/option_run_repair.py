@@ -10,12 +10,12 @@ here leaves the router with the two handlers and their response mapping.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from fastapi import HTTPException
 
 from backend.api.services.hosted_strategy_authz import authorize_account_scope
-from backend.options.execution.repair import OptionRunRepairService
+from backend.options.execution.repair import OptionRunRepairRefusal, OptionRunRepairService
 
 #: The audit outcome one repair writes. Distinct from ``reconciled`` on purpose:
 #: this path never clears the job's block, so it must not read as a reconciliation
@@ -249,12 +249,24 @@ def require_residual_close_available(request: Any, run: Any) -> None:
         )
 
 
-def paper_structure_exit_boundary(paper_service: Any):
+def paper_structure_exit_boundary(
+    paper_service: Any,
+    *,
+    entry_surface: str = "hosted_option_repair",
+    source: str = "operator_option_run_repair",
+    strategy_name: str = "option_structure_repair",
+):
     """The paper runtime as the staged structure exit's broker boundary.
 
     Same shape as the live boundary in ``protection_runtime``: one basket leg per
     claim leg, a SERVER-SIDE attribution (never the evaluator's order list), and
     only the closes the exit builder permitted. It cannot increase exposure.
+
+    The attribution stamps are parameters because the SAME paper staged
+    submitter serves two owner actions (B2.6b): the governed repair close
+    (defaults) and the owner-authorized discretionary exit
+    (``hosted_option_owner_exit`` / ``owner_discretionary_exit``). One boundary,
+    two truthful attributions.
     """
     from backend.algo_runtime.execution_attribution import build_execution_attribution
 
@@ -275,10 +287,10 @@ def paper_structure_exit_boundary(paper_service: Any):
                 execution_mode="paper",
                 strategy_run_id=str(worker_run_id),
                 strategy_family="options_strategy",
-                strategy_name="option_structure_repair",
+                strategy_name=str(strategy_name),
                 account_ref=str(account_id),
-                entry_surface="hosted_option_repair",
-                source="operator_option_run_repair",
+                entry_surface=str(entry_surface),
+                source=str(source),
                 idempotency_key=str(idempotency_key),
                 metadata={
                     "option_run_id": str(option_run_id),
@@ -392,3 +404,600 @@ async def submit_residual_close(
         },
         trigger={"status": "triggered"},
     )
+
+
+# ---------------------------------------------------------------------------
+# Owner-authorized discretionary exit of ONE option run (B2.6b S2)
+# ---------------------------------------------------------------------------
+#
+# The action's own vocabulary. Everything else is the repair machinery above:
+# the SAME assessment (in its owner-exit view), the SAME staged structure exit,
+# the SAME run CAS. What differs is only what the §5 contract names, which
+# boundary the stage is submitted through, and which refusal a stage failure is
+# reported as.
+
+#: The live boundary could not be proven available, so no stage was claimed and
+#: nothing was sent. Fail closed BEFORE the run moves.
+REASON_EXIT_LIVE_UNAVAILABLE = "OPTION_OWNER_EXIT_LIVE_UNAVAILABLE"
+
+#: The attribution the owner exit stamps: the platform's own broker boundary
+#: carries the action, and the ledger must say which action that was.
+OWNER_EXIT_ENTRY_SURFACE = "hosted_option_owner_exit"
+OWNER_EXIT_SOURCE = "owner_discretionary_exit"
+OWNER_EXIT_STRATEGY_NAME = "option_structure_owner_exit"
+
+
+def owner_exit_attribution_run_id(session_factory: Any, run: Any) -> Optional[str]:
+    """The worker run the owner exit is ATTRIBUTED to, or ``None``.
+
+    The structure's CURRENT protection owner row wins when it is readable (B2.4:
+    a handover moves the row while the creation-time snapshot keeps naming the
+    predecessor), and the run's own creation snapshot is the fallback. Both the
+    owner row being ABSENT and it being UNREADABLE fall back, because this action
+    only reduces risk: an unknown owner must not block an exit
+    (``require_option_protection_owner``'s "reduce-only work and exits stay
+    admissible"). No ``caller_worker_run_id`` is ever passed, because the owner
+    acts on the STRUCTURE - the superseded-caller rule is about a caller acting
+    for a run the row has moved past, not about the platform's own exit.
+    """
+    try:
+        return current_protection_owner_run_id(session_factory, run)
+    except Exception:  # noqa: BLE001 - an unreadable owner row is not a blocker
+        return None
+
+
+def live_owner_exit_basket_boundary(request: Any, *, kite: Any):
+    """The live basket boundary for the owner exit, stamped as the owner's action.
+
+    The mechanism is the one backend protection already uses
+    (``protection_runtime.submit_worker_protection_structure_exit``'s boundary:
+    the platform's own broker session, ``OrdersService.place_basket`` and a
+    SERVER-SIDE attribution), reproduced here only because the attribution must
+    name THIS action (``hosted_option_owner_exit`` / ``owner_discretionary_exit``)
+    and that function's stamps are hard-coded to protection. Nothing here reads
+    the child's token, and every leg is a close of a leg the run's own evidence
+    says it holds, so the boundary cannot increase exposure.
+    """
+    from uuid import uuid4
+
+    from fastapi import Response
+
+    async def place_orders(
+        *,
+        account_id: str,
+        worker_run_id: str,
+        option_run_id: str,
+        structure_digest: str,
+        legs: List[Dict[str, Any]],
+        idempotency_key: str,
+    ) -> Dict[str, Any]:
+        from backend.algo_runtime.execution_attribution import build_execution_attribution
+        from backend.broker_api.orders import BasketOrderRequest, OrdersService
+
+        stage = idempotency_key.rsplit(":", 1)[-1][:8].upper()
+        payload_orders: List[Dict[str, Any]] = []
+        for index, leg in enumerate(legs):
+            leg = dict(leg or {})
+            client_order_ref = str(
+                leg.get("client_order_ref") or f"KA{stage}{index + 1:02d}"
+            )
+            attribution = build_execution_attribution(
+                execution_mode="live",
+                strategy_run_id=str(worker_run_id),
+                strategy_family="options_strategy",
+                strategy_name=OWNER_EXIT_STRATEGY_NAME,
+                account_ref=str(account_id),
+                entry_surface=OWNER_EXIT_ENTRY_SURFACE,
+                source=OWNER_EXIT_SOURCE,
+                idempotency_key=str(idempotency_key),
+                metadata={
+                    "option_run_id": str(option_run_id),
+                    "structure_digest": str(structure_digest),
+                    "stage_digest": idempotency_key.rsplit(":", 1)[-1],
+                    "stage_leg_index": index,
+                },
+            )
+            attribution["client_order_ref"] = client_order_ref
+            payload_orders.append(
+                {
+                    "exchange": str(leg.get("exchange") or "NFO"),
+                    "tradingsymbol": str(leg.get("tradingsymbol") or ""),
+                    "transaction_type": str(leg.get("transaction_type") or ""),
+                    "quantity": abs(int(leg.get("quantity") or 0)),
+                    "variety": str(leg.get("variety") or "regular"),
+                    "product": str(leg.get("product") or "NRML"),
+                    "order_type": str(leg.get("order_type") or "MARKET"),
+                    "attribution": attribution,
+                }
+            )
+        basket = BasketOrderRequest.model_validate(
+            {"orders": payload_orders, "all_or_none": False, "dry_run": False}
+        )
+        service = getattr(
+            _app_state(request), "algo_worker_orders_service", None
+        ) or OrdersService()
+        try:
+            result = await service.place_basket(
+                kite,
+                basket,
+                f"option-owner-exit-{uuid4()}",
+                session_id=f"backend:option-owner-exit:{option_run_id}",
+                idempotency_key=idempotency_key,
+                response=Response(),
+            )
+        except Exception as exc:  # noqa: BLE001 - the stage stays unresolved, never re-sent
+            return {
+                "legs": [
+                    {"index": index, "order_id": None, "error": str(exc)}
+                    for index in range(len(payload_orders))
+                ]
+            }
+        payload = result.model_dump(mode="json")
+        answers: Dict[int, Dict[str, Any]] = {}
+        for position, row in enumerate(list(payload.get("results") or [])):
+            if not isinstance(row, Mapping):
+                continue
+            answers[int(row.get("index", position))] = dict(row)
+        return {
+            "legs": [
+                {
+                    "index": index,
+                    "order_id": (
+                        str(answers[index].get("order_id"))
+                        if answers.get(index, {}).get("order_id")
+                        else None
+                    ),
+                    "error": (
+                        None
+                        if answers.get(index, {}).get("order_id")
+                        else "no order reference returned for this leg"
+                    ),
+                }
+                for index in range(len(payload_orders))
+            ]
+        }
+
+    return place_orders
+
+
+async def require_owner_exit_boundary(
+    request: Any, *, scope: Mapping[str, Any], run: Any
+) -> Any:
+    """The broker boundary one owner-exit stage will be sent through.
+
+    Fail closed BEFORE the run moves: a stage is only ever submitted through a
+    boundary the platform can actually reach. Paper (and ``dry_run``) needs the
+    configured paper runtime; ``live`` needs the platform's own broker session
+    for the run's account (the same session loader backend protection uses), or
+    the injected owner-exit boundary in tests. Missing either is the named
+    refusal ``OPTION_OWNER_EXIT_LIVE_UNAVAILABLE`` rather than a claimed stage
+    that could never be sent.
+    """
+    import asyncio
+
+    environment = str(scope.get("execution_environment") or "")
+    state = _app_state(request)
+    if environment != "live":
+        paper_service = getattr(state, "paper_runtime_service", None)
+        if paper_service is None:
+            raise HTTPException(status_code=503, detail="Paper runtime is not available")
+        return paper_structure_exit_boundary(
+            paper_service,
+            entry_surface=OWNER_EXIT_ENTRY_SURFACE,
+            source=OWNER_EXIT_SOURCE,
+            strategy_name=OWNER_EXIT_STRATEGY_NAME,
+        )
+    injected = getattr(state, "option_owner_exit_live_boundary", None)
+    if injected is not None:
+        return injected
+    from backend.api.routers.worker_shared import _load_live_kite_for_account
+
+    try:
+        kite = await asyncio.to_thread(
+            _load_live_kite_for_account, str(scope.get("account_id") or "")
+        )
+    except Exception as exc:  # noqa: BLE001 - no session, no send
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "rejection_reason": REASON_EXIT_LIVE_UNAVAILABLE,
+                "option_run_id": str(getattr(run, "strategy_run_id", "") or ""),
+                "execution_environment": "live",
+                "reason": type(exc).__name__,
+                "message": (
+                    "the platform's live broker boundary is not available for this "
+                    "account, so no exit stage may be claimed or sent"
+                ),
+            },
+        ) from exc
+    return live_owner_exit_basket_boundary(request, kite=kite)
+
+
+async def submit_owner_exit_stage(
+    request: Any,
+    session_factory: Any,
+    *,
+    run: Any,
+    scope: Mapping[str, Any],
+    boundary: Any,
+) -> Dict[str, Any]:
+    """Submit ONE owner-exit stage through the staged structure exit engine.
+
+    The engine re-derives the bounded actions from the run's OWN confirmed fills
+    (shorts first, a hedge only once its short is proven closed), claims the stage
+    durably before the send, and never re-sends an unresolved one. The action
+    contributes only the boundary and the attribution the stage carries.
+    """
+    from backend.options.execution.durable_store import DurableOptionRunStore
+    from backend.options.protection.staged_exit import StagedStructureExit
+
+    metadata = dict(getattr(run, "metadata", None) or {})
+    attribution_run_id = owner_exit_attribution_run_id(session_factory, run)
+    run_store = getattr(_app_state(request), "option_run_store", None)
+    if run_store is None:
+        run_store = DurableOptionRunStore(session_factory=session_factory)
+    staged = StagedStructureExit(
+        session_factory=session_factory,
+        run_store=run_store,
+        place_orders=boundary,
+    )
+    protection = dict(getattr(run, "protection", None) or {})
+    return await staged.submit(
+        worker_run={
+            "strategy_run_id": str(
+                attribution_run_id or metadata.get("worker_run_id") or ""
+            ),
+            "account_scope": str(scope.get("account_id") or ""),
+            "metadata": metadata,
+            "runtime_state": {
+                "backend_protection": {
+                    "structure": {
+                        "structure_digest": str(protection.get("structure_digest") or "")
+                    }
+                }
+            },
+        },
+        trigger={"status": "triggered"},
+    )
+
+
+def owner_exit_view(service: Any, option_run_id: str) -> Dict[str, Any]:
+    """The §5 ``GET .../exit`` body: the evidence one POST will be pinned to.
+
+    ``state`` is DERIVED from the run's own confirmed fills, never asserted by a
+    caller. ``adjust_owner_state`` is the shared takeover rule's own word for a
+    run whose status is ``adjusting`` - the only status an adjust can own - and
+    ``finished`` otherwise, because no adjust is in flight for it (the same
+    condition the adjust gate asks). ``protective_stage_state`` is the run's own
+    stage record: ``resolved`` when nothing is unresolved, else the claim's state.
+    """
+    assessment = service.assessment(option_run_id, owner_exit=True)
+    return {
+        "option_run_id": str(assessment.get("option_run_id") or ""),
+        "status": str(assessment.get("status") or ""),
+        "state": str(assessment.get("state") or ""),
+        "reason_code": assessment.get("reason_code"),
+        "reasons": [str(value) for value in (assessment.get("reasons") or [])],
+        **_owner_exit_evidence_view(assessment),
+        "evidence_digest": str(assessment.get("evidence_digest") or ""),
+    }
+
+
+def _owner_exit_evidence_view(assessment: Mapping[str, Any]) -> Dict[str, Any]:
+    evidence = dict(assessment.get("evidence") or {})
+    detail = dict(assessment.get("detail") or {})
+    status = str(assessment.get("status") or "")
+    owner_state = dict(evidence.get("adjust_owner") or {})
+    unresolved = evidence.get("unresolved_stage") or None
+    close_plan = [
+        {
+            "tradingsymbol": str(order.get("tradingsymbol") or ""),
+            "transaction_type": str(order.get("transaction_type") or ""),
+            "quantity": int(order.get("quantity") or 0),
+            "exchange": None
+            if order.get("exchange") is None
+            else str(order.get("exchange")),
+            "product": None
+            if order.get("product") is None
+            else str(order.get("product")),
+            "order_type": None
+            if order.get("order_type") is None
+            else str(order.get("order_type")),
+        }
+        for order in (assessment.get("close_plan") or [])
+    ]
+    if status == "adjusting":
+        # The ONLY status an adjust phase can own: the shared takeover rule's own
+        # word, and its own named reason when the rule could not be asked.
+        adjust_state = str(owner_state.get("state") or "unknown")
+        adjust_reason = str(owner_state.get("reason") or "") or None
+    else:
+        # No adjust owns this run, so none can be in flight - the same condition
+        # the adjust gate itself asks.
+        adjust_state = "finished"
+        adjust_reason = "no_adjust_owner"
+    return {
+        "adjust_owner_state": adjust_state,
+        "adjust_owner_reason": adjust_reason,
+        "protective_stage_state": (
+            "resolved"
+            if unresolved is None
+            else str(unresolved.get("state") or "unknown")
+        ),
+        "close_plan": close_plan,
+        "shorts_proven_closed": bool(evidence.get("shorts_proven_closed")),
+        "naked_short_quantity": int(detail.get("naked_short_quantity") or 0),
+        "withheld_hedges": [
+            dict(row or {})
+            for row in (
+                assessment.get("withheld_hedges")
+                or detail.get("withheld_hedges")
+                or []
+            )
+        ],
+        "waiting_reason": _owner_exit_waiting_reason(assessment, evidence, close_plan),
+    }
+
+
+def _owner_exit_waiting_reason(
+    assessment: Mapping[str, Any], evidence: Mapping[str, Any], close_plan: List[Any]
+) -> Optional[str]:
+    """Why a residual run has no stage to submit right now, or ``None``.
+
+    Proof-based waiting is expected, not an error (§7): a clear read with an
+    empty ``close_plan`` is the platform saying "this run still holds something,
+    and nothing is releasable yet" - most often a submitted stage whose fills
+    have not landed, or a hedge withheld until its short is proven closed.
+    """
+    if str(assessment.get("state") or "") != "residual" or close_plan:
+        return None
+    if evidence.get("outstanding_buy") or evidence.get("outstanding_sell"):
+        return "orders_outstanding"
+    if not evidence.get("shorts_proven_closed"):
+        return "shorts_not_proven_closed"
+    return "no_permitted_action"
+
+
+def _owner_exit_reason_for(
+    *, reason_code: str, status: str, reasons: Sequence[str]
+) -> Optional[str]:
+    """The §5 owner-exit name for one assessment verdict, or ``None``.
+
+    ONE mapping, so the GET-side gates and the POST's plan/commit refusals can
+    never disagree about what a verdict is called.
+    """
+    from backend.options.execution import repair as repair_module
+
+    code = str(reason_code or "")
+    if code == repair_module.REASON_EVIDENCE_CHANGED:
+        return repair_module.REASON_EXIT_EVIDENCE_CHANGED
+    if code == repair_module.REASON_STATE_CHANGED:
+        return repair_module.REASON_EXIT_STATE_CHANGED
+    if code == repair_module.REASON_NOT_REPAIRABLE:
+        return (
+            repair_module.REASON_EXIT_BEFORE_ENTRY
+            if str(status or "") in repair_module.BEFORE_ENTRY_RUN_STATUSES
+            else repair_module.REASON_EXIT_NOT_APPLICABLE
+        )
+    if code == repair_module.REASON_AMBIGUOUS:
+        if repair_module.REASON_ADJUST_IN_FLIGHT in set(reasons or ()):
+            return repair_module.REASON_EXIT_ADJUST_IN_FLIGHT
+        if repair_module.REASON_PROTECTIVE_STAGE_UNRESOLVED in set(reasons or ()):
+            return repair_module.REASON_EXIT_PROTECTIVE_UNRESOLVED
+        return repair_module.REASON_EXIT_EVIDENCE_AMBIGUOUS
+    return None
+
+
+def _owner_exit_detail(
+    *,
+    option_run_id: str,
+    status: str,
+    reasons: Sequence[str],
+    message: str,
+    extra: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "option_run_id": str(option_run_id or ""),
+        "observed_status": str(status or ""),
+        "reasons": [str(value) for value in (reasons or [])],
+        "message": str(message or ""),
+    }
+    payload.update(dict(extra or {}))
+    return payload
+
+
+def owner_exit_gates(assessment: Mapping[str, Any]) -> None:
+    """Refuse an assessment the owner exit may not act on, by its §5 name.
+
+    Asked BEFORE the transition, so the most specific refusal wins: an adjust
+    that is not provably finished, a stage the run's own records still own, or
+    fills the platform cannot explain. A verdict the exit MAY act on passes.
+    """
+    from backend.options.execution import repair as repair_module
+
+    state = str(assessment.get("state") or "")
+    if state not in (repair_module.STATE_AMBIGUOUS, repair_module.STATE_NOT_REPAIRABLE):
+        return
+    status = str(assessment.get("status") or "")
+    reasons = [str(value) for value in (assessment.get("reasons") or [])]
+    reason_code = str(assessment.get("reason_code") or "")
+    mapped = _owner_exit_reason_for(
+        reason_code=reason_code, status=status, reasons=reasons
+    )
+    if mapped is None:
+        return
+    raise OptionRunRepairRefusal(
+        mapped,
+        _owner_exit_detail(
+            option_run_id=str(assessment.get("option_run_id") or ""),
+            status=status,
+            reasons=reasons,
+            message={
+                repair_module.REASON_EXIT_ADJUST_IN_FLIGHT: (
+                    "another plan's adjust is not provably finished; nothing may be "
+                    "submitted on top of it"
+                ),
+                repair_module.REASON_EXIT_PROTECTIVE_UNRESOLVED: (
+                    "this run's own records still own an unresolved exit stage; it is "
+                    "reconciled before anything new is sent"
+                ),
+            }.get(mapped, "this run cannot be explained from its own confirmed fills"),
+            extra={
+                "unattributable_trades": assessment.get("unattributable_trades"),
+                "unreadable_fills": assessment.get("unreadable_fills"),
+            },
+        ),
+    )
+
+
+def owner_exit_refusal(exc: Any, *, status: str = "") -> Any:
+    """The §5 owner-exit name for one repair plan/commit refusal.
+
+    A refusal that is already an owner-exit refusal (the live boundary, say)
+    passes through untouched.
+    """
+    reason_code = str(getattr(exc, "reason_code", "") or "")
+    detail = dict(getattr(exc, "detail", None) or {})
+    mapped = _owner_exit_reason_for(
+        reason_code=reason_code,
+        status=str(detail.get("status") or status or ""),
+        reasons=[str(value) for value in (detail.get("reasons") or [])],
+    )
+    if mapped is None:
+        return exc
+    return OptionRunRepairRefusal(
+        mapped,
+        _owner_exit_detail(
+            option_run_id=str(detail.get("option_run_id") or ""),
+            status=str(detail.get("status") or status or ""),
+            reasons=[str(value) for value in (detail.get("reasons") or [])],
+            message=str(detail.get("message") or ""),
+            extra={
+                key: detail[key]
+                for key in ("unattributable_trades", "unreadable_fills")
+                if key in detail
+            },
+        ),
+        status_code=int(getattr(exc, "status_code", 409) or 409),
+    )
+
+
+def owner_exit_submission_refusal(submission: Mapping[str, Any]) -> Optional[str]:
+    """The §5 name for a stage the engine could not submit, or ``None``.
+
+    A stage that lost the run's claim to another sender is a LOST CAS
+    (``OPTION_RUN_STATE_CHANGED``); a claim whose send outcome is unknown leaves
+    the run's own records owning the stage (``OPTION_PROTECTIVE_EXIT_UNRESOLVED``);
+    an attribution the platform cannot read is ambiguous evidence.
+    """
+    from backend.options.execution import repair as repair_module
+
+    reason = str(submission.get("reason") or "")
+    if submission.get("submitted") or reason in ("submitted", "already_submitted"):
+        # The stage is this run's own, durably recorded submission (or the same
+        # stage answered again): there is nothing to refuse.
+        return None
+    if not reason:
+        return None
+    if reason == "stage_claimed_by_other":
+        return repair_module.REASON_EXIT_STATE_CHANGED
+    if reason in (
+        "stage_send_unknown",
+        "stage_claim_failed",
+        "stage_record_failed",
+        "no_order_boundary",
+    ):
+        return repair_module.REASON_EXIT_PROTECTIVE_UNRESOLVED
+    return repair_module.REASON_EXIT_EVIDENCE_AMBIGUOUS
+
+
+def record_owner_exit_audit(
+    session_factory: Any,
+    repo: Any,
+    *,
+    strategy_id: str,
+    run: Any,
+    action_id: str,
+    assessment: Mapping[str, Any],
+    submission: Mapping[str, Any],
+    reason: str,
+    actor: str,
+) -> Optional[str]:
+    """Append the exit to the owner-action audit (journal + hosted job record).
+
+    The SAME audit the S1 owner actions write: a strategy-scoped append-only
+    journal row, plus the hosted job's reconciliation row when this run resolves
+    to one. A job that cannot be resolved yields the journal id rather than an
+    invented audit id.
+    """
+    from backend.api.services.owner_actions import OwnerActionsService
+
+    run_id = str(dict(getattr(run, "metadata", None) or {}).get("worker_run_id") or "")
+    service = OwnerActionsService(session_factory=session_factory, repository=repo)
+    return service.record_audit(
+        {"strategy_id": str(strategy_id)},
+        action="owner_exit",
+        evidence={
+            "action_id": str(action_id),
+            "option_run_id": str(getattr(run, "strategy_run_id", "") or ""),
+            "run_status": str(getattr(run, "status", "") or ""),
+            "state": str(assessment.get("state") or ""),
+            "evidence_digest": str(assessment.get("evidence_digest") or ""),
+            "evidence": dict(assessment.get("evidence") or {}),
+            "close_plan": list(assessment.get("close_plan") or []),
+            "submission": dict(submission or {}),
+            "reason": str(reason or ""),
+            "entry_surface": OWNER_EXIT_ENTRY_SURFACE,
+            "source": OWNER_EXIT_SOURCE,
+        },
+        run_id=run_id or None,
+        option_run_id=str(getattr(run, "strategy_run_id", "") or ""),
+        actor=str(actor),
+    )
+
+
+def owner_exit_stage_items(submission: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """One item per leg of the stage the engine answered for.
+
+    A leg with no broker reference is reported with its named blocker instead of
+    being dropped: an exit that quietly loses a leg is a structure left
+    half-hedged.
+    """
+    outcomes = list(submission.get("leg_outcomes") or [])
+    stage_digest = str(submission.get("stage_digest") or "") or None
+    if not outcomes:
+        orders = list(submission.get("orders") or [])
+        order_ids = [str(value) for value in (submission.get("order_ids") or [])]
+        outcomes = [
+            {
+                "index": index,
+                "tradingsymbol": str(dict(order or {}).get("tradingsymbol") or ""),
+                "transaction_type": str(
+                    dict(order or {}).get("transaction_type") or ""
+                ),
+                "quantity": abs(int(dict(order or {}).get("quantity") or 0)),
+                "client_order_ref": dict(order or {}).get("client_order_ref"),
+                "order_id": order_ids[index] if index < len(order_ids) else None,
+                "error": None,
+            }
+            for index, order in enumerate(orders)
+        ]
+    items: List[Dict[str, Any]] = []
+    for row in outcomes:
+        row = dict(row or {})
+        order_id = row.get("order_id")
+        items.append(
+            {
+                "tradingsymbol": str(row.get("tradingsymbol") or ""),
+                "transaction_type": str(row.get("transaction_type") or ""),
+                "quantity": abs(int(row.get("quantity") or 0)),
+                "order_id": None if order_id in (None, "") else str(order_id),
+                "client_order_ref": row.get("client_order_ref"),
+                "stage_digest": stage_digest,
+                "state": "submitted" if order_id else "unknown",
+                "reason_code": None
+                if order_id
+                else str(row.get("error") or "no_order_reference_returned"),
+            }
+        )
+    return items

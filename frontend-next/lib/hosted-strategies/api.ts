@@ -38,6 +38,9 @@ import type {
   HostedVersion,
   HostedVersionList,
   JobLogs,
+  OptionExitActionPayload,
+  OptionExitActionResult,
+  OptionExitAssessment,
   OptionRunDetail,
   OptionRunList,
   OptionRunRepairActionPayload,
@@ -484,6 +487,42 @@ export async function resolveDeadSubmission(
 ): Promise<DeadSubmissionActionResult> {
   return apiFetch<DeadSubmissionActionResult>(
     `${BASE}/${encodeURIComponent(strategyId)}/plans/${encodeURIComponent(planId)}/steps/${encodeURIComponent(String(stepNo))}/dead-submission`,
+    { method: "POST", json: payload },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// B2.6b S2: owner-facing single-run governed exit (design §2, §5)
+// ---------------------------------------------------------------------------
+
+/**
+ * The current owner-exit assessment for one option run: whether an in-flight
+ * adjust or an unresolved protective stage blocks a new submission, THIS
+ * stage's own close plan (shorts first, derived from the run's own confirmed
+ * fills), and the digest the POST must carry.
+ */
+export async function fetchOptionExit(
+  strategyId: string,
+  optionRunId: string,
+): Promise<OptionExitAssessment> {
+  return apiFetch<OptionExitAssessment>(
+    `${BASE}/${encodeURIComponent(strategyId)}/option-runs/${encodeURIComponent(optionRunId)}/exit`,
+  );
+}
+
+/**
+ * Submit the owner-authorized discretionary exit for one stage, pinned to
+ * the digest read from `fetchOptionExit`. A run may need more than one call
+ * to this route to fully exit: hedges are released only after every short is
+ * proven closed by confirmed fills, so `accepted` is not `complete`.
+ */
+export async function submitOptionExit(
+  strategyId: string,
+  optionRunId: string,
+  payload: OptionExitActionPayload,
+): Promise<OptionExitActionResult> {
+  return apiFetch<OptionExitActionResult>(
+    `${BASE}/${encodeURIComponent(strategyId)}/option-runs/${encodeURIComponent(optionRunId)}/exit`,
     { method: "POST", json: payload },
   );
 }

@@ -8,6 +8,7 @@ import { ApiClientError } from "@/lib/api/client";
 import type {
   DeadSubmissionEvidence,
   HostedJobSummary,
+  OptionExitAssessment,
   OptionRun,
   OptionRunDetail,
   OptionRunList,
@@ -28,17 +29,21 @@ vi.mock("@/lib/hosted-strategies/api", () => ({
   cancelPendingWork: vi.fn(),
   fetchDeadSubmission: vi.fn(),
   resolveDeadSubmission: vi.fn(),
+  fetchOptionExit: vi.fn(),
+  submitOptionExit: vi.fn(),
 }));
 
 import {
   cancelPendingWork,
   fetchDeadSubmission,
   fetchHostedJobs,
+  fetchOptionExit,
   fetchOptionRun,
   fetchOptionRunRepair,
   fetchOptionRuns,
   fetchPendingWork,
   resolveDeadSubmission,
+  submitOptionExit,
   submitOptionRunRepair,
 } from "@/lib/hosted-strategies/api";
 
@@ -248,14 +253,19 @@ describe("hosted options panel: controls", () => {
     );
   }
 
-  it("renders controls without a backend route as disabled with 'not available yet'", () => {
+  it("renders exit structure as an informational per-run pointer, and flatten as disabled", () => {
     renderControls([job()]);
 
-    // Exit structure and flatten have no owner-facing route yet.
-    for (const testId of ["option-control-exit-structure", "option-control-flatten"]) {
-      expect(screen.getByTestId(testId)).toBeDisabled();
-    }
-    expect(screen.getAllByText(/not available yet/i)).toHaveLength(2);
+    // Exit structure now works per run (see the per-run panel), so the
+    // top-level card is informational, not a disabled control.
+    const exitCard = screen.getByTestId("option-control-exit-structure");
+    expect(exitCard.tagName).not.toBe("BUTTON");
+    expect(exitCard).toHaveTextContent(/details/i);
+    expect(exitCard).toHaveTextContent(/exit structure/i);
+
+    // Flatten has no owner-facing route yet.
+    expect(screen.getByTestId("option-control-flatten")).toBeDisabled();
+    expect(screen.getAllByText(/not available yet/i)).toHaveLength(1);
 
     // Stop evaluator has a real route (job stop) and an active job, so it is wired.
     expect(screen.getByTestId("option-control-stop-evaluator")).toBeEnabled();
@@ -413,5 +423,105 @@ describe("hosted options panel: dead-submission disposition", () => {
         reason: "confirmed terminal cancel",
       }),
     );
+  });
+});
+
+describe("hosted options panel: exit structure (B2.6b S2)", () => {
+  function exitAssessment(overrides: Partial<OptionExitAssessment> = {}): OptionExitAssessment {
+    return {
+      adjust_owner_state: "finished",
+      protective_stage_state: "resolved",
+      state: "residual",
+      close_plan: [
+        { tradingsymbol: "NIFTY26NOV22500CE", transaction_type: "BUY", quantity: 150, product: "NRML" },
+      ],
+      evidence_digest: "exit-digest-1",
+      reasons: [],
+      reason_code: null,
+      ...overrides,
+    };
+  }
+
+  async function openExitDialog(run: OptionRun) {
+    vi.mocked(fetchOptionRuns).mockResolvedValue({
+      strategy_id: "s-1",
+      coverage: "known",
+      coverage_reason: "",
+      runs: [run],
+    } satisfies OptionRunList);
+    vi.mocked(fetchOptionRun).mockResolvedValue(optionRunDetail(run));
+
+    renderPanel();
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByRole("button", { name: /details/i }));
+    await user.click(
+      await screen.findByTestId(`option-exit-structure-trigger-${run.option_run_id}`),
+    );
+    // Wait for the assessment to load (the close plan renders) before the
+    // caller clicks confirm, so the button is not still disabled mid-fetch.
+    await screen.findByText(/close plan \(shorts first\)/i);
+    await waitFor(() => expect(screen.getByRole("button", { name: /^confirm exit$/i })).toBeEnabled());
+    return user;
+  }
+
+  it("POST carries the digest read from the GET assessment", async () => {
+    const run = optionRun({ repairable: false });
+    vi.mocked(fetchOptionExit).mockResolvedValue(exitAssessment());
+    vi.mocked(submitOptionExit).mockResolvedValue({
+      status: "complete",
+      action_id: "act-9",
+      evidence_digest: "exit-digest-1",
+      items: [],
+    });
+
+    const user = await openExitDialog(run);
+    await user.click(screen.getByRole("button", { name: /^confirm exit$/i }));
+
+    await waitFor(() =>
+      expect(submitOptionExit).toHaveBeenCalledWith("s-1", "opt_run_1", {
+        evidence_digest: "exit-digest-1",
+        reason: "owner_exit",
+      }),
+    );
+    expect(await screen.findByTestId("option-exit-structure-complete-message")).toHaveTextContent(
+      /run exited/i,
+    );
+  });
+
+  it("shows a 409 OPTION_RUN_ADJUST_IN_FLIGHT refusal inline and re-reads the assessment", async () => {
+    const run = optionRun({ repairable: false });
+    vi.mocked(fetchOptionExit).mockResolvedValue(exitAssessment());
+    vi.mocked(submitOptionExit).mockRejectedValue(
+      new ApiClientError(409, { detail: { rejection_reason: "OPTION_RUN_ADJUST_IN_FLIGHT" } }, "Conflict"),
+    );
+
+    const user = await openExitDialog(run);
+    await user.click(screen.getByRole("button", { name: /^confirm exit$/i }));
+
+    const error = await screen.findByTestId("option-exit-structure-error-opt_run_1");
+    expect(error).toHaveTextContent(/adjustment is still in flight/i);
+    expect(error).toHaveTextContent("OPTION_RUN_ADJUST_IN_FLIGHT");
+
+    await waitFor(() => expect(fetchOptionExit).toHaveBeenCalledTimes(2));
+  });
+
+  it("'accepted' shows the multi-stage message, not an exited run", async () => {
+    const run = optionRun({ repairable: false });
+    vi.mocked(fetchOptionExit).mockResolvedValue(exitAssessment());
+    vi.mocked(submitOptionExit).mockResolvedValue({
+      status: "accepted",
+      action_id: "act-10",
+      evidence_digest: "exit-digest-1",
+      items: exitAssessment().close_plan,
+    });
+
+    const user = await openExitDialog(run);
+    await user.click(screen.getByRole("button", { name: /^confirm exit$/i }));
+
+    const stageMessage = await screen.findByTestId("option-exit-structure-stage-message");
+    expect(stageMessage).toHaveTextContent(/stays open/i);
+    expect(screen.queryByTestId("option-exit-structure-complete-message")).not.toBeInTheDocument();
+    expect(screen.queryByText(/run exited/i)).not.toBeInTheDocument();
   });
 });

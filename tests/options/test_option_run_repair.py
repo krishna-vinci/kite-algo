@@ -13,6 +13,7 @@ from backend.options.execution.models import OptionRunState
 from backend.options.execution.repair import (
     ACTION_CLOSE_FLAT,
     ACTION_CLOSE_RESIDUAL,
+    ACTION_OWNER_EXIT,
     REASON_ADJUST_IN_FLIGHT,
     REASON_AMBIGUOUS,
     REASON_EVIDENCE_CHANGED,
@@ -490,3 +491,252 @@ def test_a_changed_evidence_digest_refuses_before_anything_moves():
         )
     assert refusal.value.reason_code == REASON_EVIDENCE_CHANGED
     assert store.run.status == "partial_entry"
+
+
+# ---------------------------------------------------------------------------
+# B2.6b S2: the owner-authorized discretionary exit of ONE option run
+# ---------------------------------------------------------------------------
+
+
+def _exit_service(run: OptionRunState, *, adjust_owner: dict | None = None):
+    return _service(run, adjust_owner=adjust_owner)
+
+
+def _unresolved_stage() -> list:
+    return [
+        {
+            "stage_digest": "abcdef1234567890",
+            "attempt": 1,
+            "state": "sending",
+            "account_id": "acc_1",
+            "legs": [],
+        }
+    ]
+
+
+def test_an_entered_run_is_admitted_for_the_owner_exit_and_hedges_stay_withheld():
+    """A clean ``entered`` run admits an exit; its hedge is NOT released yet."""
+    run = _run(
+        "entered",
+        trades=[_trade("leg_short", "SELL", 75), _trade("leg_hedge", "BUY", 75)],
+    )
+    # The repair path still refuses it: an exit is the owner exit's job.
+    assert assess_option_run_repair(run, _staged_exit())["state"] == STATE_NOT_REPAIRABLE
+
+    assessment = assess_option_run_repair(run, _staged_exit(), owner_exit=True)
+    assert assessment["state"] == STATE_RESIDUAL
+    assert assessment["evidence"]["shorts_proven_closed"] is False
+    assert [
+        (order["tradingsymbol"], order["transaction_type"], order["quantity"])
+        for order in assessment["close_plan"]
+    ] == [(SHORT, "BUY", 75)]
+
+    service, store = _exit_service(run)
+    next_run, planned = service.plan(
+        option_run_id=run.strategy_run_id,
+        action=ACTION_OWNER_EXIT,
+        evidence_digest=assessment["evidence_digest"],
+        owner_exit=True,
+    )
+    assert planned["state"] == STATE_RESIDUAL
+    # The run takes the exiting state; it is NOT exited on a stage being accepted.
+    assert next_run.status == "exiting"
+    service.commit(next_run, allowed_from="entered")
+    assert store.run.status == "exiting"
+    assert store.run.pending_legs == ["leg_short"]
+
+
+def test_a_proven_short_closure_admits_the_hedge_release():
+    run = _run(
+        "entered",
+        trades=[
+            _trade("leg_short", "SELL", 75),
+            _trade("leg_short", "BUY", 75),
+            _trade("leg_hedge", "BUY", 75),
+        ],
+    )
+    assessment = assess_option_run_repair(run, _staged_exit(), owner_exit=True)
+    assert assessment["evidence"]["shorts_proven_closed"] is True
+    assert [
+        (order["tradingsymbol"], order["transaction_type"], order["quantity"])
+        for order in assessment["close_plan"]
+    ] == [(HEDGE, "SELL", 75)]
+
+
+def test_a_short_only_entered_run_admits_exactly_its_short_close():
+    """No hedge to hold back: the plan is the short's close and nothing else."""
+    run = _run(
+        "entered",
+        trades=[_trade("leg_short", "SELL", 75)],
+    )
+    assessment = assess_option_run_repair(run, _staged_exit(), owner_exit=True)
+    assert assessment["state"] == STATE_RESIDUAL
+    assert assessment["withheld_hedges"] == []
+    assert [
+        (order["tradingsymbol"], order["transaction_type"], order["quantity"])
+        for order in assessment["close_plan"]
+    ] == [(SHORT, "BUY", 75)]
+
+
+def test_a_flat_entered_run_completes_the_exit_as_exited():
+    run = _run(
+        "entered",
+        trades=[
+            _trade("leg_short", "SELL", 75),
+            _trade("leg_short", "BUY", 75),
+            _trade("leg_hedge", "BUY", 75),
+            _trade("leg_hedge", "SELL", 75),
+        ],
+    )
+    assessment = assess_option_run_repair(run, _staged_exit(), owner_exit=True)
+    assert assessment["state"] == STATE_FLAT
+    service, store = _exit_service(run)
+    next_run, _planned = service.plan(
+        option_run_id=run.strategy_run_id,
+        action=ACTION_OWNER_EXIT,
+        evidence_digest=assessment["evidence_digest"],
+        owner_exit=True,
+    )
+    assert next_run.status == "exited"
+    service.commit(next_run, allowed_from="entered")
+    assert store.run.status == "exited"
+    # A terminal run reads COMPLETE, never "not repairable".
+    terminal = assess_option_run_repair(store.run, _staged_exit(), owner_exit=True)
+    assert terminal["state"] == STATE_FLAT
+
+
+@pytest.mark.parametrize(
+    "status,trades,adjust_owner,expected_reason",
+    [
+        (
+            "entered",
+            [_trade("leg_short", "SELL", 75)],
+            {"state": "finished"},
+            "OPTION_PROTECTIVE_EXIT_UNRESOLVED",
+        ),
+        (
+            "adjusting",
+            [_trade("leg_short", "SELL", 75), _trade("leg_hedge", "BUY", 75)],
+            {"state": "in_flight"},
+            "OPTION_RUN_ADJUST_IN_FLIGHT",
+        ),
+        (
+            "entered",
+            [
+                {"leg_id": "leg_ghost", "transaction_type": "BUY", "quantity": 75},
+            ],
+            {"state": "finished"},
+            "OPTION_RUN_EVIDENCE_AMBIGUOUS",
+        ),
+    ],
+)
+def test_the_owner_exit_refuses_each_gate_by_its_own_name(
+    status, trades, adjust_owner, expected_reason
+):
+    from backend.api.services.option_run_repair import owner_exit_refusal
+
+    orders = _unresolved_stage() if expected_reason == "OPTION_PROTECTIVE_EXIT_UNRESOLVED" else None
+    run = _run(status, trades=trades, orders=orders)
+    service, store = _exit_service(run, adjust_owner=adjust_owner)
+    assessment = assess_option_run_repair(
+        run,
+        _staged_exit(),
+        adjust_owner=adjust_owner,
+        owner_exit=True,
+    )
+    with pytest.raises(OptionRunRepairRefusal) as refusal:
+        service.plan(
+            option_run_id=run.strategy_run_id,
+            action=ACTION_OWNER_EXIT,
+            evidence_digest=assessment["evidence_digest"],
+            owner_exit=True,
+        )
+    assert owner_exit_refusal(refusal.value).reason_code == expected_reason
+    assert store.run.status == status
+
+
+def test_a_created_run_is_not_exitable_and_a_lost_cas_names_the_state_change():
+    from backend.api.services.option_run_repair import owner_exit_refusal
+
+    run = _run("created", trades=[])
+    service, store = _exit_service(run)
+    assessment = assess_option_run_repair(run, _staged_exit(), owner_exit=True)
+    assert assessment["state"] == STATE_NOT_REPAIRABLE
+    with pytest.raises(OptionRunRepairRefusal) as refusal:
+        service.plan(
+            option_run_id=run.strategy_run_id,
+            action=ACTION_OWNER_EXIT,
+            evidence_digest=assessment["evidence_digest"],
+            owner_exit=True,
+        )
+    assert owner_exit_refusal(refusal.value).reason_code == "OPTION_EXIT_BEFORE_ENTRY"
+
+    # A run that MOVED between the plan and the commit loses the CAS by name.
+    entered = _run(
+        "entered",
+        trades=[_trade("leg_short", "SELL", 75), _trade("leg_hedge", "BUY", 75)],
+    )
+    service, store = _exit_service(entered)
+    planned, _assessment = service.plan(
+        option_run_id=entered.strategy_run_id,
+        action=ACTION_OWNER_EXIT,
+        evidence_digest=assess_option_run_repair(
+            entered, _staged_exit(), owner_exit=True
+        )["evidence_digest"],
+        owner_exit=True,
+    )
+    store.run.status = "exiting"  # another caller won the transition first
+    with pytest.raises(OptionRunRepairRefusal) as refusal:
+        service.commit(planned, allowed_from="entered")
+    assert owner_exit_refusal(refusal.value).reason_code == "OPTION_RUN_STATE_CHANGED"
+
+
+def test_the_evidence_digest_is_binding_for_the_owner_exit_too():
+    from backend.api.services.option_run_repair import owner_exit_refusal
+
+    run = _run(
+        "entered",
+        trades=[_trade("leg_short", "SELL", 75), _trade("leg_hedge", "BUY", 75)],
+    )
+    stale = assess_option_run_repair(run, _staged_exit(), owner_exit=True)["evidence_digest"]
+    run.trades.append(_trade("leg_short", "BUY", 75))
+    service, store = _exit_service(run)
+    with pytest.raises(OptionRunRepairRefusal) as refusal:
+        service.plan(
+            option_run_id=run.strategy_run_id,
+            action=ACTION_OWNER_EXIT,
+            evidence_digest=stale,
+            owner_exit=True,
+        )
+    assert owner_exit_refusal(refusal.value).reason_code == "OPTION_RUN_EXIT_EVIDENCE_CHANGED"
+    assert store.run.status == "entered"
+
+
+def test_the_owner_exit_view_names_the_run_evidence_a_post_must_match():
+    from backend.api.services.option_run_repair import owner_exit_view
+
+    run = _run(
+        "entered",
+        trades=[_trade("leg_short", "SELL", 75), _trade("leg_hedge", "BUY", 75)],
+    )
+    service, _store = _exit_service(run)
+    view = owner_exit_view(service, run.strategy_run_id)
+    assert view["state"] == STATE_RESIDUAL
+    assert view["status"] == "entered"
+    assert view["adjust_owner_state"] == "finished"
+    assert view["protective_stage_state"] == "resolved"
+    assert view["shorts_proven_closed"] is False
+    assert view["naked_short_quantity"] == 75
+    assert [row["tradingsymbol"] for row in view["close_plan"]] == [SHORT]
+    assert view["evidence_digest"] == assess_option_run_repair(
+        run, _staged_exit(), owner_exit=True
+    )["evidence_digest"]
+
+    # An unresolved stage is reported as its own state, not as "resolved".
+    staged = _run(
+        "entered",
+        trades=[_trade("leg_short", "SELL", 75)],
+        orders=_unresolved_stage(),
+    )
+    service, _store = _exit_service(staged)
+    assert owner_exit_view(service, staged.strategy_run_id)["protective_stage_state"] == "sending"

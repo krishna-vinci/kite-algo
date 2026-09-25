@@ -878,3 +878,61 @@ export type DeadSubmissionActionResult = {
   audit_id?: string | null;
   detail?: Record<string, unknown>;
 };
+
+// ---------------------------------------------------------------------------
+// B2.6b S2: owner-facing single-run governed exit (design §2, §5)
+// ---------------------------------------------------------------------------
+
+/** Must be `finished` before a new owner exit is admitted. */
+export type OptionAdjustOwnerState = "finished" | string;
+
+/** Must be `resolved` before a new owner exit is admitted. */
+export type OptionProtectiveStageState = "resolved" | string;
+
+export type OptionExitState = "residual" | "flat" | "ambiguous" | string;
+
+/**
+ * One risk-reducing close action THIS stage would submit, derived from the
+ * run's own confirmed fills by the staged exit engine (shorts first). Hedges
+ * are withheld until every short is proven closed; this plan never includes a
+ * hedge release ahead of that proof.
+ */
+export type OptionExitCloseLeg = {
+  tradingsymbol: string;
+  transaction_type: string;
+  quantity: number;
+  exchange?: string | null;
+  product?: string | null;
+  order_type?: string | null;
+};
+
+export type OptionExitAssessment = {
+  adjust_owner_state: OptionAdjustOwnerState;
+  protective_stage_state: OptionProtectiveStageState;
+  state: OptionExitState;
+  close_plan: OptionExitCloseLeg[];
+  evidence_digest: string;
+  reasons?: string[];
+  reason_code?: string | null;
+};
+
+export type OptionExitActionPayload = {
+  /** Pinned to the digest read from the assessment; a stale digest refuses. */
+  evidence_digest: string;
+  reason: "owner_exit" | string;
+};
+
+/**
+ * The first POST returns exactly one accepted stage; hedges stay until every
+ * short is proven closed. `complete` means the run's own fills are flat and
+ * it is exited. `blocked` is not a 409 — it is a named refusal in the normal
+ * response envelope.
+ */
+export type OptionExitActionResult = {
+  status: OwnerActionStatus;
+  action_id: string;
+  evidence_digest: string;
+  items: OptionExitCloseLeg[];
+  refusal?: string | null;
+  audit_id?: string | null;
+};

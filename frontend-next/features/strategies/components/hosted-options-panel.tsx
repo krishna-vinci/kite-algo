@@ -42,12 +42,14 @@ import {
   useCancelPendingWork,
   useDeadSubmission,
   useHostedJobs,
+  useOptionExitAssessment,
   useOptionRun,
   useOptionRunRepairAssessment,
   useOptionRuns,
   usePendingWork,
   useResolveDeadSubmission,
   useStopHostedJob,
+  useSubmitOptionExit,
   useSubmitOptionRunRepair,
 } from "@/features/strategies/hooks/use-hosted-strategies-queries";
 import {
@@ -65,6 +67,7 @@ import type {
   DeadSubmissionDisposition,
   DeadSubmissionEvidence,
   HostedJobSummary,
+  OptionExitAssessment,
   OptionRun,
   OptionRunLeg,
   OptionRunRepairActionPayload,
@@ -591,6 +594,233 @@ function OptionRunRepairPanel({
 }
 
 // ---------------------------------------------------------------------------
+// Exit structure (B2.6b S2 — single-run governed exit, design §2)
+// ---------------------------------------------------------------------------
+
+/** True while a new owner-exit submission would be refused before it is sent. */
+function exitBlocked(assessment: OptionExitAssessment): boolean {
+  return (
+    assessment.adjust_owner_state !== "finished" ||
+    assessment.protective_stage_state !== "resolved" ||
+    assessment.state === "ambiguous"
+  );
+}
+
+function OptionExitClosePlanTable({ legs }: Readonly<{ legs: OptionExitAssessment["close_plan"] }>) {
+  if (legs.length === 0) {
+    return <p className="text-xs text-muted-foreground">This run&apos;s own fills show nothing left to close.</p>;
+  }
+  return (
+    <Table>
+      <TableHeader>
+        <TableRow>
+          <TableHead>Tradingsymbol</TableHead>
+          <TableHead>Transaction</TableHead>
+          <TableHead>Qty</TableHead>
+          <TableHead>Product</TableHead>
+        </TableRow>
+      </TableHeader>
+      <TableBody>
+        {legs.map((leg, index) => (
+          <TableRow key={`${leg.tradingsymbol}-${index}`}>
+            <TableCell className="font-mono text-xs">{leg.tradingsymbol}</TableCell>
+            <TableCell className="text-sm">{leg.transaction_type}</TableCell>
+            <TableCell className="text-sm">{leg.quantity}</TableCell>
+            <TableCell className="text-sm text-muted-foreground">{leg.product ?? "—"}</TableCell>
+          </TableRow>
+        ))}
+      </TableBody>
+    </Table>
+  );
+}
+
+/**
+ * Governed exit of this run's own confirmed fills (design §2). The engine
+ * enforces short-first closure and proof-before-hedge-release; a POST here is
+ * exactly one accepted stage, never the whole exit. `accepted` keeps the run
+ * open, `complete` means it is exited, and `blocked` (either a named refusal
+ * in the response or a 409) is shown as actionable text, not silence.
+ */
+function OptionRunExitPanel({
+  strategyId,
+  optionRunId,
+}: Readonly<{ strategyId: string; optionRunId: string }>) {
+  const [open, setOpen] = useState(false);
+  const assessmentQuery = useOptionExitAssessment(strategyId, optionRunId, open);
+  const mutation = useSubmitOptionExit(strategyId, optionRunId);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [stage, setStage] = useState<"complete" | "accepted" | null>(null);
+
+  const assessment = assessmentQuery.data;
+  const blocked = assessment ? exitBlocked(assessment) : true;
+  const canContinue = stage === "accepted" && Boolean(assessment) && !blocked && (assessment?.close_plan.length ?? 0) > 0;
+
+  function reset() {
+    setActionError(null);
+    setStage(null);
+  }
+
+  async function runExit(evidenceDigest: string) {
+    setActionError(null);
+    try {
+      const result = await mutation.mutateAsync({ evidence_digest: evidenceDigest, reason: "owner_exit" });
+      if (result.status === "complete") {
+        setStage("complete");
+        toast.success("Run exited.");
+      } else if (result.status === "accepted") {
+        setStage("accepted");
+        toast.success("Stage submitted. This run stays open until every stage completes.");
+      } else {
+        setStage(null);
+        setActionError(result.refusal ? withRefusalCopy(result.refusal) : "The platform blocked this exit.");
+      }
+    } catch (error) {
+      setStage(null);
+      setActionError(hostedErrorMessage(error));
+    } finally {
+      void assessmentQuery.refetch();
+    }
+  }
+
+  async function confirmExit() {
+    if (!assessment) return;
+    await runExit(assessment.evidence_digest);
+  }
+
+  async function continueExit() {
+    const fresh = await assessmentQuery.refetch();
+    const data = fresh.data;
+    if (!data) return;
+    if (exitBlocked(data)) return;
+    await runExit(data.evidence_digest);
+  }
+
+  return (
+    <div className="flex flex-col gap-3 rounded-lg border p-3">
+      <h4 className="text-sm font-medium">Exit structure</h4>
+      <p className="text-xs text-muted-foreground">
+        Governed exit of this run&apos;s own confirmed fills. Shorts close first; hedges are released only
+        after every short in this run is proven closed — a run may need more than one stage to fully exit.
+      </p>
+      <Button
+        size="sm"
+        variant="outline"
+        onClick={() => setOpen(true)}
+        data-testid={`option-exit-structure-trigger-${optionRunId}`}
+      >
+        Exit structure
+      </Button>
+      <Dialog
+        open={open}
+        onOpenChange={(openState) => {
+          setOpen(openState);
+          if (!openState) reset();
+        }}
+      >
+        <DialogContent className="sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>Exit this option run?</DialogTitle>
+            <DialogDescription>
+              This sends the platform&apos;s own governed exit for this run&apos;s confirmed fills — never a
+              freshly built order list. Hedges stay in place until every short is proven closed.
+            </DialogDescription>
+          </DialogHeader>
+          {assessmentQuery.isLoading ? (
+            <Skeleton className="h-24 w-full rounded-md" />
+          ) : assessmentQuery.isError || !assessment ? (
+            <Alert variant="destructive">
+              <AlertTitle>Could not load the exit assessment</AlertTitle>
+              <AlertDescription>{hostedErrorMessage(assessmentQuery.error)}</AlertDescription>
+            </Alert>
+          ) : (
+            <>
+              {assessment.protective_stage_state !== "resolved" ? (
+                <Alert variant="destructive" data-testid="option-exit-structure-protective-unresolved">
+                  <AlertTitle>Protective exit unresolved</AlertTitle>
+                  <AlertDescription>{withRefusalCopy("OPTION_PROTECTIVE_EXIT_UNRESOLVED")}</AlertDescription>
+                </Alert>
+              ) : null}
+              {assessment.adjust_owner_state !== "finished" ? (
+                <Alert variant="destructive" data-testid="option-exit-structure-adjust-in-flight">
+                  <AlertTitle>Adjustment in flight</AlertTitle>
+                  <AlertDescription>{withRefusalCopy("OPTION_RUN_ADJUST_IN_FLIGHT")}</AlertDescription>
+                </Alert>
+              ) : null}
+              {assessment.state === "ambiguous" ? (
+                <Alert variant="destructive" data-testid="option-exit-structure-ambiguous">
+                  <AlertTitle>Evidence ambiguous</AlertTitle>
+                  <AlertDescription>{withRefusalCopy("OPTION_RUN_EVIDENCE_AMBIGUOUS")}</AlertDescription>
+                </Alert>
+              ) : null}
+              {assessment.reason_code ? (
+                <p className="text-xs text-muted-foreground">{withRefusalCopy(assessment.reason_code)}</p>
+              ) : null}
+              {assessment.reasons && assessment.reasons.length > 0 ? (
+                <ul className="list-disc pl-5 text-xs text-muted-foreground">
+                  {assessment.reasons.map((reason) => (
+                    <li key={reason}>{reason}</li>
+                  ))}
+                </ul>
+              ) : null}
+              <div>
+                <h5 className="text-xs font-medium">This stage&apos;s close plan (shorts first)</h5>
+                <OptionExitClosePlanTable legs={assessment.close_plan} />
+              </div>
+              <p className="text-xs text-muted-foreground">
+                This is a multi-stage exit: hedges in this run are released only once every short is proven
+                closed by confirmed fills. Confirming submits exactly this stage — not the whole exit.
+              </p>
+              {stage === "accepted" ? (
+                <Alert data-testid="option-exit-structure-stage-message">
+                  <AlertTitle>Stage submitted</AlertTitle>
+                  <AlertDescription>
+                    This run stays open until every stage completes.
+                    {canContinue
+                      ? " The next stage is now releasable."
+                      : " Waiting for the next stage to become releasable."}
+                  </AlertDescription>
+                </Alert>
+              ) : null}
+              {stage === "complete" ? (
+                <Alert data-testid="option-exit-structure-complete-message">
+                  <AlertTitle>Run exited</AlertTitle>
+                  <AlertDescription>This run&apos;s own fills are flat and it is now exited.</AlertDescription>
+                </Alert>
+              ) : null}
+            </>
+          )}
+          {actionError ? (
+            <p className="text-xs text-destructive" data-testid={`option-exit-structure-error-${optionRunId}`}>
+              {actionError}
+            </p>
+          ) : null}
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setOpen(false)}>
+              Close
+            </Button>
+            {stage === "accepted" ? (
+              <Button onClick={continueExit} disabled={!canContinue || mutation.isPending} data-testid="option-exit-structure-continue">
+                {mutation.isPending ? <Loader2Icon className="size-3 animate-spin" aria-hidden /> : null}
+                Continue exit
+              </Button>
+            ) : (
+              <Button
+                onClick={confirmExit}
+                disabled={!assessment || blocked || mutation.isPending || stage === "complete"}
+                data-testid="option-exit-structure-confirm"
+              >
+                {mutation.isPending ? <Loader2Icon className="size-3 animate-spin" aria-hidden /> : null}
+                Confirm exit
+              </Button>
+            )}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // One run card
 // ---------------------------------------------------------------------------
 
@@ -654,6 +884,7 @@ function OptionRunCard({
         {open ? (
           <div id={`option-run-detail-${run.option_run_id}`} className="flex flex-col gap-4 border-t pt-4">
             <OptionRunDetailSection strategyId={strategyId} optionRunId={run.option_run_id} />
+            <OptionRunExitPanel strategyId={strategyId} optionRunId={run.option_run_id} />
             {run.repairable ? (
               <OptionRunRepairPanel strategyId={strategyId} optionRunId={run.option_run_id} />
             ) : null}
@@ -895,8 +1126,11 @@ export function OptionsControls({
   // (`POST /{strategy_id}/jobs/{job_id}/stop`); its own note is explicit that
   // it "does not cancel orders or flatten" — exactly the "stop evaluator"
   // semantics asked for here. Cancel pending work (B2.6b §1) is wired below.
-  // Exit structure and flatten have no owner-facing route yet, so those two
-  // stay disabled rather than invent one.
+  // Exit structure (B2.6b S2) is wired per option run — see
+  // `OptionRunExitPanel` on each run's expanded card — because it acts on
+  // exactly one run's own fills at a time. This top-level card stays purely
+  // informational rather than acting on a run it cannot itself pick. Flatten
+  // has no owner-facing route yet, so it stays disabled.
   const activeJob = jobs.find((job) =>
     ["queued", "starting", "running", "fencing"].includes(job.status),
   );
@@ -936,11 +1170,15 @@ export function OptionsControls({
       >
         <CancelPendingWorkControl strategyId={strategyId} />
       </ControlCard>
-      <ControlCard title="Exit structure" description="Governed exit of one option run.">
-        <Button size="sm" variant="outline" disabled data-testid="option-control-exit-structure">
-          Exit structure
-        </Button>
-        <p className="text-xs text-muted-foreground">Not available yet.</p>
+      <ControlCard
+        title="Exit structure"
+        description="Exits one option run's structure at a time — never every run at once."
+      >
+        <p className="text-xs text-muted-foreground" data-testid="option-control-exit-structure">
+          Open a run&apos;s <span className="font-medium text-foreground">Details</span> below, then use its
+          own <span className="font-medium text-foreground">Exit structure</span> control. Each run exits
+          separately, so hedges are never released across runs.
+        </p>
       </ControlCard>
       <ControlCard title="Flatten" description="Closes all of this strategy's exposure.">
         <Button size="sm" variant="destructive" disabled data-testid="option-control-flatten">

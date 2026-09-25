@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from .lifecycle import mark_cleanup_required, mark_closed, mark_exit_previewed, mark_exiting
@@ -44,6 +45,36 @@ REPAIRABLE_RUN_STATUSES = (
     OptionRunStatus.ADJUSTING.value,
 )
 
+#: The statuses an owner-authorized discretionary exit (B2.6b S2) may act on.
+#: An ``entered`` run is the whole point of the action - a structure the owner
+#: wants OUT of - and a run already ``exiting`` / ``partial_exit`` is a
+#: multi-stage exit that has not finished, so a later POST continues it. The
+#: statuses BEFORE an entry are deliberately absent: an exit may not precede the
+#: entry it closes.
+OWNER_EXIT_RUN_STATUSES = (
+    OptionRunStatus.PARTIAL_ENTRY.value,
+    OptionRunStatus.CLEANUP_REQUIRED.value,
+    OptionRunStatus.ADJUSTING.value,
+    OptionRunStatus.ENTERED.value,
+    OptionRunStatus.EXITING.value,
+    OptionRunStatus.PARTIAL_EXIT.value,
+)
+
+#: A run that has not been entered yet cannot be exited. The plan-execution path
+#: refuses these with the same name, so the owner exit does too.
+BEFORE_ENTRY_RUN_STATUSES = (
+    OptionRunStatus.CREATED.value,
+    OptionRunStatus.ENTRY_PREVIEWED.value,
+    OptionRunStatus.ENTERING.value,
+)
+
+#: A run already past the exit (the same vocabulary ``ownership`` releases an
+#: owner row on). The owner exit reports it complete rather than exiting it again.
+TERMINAL_RUN_STATUSES = (
+    OptionRunStatus.EXITED.value,
+    OptionRunStatus.SETTLED.value,
+)
+
 STATE_FLAT = "flat"
 STATE_RESIDUAL = "residual"
 STATE_AMBIGUOUS = "ambiguous"
@@ -56,13 +87,29 @@ REASON_ACTION_MISMATCH = "OPTION_RUN_REPAIR_ACTION_MISMATCH"
 REASON_STATE_CHANGED = "OPTION_RUN_REPAIR_STATE_CHANGED"
 REASON_LIVE_UNSUPPORTED = "OPTION_RUN_REPAIR_LIVE_UNSUPPORTED"
 
+#: The owner exit's OWN refusal vocabulary (B2.6b §5). It is deliberately
+#: distinct from ``OPTION_RUN_REPAIR_*``: the names below are what the Options UI
+#: is built against, and a repair refusal means something narrower.
+REASON_EXIT_ADJUST_IN_FLIGHT = "OPTION_RUN_ADJUST_IN_FLIGHT"
+REASON_EXIT_PROTECTIVE_UNRESOLVED = "OPTION_PROTECTIVE_EXIT_UNRESOLVED"
+REASON_EXIT_EVIDENCE_AMBIGUOUS = "OPTION_RUN_EVIDENCE_AMBIGUOUS"
+REASON_EXIT_EVIDENCE_CHANGED = "OPTION_RUN_EXIT_EVIDENCE_CHANGED"
+REASON_EXIT_STATE_CHANGED = "OPTION_RUN_STATE_CHANGED"
+REASON_EXIT_NOT_APPLICABLE = "OPTION_RUN_EXIT_NOT_APPLICABLE"
+REASON_EXIT_BEFORE_ENTRY = "OPTION_EXIT_BEFORE_ENTRY"
+
 #: The assessment reason an ``adjusting`` run carries while the plan that owns
 #: its adjust may still be submitting (or cannot be proven finished).
 REASON_ADJUST_IN_FLIGHT = "adjust_in_flight"
 REASON_LEDGER_INCOMPLETE = "ledger_incomplete"
+#: The assessment reason an unresolved protective stage carries. Named here so
+#: the owner exit can map it without restating the string.
+REASON_PROTECTIVE_STAGE_UNRESOLVED = "protective_stage_unresolved"
 
 ACTION_CLOSE_FLAT = "close_flat"
 ACTION_CLOSE_RESIDUAL = "close_residual"
+#: One owner-authorized discretionary exit stage (B2.6b S2).
+ACTION_OWNER_EXIT = "owner_exit"
 REPAIR_ACTIONS = (ACTION_CLOSE_FLAT, ACTION_CLOSE_RESIDUAL)
 
 
@@ -100,6 +147,7 @@ def assess_option_run_repair(
     adjust_owner: Optional[Mapping[str, Any]] = None,
     ledger_consistent: Optional[bool] = None,
     unresolved_step_reader: Any = None,
+    owner_exit: bool = False,
 ) -> Dict[str, Any]:
     """Classify one option run from its OWN confirmed evidence. Side-effect free.
 
@@ -108,6 +156,13 @@ def assess_option_run_repair(
     verdict rests on. Nothing is refreshed here: a GET must be able to report the
     state without moving it, and the POST re-derives the same digest before it is
     allowed to act.
+
+    ``owner_exit`` widens WHICH statuses the same verdict may describe: the
+    owner-authorized discretionary exit (B2.6b S2) acts on an ``entered`` run -
+    and continues one already ``exiting`` - so those join the repairable set and
+    a run already past the exit is reported ``flat`` (complete) instead of
+    ``not_repairable``. Every rule about the EVIDENCE is unchanged, because the
+    two callers must not disagree about what the run holds.
 
     ``adjust_owner`` is the execution state of the plan(s) that own an
     ``adjusting`` run's adjust phase (``option_adjust_owner_state``). A caller
@@ -172,8 +227,13 @@ def assess_option_run_repair(
                     }
                 )
         if unresolved is not None:
-            reasons.append("protective_stage_unresolved")
-        if outstanding_buy or outstanding_sell:
+            reasons.append(REASON_PROTECTIVE_STAGE_UNRESOLVED)
+        if (outstanding_buy or outstanding_sell) and not owner_exit:
+            # The owner exit reads the SAME outstanding quantity the staged exit
+            # engine nets by, and those orders come from the run's OWN stage
+            # records: a working stage is the exit WAITING, not evidence the
+            # platform cannot explain. The repair path keeps the stricter reading
+            # because an operator repair must not race work it did not submit.
             reasons.append("orders_outstanding")
         if unattributable:
             reasons.append("unattributable_trades")
@@ -185,9 +245,11 @@ def assess_option_run_repair(
             else:
                 close_plan = [dict(order or {}) for order in (orders or [])]
                 close_detail = dict(detail or {})
-                if not close_plan:
+                if not close_plan and not owner_exit:
                     # Open legs but no permitted bounded action: the platform will
                     # not invent one, and it will not call that "flat".
+                    # Owner exit: nothing is releasable RIGHT NOW (a short still
+                    # owes its proof), which is waiting, not ambiguity.
                     reasons.append("residual_close_unavailable")
     if unreadable:
         # An unreadable book is never "flat" and never a residual: the run is
@@ -195,6 +257,33 @@ def assess_option_run_repair(
         reasons.append("unreadable_fills")
     if ledger_consistent is False:
         reasons.append(REASON_LEDGER_INCOMPLETE)
+
+    # Why a hedge the run still holds is NOT released yet. The exit builder omits
+    # a hedge from its plan entirely until its short is PROVEN closed (there is no
+    # permitted action to report), so the reason has to be named from the run's own
+    # evidence - §7: proof-based waiting is expected, and the owner has to be able
+    # to see what it is waiting for.
+    withheld_hedges: List[Dict[str, Any]] = []
+    if (
+        not is_flat
+        and not shorts_proven_closed
+        and not unreadable
+        and not unattributable
+    ):
+        for leg in legs:
+            if str(leg.get("transaction_type") or "").upper() != "BUY":
+                continue
+            leg_id = str(leg.get("leg_id") or "")
+            open_quantity = max(0, int(open_by_leg.get(leg_id, 0) or 0))
+            if open_quantity <= 0:
+                continue
+            withheld_hedges.append(
+                {
+                    "tradingsymbol": str(leg.get("tradingsymbol") or ""),
+                    "quantity": open_quantity,
+                    "reason": "short_not_proven_closed",
+                }
+            )
 
     # An ``adjusting`` run is mid-mutation: it is only repairable once the plan
     # that owns its adjust has provably finished executing. While that plan may
@@ -206,9 +295,23 @@ def assess_option_run_repair(
     ):
         reasons.append(REASON_ADJUST_IN_FLIGHT)
 
-    if status not in REPAIRABLE_RUN_STATUSES:
+    reason_code: Optional[str]
+    admissible = OWNER_EXIT_RUN_STATUSES if owner_exit else REPAIRABLE_RUN_STATUSES
+    if owner_exit and status in TERMINAL_RUN_STATUSES:
+        # Past the exit already: the owner exit reports the run's own evidence -
+        # ``flat`` when it finished, ``ambiguous`` when the terminal status
+        # disagrees with the fills - and never exits it a second time.
+        if reasons or not is_flat:
+            state = STATE_AMBIGUOUS
+            reason_code = REASON_AMBIGUOUS
+            if not reasons:
+                reasons = ["terminal_run_not_flat"]
+        else:
+            state = STATE_FLAT
+            reason_code = None
+    elif status not in admissible:
         state = STATE_NOT_REPAIRABLE
-        reason_code: Optional[str] = REASON_NOT_REPAIRABLE
+        reason_code = REASON_NOT_REPAIRABLE
         reasons = [f"status_{status or 'unknown'}"]
     elif reasons:
         state = STATE_AMBIGUOUS
@@ -229,6 +332,7 @@ def assess_option_run_repair(
         "outstanding_buy": outstanding_buy,
         "outstanding_sell": outstanding_sell,
         "shorts_proven_closed": bool(shorts_proven_closed),
+        "withheld_hedges": withheld_hedges,
         "unresolved_stage": (
             None
             if unresolved is None
@@ -250,6 +354,11 @@ def assess_option_run_repair(
         "evidence": evidence,
         "close_plan": close_plan,
         "detail": close_detail,
+        "withheld_hedges": (
+            withheld_hedges
+            if withheld_hedges
+            else [dict(row or {}) for row in (close_detail.get("withheld_hedges") or [])]
+        ),
         "unattributable_trades": unattributable,
         "unreadable_fills": unreadable,
         "unresolved_steps": unresolved_step_coordinates(
@@ -305,11 +414,13 @@ def _repair_exiting(run: OptionRunState, *, pending_legs: List[str]) -> OptionRu
     """The durable ``exiting`` state for a repaired run, along existing edges.
 
     The durable vocabulary has no direct edge from ``partial_entry`` /
-    ``adjusting`` / ``cleanup_required`` to ``exiting``; the repair walks the
-    edges the lifecycle already allows (``partial_entry`` | ``adjusting`` ->
-    ``cleanup_required`` -> ``exit_previewed`` -> ``exiting``) and only the FINAL
-    state is ever persisted. That keeps one state machine for both the plan path
-    and the repair path.
+    ``adjusting`` / ``cleanup_required`` (nor from ``entered``) to ``exiting``;
+    both repair and the owner exit walk the edges the lifecycle already allows
+    (``partial_entry`` | ``adjusting`` -> ``cleanup_required``,
+    ``entered`` | ``cleanup_required`` -> ``exit_previewed`` -> ``exiting``) and
+    only the FINAL state is ever persisted. A run already ``exiting`` stays
+    there: it only takes the current stage's legs. That keeps one state machine
+    for the plan path, the repair path and the owner exit alike.
     """
     working = run
     if str(working.status) in (
@@ -317,13 +428,30 @@ def _repair_exiting(run: OptionRunState, *, pending_legs: List[str]) -> OptionRu
         OptionRunStatus.ADJUSTING.value,
     ):
         working = mark_cleanup_required(working)
-    if str(working.status) == OptionRunStatus.CLEANUP_REQUIRED.value:
+    if str(working.status) in (
+        OptionRunStatus.CLEANUP_REQUIRED.value,
+        OptionRunStatus.ENTERED.value,
+    ):
         working = mark_exit_previewed(working)
+    if str(working.status) == OptionRunStatus.EXITING.value:
+        # Already exiting: the status carries, only the stage's legs change.
+        return replace(working, pending_legs=list(pending_legs))
     return mark_exiting(working, pending_legs=pending_legs)
 
 
 def _repair_closed(run: OptionRunState) -> OptionRunState:
     """The durable ``exited`` state for a proven-flat run (existing edges only)."""
+    return mark_closed(_repair_exiting(run, pending_legs=[]))
+
+
+def _owner_exit_closed(run: OptionRunState) -> OptionRunState:
+    """The durable ``exited`` state for a run whose own fills prove it flat.
+
+    A run already past the exit is returned unchanged - the owner exit reports
+    it complete instead of writing the same terminal status again.
+    """
+    if str(run.status) in TERMINAL_RUN_STATUSES:
+        return run
     return mark_closed(_repair_exiting(run, pending_legs=[]))
 
 
@@ -449,31 +577,91 @@ class OptionRunRepairService:
                 "OPTION_RUN_NOT_FOUND", {"option_run_id": str(option_run_id)}, status_code=404
             ) from exc
 
-    def assessment(self, option_run_id: str) -> Dict[str, Any]:
-        """The read-only verdict for one run."""
-        return assess_option_run_repair(
-            self._run(option_run_id),
-            self._staged_exit,
-            adjust_owner=self._adjust_owner(option_run_id),
-            ledger_consistent=self._ledger_consistent(self._run(option_run_id)),
-            unresolved_step_reader=self._unresolved_step_reader,
-        )
+    def run(self, option_run_id: str) -> OptionRunState:
+        """The durable run itself, for a caller that needs its own metadata."""
+        return self._run(option_run_id)
 
-    def plan(
-        self, *, option_run_id: str, action: str, evidence_digest: str
-    ) -> Tuple[OptionRunState, Dict[str, Any]]:
-        """Validate one action against the CURRENT evidence and name its next state.
+    def _owner_exit_evidence_run(self, run: OptionRunState) -> OptionRunState:
+        """The run a submission would actually derive from, without moving it.
 
-        The digest the caller read must still describe the run: the platform
-        never acts on evidence an operator saw before a fill moved it.
+        A submission translates the confirmed fills of the run's OWN exit orders
+        (``StagedStructureExit.reconcile_own_fills``) onto the run BEFORE it
+        derives, so an assessment that read only the persisted trades would
+        describe a structure the submission never trades - a close plan the exit
+        would not send, and a digest pinned to it. The translation is read-only
+        here, so a GET still moves nothing.
+        """
+        translate = getattr(self._staged_exit, "translate_own_fills", None)
+        if translate is None:
+            return run
+        try:
+            translated = dict(translate(run) or {})
+        except Exception:  # noqa: BLE001 - an unreadable translation is not evidence
+            return run
+        recorded = [
+            dict(row or {}) for row in (translated.get("recorded") or []) if row
+        ]
+        if not recorded:
+            return run
+        already = {
+            str(dict(trade or {}).get("stage_fill_id") or "")
+            for trade in (getattr(run, "trades", None) or [])
+        }
+        fresh = [
+            row
+            for row in recorded
+            if str(row.get("stage_fill_id") or "") not in already
+        ]
+        if not fresh:
+            return run
+        return replace(run, trades=list(run.trades) + fresh)
+
+    def assessment(self, option_run_id: str, *, owner_exit: bool = False) -> Dict[str, Any]:
+        """The read-only verdict for one run.
+
+        ``owner_exit`` asks the same question of the same evidence through the
+        owner-exit status set (an ``entered`` run is admissible, a run already
+        past the exit reads ``flat``).
         """
         run = self._run(option_run_id)
-        assessment = assess_option_run_repair(
+        if owner_exit:
+            run = self._owner_exit_evidence_run(run)
+        return assess_option_run_repair(
             run,
             self._staged_exit,
             adjust_owner=self._adjust_owner(option_run_id),
             ledger_consistent=self._ledger_consistent(run),
             unresolved_step_reader=self._unresolved_step_reader,
+            owner_exit=owner_exit,
+        )
+
+    def plan(
+        self,
+        *,
+        option_run_id: str,
+        action: str,
+        evidence_digest: str,
+        owner_exit: bool = False,
+    ) -> Tuple[OptionRunState, Dict[str, Any]]:
+        """Validate one action against the CURRENT evidence and name its next state.
+
+        The digest the caller read must still describe the run: the platform
+        never acts on evidence an operator saw before a fill moved it.
+
+        ``owner_exit`` runs the same validation in the owner-exit view: the
+        admissible statuses are wider (``entered`` and a run already ``exiting``)
+        and ``ACTION_OWNER_EXIT`` names the transition. The evidence rules - the
+        digest, the ambiguity verdict, the CAS - are untouched.
+        """
+        run = self._run(option_run_id)
+        assessment_run = self._owner_exit_evidence_run(run) if owner_exit else run
+        assessment = assess_option_run_repair(
+            assessment_run,
+            self._staged_exit,
+            adjust_owner=self._adjust_owner(option_run_id),
+            ledger_consistent=self._ledger_consistent(run),
+            unresolved_step_reader=self._unresolved_step_reader,
+            owner_exit=owner_exit,
         )
         if str(evidence_digest or "") != str(assessment.get("evidence_digest") or ""):
             raise OptionRunRepairRefusal(
@@ -531,6 +719,26 @@ class OptionRunRepairService:
                 )
             pending = pending_leg_ids(run, list(assessment.get("close_plan") or []))
             return _repair_exiting(run, pending_legs=pending), assessment
+        if action == ACTION_OWNER_EXIT:
+            # The discretionary exit of ONE structure: a flat run is COMPLETE
+            # (its own fills prove nothing is held), otherwise the run takes the
+            # ``exiting`` state and the close plan becomes the stage's pending
+            # legs. The caller submits ONE stage of that plan and never a
+            # freshly compiled order list.
+            if state == STATE_FLAT:
+                return _owner_exit_closed(run), assessment
+            if state == STATE_RESIDUAL:
+                pending = pending_leg_ids(run, list(assessment.get("close_plan") or []))
+                return _repair_exiting(run, pending_legs=pending), assessment
+            raise OptionRunRepairRefusal(
+                REASON_ACTION_MISMATCH,
+                {
+                    "option_run_id": str(option_run_id),
+                    "action": action,
+                    "state": state,
+                    "message": "an owner exit needs a run that holds or is already exiting",
+                },
+            )
         raise OptionRunRepairRefusal(
             REASON_ACTION_MISMATCH,
             {"action": str(action), "supported": list(REPAIR_ACTIONS)},

@@ -541,8 +541,8 @@ class StagedStructureExit:
 
     # -- reconciliation -----------------------------------------------------
 
-    def reconcile_own_fills(self, run: Any) -> Dict[str, Any]:
-        """Record confirmed fills of OUR OWN protection orders on the run.
+    def translate_own_fills(self, run: Any) -> Dict[str, Any]:
+        """The confirmed fills of OUR OWN protection orders, as run trade rows.
 
         The fills themselves are written by the ORDINARY ingestion path
         (``order_trade_fills``); this only translates the ones whose attribution is
@@ -550,6 +550,11 @@ class StagedStructureExit:
         by ``(order_id, trade_id)`` so a replay records nothing twice. That is what
         makes a short's closure provable in a real deployment rather than only in a
         test that seeded the trades by hand.
+
+        This is the READ-ONLY half of :meth:`reconcile_own_fills`: a caller that
+        must not move the run (the owner-exit assessment behind a GET) needs the
+        SAME evidence a submission would derive from, or its close plan would
+        describe a structure the submission never trades. One rule, two callers.
         """
         recorded: List[Dict[str, Any]] = []
         mismatched: List[Dict[str, Any]] = []
@@ -618,6 +623,22 @@ class StagedStructureExit:
                         "recorded_at": self._clock().isoformat(),
                     }
                 )
+        return {
+            "recorded": recorded,
+            "mismatched_fills": mismatched,
+            "option_run_id": str(run.strategy_run_id),
+        }
+
+    def reconcile_own_fills(self, run: Any) -> Dict[str, Any]:
+        """Record confirmed fills of OUR OWN protection orders on the run.
+
+        The translation (and the fill/leg match that can refuse a row) lives in
+        :meth:`translate_own_fills`; this only writes what that read found, keyed
+        so a replay records nothing twice.
+        """
+        translated = self.translate_own_fills(run)
+        recorded = list(translated.get("recorded") or [])
+        mismatched = list(translated.get("mismatched_fills") or [])
         if recorded:
             # The dedup happens INSIDE the run's row-locked transaction, so two
             # reconcilers that both observed the marker as absent cannot both write

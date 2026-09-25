@@ -1,4 +1,4 @@
-"""Owner-action schemas for one hosted strategy (B2.6b S1).
+"""Owner-action schemas for one hosted strategy (B2.6b S1 and S2).
 
 Field names and shapes here are the binding API contract (design note
 ``documents/hosted-owner-actions-b2-6b-design-2026-09-25.md`` §5): the options UI
@@ -13,7 +13,7 @@ cannot read its evidence refuses by name.
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -128,3 +128,111 @@ class DeadSubmissionDispositionRequest(BaseModel):
     evidence_digest: str
     disposition: str
     reason: str
+
+
+# ---------------------------------------------------------------------------
+# owner exit of ONE option run (B2.6b S2, §5)
+# ---------------------------------------------------------------------------
+
+
+class OptionRunExitPlanLeg(BaseModel):
+    """One bounded, risk-reducing close the staged structure exit would submit.
+
+    Shorts come first; a hedge leg appears only once every short the run holds is
+    PROVEN closed by confirmed fills.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tradingsymbol: str
+    transaction_type: str
+    quantity: int
+    exchange: Optional[str] = None
+    product: Optional[str] = None
+    order_type: Optional[str] = None
+
+
+class OptionRunExitResponse(BaseModel):
+    """``GET .../option-runs/{option_run_id}/exit``.
+
+    ``state`` is DERIVED from the run's own confirmed fills: ``flat`` (nothing
+    held - the exit is complete), ``residual`` (some leg is still open - the
+    ``close_plan`` is the next stage), ``ambiguous`` (the platform cannot explain
+    the run from its own evidence) or ``not_repairable`` (a status an exit may not
+    act on). ``evidence_digest`` is what a POST must still match.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    option_run_id: str
+    #: The run's own durable status (``entered``, ``exiting``, ...).
+    status: str
+    state: str
+    reason_code: Optional[str] = None
+    reasons: List[str] = Field(default_factory=list)
+    #: The adjust takeover rule's word for a run an adjust owns; ``finished``
+    #: when no adjust can be in flight.
+    adjust_owner_state: str = "unknown"
+    adjust_owner_reason: Optional[str] = None
+    #: ``resolved``, or the unresolved stage claim's own state.
+    protective_stage_state: str = "resolved"
+    close_plan: List[OptionRunExitPlanLeg] = Field(default_factory=list)
+    #: Whether every short the run holds is proven closed by its own fills.
+    shorts_proven_closed: bool = False
+    #: The short quantity that is still uncovered - why hedges stay withheld.
+    naked_short_quantity: int = 0
+    withheld_hedges: List[Dict[str, Any]] = Field(default_factory=list)
+    #: ``orders_outstanding`` | ``shorts_not_proven_closed`` |
+    #: ``no_permitted_action`` when a residual run has nothing to submit YET,
+    #: else ``None``. Waiting is expected; it is not ambiguity.
+    waiting_reason: Optional[str] = None
+    evidence_digest: str
+
+
+class OptionRunExitRequest(BaseModel):
+    """The digest the owner actually read, plus their reason."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    evidence_digest: str
+    reason: str
+
+
+class OptionRunExitItemResponse(BaseModel):
+    """One leg of the stage an exit POST actually submitted."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    tradingsymbol: str
+    transaction_type: str
+    quantity: int
+    order_id: Optional[str] = None
+    client_order_ref: Optional[str] = None
+    stage_digest: Optional[str] = None
+    #: ``submitted`` | ``unknown`` - a leg without a broker reference is never
+    #: reported as submitted.
+    state: str
+    reason_code: Optional[str] = None
+
+
+class OptionRunExitActionResponse(BaseModel):
+    """``POST .../option-runs/{option_run_id}/exit`` (§5).
+
+    ``status`` is ``accepted`` for one submitted stage, ``complete`` when the
+    run's own fills are flat (and the run is ``exited``), and ``blocked`` when a
+    stage could not be submitted - ``refusal`` then names why, and the run is
+    left in the durable state the refusal describes.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: str
+    action_id: str
+    option_run_id: str
+    run_status: str
+    state: str
+    evidence_digest: str
+    items: List[OptionRunExitItemResponse] = Field(default_factory=list)
+    refusal: Optional[str] = None
+    audit_id: Optional[str] = None
+    submission: Dict[str, Any] = Field(default_factory=dict)

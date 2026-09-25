@@ -32,4 +32,6 @@ export const hostedKeys = {
   pendingWork: (strategyId: string) => ["hosted", "pending-work", strategyId] as const,
   deadSubmission: (strategyId: string, planId: string, stepNo: number) =>
     ["hosted", "dead-submission", strategyId, planId, stepNo] as const,
+  optionExit: (strategyId: string, optionRunId: string) =>
+    ["hosted", "option-exit", strategyId, optionRunId] as const,
 };
