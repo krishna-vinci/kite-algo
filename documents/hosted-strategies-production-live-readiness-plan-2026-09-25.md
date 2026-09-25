@@ -102,6 +102,12 @@ actions (from B2.1b), protection policy and active owner, pending adjustments, a
 refusal reasons. Four clearly separate controls: stop evaluator / cancel pending work / exit structure /
 flatten. Reuse existing hosted-strategy UI patterns and API; vitest on new components only.
 
+**B2.6b owner actions.** Safe owner-facing routes for the three controls B2.6a leaves disabled. Cancel pending work
+cancels this strategy's pending ENTRY orders only, never protective or exit orders. Exit structure is a
+platform-generated governed exit plan for one option run. Flatten runs governed exits for all of the strategy's
+exposure. B2.6b also adds the protection-owner display (after B2.4) and an operator disposition for an adjust
+submission that has no outcome.
+
 **B2 exit gate:** options harness scenarios (restart/hold/close, adjust/resize, roll) pass on paper; momentum
 recurring regression passes once; report `documents/hosted-options-dynamic-b2-<date>.md`.
 
@@ -152,4 +158,10 @@ notifications. Record in `documents/hosted-strategies-rollout-<lane>-<date>.md`.
 | B2.2 S2 adjust engine | done, reviewed | `199bbfb` |
 | B2.2 S3 adjust gates | done, reviewed | `8b5cf33` |
 | B2.2 S4 roll + takeover | done, reviewed | `59a10d5` |
-| B2.2 S5 example + harness | next | |
+| B2.2 S5 example + harness | done, reviewed | `847fdb5` |
+| B2.4 design | accepted | `4976679` |
+| B2.5 risk policy | done, reviewed | `0e02f39` |
+| B2.6a options view + repair UI | done, reviewed | `4679956` |
+| B2.2 hardening (review findings) | in progress | |
+| B2.4 S1 owner row | in progress | |
+| B2.6b owner actions | design | |
