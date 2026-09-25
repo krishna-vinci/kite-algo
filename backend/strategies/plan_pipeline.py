@@ -39,77 +39,163 @@ class PipelineRefusal(Exception):
         return {"rejection_reason": self.reason_code, **self.detail}
 
 
-def live_margin_evidence(account_scope: str, plan: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
-    """Authoritative live margin for the plan's legs, or ``None``.
+def _live_kite_for_account(account_scope: str, session_factory: Optional[Callable[[], Any]] = None):
+    """The authoritative broker client for an owner's live account binding.
 
-    ``None`` is a real answer here: admission refuses MARGIN_UNAVAILABLE rather
-    than assuming headroom, which is the fail-closed behaviour D-9 requires. The
-    quote's timestamp travels with it so admission can refuse a stale one.
+    A supplied ``session_factory`` is honoured (the pipeline owns one), and the
+    caller-less path falls back to the worker router's own loader. Both read the
+    same persisted ``public.kite_sessions`` row and never issue a mutation.
+    """
+    if session_factory is None:
+        from backend.api.routers.worker_shared import _load_live_kite_for_account
+
+        return _load_live_kite_for_account(account_scope)
+    from backend.strategies.live_readers import live_kite_for_account
+
+    return live_kite_for_account(account_scope, session_factory=session_factory)
+
+
+def _leg_margin_required_inr(
+    kite: Any,
+    account_scope: str,
+    plan: Mapping[str, Any],
+    legs: Any,
+) -> Optional[float]:
+    """The broker's own order margin for the plan's exact frozen legs, or unknown.
+
+    The frozen sizing is retained verbatim from the pre-C1.1 reader: a weight is
+    a FRACTION of the frozen capital basis (not a share count), and an unsized
+    weighted leg or incompletely priced response is unknown evidence, not zero.
+    """
+    from backend.broker_api.orders.models import OrderMarginInput
+    from backend.broker_api.orders.service import OrdersService
+
+    resolved = dict(plan.get("resolved_plan") or {})
+    logical = dict(plan.get("logical_plan") or {})
+    try:
+        capital_basis = resolved.get("capital_basis_inr", logical.get("capital_basis_inr"))
+        capital_basis = None if capital_basis is None else float(capital_basis)
+    except (TypeError, ValueError):
+        capital_basis = None
+    try:
+        buffer_pct = resolved.get("cash_buffer_pct", logical.get("cash_buffer_pct"))
+        buffer_pct = 0.0 if buffer_pct is None else float(buffer_pct)
+    except (TypeError, ValueError):
+        buffer_pct = 0.0
+    items = []
+    for leg in legs:
+        if leg.get("signed_quantity") is None and leg.get("target_weight") is not None:
+            price = float(leg.get("reference_price") or 0)
+            if capital_basis is None or price <= 0:
+                return None
+            quantity = (
+                abs(float(leg.get("target_weight") or 0.0))
+                * capital_basis
+                * max(0.0, 1.0 - buffer_pct)
+                / price
+            )
+            side = "BUY"
+        else:
+            quantity = abs(float(leg.get("signed_quantity") or 0.0))
+            side = "BUY" if float(leg.get("signed_quantity") or 0) >= 0 else "SELL"
+        if quantity <= 0:
+            continue
+        items.append(
+            OrderMarginInput(
+                exchange=str(leg.get("broker_exchange") or leg.get("exchange") or "NSE"),
+                tradingsymbol=str(leg.get("broker_symbol") or leg.get("tradingsymbol") or ""),
+                transaction_type=side,
+                variety="regular",
+                product=str(leg.get("product") or "CNC"),
+                order_type="MARKET",
+                quantity=quantity,
+                price=float(leg.get("reference_price") or 0),
+            )
+        )
+    if not items:
+        # A plan with no increasing leg (a pure reduction) needs no order margin;
+        # it still needs FUNDS evidence, so this is zero and not "unknown".
+        return 0.0
+    quotes = list(
+        OrdersService().order_margins(kite, items, f"admission-{account_scope}", None) or []
+    )
+    if len(quotes) != len(items):
+        return None
+    if any(getattr(quote, "total", None) is None for quote in quotes):
+        return None
+    return float(sum(float(getattr(quote, "total", 0.0) or 0.0) for quote in quotes))
+
+
+def _cnc_available_cash(kite: Any, account_scope: str) -> Optional[float]:
+    """``funds.equity.available.cash`` from the read-only portfolio snapshot.
+
+    The CNC cash segment trades against settled cash only, so no other funds
+    component is credited. An absent or non-numeric figure is UNKNOWN (``None``),
+    never zero: "we did not read it" and "there is none" must not look alike.
+    """
+    from backend.broker_api.account.portfolio_snapshot import build_portfolio_snapshot
+
+    snapshot = dict(build_portfolio_snapshot(kite, account_scope) or {})
+    funds = snapshot.get("funds")
+    equity = dict(funds).get("equity") if isinstance(funds, Mapping) else None
+    available = dict(equity).get("available") if isinstance(equity, Mapping) else None
+    cash = dict(available).get("cash") if isinstance(available, Mapping) else None
+    if cash is None or isinstance(cash, bool):
+        return None
+    try:
+        return float(cash)
+    except (TypeError, ValueError):
+        return None
+
+
+def live_margin_evidence(
+    account_scope: str,
+    plan: Mapping[str, Any],
+    *,
+    session_factory: Optional[Callable[[], Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Authoritative live CNC funding evidence for the plan's legs, or ``None``.
+
+    The ONE evidence reader carries two facts together:
+
+    * ``required_inr`` - the broker's own order margin for the exact frozen legs;
+    * ``usable`` - authoritative account FUNDS (``equity.available.cash``) read
+      through the read-only portfolio snapshot boundary.
+
+    ``None`` is a real answer: admission refuses MARGIN_UNAVAILABLE rather than
+    assuming headroom, which is the fail-closed behaviour D-9 requires. The
+    observation instant travels with it so admission can refuse a stale one.
+
+    A PROGRAMMING error (TypeError/AttributeError/NameError) is deliberately not
+    caught: a bug in this reader must surface, never masquerade as "no evidence".
+    Only a genuine read failure becomes unavailable evidence.
     """
     try:
-        from backend.api.routers.worker_shared import _load_live_kite_for_account
-        from backend.broker_api.orders.models import OrderMarginInput
-        from backend.broker_api.orders.service import OrdersService
-
         legs = list((plan.get("resolved_plan") or {}).get("legs") or [])
         if not legs:
             return None
-        resolved = dict(plan.get("resolved_plan") or {})
-        logical = dict(plan.get("logical_plan") or {})
-        try:
-            capital_basis = resolved.get("capital_basis_inr", logical.get("capital_basis_inr"))
-            capital_basis = None if capital_basis is None else float(capital_basis)
-        except (TypeError, ValueError):
-            capital_basis = None
-        try:
-            buffer_pct = resolved.get("cash_buffer_pct", logical.get("cash_buffer_pct"))
-            buffer_pct = 0.0 if buffer_pct is None else float(buffer_pct)
-        except (TypeError, ValueError):
-            buffer_pct = 0.0
-        items = []
-        for leg in legs:
-            # A weight is a FRACTION of the frozen capital basis, not a share
-            # count: asking the broker for margin on 0.25 "shares" would
-            # under-state the requirement by orders of magnitude.
-            if leg.get("signed_quantity") is None and leg.get("target_weight") is not None:
-                price = float(leg.get("reference_price") or 0)
-                if capital_basis is None or price <= 0:
-                    return None
-                quantity = (
-                    abs(float(leg.get("target_weight") or 0.0))
-                    * capital_basis
-                    * max(0.0, 1.0 - buffer_pct)
-                    / price
-                )
-                side = "BUY"
-            else:
-                quantity = abs(float(leg.get("signed_quantity") or 0.0))
-                side = "BUY" if float(leg.get("signed_quantity") or 0) >= 0 else "SELL"
-            if quantity <= 0:
-                continue
-            items.append(
-                OrderMarginInput(
-                    exchange=str(leg.get("broker_exchange") or leg.get("exchange") or "NSE"),
-                    tradingsymbol=str(leg.get("broker_symbol") or leg.get("tradingsymbol") or ""),
-                    transaction_type=side,
-                    variety="regular",
-                    product=str(leg.get("product") or "CNC"),
-                    order_type="MARKET",
-                    quantity=quantity,
-                    price=float(leg.get("reference_price") or 0),
-                )
-            )
-        if not items:
+        kite = _live_kite_for_account(account_scope, session_factory)
+        required_inr = _leg_margin_required_inr(kite, account_scope, plan, legs)
+        if required_inr is None:
             return None
-        kite = _load_live_kite_for_account(account_scope)
-        quotes = OrdersService().order_margins(kite, items, f"admission-{account_scope}", None)
-        usable = sum(float(getattr(quote, "total", 0.0) or 0.0) for quote in quotes)
+        usable = _cnc_available_cash(kite, account_scope)
+        if usable is None:
+            return None
         return {
             "usable": usable,
-            "as_of": datetime.now(timezone.utc),
-            "legs": [str(getattr(quote, "tradingsymbol", "") or "") for quote in quotes],
+            "required_inr": required_inr,
+            "as_of": _utcnow(),
+            "source": "portfolio_snapshot:funds.equity.available.cash",
+            "account_scope": str(account_scope or ""),
+            "legs": [
+                str(leg.get("instrument_id") or leg.get("tradingsymbol") or "")
+                for leg in legs
+            ],
         }
-    except Exception:  # noqa: BLE001 - unavailable evidence is not headroom
+    except (TypeError, AttributeError, NameError):
+        # A programming error is a bug to surface, not "unavailable evidence".
+        raise
+    except Exception:  # noqa: BLE001 - a genuine read failure is not headroom
         return None
 
 
@@ -214,8 +300,12 @@ class PlanExecutionPipeline:
     def margin(self, plan: Mapping[str, Any], environment: str) -> Optional[Dict[str, Any]]:
         if environment != "live":
             return None
-        reader = self._margin_reader or live_margin_evidence
-        return reader(str(plan.get("account_id") or ""), plan)
+        account_scope = str(plan.get("account_id") or "")
+        if self._margin_reader is not None:
+            # An injected reader keeps its established two-argument seam; the
+            # built-in CNC funding reader owns its own session resolution.
+            return self._margin_reader(account_scope, plan)
+        return live_margin_evidence(account_scope, plan, session_factory=self.session_factory)
 
     def admit(self, plan: Mapping[str, Any], *, environment: str) -> Dict[str, Any]:
         self._assert_option_structure_admissible(plan, environment=environment)

@@ -929,7 +929,8 @@ class StrategyReservationEvent(Base):
     __table_args__ = (
         CheckConstraint(
             "event IN ('created', 'renewed', 'advanced', 'consumed', 'released', "
-            "'expired', 'action_required', 'disposition_confirmed')",
+            "'expired', 'action_required', 'disposition_confirmed', "
+            "'staged_increase_authorized')",
             name="ck_res_event",
         ),
         ForeignKeyConstraint(

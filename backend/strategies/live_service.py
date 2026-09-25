@@ -28,10 +28,10 @@ from backend.strategies.live_readers import (
     LiveEvidenceUnavailable,
     attributed_position_reader,
     ingested_fill_reader,
-    live_margin_evidence,
     live_quote_for_leg,
     live_session_id_for_account,
 )
+from backend.strategies.plan_pipeline import live_margin_evidence
 from backend.strategies.live_settings import hosted_live_disabled_detail, hosted_live_enabled
 from backend.strategies.live_sequence import (
     BLOCKER_HEDGE_NOT_FILLED,
@@ -40,6 +40,7 @@ from backend.strategies.live_sequence import (
     RULE_HEDGE_FILL_GATE,
     RULE_HEDGE_RELEASE_WITHHELD,
     RULE_ROLL_CLOSE_RELEASED,
+    RULE_STAGED_FUNDING_GATE,
     LivePlanSequence,
     lane_for_plan,
     prerequisites_met,
@@ -651,13 +652,17 @@ class LivePlanExecutor:
                     intent_handler=self._intent_handler,
                     clock=self._clock,
                 )
+                staged_gate = str(spec.release_rule) == RULE_STAGED_FUNDING_GATE
                 result = await adapter.release_step(
                     plan,
                     spec,
                     binding=binding,
                     authority=authority,
                     actor=actor,
-                    margin_evidence=margin_reader(account_id, plan),
+                    margin_evidence=None if staged_gate else margin_reader(account_id, plan),
+                    funds_reader=(lambda: margin_reader(account_id, plan))
+                    if staged_gate
+                    else None,
                     session_id=session_id_reader(account_id),
                     quote_reader=self._quote_reader or live_quote_for_leg,
                     all_specs=list(parent["step_spec"]),
@@ -713,6 +718,11 @@ class LivePlanExecutor:
         roll close owns its replacement-fill proof and a structure hedge owns its
         proven short closure."""
         rule = str(getattr(spec, "release_rule", ""))
+        if rule == RULE_STAGED_FUNDING_GATE:
+            # The lane passes sequencing here; executable quote/funds/admission
+            # and the keyed reservation authorization run inside the release
+            # transaction, immediately before its withheld -> releasing CAS.
+            return True, "", {"staged_funding_gate": "enforced_in_release_transaction"}
         if rule == RULE_ROLL_CLOSE_RELEASED:
             return self._roll_close_release_rule(plan=plan, spec=spec)
         if rule == RULE_HEDGE_FILL_GATE:

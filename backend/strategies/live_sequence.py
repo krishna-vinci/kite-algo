@@ -98,6 +98,12 @@ PARENT_INFLIGHT = (PARENT_PLANNED, PARENT_EXECUTING, PARENT_BLOCKED)
 RULE_IMMEDIATE = "immediate"
 #: Every step in ``depends_on`` must be ``filled`` before this step is released.
 RULE_ALL_PREREQUISITES_FILLED = "all_prerequisites_filled"
+#: A STAGED CNC portfolio's dependent buy: released only by the staged funding
+#: gate (the post-fill funds read and per-buy authorization). C1.1 S1 freezes the
+#: rule and fails closed on it; S2 implements the gate body. It is deliberately
+#: NOT ``all_prerequisites_filled``: a filled reduction alone never proves the
+#: buy is funded.
+RULE_STAGED_FUNDING_GATE = "staged_funding_gate"
 #: A risk-reducing MIS step: released by the platform's own square-off clock (or
 #: an authorising risk-reduction condition), never by a guessed exchange close.
 RULE_MIS_SQUAREOFF = "mis_squareoff"
@@ -115,6 +121,7 @@ RULE_HEDGE_RELEASE_WITHHELD = "hedge_release_withheld"
 RELEASE_RULES = (
     RULE_IMMEDIATE,
     RULE_ALL_PREREQUISITES_FILLED,
+    RULE_STAGED_FUNDING_GATE,
     RULE_MIS_SQUAREOFF,
     RULE_ROLL_CLOSE_RELEASED,
     RULE_HEDGE_FILL_GATE,
@@ -281,6 +288,11 @@ class LaneContext:
     #: ``(index, leg, quantity, side)`` per frozen leg, sized from the RUN's own
     #: confirmed executions. Reused verbatim; never re-derived here.
     option_run_steps: Optional[Callable[[Mapping[str, Any], Mapping[str, Any]], Sequence[Any]]] = None
+    #: Whether ADMISSION classified this plan as the staged CNC financing lane
+    #: (it recorded ``staged_increase_inr``). Only a staged plan's dependent buys
+    #: go behind the staged funding gate; every other portfolio plan keeps the
+    #: generic ``all_prerequisites_filled`` rule.
+    staged_financing: bool = False
 
     @property
     def plan_id(self) -> str:
@@ -458,6 +470,11 @@ def build_portfolio_steps(ctx: LaneContext) -> List[StepSpec]:
 
     ``weights.WeightsPortfolioCompiler._target_quantity`` is reused verbatim so
     the live size is the same arithmetic the paper lane and the compiler use.
+
+    A dependent increase of a plan ADMISSION marked as staged (``staged_increase_inr``)
+    is released by :data:`RULE_STAGED_FUNDING_GATE`, not by the generic
+    prerequisite rule: its reductions filling does not prove the buy is funded.
+    Every other portfolio plan keeps ``RULE_ALL_PREREQUISITES_FILLED``.
     """
     from .compiler.weights import WeightsPortfolioCompiler
 
@@ -539,6 +556,15 @@ def build_portfolio_steps(ctx: LaneContext) -> List[StepSpec]:
         # and sequence it: with no reducing leg there is nothing to wait for, so the
         # buy is ready immediately.
         gated = bool(increases and prereqs)
+        # A STAGED plan's dependent buy is released ONLY by the staged funding
+        # gate, never by the generic "every prerequisite filled" label: a filled
+        # reduction proves the sequence moved, not that the buy is funded.
+        if not gated:
+            release_rule = RULE_IMMEDIATE
+        elif bool(getattr(ctx, "staged_financing", False)):
+            release_rule = RULE_STAGED_FUNDING_GATE
+        else:
+            release_rule = RULE_ALL_PREREQUISITES_FILLED
         specs.append(
             StepSpec(
                 step_no=index,
@@ -554,9 +580,7 @@ def build_portfolio_steps(ctx: LaneContext) -> List[StepSpec]:
                 notional_inr=float(delta.get("notional_inr") or 0.0),
                 increases_exposure=increases,
                 depends_on=prereqs if gated else (),
-                release_rule=(
-                    RULE_ALL_PREREQUISITES_FILLED if gated else RULE_IMMEDIATE
-                ),
+                release_rule=release_rule,
                 detail={
                     "sizing": dict(delta),
                     "target_weight": float(leg.get("target_weight") or 0.0),

@@ -20,6 +20,8 @@ event log beside it, which records every transition with the actor who caused it
 
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -58,6 +60,7 @@ RESERVATION_EVENTS = (
     "expired",
     "action_required",
     "disposition_confirmed",
+    "staged_increase_authorized",
 )
 
 
@@ -470,11 +473,15 @@ class ReservationLedger:
         self,
         *,
         plan_id: str,
+        step_no: int,
         requirement_inr: float,
         account_capacity_inr: float,
+        quote: Optional[Mapping[str, Any]] = None,
+        funds_evidence: Optional[Mapping[str, Any]] = None,
         evidence: Optional[Mapping[str, Any]] = None,
         actor_id: Optional[str] = None,
         now: Optional[datetime] = None,
+        db: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Authorize the INCREASE phase of a staged CNC claim to spend real money.
 
@@ -489,15 +496,17 @@ class ReservationLedger:
         paper runtime's own figure, which already reflects the plan's confirmed
         sales and is reduced by every order that has already consumed cash.
 
-        Idempotent by amount: an already-authorized increase is not charged
-        twice, so a retried step cannot inflate the account's commitments.
+        Idempotent by ``plan_id:step_no``: the key (not a reservation-wide
+        total) decides whether this buy is already covered, so two equal-sized
+        buys always require two distinct authorizations. When ``db`` is
+        supplied, the caller owns transaction ownership and lock ordering; this
+        method takes only the reservation account lock and leaves commit to the
+        caller.
         """
         moment = now or _utcnow()
-        session = self.session_factory()
+        owns = db is None
+        session = db or self.session_factory()
         try:
-            self._lock_account(session, str(self._account_for(session, plan_id)))
-            from backend.strategies.financing import account_capacity_held_inr
-
             row = session.execute(
                 select(StrategyReservation).where(
                     StrategyReservation.plan_id == str(plan_id)
@@ -505,6 +514,18 @@ class ReservationLedger:
             ).scalar_one_or_none()
             if row is None:
                 raise ReservationNotFound({"plan_id": str(plan_id)})
+            self._lock_account(session, str(row.account_id))
+            # The advisory lock serializes writers; reread after taking it so the
+            # authorization scans current lifecycle and capacity rows.
+            row = session.execute(
+                select(StrategyReservation).where(
+                    StrategyReservation.plan_id == str(plan_id)
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                raise ReservationNotFound({"plan_id": str(plan_id)})
+            from backend.strategies.financing import account_capacity_held_inr
+
             if str(row.status) not in EXECUTABLE_STATUSES:
                 raise ReservationStateError(
                     {
@@ -514,12 +535,17 @@ class ReservationLedger:
                         "message": "only an executable reservation may authorize an increase",
                     }
                 )
-            already = self._authorized_increase_inr(session, str(row.reservation_id))
+            authorization_key = f"{str(plan_id)}:{int(step_no)}"
+            already = self._authorized_increase_inr(
+                session, str(row.reservation_id), authorization_key=authorization_key
+            )
+            authorized_total = self._authorized_increase_inr(session, str(row.reservation_id))
             needed = max(0.0, float(requirement_inr) - already)
             if needed <= 0.0:
                 return {
                     "authorized": True,
                     "already_authorized": True,
+                    "authorization_key": authorization_key,
                     "authorized_increase_inr": already,
                     "reservation_id": str(row.reservation_id),
                 }
@@ -532,7 +558,10 @@ class ReservationLedger:
                 execution_environment=str(row.execution_environment),
             ) - float(row.reserved_notional_inr or 0.0)
             competing = max(0.0, competing)
-            if competing + needed > float(account_capacity_inr):
+            # The broker figure is account-wide. This plan's prior keyed
+            # authorizations are not other plans' commitments, but they do spend
+            # the same cash until real fills/dispositions replace them.
+            if competing + authorized_total + needed > float(account_capacity_inr):
                 raise CapacityExceeded(
                     {
                         "account_id": str(row.account_id),
@@ -542,7 +571,8 @@ class ReservationLedger:
                         "reservation_id": str(row.reservation_id),
                         "account_capacity_inr": float(account_capacity_inr),
                         "competing_commitments_inr": competing,
-                        "already_authorized_inr": already,
+                        "already_authorized_inr": authorized_total,
+                        "authorization_key": authorization_key,
                         "requested_increase_inr": float(requirement_inr),
                         "message": (
                             "This staged increase would spend account money that is not "
@@ -553,33 +583,36 @@ class ReservationLedger:
             self._record(
                 session,
                 reservation_id=str(row.reservation_id),
-                # ``advanced`` is the existing progress event; the AUTHORIZATION
-                # travels explicitly in the detail instead of widening the
-                # reservation event vocabulary (which would need a migration).
-                event="advanced",
+                event="staged_increase_authorized",
                 actor_id=actor_id,
                 detail={
-                    "staged_increase_authorized": True,
+                    "authorization_key": authorization_key,
                     "increase_inr": needed,
                     "cumulative_authorized_inr": already + needed,
+                    "quote": _json_safe(dict(quote or {})),
+                    "funds_evidence_sha256": self._evidence_digest(funds_evidence),
                     "account_capacity_inr": float(account_capacity_inr),
                     "competing_commitments_inr": competing,
                     **dict(evidence or {}),
                 },
                 at=moment,
             )
-            session.commit()
+            if owns:
+                session.commit()
             return {
                 "authorized": True,
                 "already_authorized": False,
+                "authorization_key": authorization_key,
                 "authorized_increase_inr": already + needed,
                 "reservation_id": str(row.reservation_id),
             }
         except Exception:
-            session.rollback()
+            if owns:
+                session.rollback()
             raise
         finally:
-            session.close()
+            if owns:
+                session.close()
 
     def _account_for(self, session: Any, plan_id: str) -> str:
         row = session.execute(
@@ -589,22 +622,32 @@ class ReservationLedger:
         ).first()
         return str(row[0]) if row is not None else ""
 
-    @staticmethod
-    def _authorized_increase_inr(session: Any, reservation_id: str) -> float:
+    def _authorized_increase_inr(
+        self, session: Any, reservation_id: str, *, authorization_key: Optional[str] = None
+    ) -> float:
         """Cumulative increase already authorized on this reservation."""
         rows = session.execute(
             select(StrategyReservationEvent.detail).where(
                 StrategyReservationEvent.reservation_id == str(reservation_id),
-                StrategyReservationEvent.event == "advanced",
+                StrategyReservationEvent.event == "staged_increase_authorized",
             )
         ).scalars().all()
         total = 0.0
         for detail in rows:
             payload = dict(detail or {})
-            if not payload.get("staged_increase_authorized"):
+            if authorization_key is not None and str(
+                payload.get("authorization_key") or ""
+            ) != str(authorization_key):
                 continue
             total += float(payload.get("increase_inr") or 0.0)
         return total
+
+    @staticmethod
+    def _evidence_digest(evidence: Optional[Mapping[str, Any]]) -> str:
+        payload = json.dumps(
+            _json_safe(dict(evidence or {})), sort_keys=True, separators=(",", ":")
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def renew(
         self,

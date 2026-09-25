@@ -45,7 +45,6 @@ ADMISSION_REFUSALS = (
     "ALLOCATION_EXCEEDED",
     "REFERENCE_PRICE_UNAVAILABLE",
     "POSITION_VALUATION_UNAVAILABLE",
-    "STAGED_LIVE_FINANCING_UNSUPPORTED",
     "INSTRUMENT_NOTIONAL_EXCEEDED",
     "GROSS_NOTIONAL_EXCEEDED",
     "MAX_OPEN_INSTRUMENTS_EXCEEDED",
@@ -59,6 +58,7 @@ ADMISSION_REFUSALS = (
     "STRATEGY_NOTIONAL_LIMIT_EXCEEDED",
     "CATALOG_INVALID",
     "SESSION_PRODUCT_INVALID",
+    "STAGED_CNC_SHORT_UNSUPPORTED",
     "MARGIN_UNAVAILABLE",
     "MARGIN_QUOTE_STALE",
     "MARGIN_INSUFFICIENT",
@@ -75,6 +75,12 @@ CAPACITY_HOLDING_STATUSES = ("active", "renewed", "consumed", "action_required")
 PENDING_COMMITMENT_STATUSES = ("active", "renewed", "action_required")
 
 DEFAULT_MARGIN_MAX_AGE_SECONDS = 60
+
+#: The ONE live plan kind eligible for staged CNC financing (C1.1 §1). A live
+#: ``intent_bundle`` still refuses: it is not a persisted ``target_weights`` plan
+#: and its own lane rule governs it (``LIVE_PLAN_KIND_UNSUPPORTED`` at the
+#: adapter). Paper staging keeps accepting both kinds, exactly as before.
+LIVE_STAGED_PLAN_KIND = "target_weights"
 
 #: Products admission accepts, per the existing platform vocabulary.
 VALID_PRODUCTS = frozenset({"CNC", "MIS", "NRML"})
@@ -1041,11 +1047,22 @@ class AdmissionService:
             and any(quantity < 0 for quantity in order_quantities)
             and any(quantity > 0 for quantity in order_quantities)
         )
+        # A frozen CNC target below zero is a SHORT: either an explicit short
+        # target, or a reduction that crosses flat into one. The live lane
+        # refuses it by name below (``STAGED_CNC_SHORT_UNSUPPORTED``).
+        cnc_short = bool(
+            cnc_lane
+            and any(
+                int(row.get("target_quantity") or 0) < 0
+                for row in exposure["per_instrument"]
+            )
+        )
         detail: Dict[str, Any] = {
             "execution_environment": environment,
             "plan_requirement_inr": requirement,
             "incremental_funding_inr": requirement,
             "staged_financing_lane": staged_plan,
+            "cnc_short": cnc_short,
             # The part of the requirement a staged plan funds from its OWN
             # reductions, and therefore must NOT be reserved against free cash at
             # claim time. It is authorized later, per increase, against confirmed
@@ -1277,6 +1294,24 @@ class AdmissionService:
                 return AdmissionVerdict(False, "MARGIN_INSUFFICIENT", {**detail, **refusal})
 
         if is_live:
+            if cnc_short:
+                # A live CNC leg targets a SHORT. The cash segment is long-only,
+                # so a short target - or a reduction that crosses flat into one -
+                # can never enter the staged lane: its "funding" reduction would
+                # be opening a liability the broker margins on its own terms.
+                # Refused by NAME rather than falling through to a generic one.
+                return AdmissionVerdict(
+                    False,
+                    "STAGED_CNC_SHORT_UNSUPPORTED",
+                    {
+                        **detail,
+                        "message": (
+                            "a live CNC leg targets a SHORT position; the staged "
+                            "sell-before-buy lane is long-only and never opens or "
+                            "crosses into a short"
+                        ),
+                    },
+                )
             margin = dict(margin_evidence or {})
             if not margin or margin.get("usable") is None:
                 return AdmissionVerdict(
@@ -1306,26 +1341,26 @@ class AdmissionService:
             # never reserve the same actual account funds.
             detail["account_available_inr"] = available
             if available is not None and available < requirement:
-                if staged_plan:
-                    # LIVE staged financing is NOT implemented: the live adapter
-                    # has no confirmed-release authorization path, so a live
-                    # rebalance whose cash is short refuses by name rather than
-                    # trading on money the platform has not proved.
-                    return AdmissionVerdict(
-                        False,
-                        "STAGED_LIVE_FINANCING_UNSUPPORTED",
-                        {
-                            **detail,
-                            "required_inr": requirement,
-                            "message": (
-                                "A live rebalance whose increases are not covered by "
-                                "available margin is refused: staged sell-before-buy "
-                                "financing is only implemented for paper"
-                            ),
-                        },
+                if staged_plan and str(plan.get("plan_kind") or "") == LIVE_STAGED_PLAN_KIND:
+                    # C1.1: a LIVE CNC ``target_weights`` rebalance may trade on
+                    # its OWN confirmed reductions exactly as paper does. Whole-plan
+                    # cash being short is NOT a refusal here - the shortfall is
+                    # recorded, and the live sequence withholds every dependent buy
+                    # behind its filled reductions (and, from S2, the release gate).
+                    # A projected or partial sale never supplies money.
+                    detail["staged_financing_shortfall_inr"] = float(
+                        requirement - available
                     )
+                    detail["staged_financing_message"] = (
+                        "Live cash is short of the whole incremental requirement; "
+                        "this plan's own confirmed reductions must fund the rest and "
+                        "each dependent buy is withheld unless they do."
+                    )
+                    return AdmissionVerdict(True, None, detail)
                 # Authoritative insufficiency is a refusal; the named reason is the
-                # margin axis, since the broker said the money is not there.
+                # margin axis, since the broker said the money is not there. A live
+                # staged shape that is NOT the target_weights lane (e.g. an
+                # intent_bundle) keeps the refusal.
                 return AdmissionVerdict(
                     False,
                     "MARGIN_UNAVAILABLE",

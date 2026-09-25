@@ -3123,7 +3123,7 @@ CREATE TABLE IF NOT EXISTS public.strategy_reservation_events (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT ck_res_event CHECK (event IN (
         'created', 'renewed', 'advanced', 'consumed', 'released', 'expired',
-        'action_required', 'disposition_confirmed'
+        'action_required', 'disposition_confirmed', 'staged_increase_authorized'
     )),
     CONSTRAINT fk_res_event_reservation FOREIGN KEY (reservation_id)
         REFERENCES public.strategy_reservations (reservation_id) ON DELETE RESTRICT

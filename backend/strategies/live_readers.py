@@ -85,55 +85,17 @@ def live_margin_evidence(
     *,
     session_factory: Optional[Callable[[], Any]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Authoritative live margin for the plan's legs, or ``None`` when unknown.
+    """Deprecated shim: the ONE CNC funding reader now lives in the pipeline.
 
-    ``None`` is a real answer: admission refuses ``MARGIN_UNAVAILABLE`` rather
-    than assuming headroom. The snapshot must be COMPLETE: a response that does
-    not cover every frozen leg is incomplete evidence, not partial headroom.
+    ``plan_pipeline.live_margin_evidence`` is the single implementation (broker
+    order margin PLUS authoritative account funds). This alias keeps the reader
+    module's public surface while guaranteeing the two can never diverge.
     """
-    try:
-        from backend.broker_api.orders.models import OrderMarginInput
-        from backend.broker_api.orders.service import OrdersService
+    from backend.strategies.plan_pipeline import (
+        live_margin_evidence as _live_margin_evidence,
+    )
 
-        legs = list((plan.get("resolved_plan") or {}).get("legs") or [])
-        if not legs:
-            return None
-        items = []
-        for leg in legs:
-            quantity = abs(float(leg.get("signed_quantity", leg.get("target_weight", 0.0)) or 0.0))
-            if quantity <= 0:
-                continue
-            items.append(
-                OrderMarginInput(
-                    exchange=str(leg.get("broker_exchange") or leg.get("exchange") or "NSE"),
-                    tradingsymbol=str(leg.get("broker_symbol") or leg.get("tradingsymbol") or ""),
-                    transaction_type="BUY" if float(leg.get("signed_quantity") or 0) >= 0 else "SELL",
-                    variety="regular",
-                    product=str(leg.get("product") or "CNC"),
-                    order_type="MARKET",
-                    quantity=quantity,
-                    price=float(leg.get("reference_price") or 0),
-                )
-            )
-        if not items:
-            return None
-        kite = live_kite_for_account(account_scope, session_factory=session_factory)
-        quotes = OrdersService().order_margins(kite, items, f"admission-{account_scope}", None)
-        quotes = list(quotes or [])
-        if len(quotes) != len(items):
-            # Incomplete coverage is unknown: the plan's requirement must be
-            # priced for EVERY leg before any of it can be admitted.
-            return None
-        if any(getattr(quote, "total", None) is None for quote in quotes):
-            return None
-        usable = sum(float(getattr(quote, "total", 0.0) or 0.0) for quote in quotes)
-        return {
-            "usable": usable,
-            "as_of": datetime.now(timezone.utc),
-            "legs": [str(getattr(quote, "tradingsymbol", "") or "") for quote in quotes],
-        }
-    except Exception:  # noqa: BLE001 - unavailable evidence is not headroom
-        return None
+    return _live_margin_evidence(account_scope, plan, session_factory=session_factory)
 
 
 def attributed_position_reader(

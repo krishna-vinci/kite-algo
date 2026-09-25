@@ -702,8 +702,10 @@ def test_cnc_full_snapshot_sequences_reductions_before_dependent_increases(pg, l
 
     A full-snapshot portfolio target is an ORDERED set: the reducing leg is
     materialized ready and the increasing leg ``withheld`` behind it. A partial
-    sell keeps the buy withheld and holds the parent's reservation; only the
-    CONFIRMED full sell fill releases the buy, and it is released exactly once.
+    sell keeps the buy withheld and holds the parent's reservation. S2 releases
+    only after the confirmed full sell, fresh quote/funds evidence and one
+    keyed authorization event. A restart cannot send the buy again, and the
+    parent reservation remains held until every leg is terminal.
     """
     from backend.strategies.live_ingestion import LiveOutcomeConsumer
 
@@ -805,7 +807,7 @@ def test_cnc_full_snapshot_sequences_reductions_before_dependent_increases(pg, l
             )
             assert sell_spec["depends_on"] == [], sell_spec
             assert buy_spec["depends_on"] == [sell_spec["step_no"]], buy_spec
-            assert buy_spec["release_rule"] == "all_prerequisites_filled"
+            assert buy_spec["release_rule"] == "staged_funding_gate"
             assert set(spec_by_ref) == {sell_spec["step_ref"], buy_spec["step_ref"]}
 
             buy_claim = _claim(env.factory, plan_id, buy_spec["step_no"])
@@ -850,7 +852,8 @@ def test_cnc_full_snapshot_sequences_reductions_before_dependent_increases(pg, l
             held = env.executor.ledger.for_plan(plan_id)
             assert str(held["status"]) in ("active", "renewed"), held
 
-            # -- the CONFIRMED full sell fill releases the buy, exactly once.
+            # -- the CONFIRMED full sell fill gives the gate its first executable
+            # fact: only now may it read funds and authorize the exact buy.
             _ingest_fill(
                 env.factory,
                 account_id=env.account_scope,
@@ -864,24 +867,43 @@ def test_cnc_full_snapshot_sequences_reductions_before_dependent_increases(pg, l
             )
             counts = await consumer.poll_once()
             assert counts["filled"] == 1, counts
-            assert counts["sequence_released"] == 1, (
-                counts,
-                dict(_claim(env.factory, plan_id, buy_spec["step_no"])),
-            )
+            assert counts["sequence_released"] == 1, counts
             assert len(env.broker.calls) == 3, [c[0].payload for c in env.broker.calls]
             buy_intent, _ = env.broker.calls[-1]
             assert buy_intent.payload["order"]["transaction_type"] == "BUY"
             assert buy_intent.payload["order"]["tradingsymbol"] == RELIANCE
-            released = _claim(env.factory, plan_id, buy_spec["step_no"])
-            assert released["state"] == "pending", dict(released)
-            assert list(released["broker_order_ids"]) == ["OID-REL-BUY"]
-            assert released["detail"]["released_by"] == "live-sequence"
+            buy_claim = _claim(env.factory, plan_id, buy_spec["step_no"])
+            assert buy_claim["state"] == "pending", dict(buy_claim)
+            assert list(buy_claim["broker_order_ids"]) == ["OID-REL-BUY"]
 
-            # -- restart / duplicate release: nothing is sent twice.
+            with env.factory() as session:
+                from sqlalchemy import text
+
+                reservations = session.execute(
+                    text(
+                        "SELECT reservation_id FROM public.strategy_reservations "
+                        "WHERE plan_id = :plan_id"
+                    ),
+                    {"plan_id": plan_id},
+                ).scalars().all()
+                authorizations = session.execute(
+                    text(
+                        "SELECT detail FROM public.strategy_reservation_events "
+                        "WHERE reservation_id = :rid "
+                        "AND event = 'staged_increase_authorized'"
+                    ),
+                    {"rid": str(reservations[0])},
+                ).scalars().all()
+            assert len(authorizations) == 1
+            assert authorizations[0]["authorization_key"] == f"{plan_id}:{buy_spec['step_no']}"
+            assert authorizations[0]["quote"]["ltp"] == 1500.0
+            assert authorizations[0]["funds_evidence_sha256"]
+
+            # -- restart / duplicate consumer: the durable claim is no longer
+            # withheld, so neither path reauthorizes or retransmits the buy.
             calls_before = len(env.broker.calls)
             again = await env.executor.release_sequence()
             assert again["released"] == 0, again
-            assert len(env.broker.calls) == calls_before
             restarted = LiveOutcomeConsumer(
                 session_factory=env.factory,
                 clock=env.clock,
@@ -890,16 +912,37 @@ def test_cnc_full_snapshot_sequences_reductions_before_dependent_increases(pg, l
             counts = await restarted.poll_once()
             assert counts["sequence_released"] == 0, counts
             assert len(env.broker.calls) == calls_before
+            assert _claim(env.factory, plan_id, buy_spec["step_no"])["state"] == "pending"
             assert reservation["execution_environment"] == "live"
+
+            # -- the buy's terminal proof is the LAST funding leg. Until it arrives,
+            # the parent (and therefore the reservation) remains in flight.
+            buy_order = list(buy_claim["broker_order_ids"])[0]
+            _ingest_fill(
+                env.factory,
+                account_id=env.account_scope,
+                run_id=attempt["run_id"],
+                order_id=buy_order,
+                trade_id="TR-REL-1",
+                quantity=int(buy_spec["quantity"]),
+                side="BUY",
+                symbol=RELIANCE,
+                token=RELIANCE_TOKEN,
+            )
+            counts = await consumer.poll_once()
+            assert counts["filled"] == 1, counts
+            assert _claim(env.factory, plan_id, buy_spec["step_no"])["state"] == "filled"
             return {"plan_id": plan_id, "buy_step": buy_spec["step_no"], "strategy_id": strategy_id}
         finally:
             await client.aclose()
 
     result = asyncio.run(_run())
-    # The reservation is NOT consumed by the first leg: the parent still has an
-    # unresolved leg, so its allocation stays held.
+    # Only the terminal BUY let the parent settle; a real fill consumes capacity
+    # rather than releasing it, even though a keyed authorization already exists.
     parent = _execution(env.factory, result["plan_id"])
-    assert parent["state"] == "executing", dict(parent)
+    assert parent["state"] == "settled", dict(parent)
+    reservation = env.executor.ledger.for_plan(result["plan_id"])
+    assert reservation["status"] == "consumed", dict(reservation)
 
 
 def _fresh_executor(env):
@@ -908,7 +951,9 @@ def _fresh_executor(env):
     return executor
 
 
-async def _open_position(client, env, attempt, revision_id, *, order_id="OID-INFY-ENTRY"):
+async def _open_position(
+    client, env, attempt, revision_id, *, order_id="OID-INFY-ENTRY", product="CNC"
+):
     """Open a real attributed INFY book so a later plan must REDUCE it."""
     entry = await _submit_proposal(
         client,
@@ -917,6 +962,7 @@ async def _open_position(client, env, attempt, revision_id, *, order_id="OID-INF
             "target_kind": "target_weights",
             "payload": {
                 "universe_revision_id": revision_id,
+                "product": product,
                 "target_weights": {RELIANCE: 0.0, INFY: 0.02},
                 "reference_prices": {RELIANCE: 1500.0, INFY: 1500.0},
             },
@@ -938,13 +984,14 @@ async def _open_position(client, env, attempt, revision_id, *, order_id="OID-INF
         side="BUY",
         symbol=INFY,
         token=INFY_TOKEN,
+        product=product,
     )
     counts = await env.consumer().poll_once()
     assert counts["filled"] == 1, counts
     assert _attributed(env.factory, attempt["strategy_id"], env.account_scope) == 66
 
 
-async def _rebalance_plan(client, env, attempt, revision_id):
+async def _rebalance_plan(client, env, attempt, revision_id, *, product="CNC"):
     """Materialize a two-leg plan: SELL INFY to zero, BUY RELIANCE."""
     response = await _submit_proposal(
         client,
@@ -953,6 +1000,7 @@ async def _rebalance_plan(client, env, attempt, revision_id):
             "target_kind": "target_weights",
             "payload": {
                 "universe_revision_id": revision_id,
+                "product": product,
                 "target_weights": {RELIANCE: 0.04, INFY: 0.0},
                 "reference_prices": {RELIANCE: 1500.0, INFY: 1500.0},
             },
@@ -1049,8 +1097,15 @@ def test_cnc_release_refuses_when_the_attempt_authority_is_gone(pg, live_env):
     assert parent["state"] in ("executing", "planned", "blocked"), dict(parent)
 
 
-def test_cnc_uncertain_dependent_submission_is_never_retransmitted(pg, live_env):
-    """A transport-uncertain release keeps its work and is NEVER repeated."""
+def test_non_staged_uncertain_release_is_never_retransmitted(pg, live_env):
+    """A transport-uncertain release keeps its work and is NEVER repeated.
+
+    The basket is NON-CNC (MIS product), so it never enters the C1.1 staged
+    funding lane: its dependent buy keeps the generic ``all_prerequisites_filled``
+    rule and still releases once the reduction fills - no behaviour change. (A
+    STAGED CNC basket's dependent buy is now gated; S1 pins that in the sibling
+    test above.)
+    """
     env = _Env(
         pg,
         live_env,
@@ -1067,11 +1122,12 @@ def test_cnc_uncertain_dependent_submission_is_never_retransmitted(pg, live_env)
             attempt = await _prepare_live_attempt(
                 client, account_scope=env.account_scope, lease_until=env.lease_until
             )
-            await _open_position(client, env, attempt, revision_id)
+            await _open_position(client, env, attempt, revision_id, product="MIS")
             plan_id, _sell_spec, buy_spec, body = await _rebalance_plan(
-                client, env, attempt, revision_id
+                client, env, attempt, revision_id, product="MIS"
             )
             assert body["broker_order_ids"] == ["OID-INFY-EXIT"], body
+            assert buy_spec["release_rule"] == "all_prerequisites_filled", buy_spec
             _ingest_fill(
                 env.factory,
                 account_id=env.account_scope,
@@ -1082,6 +1138,7 @@ def test_cnc_uncertain_dependent_submission_is_never_retransmitted(pg, live_env)
                 side="SELL",
                 symbol=INFY,
                 token=INFY_TOKEN,
+                product="MIS",
             )
             counts = await env.consumer().poll_once()
             assert counts["sequence_released"] == 1, counts

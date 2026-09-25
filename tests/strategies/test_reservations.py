@@ -274,33 +274,67 @@ class CapacityClaimTests(ReservationTestCase):
             [
                 row
                 for row in self.ledger.events(claimed["reservation_id"])
-                if row["detail"].get("staged_increase_authorized")
+                if row["event"] == "staged_increase_authorized"
             ]
         )
 
         # The sale has NOT produced money yet: the increase cannot spend.
         with self.assertRaises(CapacityExceeded) as ctx:
             self.ledger.authorize_staged_increase(
-                plan_id="plan-1", requirement_inr=1500.0, account_capacity_inr=0.0, now=NOW
+                plan_id="plan-1",
+                step_no=2,
+                requirement_inr=1500.0,
+                account_capacity_inr=0.0,
+                now=NOW,
             )
         self.assertEqual(ctx.exception.detail["scope"], "account_funds_increase")
 
         # The proceeds are now in the account: authorized, exactly once.
         first = self.ledger.authorize_staged_increase(
-            plan_id="plan-1", requirement_inr=1500.0, account_capacity_inr=2000.0, now=NOW
+                plan_id="plan-1",
+                step_no=2,
+                requirement_inr=1500.0,
+                account_capacity_inr=1500.0,
+                quote={"ltp": 100.0, "as_of": NOW.isoformat()},
+                funds_evidence={"usable": 1500.0, "as_of": NOW.isoformat()},
+                now=NOW,
         )
         self.assertTrue(first["authorized"])
         self.assertFalse(first["already_authorized"])
         again = self.ledger.authorize_staged_increase(
-            plan_id="plan-1", requirement_inr=1500.0, account_capacity_inr=2000.0, now=NOW
+                plan_id="plan-1",
+                step_no=2,
+                requirement_inr=1500.0,
+                account_capacity_inr=1500.0,
+                quote={"ltp": 100.0, "as_of": NOW.isoformat()},
+                funds_evidence={"usable": 1500.0, "as_of": NOW.isoformat()},
+                now=NOW,
         )
         self.assertTrue(again["already_authorized"])
         authorized = [
             row for row in self.ledger.events(claimed["reservation_id"])
-            if row["detail"].get("staged_increase_authorized")
+            if row["event"] == "staged_increase_authorized"
         ]
         self.assertEqual(len(authorized), 1)
-        self.assertEqual(authorized[0]["detail"]["account_capacity_inr"], 2000.0)
+        self.assertEqual(authorized[0]["event"], "staged_increase_authorized")
+        self.assertEqual(authorized[0]["detail"]["account_capacity_inr"], 1500.0)
+
+        # A second equal-sized leg is not covered by the first key. The account
+        # has funds for only one, so it refuses instead of reusing authorization.
+        with self.assertRaises(CapacityExceeded):
+            self.ledger.authorize_staged_increase(
+                plan_id="plan-1",
+                step_no=3,
+                requirement_inr=1500.0,
+                account_capacity_inr=1500.0,
+                now=NOW,
+            )
+
+        # Authorization is not execution progress: a later disposition proves the
+        # buy was never attempted, and the parent's unused capacity is releasable.
+        self.ledger.release(
+            claimed["reservation_id"], reason="terminal_unfilled_no_attempt", now=NOW
+        )
 
     def test_an_unstaged_claim_still_enforces_the_account_cap(self):
         """The control: without staging the same zero-cash claim is refused."""

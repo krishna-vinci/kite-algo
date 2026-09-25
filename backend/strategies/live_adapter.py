@@ -44,6 +44,7 @@ from that delta), floored to the pinned lot and recorded as the delta snapshot.
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -53,9 +54,9 @@ from sqlalchemy import text
 
 from backend.app.database import SessionLocal
 
-from .admission import AdmissionService
+from .admission import AdmissionService, margin_max_age_seconds
 from .approvals import ApprovalService
-from .reservations import ReservationLedger
+from .reservations import CapacityExceeded, ReservationLedger
 from .settlement import ExecutionBarrier
 
 #: The plan kinds this adapter dispatches. Everything else - an ``intent_bundle``
@@ -73,6 +74,10 @@ QUOTE_MAX_AGE_SECONDS = 5.0
 
 #: How far ahead the evaluation authority must still be valid.
 AUTHORITY_MIN_REMAINING_SECONDS = 1.0
+
+#: The largest relative move from a frozen buy reference that the staged
+#: funding gate will authorize. A tighter operator limit stays configurable.
+DEFAULT_STAGED_BUY_MAX_PRICE_DRIFT_PCT = 0.005
 
 #: The ONE approval pin a released dependent leg may explain away, and only when
 #: it can PROVE the book moved by nothing but this parent's own confirmed fills.
@@ -971,6 +976,133 @@ class LivePlanAdapter:
             )
         return {"admitted": True, "detail": dict(verdict.detail or {})}
 
+    @staticmethod
+    def staged_buy_max_price_drift_pct() -> float:
+        raw = os.environ.get("LIVE_STAGED_BUY_MAX_PRICE_DRIFT_PCT")
+        if raw is None:
+            return DEFAULT_STAGED_BUY_MAX_PRICE_DRIFT_PCT
+        try:
+            value = float(raw)
+        except ValueError:
+            return DEFAULT_STAGED_BUY_MAX_PRICE_DRIFT_PCT
+        return value if value >= 0.0 else DEFAULT_STAGED_BUY_MAX_PRICE_DRIFT_PCT
+
+    async def _staged_funding_gate(
+        self,
+        plan: Mapping[str, Any],
+        spec: Any,
+        *,
+        states: Mapping[int, str],
+        quote: Optional[Mapping[str, Any]],
+        quote_reader: Any,
+        funds_reader: Optional[Callable[[], Any]],
+        margin_evidence: Optional[Mapping[str, Any]],
+        catalog_state: Optional[Mapping[str, Any]],
+    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        """Prove a dependent buy is funded before its CAS; place nothing.
+
+        The two stages are deliberately separate. A non-``filled`` reduction is
+        sequencing evidence, while quote/funds evidence is executable funding
+        evidence and is read only after the first stage passes.
+        """
+        plan_id = str(plan.get("plan_id") or "")
+        unconfirmed = [
+            int(value)
+            for value in (spec.depends_on or ())
+            if str(states.get(int(value)) or "") != "filled"
+        ]
+        if unconfirmed:
+            raise LiveRefusal(
+                "STAGED_FUNDING_REDUCTION_NOT_CONFIRMED",
+                {
+                    "plan_id": plan_id,
+                    "step_no": int(spec.step_no),
+                    "confirmed_reduction_steps": [
+                        int(value) for value in spec.depends_on if value not in unconfirmed
+                    ],
+                    "unconfirmed_reduction_steps": unconfirmed,
+                    "states": {str(key): str(value) for key, value in states.items()},
+                },
+            )
+
+        leg = self._leg_view(spec)
+        if quote is None and callable(quote_reader):
+            candidate = quote_reader(leg)
+            if hasattr(candidate, "__await__"):
+                candidate = await candidate
+            quote = candidate
+        validated_quote = self._check_quote(plan, leg, dict(quote or {}))
+
+        reference_price = abs(float(getattr(spec, "detail", {}).get("reference_price") or 0.0))
+        if reference_price <= 0.0:
+            quantity = abs(int(spec.quantity))
+            reference_price = (
+                abs(float(spec.notional_inr)) / quantity if quantity else 0.0
+            )
+        if reference_price <= 0.0:
+            raise LiveRefusal(
+                "LIVE_REFERENCE_PRICE_UNAVAILABLE",
+                {"plan_id": plan_id, "step_no": int(spec.step_no)},
+            )
+        price = abs(float(validated_quote.get("ltp") or 0.0))
+        drift = abs(price / reference_price - 1.0) if reference_price else 1.0
+        max_drift = self.staged_buy_max_price_drift_pct()
+        if drift > max_drift:
+            raise LiveRefusal(
+                "LIVE_FINANCING_PRICE_DRIFT",
+                {
+                    "plan_id": plan_id,
+                    "step_no": int(spec.step_no),
+                    "reference_price_inr": reference_price,
+                    "quote_price_inr": price,
+                    "price_drift_pct": drift,
+                    "max_price_drift_pct": max_drift,
+                },
+            )
+
+        try:
+            funds = (
+                dict(funds_reader() or {})
+                if callable(funds_reader)
+                else dict(margin_evidence or {})
+            )
+        except LiveRefusal:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a broker read failure is not headroom
+            raise LiveRefusal(
+                "STAGED_FUNDING_EVIDENCE_UNAVAILABLE",
+                {"plan_id": plan_id, "step_no": int(spec.step_no), "error": str(exc)},
+            ) from exc
+        account_scope = str(funds.get("account_scope") or "")
+        if not funds or funds.get("usable") is None or (
+            account_scope and account_scope != str(plan.get("account_id") or "")
+        ):
+            raise LiveRefusal(
+                "STAGED_FUNDING_EVIDENCE_UNAVAILABLE",
+                {
+                    "plan_id": plan_id,
+                    "step_no": int(spec.step_no),
+                    "account_scope": account_scope or None,
+                },
+            )
+        as_of = _as_datetime(funds.get("as_of"))
+        age = (self._clock() - as_of).total_seconds() if as_of else None
+        max_age = margin_max_age_seconds()
+        if age is None or age > max_age:
+            raise LiveRefusal(
+                "STAGED_FUNDING_EVIDENCE_STALE",
+                {
+                    "plan_id": plan_id,
+                    "step_no": int(spec.step_no),
+                    "funds_age_seconds": age,
+                    "max_age_seconds": max_age,
+                },
+            )
+        self._check_admission(
+            plan, margin_evidence=funds, catalog_state=catalog_state
+        )
+        return validated_quote, funds
+
     def _check_option_structure_admissibility(self, plan: Mapping[str, Any]) -> None:
         """Refuse a live option plan the strategy's own durable work blocks.
 
@@ -1238,7 +1370,16 @@ class LivePlanAdapter:
         self._check_authority(plan, evaluation_authority, binding)
         self._check_approval(plan)
         reservation = self._check_reservation(plan)
-        self._check_admission(plan, margin_evidence=margin_evidence, catalog_state=catalog_state)
+        admission = self._check_admission(
+            plan, margin_evidence=margin_evidence, catalog_state=catalog_state
+        )
+        # ADMISSION owns the staged-lane classification (it recorded
+        # ``staged_increase_inr``). The frozen step protocol must carry it so the
+        # dependent buys of a staged plan go behind the staged funding gate rather
+        # than the generic prerequisite rule.
+        staged_financing = (
+            (admission.get("detail") or {}).get("staged_increase_inr") is not None
+        )
         # The LANE's own domain invariants (the roll contract, the durable option
         # run inside its frozen expiry policy) are checked once more here, before
         # anything is materialized. A lane that cannot name its domain object
@@ -1256,6 +1397,7 @@ class LivePlanAdapter:
                     attributed_quantity=lambda leg: self._attributed_quantity(plan, dict(leg)),
                     option_target=self._option_target,
                     option_run_steps=self._option_steps,
+                    staged_financing=staged_financing,
                 ),
                 resolved_lane,
             )
@@ -1587,6 +1729,7 @@ class LivePlanAdapter:
         all_specs: Optional[Sequence[Any]] = None,
         parent: Optional[Mapping[str, Any]] = None,
         governed_authority_check: Optional[Callable[[Any], Optional[Mapping[str, Any]]]] = None,
+        funds_reader: Optional[Callable[[], Any]] = None,
     ) -> Dict[str, Any]:
         """Release ONE ``withheld`` step, or refuse by name without placing anything.
 
@@ -1604,6 +1747,7 @@ class LivePlanAdapter:
         """
         from .live_sequence import (
             LiveRefusal as _SequenceRefusal,
+            RULE_STAGED_FUNDING_GATE,
             capacity_covers,
             prerequisites_met,
         )
@@ -1724,21 +1868,78 @@ class LivePlanAdapter:
                         },
                     )
                 exposure_proof["pin"] = "EXPOSURE_SNAPSHOT_CHANGED"
-            reservation = self._check_reservation(plan)
-            self._check_admission(
-                plan, margin_evidence=margin_evidence, catalog_state=catalog_state
-            )
-            covered, coverage = capacity_covers(reservation, specs)
-            if not covered:
-                raise LiveRefusal(
-                    "LIVE_CAPACITY_SHORTFALL",
-                    {
-                        "plan_id": plan_id,
-                        "step_no": step_no,
-                        **coverage,
-                        "message": "the reservation no longer covers every outstanding leg",
-                    },
+            if str(getattr(spec, "release_rule", "")) == RULE_STAGED_FUNDING_GATE:
+                staged_detail = None
+                validated_quote, funds = await self._staged_funding_gate(
+                    plan,
+                    spec,
+                    states=states,
+                    quote=quote,
+                    quote_reader=quote_reader,
+                    funds_reader=funds_reader,
+                    margin_evidence=margin_evidence,
+                    catalog_state=catalog_state,
                 )
+                staged_detail = {
+                    "confirmed_reduction_steps": sorted(
+                        int(value)
+                        for value in spec.depends_on
+                        if str(states.get(int(value)) or "") == "filled"
+                    ),
+                    "unconfirmed_reduction_steps": [],
+                    "authorization_key": f"{plan_id}:{step_no}",
+                }
+                reservation = self._check_reservation(plan)
+                covered, coverage = capacity_covers(reservation, specs)
+                if not covered:
+                    raise LiveRefusal(
+                        "LIVE_CAPACITY_SHORTFALL",
+                        {
+                            "plan_id": plan_id,
+                            "step_no": step_no,
+                            **coverage,
+                            "message": "the reservation no longer covers every outstanding leg",
+                        },
+                    )
+                self.ledger._lock_account(session, account_id)
+                try:
+                    authorization = self.ledger.authorize_staged_increase(
+                        plan_id=plan_id,
+                        step_no=step_no,
+                        requirement_inr=float(validated_quote["ltp"]) * abs(int(spec.quantity)),
+                        account_capacity_inr=float(funds["usable"]),
+                        quote=dict(validated_quote),
+                        funds_evidence=dict(funds),
+                        actor_id=actor,
+                        db=session,
+                    )
+                except CapacityExceeded as exc:
+                    raise LiveRefusal(
+                        "ACCOUNT_FUNDS_UNSECURED",
+                        {
+                            "plan_id": plan_id,
+                            "step_no": step_no,
+                            "authorization_key": f"{plan_id}:{step_no}",
+                            "reservation_error": str(getattr(exc, "reason_code", type(exc).__name__)),
+                            "reservation_error_detail": dict(getattr(exc, "detail", {}) or {}),
+                        },
+                    ) from exc
+            else:
+                reservation = self._check_reservation(plan)
+                self._check_admission(
+                    plan, margin_evidence=margin_evidence, catalog_state=catalog_state
+                )
+                covered, coverage = capacity_covers(reservation, specs)
+                if not covered:
+                    raise LiveRefusal(
+                        "LIVE_CAPACITY_SHORTFALL",
+                        {
+                            "plan_id": plan_id,
+                            "step_no": step_no,
+                            **coverage,
+                            "message": "the reservation no longer covers every outstanding leg",
+                        },
+                    )
             result = session.execute(
                 text(
                     """
@@ -1790,7 +1991,11 @@ class LivePlanAdapter:
                 quote_reader=quote_reader,
                 authority=authority,
                 released_by="live-sequence",
-                extra_evidence=(exposure_proof or None),
+                extra_evidence=(
+                    {**exposure_proof, "staged_funding_gate": staged_detail}
+                    if staged_detail
+                    else (exposure_proof or None)
+                ),
             )
         except LiveRefusal:
             # A refusal BEFORE the handler was called means nothing was sent. The

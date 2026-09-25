@@ -1107,79 +1107,16 @@ def _plan_or_404(store: Any, *, owner: str, repo: Any, strategy_id: str, plan_id
 
 
 def _live_margin_evidence(account_scope: str, plan: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Authoritative live margin for the plan's legs, or ``None``.
+    """The ONE live CNC funding reader, delegated to the pipeline.
 
-    ``None`` is a real answer here: admission refuses MARGIN_UNAVAILABLE rather
-    than assuming headroom, which is the fail-closed behaviour D-9 requires. The
-    quote's timestamp travels with it so admission can refuse a stale one.
+    A local copy of this reader is exactly the drift C1.1 §2 removes: the owner
+    route and the hosted live executor must evaluate the SAME evidence or an
+    admission preview can disagree with the submission it authorises. The seam
+    (a two-argument reader the pipeline can be given) is preserved for tests.
     """
-    try:
-        from datetime import datetime, timezone
+    from backend.strategies.plan_pipeline import live_margin_evidence
 
-        from backend.api.routers.worker_shared import _load_live_kite_for_account
-        from backend.broker_api.orders.models import OrderMarginInput
-        from backend.broker_api.orders.service import OrdersService
-
-        legs = list((plan.get("resolved_plan") or {}).get("legs") or [])
-        if not legs:
-            return None
-        resolved = dict(plan.get("resolved_plan") or {})
-        logical = dict(plan.get("logical_plan") or {})
-        try:
-            capital_basis = resolved.get("capital_basis_inr", logical.get("capital_basis_inr"))
-            capital_basis = None if capital_basis is None else float(capital_basis)
-        except (TypeError, ValueError):
-            capital_basis = None
-        try:
-            buffer_pct = resolved.get("cash_buffer_pct", logical.get("cash_buffer_pct"))
-            buffer_pct = 0.0 if buffer_pct is None else float(buffer_pct)
-        except (TypeError, ValueError):
-            buffer_pct = 0.0
-        items = []
-        for leg in legs:
-            # A weight is a FRACTION of the frozen capital basis, not a share
-            # count: asking the broker for margin on 0.25 "shares" would under-state
-            # the requirement by orders of magnitude.
-            if leg.get("signed_quantity") is None and leg.get("target_weight") is not None:
-                price = float(leg.get("reference_price") or 0)
-                if capital_basis is None or price <= 0:
-                    return None
-                quantity = (
-                    abs(float(leg.get("target_weight") or 0.0))
-                    * capital_basis
-                    * max(0.0, 1.0 - buffer_pct)
-                    / price
-                )
-                side = "BUY"
-            else:
-                quantity = abs(float(leg.get("signed_quantity") or 0.0))
-                side = "BUY" if float(leg.get("signed_quantity") or 0) >= 0 else "SELL"
-            if quantity <= 0:
-                continue
-            items.append(
-                OrderMarginInput(
-                    exchange=str(leg.get("broker_exchange") or leg.get("exchange") or "NSE"),
-                    tradingsymbol=str(leg.get("broker_symbol") or leg.get("tradingsymbol") or ""),
-                    transaction_type=side,
-                    variety="regular",
-                    product=str(leg.get("product") or "CNC"),
-                    order_type="MARKET",
-                    quantity=quantity,
-                    price=float(leg.get("reference_price") or 0),
-                )
-            )
-        if not items:
-            return None
-        kite = _load_live_kite_for_account(account_scope)
-        quotes = OrdersService().order_margins(kite, items, f"admission-{account_scope}", None)
-        usable = sum(float(getattr(quote, "total", 0.0) or 0.0) for quote in quotes)
-        return {
-            "usable": usable,
-            "as_of": datetime.now(timezone.utc),
-            "legs": [str(getattr(quote, "tradingsymbol", "") or "") for quote in quotes],
-        }
-    except Exception:  # noqa: BLE001 - unavailable evidence is not headroom
-        return None
+    return live_margin_evidence(account_scope, plan)
 
 
 @router.put("/{strategy_id}/admission-policy", response_model=AdmissionPolicyResponse)

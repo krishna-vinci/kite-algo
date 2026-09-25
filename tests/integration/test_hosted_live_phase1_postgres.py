@@ -96,7 +96,7 @@ class _FakeBroker:
 class _LiveFixture:
     """One hosted strategy in LIVE mode + a frozen single-instrument plan."""
 
-    def __init__(self, factory, *, target: int = 10, with_reservation: bool = True):
+    def __init__(self, factory, *, target: int = 10, with_reservation: bool = True, with_catalog: bool = False):
         from sqlalchemy import text
 
         from backend.strategies.repository import SqlAlchemyStrategyRepository
@@ -115,6 +115,8 @@ class _LiveFixture:
         self.token_id = f"tok-live1-{uuid.uuid4().hex[:6]}"
         self.job_id = f"job-live1-{uuid.uuid4().hex[:6]}"
         self.instrument_id = str(uuid.uuid4())
+        if with_catalog:
+            self._seed_catalog()
         self.leg = {
             "instrument_id": self.instrument_id,
             "exchange": "NSE",
@@ -262,6 +264,37 @@ class _LiveFixture:
                 now=self.now,
             )
 
+    def _seed_catalog(self) -> None:
+        """Map the broker token to this strategy's canonical instrument.
+
+        Without this, the fill ingestion cannot resolve the instrument identity
+        and the attributed book carries an unresolved ``raw`` fact, which
+        admission correctly refuses. The production catalog always carries the
+        mapping; the neighboring live PG suites seed it for the same reason.
+        """
+        from sqlalchemy import text
+
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT INTO public.instrument_catalog_records "
+                    "(instrument_id, identity_key, public_key, exchange, tradingsymbol, "
+                    " lifecycle_status, instrument_type, lot_size, tick_size, current_generation_id) "
+                    "VALUES (:iid, :key, :key, 'NSE', 'RELIANCE', 'active', 'EQ', 1, 0.05, :gen)"
+                ),
+                {"iid": self.instrument_id, "key": "NSE:RELIANCE", "gen": G1},
+            )
+            session.execute(
+                text(
+                    "INSERT INTO public.instrument_broker_mappings "
+                    "(mapping_id, instrument_id, broker, broker_exchange, broker_symbol, "
+                    " broker_token, valid_from_generation, is_current) "
+                    "VALUES (:mid, :iid, 'kite', 'NSE', 'RELIANCE', 738561, :gen, TRUE)"
+                ),
+                {"mid": str(uuid.uuid4()), "iid": self.instrument_id, "gen": G1},
+            )
+            session.commit()
+
     def _insert_plan(self, *, target: int) -> None:
         from sqlalchemy import text
 
@@ -334,7 +367,9 @@ class _LiveFixture:
                         " identity_kind, identity_key, canonical_instrument_id, instrument_token, exchange, "
                         " tradingsymbol, product, net_quantity, projection_version, updated_at) "
                         "VALUES (:account, :sid, 'live', 'canonical', :iid, :iid, 738561, 'NSE', 'RELIANCE', "
-                        " 'CNC', :qty, 1, NOW())"
+                        " 'CNC', :qty, 1, NOW()) "
+                        "ON CONFLICT (account_id, strategy_id, execution_environment, identity_kind, "
+                        " identity_key, product) DO NOTHING"
                     ),
                     {"account": self.account_id, "sid": self.strategy_id, "iid": self.instrument_id, "qty": int(net_quantity)},
                 )
@@ -551,7 +586,7 @@ def test_single_instrument_live_entry_ingestion_exit_and_settlement(pg):
     from backend.strategies.live_ingestion import LiveOutcomeConsumer
     from backend.strategies.settlement import ExecutionBarrier
 
-    fixture = _LiveFixture(pg["factory"])
+    fixture = _LiveFixture(pg["factory"], with_catalog=True)
     broker = _FakeBroker(order_ids=("OID-LIVE-1", "OID-LIVE-2"))
     executor = _executor(pg, fixture, live_enabled=True, broker=broker)
 

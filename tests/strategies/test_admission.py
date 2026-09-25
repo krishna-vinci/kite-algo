@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest import mock
 
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import sessionmaker
@@ -711,16 +712,25 @@ class OptionalAxisTests(AdmissionTestCase):
         self.assertFalse(verdict.detail["staged_financing_lane"])
 
     def test_live_staged_rebalance_refuses_by_name(self):
-        """Staged sell-before-buy financing is PAPER-only today.
+        """The mutation twin: a live ``intent_bundle`` is NOT the staged lane.
 
-        The live adapter has no confirmed-release authorization path, so a live
-        rebalance whose increases are not covered by available margin refuses by
-        NAME instead of trading on money the platform has not proved. This is the
-        explicit live boundary root accepted, not a silent fallback.
+        C1.1 admits a live ``target_weights`` rebalance whose cash is short, but
+        only that kind. The same shape carried as an ``intent_bundle`` keeps the
+        whole-plan cash refusal: it is not a persisted portfolio target, and its
+        own lane rule (``LIVE_PLAN_KIND_UNSUPPORTED`` at the adapter) governs it.
         """
-        self.policy(allocation_inr=20000.0)
-        self.book(100)
-        self.publish_state(at=NOW)
+        verdict = self._live_staged_verdict(
+            plan_kind="intent_bundle",
+            margin_evidence=self.margin(usable=0.0),
+        )
+
+        self.assertFalse(verdict.admitted)
+        self.assertEqual(verdict.refusal_reason, "MARGIN_UNAVAILABLE")
+        self.assertTrue(verdict.detail["staged_financing_lane"])
+
+    # -- C1.1 live staged CNC financing -------------------------------------
+
+    def _staged_rebalance_legs(self, *, sell_target=0):
         buy_leg = {
             "instrument_id": "inst-INFY",
             "exchange": "NSE",
@@ -732,11 +742,99 @@ class OptionalAxisTests(AdmissionTestCase):
             "signed_quantity": 100,
             "reference_price": 100.0,
         }
-        sell_leg = {**self._leg(), "signed_quantity": 0}
+        sell_leg = {**self._leg(), "signed_quantity": sell_target}
+        return sell_leg, buy_leg
 
+    def _live_staged_plan(self, *, plan_kind="target_weights", sell_target=0):
+        """Book 100 RELIANCE and freeze the sell-A/buy-B plan under test."""
+        self.policy(allocation_inr=20000.0)
+        self.book(100)  # 100 x 100 = 10000 of RELIANCE held
+        self.publish_state(at=NOW)
+        sell_leg, buy_leg = self._staged_rebalance_legs(sell_target=sell_target)
+        return self.plan(
+            plan_kind=plan_kind,
+            resolved_plan={"legs": [sell_leg, buy_leg]},
+        )
+
+    def _live_staged_verdict(self, *, plan_kind="target_weights", margin_evidence=None, sell_target=0):
+        return self.service.evaluate(
+            self._live_staged_plan(plan_kind=plan_kind, sell_target=sell_target),
+            execution_environment="live",
+            now=NOW,
+            margin_evidence=margin_evidence,
+        )
+
+    def test_a_live_zero_free_cash_rebalance_is_admitted_staged(self):
+        """The zero-free-cash live sell-A/buy-B is ADMITTED, staged (C1.1 §1).
+
+        Every leg is CNC, at least one reduction and one increase exist, and the
+        whole-plan cash is short. The shortfall is funded by the plan's OWN
+        confirmed reductions, so admission records ``staged_increase_inr`` exactly
+        as paper does and admits; the dependent buy still has to be released on
+        evidence.
+        """
+        verdict = self._live_staged_verdict(margin_evidence=self.margin(usable=0.0))
+
+        self.assertTrue(verdict.admitted, verdict.detail)
+        self.assertTrue(verdict.detail["staged_financing_lane"])
+        self.assertEqual(verdict.detail["staged_increase_inr"], 10000.0)
+        self.assertEqual(verdict.detail["staged_financing_shortfall_inr"], 10000.0)
+        self.assertEqual(verdict.detail["account_available_inr"], 0.0)
+
+    def test_live_staged_missing_funds_refuses_and_the_funded_twin_is_admitted(self):
+        """Unavailable funds never become headroom; the funded twin stages."""
+        plan = self._live_staged_plan()
+        refused = self.service.evaluate(
+            plan, execution_environment="live", now=NOW, margin_evidence=None
+        )
+        self.assertFalse(refused.admitted)
+        self.assertEqual(refused.refusal_reason, "MARGIN_UNAVAILABLE")
+        self.assertTrue(refused.detail["staged_financing_lane"])
+
+        admitted = self.service.evaluate(
+            plan,
+            execution_environment="live",
+            now=NOW,
+            margin_evidence=self.margin(usable=5000.0),
+        )
+        self.assertTrue(admitted.admitted, admitted.detail)
+        self.assertTrue(admitted.detail["staged_financing_lane"])
+        self.assertEqual(admitted.detail["staged_increase_inr"], 10000.0)
+        self.assertEqual(admitted.detail["staged_financing_shortfall_inr"], 5000.0)
+
+    def test_live_staged_stale_funds_refuse_and_the_fresh_twin_stages(self):
+        """Stale funds are refused by name; the fresh twin admits as staged."""
+        plan = self._live_staged_plan()
+        stale = self.service.evaluate(
+            plan,
+            execution_environment="live",
+            now=NOW,
+            margin_evidence=self.margin(usable=5000.0, age_seconds=120),
+        )
+        self.assertFalse(stale.admitted)
+        self.assertEqual(stale.refusal_reason, "MARGIN_QUOTE_STALE")
+
+        fresh = self.service.evaluate(
+            plan,
+            execution_environment="live",
+            now=NOW,
+            margin_evidence=self.margin(usable=5000.0),
+        )
+        self.assertTrue(fresh.admitted, fresh.detail)
+        self.assertTrue(fresh.detail["staged_financing_lane"])
+
+    def test_a_mixed_product_live_rebalance_is_not_the_staged_lane(self):
+        """One non-CNC product keeps the basket outside the CNC staged lane."""
+        self.policy(allocation_inr=20000.0)
+        self.book(100)
+        self.publish_state(at=NOW)
+        sell_leg, buy_leg = self._staged_rebalance_legs()
+        # The buy leg carries MIS: the basket is now mixed, so it is not the CNC
+        # staged lane regardless of the sell/buy shape.
+        buy_leg = {**buy_leg, "product": "MIS"}
         verdict = self.service.evaluate(
             self.plan(
-                plan_kind="intent_bundle",
+                plan_kind="target_weights",
                 resolved_plan={"legs": [sell_leg, buy_leg]},
             ),
             execution_environment="live",
@@ -745,8 +843,19 @@ class OptionalAxisTests(AdmissionTestCase):
         )
 
         self.assertFalse(verdict.admitted)
-        self.assertEqual(verdict.refusal_reason, "STAGED_LIVE_FINANCING_UNSUPPORTED")
-        self.assertTrue(verdict.detail["staged_financing_lane"])
+        self.assertEqual(verdict.refusal_reason, "MARGIN_UNAVAILABLE")
+        self.assertFalse(verdict.detail["staged_financing_lane"])
+        self.assertIsNone(verdict.detail["staged_increase_inr"])
+
+    def test_a_live_cnc_reduction_crossing_into_a_short_refuses_by_name(self):
+        """A CNC reduction that crosses flat opens a short: refused by name."""
+        verdict = self._live_staged_verdict(
+            margin_evidence=self.margin(usable=0.0), sell_target=-50
+        )
+
+        self.assertFalse(verdict.admitted)
+        self.assertEqual(verdict.refusal_reason, "STAGED_CNC_SHORT_UNSUPPORTED")
+        self.assertTrue(verdict.detail["cnc_short"])
 
     def test_a_non_cnc_intent_bundle_is_not_staged(self):
         """MIS/NRML bundles must not adopt the CNC portfolio sequencing.
@@ -1598,6 +1707,124 @@ class StrategyRiskPolicyTests(AdmissionTestCase):
         )
         self.assertTrue(verdict.admitted, verdict.detail)
         self.assertFalse(verdict.detail.get("risk_policy_applies", True))
+
+
+class LiveMarginEvidenceReaderTests(unittest.TestCase):
+    """The ONE CNC funding reader: funds evidence and honest failure modes.
+
+    The reader feeds admission, so its failure semantics matter as much as its
+    happy path: a broker read that genuinely failed is unavailable evidence
+    (``None``), while a PROGRAMMING error must surface instead of masquerading as
+    "there is no money".
+    """
+
+    def _plan(self):
+        return {
+            "resolved_plan": {
+                "legs": [
+                    {
+                        "instrument_id": "inst-REL",
+                        "exchange": "NSE",
+                        "tradingsymbol": "RELIANCE",
+                        "broker_exchange": "NSE",
+                        "broker_symbol": "RELIANCE",
+                        "broker_token": 100,
+                        "product": "CNC",
+                        "signed_quantity": 10,
+                        "reference_price": 100.0,
+                    }
+                ]
+            }
+        }
+
+    def test_the_reader_reports_cnc_cash_and_the_broker_order_margin(self):
+        from backend.strategies import plan_pipeline
+
+        with mock.patch.object(plan_pipeline, "_live_kite_for_account", lambda *a, **k: object()), mock.patch.object(
+            plan_pipeline, "_leg_margin_required_inr", lambda *a, **k: 1000.0
+        ), mock.patch.object(plan_pipeline, "_cnc_available_cash", lambda *a, **k: 5000.0):
+            evidence = plan_pipeline.live_margin_evidence(
+                "kite:A", self._plan(), session_factory=lambda: None
+            )
+
+        self.assertEqual(evidence["usable"], 5000.0)
+        self.assertEqual(evidence["required_inr"], 1000.0)
+        self.assertEqual(evidence["account_scope"], "kite:A")
+        self.assertEqual(evidence["legs"], ["inst-REL"])
+        self.assertIn("source", evidence)
+        self.assertIsInstance(evidence["as_of"], datetime)
+
+    def test_a_programming_error_inside_the_reader_propagates(self):
+        from backend.strategies import plan_pipeline
+
+        with mock.patch.object(plan_pipeline, "_live_kite_for_account", lambda *a, **k: object()), mock.patch.object(
+            plan_pipeline, "_leg_margin_required_inr", lambda *a, **k: 0.0
+        ), mock.patch.object(plan_pipeline, "_cnc_available_cash", side_effect=TypeError("bug")):
+            with self.assertRaises(TypeError):
+                plan_pipeline.live_margin_evidence("kite:A", self._plan())
+
+    def test_a_genuine_read_failure_is_unavailable_evidence(self):
+        from backend.strategies import plan_pipeline
+
+        with mock.patch.object(plan_pipeline, "_live_kite_for_account", lambda *a, **k: object()), mock.patch.object(
+            plan_pipeline, "_leg_margin_required_inr", lambda *a, **k: 0.0
+        ), mock.patch.object(plan_pipeline, "_cnc_available_cash", side_effect=RuntimeError("broker down")):
+            self.assertIsNone(plan_pipeline.live_margin_evidence("kite:A", self._plan()))
+
+    def test_cnc_cash_is_read_from_the_portfolio_snapshot(self):
+        from backend.strategies.plan_pipeline import _cnc_available_cash
+
+        class _Kite:
+            def __init__(self, funds):
+                self._funds = funds
+
+            def margins(self):
+                return self._funds
+
+            def holdings(self):
+                return []
+
+            def positions(self):
+                return {"net": [], "day": []}
+
+            def profile(self):
+                return {"meta": {}}
+
+        self.assertEqual(_cnc_available_cash(_Kite({"equity": {"available": {"cash": 0.0}}}), "kite:A"), 0.0)
+        self.assertEqual(
+            _cnc_available_cash(_Kite({"equity": {"available": {"cash": 1234.5}}}), "kite:A"), 1234.5
+        )
+
+    def test_an_absent_or_non_numeric_cash_is_unavailable_never_zero(self):
+        from backend.strategies.plan_pipeline import _cnc_available_cash
+
+        class _Kite:
+            def __init__(self, funds):
+                self._funds = funds
+
+            def margins(self):
+                return self._funds
+
+            def holdings(self):
+                return []
+
+            def positions(self):
+                return {"net": [], "day": []}
+
+            def profile(self):
+                return {"meta": {}}
+
+        cases = (
+            {},
+            {"equity": {}},
+            {"equity": {"available": {}}},
+            {"equity": {"available": {"cash": None}}},
+            {"equity": {"available": {"cash": "n/a"}}},
+            {"equity": {"available": {"cash": {"amount": 10}}}},
+        )
+        for funds in cases:
+            with self.subTest(funds=funds):
+                self.assertIsNone(_cnc_available_cash(_Kite(funds), "kite:A"))
 
 
 if __name__ == "__main__":

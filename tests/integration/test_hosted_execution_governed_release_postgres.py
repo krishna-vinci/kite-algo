@@ -156,7 +156,13 @@ async def _open_autonomous_grant(client, env, attempt):
 
 
 async def _freeze_rebalance(client, env, attempt, revision_id):
-    """Freeze the two-leg rebalance plan WITHOUT executing it."""
+    """Freeze the two-leg rebalance plan WITHOUT executing it.
+
+    The basket is NON-CNC (MIS product) on purpose: it never enters the C1.1
+    staged funding lane, whose S1 gate (until S2 lands) withholds a staged
+    dependent buy. This suite is about the GOVERNED authority on a dependent
+    release, so it must exercise a release that S1 still performs.
+    """
     response = await _submit_proposal(
         client,
         attempt,
@@ -164,6 +170,7 @@ async def _freeze_rebalance(client, env, attempt, revision_id):
             "target_kind": "target_weights",
             "payload": {
                 "universe_revision_id": revision_id,
+                "product": "MIS",
                 "target_weights": {RELIANCE: 0.04, INFY: 0.0},
                 "reference_prices": {RELIANCE: 1500.0, INFY: 1500.0},
             },
@@ -190,7 +197,7 @@ async def _child_request_execution(client, attempt, plan_id, *, key):
 
 async def _materialize_governed_parent(client, env, attempt, revision_id):
     """Open the book, freeze the rebalance, and dispatch it under the grant."""
-    await _open_position(client, env, attempt, revision_id)
+    await _open_position(client, env, attempt, revision_id, product="MIS")
     plan_id = await _freeze_rebalance(client, env, attempt, revision_id)
     await _open_autonomous_grant(client, env, attempt)
     request = await _child_request_execution(
@@ -229,6 +236,7 @@ async def _resolve_leg_one_fill(env, attempt, *, quantity=66, trade_id="TR-GOV-L
         side="SELL",
         symbol=INFY,
         token=INFY_TOKEN,
+        product="MIS",
     )
     # A BARE consumer: it records the outcome but does NOT release dependents, so
     # the release pass under test is the only thing that can submit leg 2.
