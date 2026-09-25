@@ -26,6 +26,11 @@ and its only step builder is `build_futures_steps`
   target-minus-current delta, and the released quantity is clamped again to the
   current attributed quantity
   (`backend/strategies/live_sequence.py:623-632`).
+- A released `close_old` is a bounded platform-side LIMIT, never MARKET: the SELL
+  limit is at least `max(bid, reference * 0.995)`, and the price is derived at
+  release time (`backend/strategies/live_limit_orders.py:85-96,269-421`). A working
+  gated LIMIT that times out is cancelled once and becomes terminal
+  (`backend/strategies/live_adapter.py:2224-2590`).
 - A future leg with no pinned lot refuses `LIVE_UNITS_UNPINNED`
   (`backend/strategies/live_sequence.py:645-652`). A `close_old` leg with no
   authoritative attributed reader refuses `LIVE_POSITION_EVIDENCE_UNAVAILABLE`
@@ -46,8 +51,8 @@ and its only step builder is `build_futures_steps`
 | `ADMISSION_MARGIN_MAX_AGE_SECONDS` | margin evidence freshness | `backend/strategies/admission.py:77,134-142` |
 | `ADMISSION_RISK_*` ceilings | only if the deployment caps declared risk | `backend/strategies/risk_policy.py:89-99,232-264` |
 
-**Migration head.** Code head `20260925_000050`
-(`backend/alembic/versions/20260925_000050_flatten_operations.py`); verify the
+**Migration head.** Code head `20260926_000051`
+(`backend/alembic/versions/20260926_000051_live_approval_binding.py`); verify the
 deployed head read-only ([README.md](README.md#verification-commands-read-only)).
 
 **Services.** `finance-app`, `alerts-worker`, `strategy-runner`, `frontend-next`
@@ -146,6 +151,10 @@ Migrations are fix-forward; do not downgrade
 - **Live non-option flatten refuses** (`FLATTEN_LIVE_NONOPTION_UNSUPPORTED`,
   `backend/api/services/owner_actions.py:117`), so a live futures book must be
   reduced through the roll/plan pipeline, not flatten.
+- **The roll close release is a bounded LIMIT** (`RULE_ROLL_CLOSE_RELEASED` is a
+  gated rule: `backend/strategies/live_limit_orders.py:88`), so an unfilled close
+  cannot become a market order; an out-of-band book refuses
+  `LIVE_LIMIT_PRICE_BOUND_EXCEEDED` rather than widening the bound.
 - **The peak-margin engine is paper-based** while live broker quotes remain future
   wiring; the peak is computed from evidence before any leg is submitted
   (`backend/strategies/futures_margin.py:9-12`).

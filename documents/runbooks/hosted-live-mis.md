@@ -46,8 +46,8 @@ depends on:
 | `ADMISSION_MARGIN_MAX_AGE_SECONDS` | margin evidence freshness | `backend/strategies/admission.py:77,134-142` |
 | stale-exit policy (`none`/`exit_on_worker_stale`) | arms the stale-worker exit authority | `backend/api/routers/strategies.py:581` (`stale_exit_policies`); `backend/strategies/live_service.py:827-836` |
 
-**Migration head.** Code head `20260925_000050`
-(`backend/alembic/versions/20260925_000050_flatten_operations.py`); verify the
+**Migration head.** Code head `20260926_000051`
+(`backend/alembic/versions/20260926_000051_live_approval_binding.py`); verify the
 deployed head read-only ([README.md](README.md#verification-commands-read-only)).
 
 **Services.** `finance-app`, `alerts-worker`, `strategy-runner`, `frontend-next`
@@ -154,6 +154,10 @@ Migrations are fix-forward; do not downgrade
 - **Exposure-increasing MIS is immediate**, i.e. it is not gated behind a
   square-off; only reductions are. An operator halting MIS should expect an armed
   entry to have already been sent.
+- **MIS square-offs stay MARKET, not bounded LIMIT.** The MIS square-off release
+  is not a gated dependent leg (`backend/strategies/live_limit_orders.py:69-111`),
+  so its order type is unchanged by C1.2; the bounded LIMIT applies only to gated
+  dependent legs.
 - **The square-off clock is exchange-local wall clock.** A container clock/zone
   mistake would mis-time it; the rule compares in `EXCHANGE_TZ`, not UTC
   (`backend/strategies/live_service.py:811-818`).

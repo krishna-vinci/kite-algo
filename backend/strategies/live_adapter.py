@@ -1429,9 +1429,8 @@ class LivePlanAdapter:
         paper admission and the execution-time gates apply - asked here because
         the live lane admits through its own service rather than
         ``pipeline.admit``. A run this plan itself is bound to does not block it,
-        so the entry's own withheld steps can still be released. An ADJUST is
-        still refused later by name (``LIVE_OPTION_ADJUST_UNSUPPORTED``): B2.2 is
-        paper-only, and asking the mutation gate here does not enable it.
+        so the entry's own withheld steps can still be released. A live ADJUST is
+        then expanded into release-ruled steps by ``build_option_steps`` (C1.2).
         """
         from backend.options.execution.plan_binding import (
             PlanBindingRefusal,

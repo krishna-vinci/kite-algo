@@ -186,6 +186,13 @@ notifications. Record in `documents/hosted-strategies-rollout-<lane>-<date>.md`.
 | **B2 paper gate** | **passed - 5/5 scenarios `ok=true`** | `documents/hosted-options-b2-completion-2026-09-26.md`; `examples/hosted_platform/evidence/phase5-20260925T183422Z.json` |
 | C1.2 design | accepted | `4af40b2` |
 | C1.2 S1 option margin + chain freshness | done, reviewed | `9dbba29` |
-| C1.2 S2 live adjust/roll | in progress | |
-| C1 runbooks (4 lanes) | done, reviewed | this commit |
-| Independent review: C1.1 + B2.4 | done (C1.1 clean; 3 B2.4 findings fixed) | |
+| C1 runbooks (4 lanes) | done, reviewed | `4a362ec` |
+| C1.2 S2 live adjust/roll | done, reviewed | `92d932c` |
+| C1.2 S3 approval + generation binding | done, reviewed | `cd452a5` |
+| C1.2 S4 bounded LIMIT + timeout | done, reviewed | `d983530` |
+| C1.2 S5 protection continuity | done | `173310c`, `807884f` |
+| C1.2 hardening (review findings) | done, reviewed | `399c8f0` |
+| Independent review: C1.1 + B2.4 | done (C1.1 clean; 3 B2.4 findings fixed) | `724e1c6` |
+| Independent review: C1.2 | done (4 findings fixed) | `399c8f0` |
+| **C1 exit requirement (bounded LIMIT for gated live legs)** | **met** | `d983530`; `documents/hosted-live-readiness-c1-completion-2026-09-26.md` |
+| C1 completion report + runbooks refreshed for C1.2 | done | `documents/hosted-live-readiness-c1-completion-2026-09-26.md` |
