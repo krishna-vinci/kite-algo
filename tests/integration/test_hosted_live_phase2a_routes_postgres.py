@@ -1890,6 +1890,613 @@ def test_mis_squareoff_is_refused_when_the_child_authority_is_gone(pg, live_env)
     asyncio.run(_run())
 
 
+def test_a_partial_or_unknown_reduction_never_releases_the_dependent_buy(pg, live_env):
+    """S3 §5: a reduction that has not resolved keeps the staged buy withheld - silently.
+
+    A partial fill and a transport-unknown reduction are both "not filled yet": the
+    buy stays withheld, no order is placed for it, and because the reduction may
+    still resolve NO blocker is recorded while the protocol is still waiting. The
+    fake broker is never asked for a second order.
+    """
+    env = _Env(
+        pg,
+        live_env,
+        broker=_FakeBroker(
+            order_ids=("C11-P1-ENTRY", "C11-P1-EXIT", "C11-P2-ENTRY", "C11-P2-EXIT"),
+            fail_on=4,
+        ),
+    )
+    catalog = _seed_catalog(env.factory)
+    revision_id = catalog["universe_revision_id"]
+
+    async def _run():
+        client = await _operator_client(env.app)
+        try:
+            # -- plan 1: the reduction PARTIALLY fills (still live work).
+            partial_attempt = await _prepare_live_attempt(
+                client, account_scope=env.account_scope, lease_until=env.lease_until
+            )
+            await _open_position(
+                client, env, partial_attempt, revision_id, order_id="C11-P1-ENTRY"
+            )
+            partial_plan, partial_sell, partial_buy, body = await _rebalance_plan(
+                client, env, partial_attempt, revision_id
+            )
+            assert body["broker_order_ids"] == ["C11-P1-EXIT"], body
+            assert partial_sell["release_rule"] == "immediate", partial_sell
+            assert partial_buy["release_rule"] == "staged_funding_gate", partial_buy
+            _ingest_fill(
+                env.factory,
+                account_id=env.account_scope,
+                run_id=partial_attempt["run_id"],
+                order_id="C11-P1-EXIT",
+                trade_id=f"TR-C11-PARTIAL-{uuid.uuid4().hex[:6]}",
+                quantity=30,
+                side="SELL",
+                symbol=INFY,
+                token=INFY_TOKEN,
+                terminal=False,
+            )
+            counts = await env.consumer().poll_once()
+            assert counts["partial"] == 1, counts
+            assert counts["sequence_released"] == 0, counts
+            partial_claim = _claim(env.factory, partial_plan, partial_buy["step_no"])
+            assert partial_claim["state"] == "withheld", dict(partial_claim)
+            assert "release_blocked" not in dict(partial_claim["detail"] or {}), dict(
+                partial_claim["detail"]
+            )
+            assert list(partial_claim["broker_order_ids"]) == []
+            calls_after_partial = len(env.broker.calls)
+
+            # -- plan 2: the reduction's SEND outcome is UNKNOWN (transport lost).
+            unknown_attempt = await _prepare_live_attempt(
+                client, account_scope=env.account_scope, lease_until=env.lease_until
+            )
+            await _open_position(
+                client, env, unknown_attempt, revision_id, order_id="C11-P2-ENTRY"
+            )
+            unknown_plan, _unknown_sell, unknown_buy, body = await _rebalance_plan(
+                client, env, unknown_attempt, revision_id
+            )
+            # The send raised, so the claim carries no order reference at all.
+            assert not body.get("broker_order_ids"), body
+            # (``_FakeBroker`` records the ATTEMPT before it raises, so this count
+            # includes the failed reduction send.)
+            calls_after_reductions = len(env.broker.calls)
+            assert calls_after_reductions == calls_after_partial + 2, [
+                call[0].payload for call in env.broker.calls
+            ]
+            sell_claim = _claim(
+                env.factory, unknown_plan, _unknown_sell["step_no"]
+            )
+            assert sell_claim["state"] == "uncertain", dict(sell_claim)
+            counts = await env.consumer().poll_once()
+            assert counts["sequence_released"] == 0, counts
+            unknown_buy_claim = _claim(env.factory, unknown_plan, unknown_buy["step_no"])
+            assert unknown_buy_claim["state"] == "withheld", dict(unknown_buy_claim)
+            assert "release_blocked" not in dict(unknown_buy_claim["detail"] or {}), dict(
+                unknown_buy_claim["detail"]
+            )
+            # Two more passes (one from a SECOND executor instance) change nothing:
+            # an unresolved reduction is waiting, and an uncertain send is never
+            # repeated.
+            await env.executor.release_sequence()
+            await _fresh_executor(env).release_sequence()
+            assert len(env.broker.calls) == calls_after_reductions, [
+                call[0].payload for call in env.broker.calls
+            ]
+            # The DEPENDENT increase was never sent for either plan.
+            assert [
+                call
+                for call in env.broker.calls
+                if call[0].payload["order"]["transaction_type"] == "BUY"
+                and call[0].payload["order"]["tradingsymbol"] == RELIANCE
+            ] == []
+            assert _claim(env.factory, partial_plan, partial_buy["step_no"])["state"] == "withheld"
+            assert _claim(env.factory, unknown_plan, unknown_buy["step_no"])["state"] == "withheld"
+        finally:
+            await client.aclose()
+
+    asyncio.run(_run())
+
+
+def test_a_rejected_reduction_names_the_blocked_steps_and_only_dead_authority_abandons_the_buy(
+    pg, live_env
+):
+    """S3 §5 + decision 4: the owner is told WHICH reduction blocked the buy.
+
+    A terminally REJECTED reduction can never fund its dependent buy, so the buy's
+    claim names ``STAGED_FUNDING_REDUCTION_NOT_CONFIRMED`` together with the blocked
+    funding step. The buy is still never auto-released: only the bounded disposition
+    resolves it, only once the plan's authority is PROVABLY gone, and then the
+    parent's own rule releases the unused capacity (nothing filled).
+    """
+    from backend.strategies.live_repair import LiveRepairRefusal, LiveRepairService
+
+    env = _Env(
+        pg,
+        live_env,
+        broker=_FakeBroker(order_ids=("C11-R-ENTRY", "C11-R-EXIT")),
+    )
+    catalog = _seed_catalog(env.factory)
+    revision_id = catalog["universe_revision_id"]
+
+    async def _run():
+        client = await _operator_client(env.app)
+        try:
+            attempt = await _prepare_live_attempt(
+                client, account_scope=env.account_scope, lease_until=env.lease_until
+            )
+            await _open_position(
+                client, env, attempt, revision_id, order_id="C11-R-ENTRY"
+            )
+            plan_id, sell_spec, buy_spec, body = await _rebalance_plan(
+                client, env, attempt, revision_id
+            )
+            assert body["broker_order_ids"] == ["C11-R-EXIT"], body
+            calls_after_reduction = len(env.broker.calls)
+
+            # The broker terminally REJECTS the sale: no fill, no residual.
+            _ingest_rejected_order(
+                env,
+                order_id="C11-R-EXIT",
+                run_id=attempt["run_id"],
+                symbol=INFY,
+                token=INFY_TOKEN,
+            )
+            counts = await env.consumer().poll_once()
+            assert counts["rejected"] == 1, counts
+            assert counts["sequence_released"] == 0, counts
+            assert counts["sequence_blocked"] >= 1, counts
+            assert len(env.broker.calls) == calls_after_reduction, [
+                call[0].payload for call in env.broker.calls
+            ]
+            buy_claim = _claim(env.factory, plan_id, buy_spec["step_no"])
+            assert buy_claim["state"] == "withheld", dict(buy_claim)
+            assert list(buy_claim["broker_order_ids"]) == []
+            buy_detail = dict(buy_claim["detail"])
+            assert (
+                buy_detail["release_blocked"] == "STAGED_FUNDING_REDUCTION_NOT_CONFIRMED"
+            ), buy_detail
+            blocked = dict(buy_detail["release_blocked_detail"])
+            assert blocked["blocked_funding_steps"] == [int(sell_spec["step_no"])], blocked
+            assert blocked["funding_leg_states"] == {
+                str(sell_spec["step_no"]): "rejected"
+            }, blocked
+
+            service = LiveRepairService(
+                session_factory=env.factory, clock=env.clock, authority_reader=_live_reader(env)
+            )
+            # While the attempt is LIVE the bounded disposition refuses: another leg
+            # (or the buy's own run) might still be worked.
+            with pytest.raises(LiveRepairRefusal) as ctx:
+                service.abandon_staged_dependent(plan_id=plan_id, actor="operator")
+            assert ctx.value.reason_code == "LIVE_AUTHORITY_STILL_ACTIVE", ctx.value.detail
+
+            # UNREADABLE authority is not evidence of absence: still refused.
+            def _unreadable(*_args, **_kwargs):
+                raise RuntimeError("authority source offline")
+
+            unknown = LiveRepairService(
+                session_factory=env.factory, clock=env.clock, authority_reader=_unreadable
+            )
+            with pytest.raises(LiveRepairRefusal) as ctx2:
+                unknown.abandon_staged_dependent(plan_id=plan_id, actor="operator")
+            assert ctx2.value.reason_code == "LIVE_REPAIR_AUTHORITY_UNKNOWN", ctx2.value.detail
+            assert _claim(env.factory, plan_id, buy_spec["step_no"])["state"] == "withheld"
+
+            # The operator stops the attempt: the authority is provably gone.
+            _stop_attempt(env, attempt)
+            result = service.abandon_staged_dependent(
+                plan_id=plan_id,
+                step_no=buy_spec["step_no"],
+                actor="operator",
+                reason="the reduction was rejected; nothing will fund this buy",
+            )
+            assert result["state"] == "residual_abandoned", result
+            record = dict(result["disposition"])
+            assert record["disposition"] == "staged_dependent_abandoned", record
+            assert record["prior_state"] == "withheld", record
+            assert record["send_outcome"] == "not_sent", record
+            assert record["blocker"] == "STAGED_FUNDING_REDUCTION_NOT_CONFIRMED", record
+            assert record["blocked_funding_steps"] == [int(sell_spec["step_no"])], record
+            assert [leg["state"] for leg in record["funding_legs"]] == ["rejected"], record
+            assert record["funding_legs"][0]["filled_quantity"] == 0, record
+            # NOTHING filled anywhere in the parent: the unused capacity goes back.
+            assert record["capacity_state"] == "settled", record
+            assert record["capacity_released"] is True, record
+            reservation = env.executor.ledger.for_plan(plan_id)
+            assert str(reservation["status"]) == "released", reservation
+            claim = _claim(env.factory, plan_id, buy_spec["step_no"])
+            assert claim["state"] == "residual_abandoned", dict(claim)
+            assert list(claim["broker_order_ids"]) == []
+            assert _execution(env.factory, plan_id)["state"] == "settled"
+
+            # Exactly one audit row and one barrier write for the decision.
+            assert _audit_rows(env, plan_id) == 1
+            barrier_events = _barrier_event_count(env, plan_id)
+            again = service.abandon_staged_dependent(
+                plan_id=plan_id, step_no=buy_spec["step_no"], actor="operator"
+            )
+            assert again["idempotent"] is True, again
+            assert again["disposition"]["disposition"] == "staged_dependent_abandoned"
+            assert _audit_rows(env, plan_id) == 1
+            assert _barrier_event_count(env, plan_id) == barrier_events
+            # And the buy was NEVER sent: the fake broker only ever saw the reduction
+            # (plus the opening buy of the book).
+            assert len(env.broker.calls) == calls_after_reduction, [
+                call[0].payload for call in env.broker.calls
+            ]
+            return plan_id
+        finally:
+            await client.aclose()
+
+    asyncio.run(_run())
+
+
+def test_a_staged_dependent_disposition_consumes_capacity_a_real_reduction_fill_backs(
+    pg, live_env
+):
+    """S3 §5: a residual disposition consumes, never frees, capacity a fill backs.
+
+    The reduction partially fills and is then terminally cancelled, so the owner
+    dispositions the residual: the buy stays withheld (never auto-released) and,
+    once the authority is gone, the bounded dependent disposition resolves it. 40
+    shares really filled, so the parent's capacity is CONSUMED rather than handed
+    back as if nothing had happened.
+    """
+    from backend.strategies.live_repair import LiveRepairService
+
+    env = _Env(
+        pg,
+        live_env,
+        broker=_FakeBroker(order_ids=("C11-C-ENTRY", "C11-C-EXIT")),
+    )
+    catalog = _seed_catalog(env.factory)
+    revision_id = catalog["universe_revision_id"]
+
+    async def _run():
+        client = await _operator_client(env.app)
+        try:
+            attempt = await _prepare_live_attempt(
+                client, account_scope=env.account_scope, lease_until=env.lease_until
+            )
+            await _open_position(
+                client, env, attempt, revision_id, order_id="C11-C-ENTRY"
+            )
+            plan_id, sell_spec, buy_spec, body = await _rebalance_plan(
+                client, env, attempt, revision_id
+            )
+            assert body["broker_order_ids"] == ["C11-C-EXIT"], body
+            _ingest_fill(
+                env.factory,
+                account_id=env.account_scope,
+                run_id=attempt["run_id"],
+                order_id="C11-C-EXIT",
+                trade_id=f"TR-C11-RESIDUAL-{uuid.uuid4().hex[:6]}",
+                quantity=40,
+                side="SELL",
+                symbol=INFY,
+                token=INFY_TOKEN,
+                terminal=False,
+            )
+            await _drive_step_to_repair_required(
+                env, order_id="C11-C-EXIT", filled=40, cancelled_residual=26
+            )
+            _stop_attempt(env, attempt)
+            service = LiveRepairService(
+                session_factory=env.factory, clock=env.clock, authority_reader=_live_reader(env)
+            )
+
+            # The REDUCTION's residual is dispositioned; the buy stays withheld and
+            # the capacity is retained for it.
+            sell_result = service.abandon_residual(
+                plan_id=plan_id, step_no=sell_spec["step_no"], actor="operator"
+            )
+            assert sell_result["disposition"]["capacity_retained"] is True, sell_result
+            assert _claim(env.factory, plan_id, buy_spec["step_no"])["state"] == "withheld"
+
+            # The next pass names the DEAD funding leg on the buy - and STILL sends
+            # nothing: the disposition is the operator's decision, not the pass's.
+            calls_before = len(env.broker.calls)
+            counts = await env.executor.release_sequence()
+            assert counts["released"] == 0, counts
+            assert len(env.broker.calls) == calls_before, [
+                call[0].payload for call in env.broker.calls
+            ]
+            buy_claim = _claim(env.factory, plan_id, buy_spec["step_no"])
+            assert buy_claim["state"] == "withheld", dict(buy_claim)
+            buy_detail = dict(buy_claim["detail"])
+            assert (
+                buy_detail["release_blocked"] == "STAGED_FUNDING_REDUCTION_NOT_CONFIRMED"
+            ), buy_detail
+            assert dict(buy_detail["release_blocked_detail"])["blocked_funding_steps"] == [
+                int(sell_spec["step_no"])
+            ]
+
+            result = service.abandon_staged_dependent(
+                plan_id=plan_id, step_no=buy_spec["step_no"], actor="operator"
+            )
+            record = dict(result["disposition"])
+            assert record["disposition"] == "staged_dependent_abandoned", record
+            assert record["funding_legs"][0]["state"] == "residual_abandoned", record
+            assert record["funding_legs"][0]["filled_quantity"] == 40, record
+            assert record["capacity_consumed"] is True, record
+            assert record["capacity_released"] is False, record
+            reservation = env.executor.ledger.for_plan(plan_id)
+            assert str(reservation["status"]) == "consumed", reservation
+            assert _execution(env.factory, plan_id)["state"] == "settled"
+            assert len(env.broker.calls) == calls_before, [
+                call[0].payload for call in env.broker.calls
+            ]
+        finally:
+            await client.aclose()
+
+    asyncio.run(_run())
+
+
+def test_a_staged_dependent_buy_is_never_retransmitted_and_the_fence_adopts_its_order(
+    pg, live_env
+):
+    """S3 §5: an uncertain buy is never repeated; a proven-sent one is ADOPTED.
+
+    A handler failure leaves the buy ``uncertain`` with work and capacity held, and
+    neither a restart nor a SECOND executor instance ever re-sends it. The bounded
+    repair for a LOST RESPONSE is the pre-send fence: the platform's own durable
+    record names the order the broker DID accept, so the claim adopts that reference
+    and ingestion owns it. Nothing is placed twice.
+    """
+    from backend.strategies.live_dispatch_fence import LiveDispatchFence
+    from backend.strategies.live_repair import LiveRepairRefusal, LiveRepairService
+
+    env = _Env(
+        pg,
+        live_env,
+        broker=_FakeBroker(
+            order_ids=(
+                "C11-U-ENTRY",
+                "C11-U-EXIT",
+                "C11-U-BUY",
+                "C11-F-ENTRY",
+                "C11-F-EXIT",
+                "C11-F-BUY",
+            ),
+            fail_on=3,
+        ),
+    )
+    catalog = _seed_catalog(env.factory)
+    revision_id = catalog["universe_revision_id"]
+
+    async def _run():
+        client = await _operator_client(env.app)
+        try:
+            attempt = await _prepare_live_attempt(
+                client, account_scope=env.account_scope, lease_until=env.lease_until
+            )
+            await _open_position(
+                client, env, attempt, revision_id, order_id="C11-U-ENTRY"
+            )
+            plan_id, _sell_spec, buy_spec, body = await _rebalance_plan(
+                client, env, attempt, revision_id
+            )
+            assert body["broker_order_ids"] == ["C11-U-EXIT"], body
+            _ingest_fill(
+                env.factory,
+                account_id=env.account_scope,
+                run_id=attempt["run_id"],
+                order_id="C11-U-EXIT",
+                trade_id=f"TR-C11-UNC-{uuid.uuid4().hex[:6]}",
+                quantity=66,
+                side="SELL",
+                symbol=INFY,
+                token=INFY_TOKEN,
+            )
+            counts = await env.consumer().poll_once()
+            assert counts["sequence_released"] == 1, counts
+            claim = _claim(env.factory, plan_id, buy_spec["step_no"])
+            assert claim["state"] == "uncertain", dict(claim)
+            assert list(claim["broker_order_ids"]) == []
+            calls_after_uncertain = len(env.broker.calls)
+            assert calls_after_uncertain == 3, calls_after_uncertain
+
+            # A restart - including a SECOND executor instance - never repeats it.
+            await env.executor.release_sequence()
+            await _fresh_executor(env).release_sequence()
+            counts = await env.consumer().poll_once()
+            assert counts["sequence_released"] == 0, counts
+            assert len(env.broker.calls) == calls_after_uncertain, [
+                call[0].payload for call in env.broker.calls
+            ]
+            assert _claim(env.factory, plan_id, buy_spec["step_no"])["state"] == "uncertain"
+
+            # An uncertain buy is neither abandoned nor re-sent: the repair path
+            # refuses it by name.
+            _stop_attempt(env, attempt)
+            service = LiveRepairService(
+                session_factory=env.factory, clock=env.clock, authority_reader=_live_reader(env)
+            )
+            with pytest.raises(LiveRepairRefusal) as ctx:
+                service.abandon_staged_dependent(
+                    plan_id=plan_id, step_no=buy_spec["step_no"], actor="operator"
+                )
+            assert ctx.value.reason_code == "LIVE_REPAIR_NOT_REQUIRED", ctx.value.detail
+            with pytest.raises(LiveRepairRefusal) as ctx2:
+                service.abandon_residual(
+                    plan_id=plan_id, step_no=buy_spec["step_no"], actor="operator"
+                )
+            assert ctx2.value.reason_code == "LIVE_REPAIR_NOT_REQUIRED", ctx2.value.detail
+            assert len(env.broker.calls) == calls_after_uncertain
+
+            # -- the LOST-RESPONSE twin: a claim parked in the 'releasing' window
+            # whose durable pre-send record names the order the broker accepted.
+            fence_attempt = await _prepare_live_attempt(
+                client, account_scope=env.account_scope, lease_until=env.lease_until
+            )
+            await _open_position(
+                client, env, fence_attempt, revision_id, order_id="C11-F-ENTRY"
+            )
+            fence_plan, _fence_sell, fence_buy, body = await _rebalance_plan(
+                client, env, fence_attempt, revision_id
+            )
+            assert body["broker_order_ids"] == ["C11-F-EXIT"], body
+            calls_before_adopt = len(env.broker.calls)
+            _park_claim_in_releasing(env, plan_id=fence_plan, step_no=fence_buy["step_no"])
+            _insert_pre_send_fence_row(
+                env,
+                plan_id=fence_plan,
+                step_no=fence_buy["step_no"],
+                broker_order_id="C11-F-ADOPTED",
+            )
+            repairing = LiveRepairService(
+                session_factory=env.factory,
+                clock=env.clock,
+                dispatch_fence=LiveDispatchFence(session_factory=env.factory),
+            )
+            adopted = repairing.abandon_residual(
+                plan_id=fence_plan, step_no=fence_buy["step_no"], actor="operator"
+            )
+            assert adopted["state"] == "pending", adopted
+            assert adopted["recovered_order_ids"] == ["C11-F-ADOPTED"], adopted
+            fence_claim = _claim(env.factory, fence_plan, fence_buy["step_no"])
+            assert fence_claim["state"] == "pending", dict(fence_claim)
+            assert list(fence_claim["broker_order_ids"]) == ["C11-F-ADOPTED"]
+            # The adoption PLACED NOTHING: the fake broker's call count is unchanged.
+            assert len(env.broker.calls) == calls_before_adopt, [
+                call[0].payload for call in env.broker.calls
+            ]
+            # A repeat finds ordinary in-flight work and REFUSES: nothing to repair
+            # remains, and the adopted reference is never rewritten or re-sent.
+            with pytest.raises(LiveRepairRefusal) as ctx3:
+                repairing.abandon_residual(
+                    plan_id=fence_plan, step_no=fence_buy["step_no"], actor="operator"
+                )
+            assert ctx3.value.reason_code == "LIVE_REPAIR_NOT_REQUIRED", ctx3.value.detail
+            fence_claim = _claim(env.factory, fence_plan, fence_buy["step_no"])
+            assert fence_claim["state"] == "pending", dict(fence_claim)
+            assert list(fence_claim["broker_order_ids"]) == ["C11-F-ADOPTED"]
+            assert len(env.broker.calls) == calls_before_adopt
+        finally:
+            await client.aclose()
+
+    asyncio.run(_run())
+
+
+def _ingest_rejected_order(
+    env,
+    *,
+    order_id: str,
+    run_id: str,
+    symbol: str,
+    token: int,
+    side: str = "SELL",
+    product: str = "CNC",
+) -> None:
+    """One ordinary ingestion artifact for a terminally REJECTED order: no trades.
+
+    A rejected order has no fill rows at all, so the attribution row that binds the
+    order to this plan's run plus a terminal ``order_state_projection`` row IS the
+    whole evidence the live outcome consumer reads.
+    """
+    from sqlalchemy import text
+
+    with env.factory() as session:
+        session.execute(
+            text(
+                "INSERT INTO live_order_intents (intent_id, client_order_ref, account_id, "
+                " strategy_run_id, strategy_family, strategy_name, entry_surface, "
+                " broker_order_id, execution_mode, status) "
+                "VALUES (:iid, :ref, :account, :run, 'target_weights', :run, 'hosted_plan', "
+                " :oid, 'live', 'placed')"
+            ),
+            {
+                "iid": f"lint_{uuid.uuid4().hex[:8]}",
+                "ref": f"KA-REJ-{uuid.uuid4().hex[:8]}",
+                "account": env.account_scope,
+                "run": run_id,
+                "oid": order_id,
+            },
+        )
+        session.execute(
+            text(
+                "INSERT INTO order_state_projection (account_id, order_id, latest_status, "
+                " latest_event_timestamp, last_seen_filled_quantity, dirty_for_trade_sync, "
+                " needs_reconcile, terminal, exchange, tradingsymbol, instrument_token, "
+                " product, transaction_type, updated_at) "
+                "VALUES (:account, :oid, 'REJECTED', NOW(), 0, false, false, true, 'NSE', "
+                " :symbol, :token, :product, :side, NOW())"
+            ),
+            {
+                "account": env.account_scope,
+                "oid": order_id,
+                "symbol": symbol,
+                "token": token,
+                "product": str(product).upper(),
+                "side": side,
+            },
+        )
+        session.commit()
+
+
+def _park_claim_in_releasing(env, *, plan_id: str, step_no: int) -> None:
+    """Write the crash window a release pass can leave behind: ``releasing``, no order.
+
+    A test can only reach that shape by writing it - the process that leaves it
+    behind is dead - and everything that DECIDES about it afterwards reads the
+    platform's own durable rows (the claim and the pre-send fence).
+    """
+    from sqlalchemy import text
+
+    with env.factory() as session:
+        session.execute(
+            text(
+                "UPDATE public.live_plan_submissions SET state = 'releasing', "
+                " broker_order_ids = '[]'::jsonb, updated_at = NOW() "
+                "WHERE plan_id = :pid AND step_no = :step"
+            ),
+            {"pid": plan_id, "step": int(step_no)},
+        )
+        session.commit()
+
+
+def _insert_pre_send_fence_row(
+    env, *, plan_id: str, step_no: int, broker_order_id: str | None = None
+) -> None:
+    """The durable pre-send record this plan STEP's broker write would have created."""
+    from sqlalchemy import text
+
+    with env.factory() as session:
+        plan = (
+            session.execute(
+                text(
+                    "SELECT strategy_id, account_id FROM public.strategy_plans "
+                    "WHERE plan_id = :pid"
+                ),
+                {"pid": plan_id},
+            )
+            .mappings()
+            .first()
+        )
+        session.execute(
+            text(
+                "INSERT INTO public.live_order_intents "
+                "(intent_id, client_order_ref, account_id, strategy_run_id, "
+                " strategy_family, strategy_name, entry_surface, idempotency_key, "
+                " broker_order_id, execution_mode, status) "
+                "VALUES (:iid, :ref, :account, :run, 'target_weights', 'c11', "
+                " 'hosted_plan', :key, :oid, 'live', 'pending')"
+            ),
+            {
+                "iid": f"lint_{uuid.uuid4().hex[:8]}",
+                "ref": f"KAC{uuid.uuid4().hex[:6].upper()}",
+                "account": str(plan["account_id"]),
+                "run": f"run_{str(plan['strategy_id'])[:12]}",
+                "key": f"live-plan:{plan_id}:step:{int(step_no)}",
+                "oid": broker_order_id,
+            },
+        )
+        session.commit()
+
+
 def _seed_orphan_repair_step(env, attempt) -> str:
     """A frozen plan + repair_required claim whose bound run row does not exist.
 

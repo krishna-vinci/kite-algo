@@ -44,6 +44,7 @@ from backend.strategies.live_sequence import (
     LivePlanSequence,
     lane_for_plan,
     prerequisites_met,
+    staged_funding_blocked_steps,
 )
 from backend.strategies.reservations import ReservationLedger
 from backend.strategies.settlement import ExecutionBarrier
@@ -577,7 +578,35 @@ class LivePlanExecutor:
             if not prerequisites_met(spec, states):
                 # Ordinary sequencing: the legs this one depends on have not all
                 # filled. Nothing is released and no blocker is recorded, because
-                # waiting is the protocol working, not a refusal.
+                # waiting is the protocol working, not a refusal. A STAGED buy is
+                # the exception: once EVERY funding reduction is terminal and did
+                # not fill, no sale proceeds can ever arrive, so the owner is told
+                # WHICH funding legs are blocking the buy instead of watching a
+                # silently, permanently withheld step.
+                if str(getattr(spec, "release_rule", "")) == RULE_STAGED_FUNDING_GATE:
+                    blocked_steps = staged_funding_blocked_steps(spec, states)
+                    if blocked_steps:
+                        self.sequence.record_release_blocker(
+                            plan_id=plan_id,
+                            step_no=step_no,
+                            reason_code="STAGED_FUNDING_REDUCTION_NOT_CONFIRMED",
+                            detail={
+                                "plan_id": plan_id,
+                                "step_no": step_no,
+                                "blocked_funding_steps": blocked_steps,
+                                "funding_leg_states": {
+                                    str(step): str(states.get(int(step)) or "")
+                                    for step in blocked_steps
+                                },
+                                "message": (
+                                    "every funding reduction for this buy is terminal "
+                                    "without filling it, so the sale proceeds the buy "
+                                    "waits for can never arrive; the buy stays withheld "
+                                    "until an operator dispositions the plan"
+                                ),
+                            },
+                        )
+                        counts["blocked"] += 1
                 continue
 
             # The authority must re-derive from PERSISTED records on every pass:

@@ -7,17 +7,25 @@ deliberately NOT automatically resolved — it blocks a quiet proof until a huma
 decides, because the residual is real exposure or real unfilled intent and only
 the owner knows which.
 
-This module is the bounded, authorised disposition:
+This module holds the bounded, authorised dispositions:
 
-* it applies ONLY to a step in ``repair_required``;
-* it requires the operator's own authorization (the route enforces ownership);
-* it refuses while the plan's evaluation authority could still fill the
+* ``repair_required`` (and the provably-unsent ``releasing`` window) — see
+  :meth:`LiveRepairService.abandon_residual`;
+* a ``withheld`` STAGED DEPENDENT BUY whose every funding leg is terminal
+  without a complete fill, so the sale proceeds it waits for can never arrive —
+  see :meth:`LiveRepairService.abandon_staged_dependent`. That buy is never
+  auto-released, and neither case ever re-sends an uncertain order.
+
+Both of them:
+
+* require the operator's own authorization (the route enforces ownership);
+* refuse while the plan's evaluation authority could still fill the
   residual — an operator may not abandon work that is still live;
-* it records the residual disposition in the append-only plan trail, releases
-  the unused capacity, and records the step's ``work_resolved`` barrier event
-  exactly once, so quiescence becomes provable;
-* it is idempotent (a second abandon names the existing disposition) and never
-  rewrites the filled quantity.
+* record the disposition in the append-only plan trail, settle the parent's
+  unused capacity by the parent's own rule, and record the step's
+  ``work_resolved`` barrier event exactly once, so quiescence becomes provable;
+* are idempotent (a second abandon names the existing disposition) and never
+  rewrite a filled quantity.
 
 What it does NOT do: fabricate a fill, fabricate a rejection, release capacity
 that a real fill consumed, or clear anything silently. ``residual_abandoned`` is
@@ -29,7 +37,7 @@ from __future__ import annotations
 import json
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from sqlalchemy import text
 
@@ -68,6 +76,12 @@ RELEASING_WITHOUT_ORDER_STATES = ("releasing",)
 ALREADY_DISPOSED_STATES = ("residual_abandoned",)
 
 DISPOSITION_ABANDONED = "residual_abandoned"
+
+#: The detail-level disposition recorded for the OTHER bounded case: a staged
+#: dependent buy whose every funding leg died without filling. The STEP state is
+#: still ``residual_abandoned`` (it is terminal and unfilled); this value is what
+#: the append-only trail and the owner view read to tell the two cases apart.
+DISPOSITION_STAGED_DEPENDENT_ABANDONED = "staged_dependent_abandoned"
 
 
 class LiveRepairRefusal(RuntimeError):
@@ -603,6 +617,482 @@ class LiveRepairService:
             "idempotent": False,
             "disposition": disposition,
         }
+
+    #: The state a staged dependent buy is dispositioned FROM.
+    STAGED_DEPENDENT_PRIOR_STATE = "withheld"
+
+    def abandon_staged_dependent(
+        self,
+        *,
+        plan_id: str,
+        step_no: Optional[int] = None,
+        actor: str,
+        reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Disposition ONE withheld staged buy whose every funding leg died unfilled.
+
+        A staged CNC dependent buy exists only to be funded by its reductions. Once
+        EVERY one of those reductions is terminal without a complete fill -
+        rejected, cancelled, or a residual an operator abandoned - the sale
+        proceeds the buy waits for can never arrive. Left alone the buy would keep
+        the parent and the settlement barrier in flight forever, so this is the
+        bounded, operator-authorised way out:
+
+        * it applies ONLY to a claim in ``withheld`` that names NO broker order;
+        * it requires the parent's FROZEN spec to name this step as a
+          ``staged_funding_gate`` leg AND every funding leg's claim to be terminal
+          without a complete fill - all read from the durable rows, never asserted
+          by the caller;
+        * it refuses while the plan's evaluation authority could still act, and
+          refuses UNKNOWN authority evidence outright (``LIVE_REPAIR_AUTHORITY_UNKNOWN``);
+        * it records the funding-leg evidence in the disposition, records the
+          barrier's ``work_resolved`` exactly once, and lets the parent's own
+          idempotent rule settle the reservation: CONSUMED when any leg of the
+          parent filled, RELEASED when none did.
+
+        It NEVER releases the buy, sends the buy, invents a fill or a rejection for a
+        funding leg, or hands back capacity a real fill already backs.
+        """
+        plan_id = str(plan_id)
+        plan_row = self._plan_book(plan_id)
+        if plan_row is None:
+            raise LiveRepairRefusal(
+                "LIVE_REPAIR_PLAN_NOT_FOUND", {"plan_id": plan_id, "step_no": step_no}
+            )
+        account_id = str(plan_row["account_id"] or "")
+        strategy_id = str(plan_row["strategy_id"] or "")
+
+        session = self.session_factory()
+        try:
+            # The canonical book lock, exactly as the residual disposition takes it:
+            # the authority read, the CAS, the barrier event and the audit row are
+            # one serialized unit per book.
+            self.barrier.lock_book(
+                session,
+                account_id=account_id,
+                strategy_id=strategy_id,
+                execution_environment=LIVE_ENVIRONMENT,
+            )
+            if step_no is None:
+                step_no = self._resolve_staged_dependent_step(session, plan_id=plan_id)
+            step_no = int(step_no)
+            step = self._step_for_update(session, plan_id=plan_id, step_no=step_no)
+            state = str(step["state"] or "")
+            if state in ALREADY_DISPOSED_STATES:
+                prior = dict(self._detail_of(step).get("disposition_record") or {})
+                if str(prior.get("disposition") or "") != DISPOSITION_STAGED_DEPENDENT_ABANDONED:
+                    session.rollback()
+                    raise LiveRepairRefusal(
+                        "LIVE_REPAIR_NOT_REQUIRED",
+                        {
+                            "plan_id": plan_id,
+                            "step_no": step_no,
+                            "state": state,
+                            "disposition": str(prior.get("disposition") or ""),
+                            "message": (
+                                "this step was already dispositioned by a different "
+                                "repair case; it is not a staged dependent buy"
+                            ),
+                        },
+                    )
+                session.rollback()
+                detail = self._detail_of(step)
+                return {
+                    "plan_id": plan_id,
+                    "step_no": step_no,
+                    "state": state,
+                    "idempotent": True,
+                    "disposition": prior,
+                    "capacity": dict(detail.get("capacity") or {}),
+                }
+            if state != self.STAGED_DEPENDENT_PRIOR_STATE:
+                session.rollback()
+                raise LiveRepairRefusal(
+                    "LIVE_REPAIR_NOT_REQUIRED",
+                    {
+                        "plan_id": plan_id,
+                        "step_no": step_no,
+                        "state": state,
+                        "message": (
+                            "only a withheld staged dependent buy may be dispositioned: a "
+                            "released, partially filled, uncertain or already ordered buy "
+                            "is ingestion's work, never an operator's to abandon"
+                        ),
+                    },
+                )
+            order_ids = self._order_ids(step.get("broker_order_ids"))
+            if order_ids:
+                session.rollback()
+                raise LiveRepairRefusal(
+                    "LIVE_REPAIR_STAGED_DEPENDENT_HAS_ORDER",
+                    {
+                        "plan_id": plan_id,
+                        "step_no": step_no,
+                        "state": state,
+                        "broker_order_ids": order_ids,
+                        "message": (
+                            "this buy already names a broker order, so ingestion owns its "
+                            "outcome; it is never abandoned and never re-sent"
+                        ),
+                    },
+                )
+            funding = self._staged_dependent_funding(
+                session, plan_id=plan_id, step_no=step_no
+            )
+            if not funding["eligible"]:
+                session.rollback()
+                refusal = dict(funding["refusal"] or {})
+                raise LiveRepairRefusal(
+                    str(refusal.get("reason_code") or "LIVE_REPAIR_NOT_REQUIRED"),
+                    dict(refusal.get("detail") or {}),
+                )
+            authority, authority_detail = self._authority_state(plan_id, db=session)
+            if authority == "live":
+                session.rollback()
+                raise LiveRepairRefusal(
+                    "LIVE_AUTHORITY_STILL_ACTIVE",
+                    {
+                        "plan_id": plan_id,
+                        "step_no": step_no,
+                        "authority": authority_detail,
+                        "message": (
+                            "the plan's evaluation authority is still live, so a funding "
+                            "leg or the buy itself might still be worked; stop the attempt "
+                            "first"
+                        ),
+                    },
+                )
+            if authority == "unknown":
+                session.rollback()
+                raise LiveRepairRefusal(
+                    "LIVE_REPAIR_AUTHORITY_UNKNOWN",
+                    {
+                        "plan_id": plan_id,
+                        "step_no": step_no,
+                        "authority": authority_detail,
+                        "message": (
+                            "the plan's authority could not be read conclusively; unknown "
+                            "evidence does not authorise abandoning a dependent buy"
+                        ),
+                    },
+                )
+
+            snapshot = step.get("delta_snapshot")
+            if isinstance(snapshot, str):
+                try:
+                    snapshot = json.loads(snapshot or "{}")
+                except ValueError:
+                    snapshot = {}
+            ordered = abs(int((snapshot or {}).get("quantity") or 0))
+            disposition = {
+                "disposition": DISPOSITION_STAGED_DEPENDENT_ABANDONED,
+                "prior_state": state,
+                "send_outcome": "not_sent",
+                "buy_quantity": ordered,
+                "filled_quantity": 0,
+                "blocker": "STAGED_FUNDING_REDUCTION_NOT_CONFIRMED",
+                "blocked_funding_steps": list(funding["funding_steps"]),
+                "funding_legs": [dict(item) for item in funding["funding_legs"]],
+                "actor_id": str(actor),
+                "reason": str(reason or "") or None,
+                "recorded_at": self._clock().isoformat(),
+                "authority_state": authority,
+                "authority_detail": authority_detail,
+            }
+            updated = session.execute(
+                text(
+                    """
+                    UPDATE public.live_plan_submissions
+                    SET state = :state,
+                        detail = COALESCE(detail, '{}'::jsonb) || CAST(:detail AS jsonb),
+                        updated_at = NOW()
+                    WHERE plan_id = :plan_id AND step_no = :step_no
+                      AND state = :prior_state
+                    """
+                ),
+                {
+                    "plan_id": plan_id,
+                    "step_no": step_no,
+                    "state": DISPOSITION_ABANDONED,
+                    "prior_state": state,
+                    "detail": json.dumps({"disposition_record": disposition}),
+                },
+            )
+            if int(getattr(updated, "rowcount", 0) or 0) == 0:
+                # A concurrent caller moved the step between the row lock and the
+                # CAS. Re-read and report honestly: never a second audit row for the
+                # same decision, never a silent success for a lost race.
+                session.rollback()
+                current = self._step(plan_id, step_no)
+                current_detail = self._detail_of(current)
+                prior = dict(current_detail.get("disposition_record") or {})
+                if str(current["state"] or "") in ALREADY_DISPOSED_STATES and str(
+                    prior.get("disposition") or ""
+                ) == DISPOSITION_STAGED_DEPENDENT_ABANDONED:
+                    return {
+                        "plan_id": plan_id,
+                        "step_no": step_no,
+                        "state": str(current["state"]),
+                        "idempotent": True,
+                        "disposition": prior,
+                        "capacity": dict(current_detail.get("capacity") or {}),
+                    }
+                raise LiveRepairRefusal(
+                    "LIVE_REPAIR_RACE_LOST",
+                    {
+                        "plan_id": plan_id,
+                        "step_no": step_no,
+                        "state": str(current["state"] or ""),
+                    },
+                )
+            # The buy's work is resolved by DISPOSITION, exactly once, in the same
+            # transaction as the CAS and the audit row.
+            version, created = self.barrier.record_work_event_once(
+                account_id=account_id,
+                strategy_id=strategy_id,
+                execution_environment=LIVE_ENVIRONMENT,
+                event="work_resolved",
+                ref=str(step["step_ref"] or ""),
+                detail={
+                    "plan_id": plan_id,
+                    "outcome": DISPOSITION_STAGED_DEPENDENT_ABANDONED,
+                    "buy_quantity": ordered,
+                    "filled_quantity": 0,
+                    "blocked_funding_steps": list(funding["funding_steps"]),
+                    "actor_id": str(actor),
+                    "reason": str(reason or "") or None,
+                },
+                dedupe_key=plan_id,
+                db=session,
+            )
+            disposition["barrier_version"] = version
+            disposition["barrier_created"] = created
+            # The append-only plan trail is where the operator's decision lives.
+            self._record_trail(session, plan_id=plan_id, step_no=step_no, disposition=disposition)
+            # The parent records the leg as TERMINAL but does not settle: settling
+            # needs EVERY leg terminal, and that belongs to the idempotent rule.
+            self.sequence.record_leg_outcome(
+                plan_id=plan_id,
+                step_no=step_no,
+                outcome=DISPOSITION_ABANDONED,
+                filled=0,
+                ordered=ordered,
+                db=session,
+            )
+            session.commit()
+        except LiveRepairRefusal:
+            session.rollback()
+            raise
+        except Exception as exc:  # noqa: BLE001 - a partial disposition must not stand
+            session.rollback()
+            raise LiveRepairRefusal(
+                "LIVE_REPAIR_DISPOSITION_FAILED",
+                {"plan_id": plan_id, "step_no": step_no, "error": str(exc)},
+            ) from exc
+        finally:
+            session.close()
+
+        # The parent's own rule decides: any real fill anywhere in the parent means
+        # the reservation is no longer the owner's to reclaim, so it is CONSUMED;
+        # no fill at all means the unused allocation goes back, so it is RELEASED.
+        capacity = self._settle_capacity(plan_id=plan_id, filled=0, actor=actor)
+        disposition.update(capacity)
+        self._record_capacity(plan_id=plan_id, step_no=step_no, capacity=capacity)
+        return {
+            "plan_id": plan_id,
+            "step_no": step_no,
+            "state": DISPOSITION_ABANDONED,
+            "idempotent": False,
+            "disposition": disposition,
+        }
+
+    def _staged_dependent_funding(
+        self, session: Any, *, plan_id: str, step_no: int
+    ) -> Dict[str, Any]:
+        """Read the funding evidence for one claimed step, or refuse by name.
+
+        Everything DECIDING is read from the platform's own rows, inside the
+        caller's transaction: the parent's FROZEN spec must name this step as a
+        ``staged_funding_gate`` leg with at least one dependency, and every funding
+        leg's claim must exist in a terminal state that did not COMPLETE a fill.
+        """
+        from backend.strategies.live_sequence import (
+            FUNDING_LEG_TERMINAL_UNFILLED_STATES,
+            RULE_STAGED_FUNDING_GATE,
+        )
+
+        def _refuse(code: str, detail: Mapping[str, Any]) -> Dict[str, Any]:
+            return {
+                "eligible": False,
+                "refusal": {
+                    "reason_code": code,
+                    "detail": {"plan_id": plan_id, "step_no": int(step_no), **dict(detail)},
+                },
+                "funding_steps": [],
+                "funding_legs": [],
+            }
+
+        parent = self.sequence.get_execution(plan_id, db=session)
+        if parent is None:
+            return _refuse(
+                "LIVE_REPAIR_STAGED_DEPENDENT_NO_PARENT",
+                {
+                    "message": (
+                        "this plan has no durable parent, so its funding dependencies "
+                        "cannot be read; a staged dependent buy always has one"
+                    )
+                },
+            )
+        spec = next(
+            (item for item in parent["step_spec"] if int(item.step_no) == int(step_no)),
+            None,
+        )
+        if spec is None:
+            return _refuse(
+                "LIVE_REPAIR_STAGED_DEPENDENT_NO_SPEC",
+                {"message": "the frozen parent does not carry this step"},
+            )
+        funding_steps = [int(value) for value in (spec.depends_on or ())]
+        if str(spec.release_rule) != RULE_STAGED_FUNDING_GATE or not funding_steps:
+            return _refuse(
+                "LIVE_REPAIR_STAGED_DEPENDENT_NOT_GATED",
+                {
+                    "release_rule": str(spec.release_rule),
+                    "depends_on": funding_steps,
+                    "message": (
+                        "only a frozen staged-funding-gate buy behind at least one "
+                        "funding reduction is dispositionable here"
+                    ),
+                },
+            )
+        rows = (
+            session.execute(
+                text(
+                    "SELECT step_no, step_ref, state, detail FROM public.live_plan_submissions "
+                    "WHERE plan_id = :plan_id"
+                ),
+                {"plan_id": str(plan_id)},
+            )
+            .mappings()
+            .all()
+        )
+        by_step = {int(row["step_no"]): dict(row) for row in rows}
+        evidence: List[Dict[str, Any]] = []
+        unresolved: List[int] = []
+        for funding_step in funding_steps:
+            row = by_step.get(int(funding_step))
+            leg_detail = self._detail_of(row or {})
+            state = str((row or {}).get("state") or "")
+            evidence.append(
+                {
+                    "step_no": int(funding_step),
+                    "step_ref": str((row or {}).get("step_ref") or ""),
+                    "state": state,
+                    "filled_quantity": int(leg_detail.get("filled_quantity") or 0),
+                    "ordered_quantity": int(leg_detail.get("ordered_quantity") or 0),
+                    "residual_quantity": int(leg_detail.get("residual_quantity") or 0),
+                }
+            )
+            if row is None or state not in FUNDING_LEG_TERMINAL_UNFILLED_STATES:
+                unresolved.append(int(funding_step))
+        if unresolved:
+            return {
+                "eligible": False,
+                "refusal": {
+                    "reason_code": "LIVE_REPAIR_STAGED_DEPENDENT_FUNDING_UNRESOLVED",
+                    "detail": {
+                        "plan_id": plan_id,
+                        "step_no": int(step_no),
+                        "funding_legs": evidence,
+                        "unresolved_funding_steps": unresolved,
+                        "message": (
+                            "a funding leg of this buy is still in flight or completed a "
+                            "fill, so the buy is never abandoned; only a reduction that "
+                            "can no longer fill leaves the buy permanently unfunded"
+                        ),
+                    },
+                },
+                "funding_steps": funding_steps,
+                "funding_legs": evidence,
+            }
+        return {
+            "eligible": True,
+            "refusal": None,
+            "funding_steps": funding_steps,
+            "funding_legs": evidence,
+        }
+
+    def _resolve_staged_dependent_step(self, session: Any, *, plan_id: str) -> int:
+        """The plan's ONE dispositionable staged dependent buy, or a named refusal.
+
+        A plan may hold several withheld legs, so the operator's request may name
+        the plan and let the server find the buy whose funding legs are all dead.
+        Zero is a refusal and more than one is ambiguous, so a leg is never silently
+        picked for them. A step already dispositioned by THIS case resolves too, so a
+        repeat reports the SAME decision rather than "nothing needs repair".
+        """
+        rows = (
+            session.execute(
+                text(
+                    "SELECT step_no, state, broker_order_ids, detail "
+                    "FROM public.live_plan_submissions WHERE plan_id = :plan_id "
+                    "ORDER BY step_no"
+                ),
+                {"plan_id": str(plan_id)},
+            )
+            .mappings()
+            .all()
+        )
+        claimed = [int(row["step_no"]) for row in rows]
+        eligible: List[int] = []
+        for row in rows:
+            candidate = int(row["step_no"])
+            state = str(row["state"] or "")
+            if state in ALREADY_DISPOSED_STATES:
+                prior = dict(self._detail_of(row).get("disposition_record") or {})
+                if str(prior.get("disposition") or "") == DISPOSITION_STAGED_DEPENDENT_ABANDONED:
+                    eligible.append(candidate)
+                continue
+            if state != self.STAGED_DEPENDENT_PRIOR_STATE:
+                continue
+            if self._order_ids(row.get("broker_order_ids")):
+                continue
+            if self._staged_dependent_funding(
+                session, plan_id=plan_id, step_no=candidate
+            )["eligible"]:
+                eligible.append(candidate)
+        if len(eligible) == 1:
+            return eligible[0]
+        if len(eligible) > 1:
+            raise LiveRepairRefusal(
+                "LIVE_REPAIR_STAGED_DEPENDENT_AMBIGUOUS",
+                {
+                    "plan_id": str(plan_id),
+                    "dispositionable_steps": eligible,
+                    "message": "more than one staged dependent buy is dispositionable; name the step",
+                },
+            )
+        raise LiveRepairRefusal(
+            "LIVE_REPAIR_STAGED_DEPENDENT_NOT_FOUND",
+            {
+                "plan_id": str(plan_id),
+                "steps": claimed,
+                "message": (
+                    "no withheld staged dependent buy of this plan has every funding leg "
+                    "terminal without a complete fill"
+                ),
+            },
+        )
+
+    @staticmethod
+    def _order_ids(value: Any) -> List[str]:
+        """The broker order references on a claim, whichever dialect stored them."""
+        if isinstance(value, str):
+            try:
+                value = json.loads(value or "[]")
+            except ValueError:
+                value = []
+        return [str(item) for item in (value or [])]
 
     def _adopt_discovered_order(
         self,

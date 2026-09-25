@@ -222,6 +222,53 @@ class LiveSubmissionStoreTests(unittest.TestCase):
         increase = specs["inst-INFY"]
         self.assertEqual(increase.release_rule, RULE_ALL_PREREQUISITES_FILLED)
 
+    def test_only_a_dead_funding_leg_names_the_blocked_steps(self):
+        """C1.1 §5: the blocked funding steps are named only once they are DEAD.
+
+        A staged buy whose reduction is pending, partial, finalizing or
+        ``repair_required`` is waiting - the protocol working - so nothing is
+        reported. Only a terminal reduction that did not COMPLETE a fill leaves
+        the buy permanently unfunded, and that is the shape the owner view must
+        be able to explain.
+        """
+        from backend.strategies.live_sequence import staged_funding_blocked_steps
+
+        class _Spec:
+            depends_on = (1,)
+
+        def _blocked(state):
+            return staged_funding_blocked_steps(_Spec(), {1: state})
+
+        self.assertEqual(_blocked("rejected"), [1])
+        self.assertEqual(_blocked("cancelled"), [1])
+        self.assertEqual(_blocked("residual_abandoned"), [1])
+        for waiting in ("withheld", "pending", "releasing", "partial", "finalizing", "uncertain", "repair_required"):
+            self.assertEqual(_blocked(waiting), [], waiting)
+        # A reduction that FILLED funded the buy: it is not a blocker.
+        self.assertEqual(_blocked("filled"), [])
+        self.assertEqual(_blocked("no_op"), [])
+
+        # EVERY funding leg has to be dead: one dead reduction behind a live one
+        # still leaves the buy waiting rather than permanently unfunded.
+        class _TwoSpec:
+            depends_on = (1, 2)
+
+        self.assertEqual(
+            staged_funding_blocked_steps(_TwoSpec(), {1: "rejected", 2: "residual_abandoned"}),
+            [1, 2],
+        )
+        self.assertEqual(
+            staged_funding_blocked_steps(_TwoSpec(), {1: "rejected", 2: "partial"}), []
+        )
+        self.assertEqual(
+            staged_funding_blocked_steps(_TwoSpec(), {1: "rejected", 2: "filled"}), []
+        )
+
+        class _NoDeps:
+            depends_on = ()
+
+        self.assertEqual(staged_funding_blocked_steps(_NoDeps(), {}), [])
+
 
 
 

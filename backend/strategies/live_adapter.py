@@ -999,11 +999,40 @@ class LivePlanAdapter:
         margin_evidence: Optional[Mapping[str, Any]],
         catalog_state: Optional[Mapping[str, Any]],
     ) -> tuple[Dict[str, Any], Dict[str, Any]]:
-        """Prove a dependent buy is funded before its CAS; place nothing.
+        """The whole gate, stage 1 then stage 2, for a caller that holds no lock.
 
-        The two stages are deliberately separate. A non-``filled`` reduction is
-        sequencing evidence, while quote/funds evidence is executable funding
-        evidence and is read only after the first stage passes.
+        ``release_step`` calls the two stages SEPARATELY, so the authoritative
+        funds read happens while the reservation ACCOUNT lock is held; this
+        composition is kept only for callers that need the gate in one call. It is
+        NOT the authority when money can move in between - a funds figure read
+        before the account lock can describe cash another plan has already spent.
+        """
+        validated_quote = await self._staged_funding_quote_stage(
+            plan, spec, states=states, quote=quote, quote_reader=quote_reader
+        )
+        funds = self._staged_funding_funds_stage(
+            plan,
+            spec,
+            funds_reader=funds_reader,
+            margin_evidence=margin_evidence,
+            catalog_state=catalog_state,
+        )
+        return validated_quote, funds
+
+    async def _staged_funding_quote_stage(
+        self,
+        plan: Mapping[str, Any],
+        spec: Any,
+        *,
+        states: Mapping[int, str],
+        quote: Optional[Mapping[str, Any]],
+        quote_reader: Any,
+    ) -> Dict[str, Any]:
+        """STAGE 1 - sequencing and price evidence. Reads no money; takes no lock.
+
+        A non-``filled`` reduction is sequencing evidence, and the quote/drift check
+        bounds the buy's estimated cost against the frozen reference price. Neither
+        spends account cash, so this stage may run before the account lock.
         """
         plan_id = str(plan.get("plan_id") or "")
         unconfirmed = [
@@ -1059,7 +1088,27 @@ class LivePlanAdapter:
                     "max_price_drift_pct": max_drift,
                 },
             )
+        return validated_quote
 
+    def _staged_funding_funds_stage(
+        self,
+        plan: Mapping[str, Any],
+        spec: Any,
+        *,
+        funds_reader: Optional[Callable[[], Any]],
+        margin_evidence: Optional[Mapping[str, Any]],
+        catalog_state: Optional[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        """STAGE 2 - the authoritative funds read, the freshness bound and admission.
+
+        This is the stage that decides whether the buy MAY spend, so its caller must
+        already hold the reservation account lock (``release_step`` does): the read
+        has to describe the account AFTER every competing authorization, spend or
+        confirmed fill that lands while the lock is being waited for. A figure read
+        before the lock is a torn view - it can still contain cash another plan has
+        already spent - and is never used as the authority.
+        """
+        plan_id = str(plan.get("plan_id") or "")
         try:
             funds = (
                 dict(funds_reader() or {})
@@ -1101,7 +1150,7 @@ class LivePlanAdapter:
         self._check_admission(
             plan, margin_evidence=funds, catalog_state=catalog_state
         )
-        return validated_quote, funds
+        return funds
 
     def _check_option_structure_admissibility(self, plan: Mapping[str, Any]) -> None:
         """Refuse a live option plan the strategy's own durable work blocks.
@@ -1870,15 +1919,14 @@ class LivePlanAdapter:
             exposure_proof["pin"] = "EXPOSURE_SNAPSHOT_CHANGED"
             staged_detail = None
             if str(getattr(spec, "release_rule", "")) == RULE_STAGED_FUNDING_GATE:
-                validated_quote, funds = await self._staged_funding_gate(
+                # STAGE 1 - sequencing and price evidence only: it reads no money,
+                # so it may run before the account lock.
+                validated_quote = await self._staged_funding_quote_stage(
                     plan,
                     spec,
                     states=states,
                     quote=quote,
                     quote_reader=quote_reader,
-                    funds_reader=funds_reader,
-                    margin_evidence=margin_evidence,
-                    catalog_state=catalog_state,
                 )
                 staged_detail = {
                     "confirmed_reduction_steps": sorted(
@@ -1901,7 +1949,23 @@ class LivePlanAdapter:
                             "message": "the reservation no longer covers every outstanding leg",
                         },
                     )
+                # The reservation ACCOUNT lock, in the fixed order (canonical book
+                # lock -> governed strategy lock -> account lock). The funds read
+                # that decides whether this buy may spend happens INSIDE it - and
+                # inside this same release transaction, together with the keyed
+                # authorization and the ``withheld -> releasing`` CAS below - so a
+                # competitor's authorization, spend or confirmed fill that lands
+                # while we wait for the lock is reflected in the figure we decide
+                # against. A pre-lock read is deliberately NOT the authority: it can
+                # still contain cash another plan has already spent.
                 self.ledger._lock_account(session, account_id)
+                funds = self._staged_funding_funds_stage(
+                    plan,
+                    spec,
+                    funds_reader=funds_reader,
+                    margin_evidence=margin_evidence,
+                    catalog_state=catalog_state,
+                )
                 try:
                     authorization = self.ledger.authorize_staged_increase(
                         plan_id=plan_id,

@@ -71,6 +71,15 @@ STEP_RELEASING = "releasing"
 #: Step states that mean the leg can never do more.
 STEP_TERMINAL = ("filled", "rejected", "no_op", "residual_abandoned")
 
+#: Funding-leg claim states that are TERMINAL without a COMPLETE fill. A staged
+#: CNC dependent buy exists only to be funded by its reductions, so a reduction
+#: that ends in one of these can never supply the cash the buy waits for. A
+#: ``residual_abandoned`` leg may still carry a PARTIAL fill; the parent's own
+#: settlement rule is what then consumes - never releases - its capacity. (A
+#: broker CANCELLED order lands as ``rejected`` after ingestion; the name is
+#: accepted here because a claim may legitimately carry it.)
+FUNDING_LEG_TERMINAL_UNFILLED_STATES = ("rejected", "cancelled", "residual_abandoned")
+
 #: Step states that are still unresolved work (the settlement barrier's view).
 STEP_INFLIGHT = (
     "pending",
@@ -945,6 +954,28 @@ def prerequisites_met(spec: StepSpec, states: Mapping[int, str]) -> bool:
     was sequenced behind, so the dependent stays withheld.
     """
     return all(str(states.get(int(step_no)) or "") == "filled" for step_no in spec.depends_on)
+
+
+def staged_funding_blocked_steps(
+    spec: StepSpec, states: Mapping[int, str]
+) -> List[int]:
+    """The funding legs of a staged dependent buy that are DEAD without filling.
+
+    Returns the funding step numbers only when EVERY one of them is terminal and
+    did not fill - the one shape that leaves a dependent buy permanently
+    un-releasable and therefore worth naming to the owner. An empty list means
+    "still in flight": waiting is the protocol working, not a refusal, so no
+    blocker is invented while a reduction is pending, partial or repairable.
+    """
+    funding = [int(value) for value in (spec.depends_on or ())]
+    if not funding:
+        return []
+    if all(
+        str(states.get(int(step_no)) or "") in FUNDING_LEG_TERMINAL_UNFILLED_STATES
+        for step_no in funding
+    ):
+        return funding
+    return []
 
 
 def required_notional(specs: Sequence[StepSpec]) -> float:
