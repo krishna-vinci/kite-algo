@@ -77,6 +77,65 @@ def _digest(value: Any) -> str:
     ).hexdigest()[:20]
 
 
+def _stage_records(run: Any) -> List[Dict[str, Any]]:
+    """Every stage record one run carries, oldest first."""
+    return [
+        dict(row)
+        for row in (getattr(run, "orders", []) or [])
+        if isinstance(row, Mapping) and row.get("stage_digest")
+    ]
+
+
+def unresolved_stage_claim(orders: Any) -> Optional[Dict[str, Any]]:
+    """The newest stage claim in ``orders`` that has NOT resolved, if any.
+
+    A ``sending`` claim means the platform committed to a stage and does not
+    know whether the broker accepted it. It is reconciled from the platform's
+    own pre-send records; until then NOTHING new is sent, because the retry key
+    of a stage whose evidence moved is not the key of the stage that may be
+    live.
+
+    This is a MODULE-level rule on purpose: the staged-exit engine, the governed
+    exit path and the owned-work snapshot all have to agree on what "an
+    unresolved protective stage" means, and two implementations would eventually
+    disagree.
+    """
+    if isinstance(orders, (str, bytes, bytearray)):
+        # A raw database row may hand back the JSON text rather than a list.
+        try:
+            orders = json.loads(orders)
+        except ValueError:
+            # Unreadable stage records are NOT "no unresolved stage": the
+            # platform cannot prove the stage settled, so it stays claimed.
+            return {"state": STAGE_UNKNOWN, "reason": "stage_records_unreadable"}
+    if orders is None:
+        orders = []
+    if not isinstance(orders, (list, tuple)):
+        return {"state": STAGE_UNKNOWN, "reason": "stage_records_unreadable"}
+    # Attempt-FENCED: a claim and its resolution are keyed by
+    # ``(stage digest, attempt)``, so an old attempt's outcome can never
+    # resolve a newer attempt's claim. ``unknown`` is UNRESOLVED work, not a
+    # settled outcome: it keeps the claim (and every later attempt) blocked
+    # until durable evidence covers every leg.
+    claims: Dict[tuple, Dict[str, Any]] = {}
+    order: List[tuple] = []
+    for row in list(orders or []):
+        if not isinstance(row, Mapping) or not row.get("stage_digest"):
+            continue
+        record = dict(row)
+        digest = str(record.get("stage_digest") or "")
+        if not digest:
+            continue
+        key = (digest, int(record.get("attempt") or 1))
+        if str(record.get("state")) in (STAGE_SENDING, STAGE_UNKNOWN) and key not in claims:
+            order.append(key)
+        claims[key] = record
+    for key in reversed(order):
+        if str(claims[key].get("state")) in (STAGE_SENDING, STAGE_UNKNOWN):
+            return claims[key]
+    return None
+
+
 class StagedStructureExit:
     """Derive and submit ONE stage of a bounded structure exit."""
 
@@ -254,40 +313,11 @@ class StagedStructureExit:
     @staticmethod
     def stage_records(run: Any) -> List[Dict[str, Any]]:
         """Every stage record this run carries, oldest first."""
-        return [
-            dict(row)
-            for row in (getattr(run, "orders", []) or [])
-            if isinstance(row, Mapping) and row.get("stage_digest")
-        ]
+        return _stage_records(run)
 
     def unresolved_stage(self, run: Any) -> Optional[Dict[str, Any]]:
-        """The newest stage claim that has not resolved, if any.
-
-        A ``sending`` claim means the platform committed to a stage and does not
-        know whether the broker accepted it. It is reconciled from the platform's
-        own pre-send records; until then NOTHING new is sent, because the retry key
-        of a stage whose evidence moved is not the key of the stage that may be
-        live.
-        """
-        # Attempt-FENCED: a claim and its resolution are keyed by
-        # ``(stage digest, attempt)``, so an old attempt's outcome can never
-        # resolve a newer attempt's claim. ``unknown`` is UNRESOLVED work, not a
-        # settled outcome: it keeps the claim (and every later attempt) blocked
-        # until durable evidence covers every leg.
-        claims: Dict[tuple, Dict[str, Any]] = {}
-        order: List[tuple] = []
-        for record in self.stage_records(run):
-            digest = str(record.get("stage_digest") or "")
-            if not digest:
-                continue
-            key = (digest, int(record.get("attempt") or 1))
-            if str(record.get("state")) in (STAGE_SENDING, STAGE_UNKNOWN) and key not in claims:
-                order.append(key)
-            claims[key] = record
-        for key in reversed(order):
-            if str(claims[key].get("state")) in (STAGE_SENDING, STAGE_UNKNOWN):
-                return claims[key]
-        return None
+        """The newest stage claim that has not resolved, if any."""
+        return unresolved_stage_claim(getattr(run, "orders", []) or [])
 
     def _record_stage(self, run_id: str, record: Mapping[str, Any]) -> None:
         self._runs().record_orders(str(run_id), [dict(record)])

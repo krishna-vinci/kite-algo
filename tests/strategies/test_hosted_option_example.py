@@ -323,6 +323,118 @@ def test_closed_run_with_no_outstanding_work_is_closed(example):
 # -- the observation loop does not re-submit while work is outstanding -------
 
 
+def _spread_chain(strikes=(22500.0, 22600.0)):
+    return {
+        "updated_at": _stamp(),
+        "expiry": "2026-10-29",
+        "spot_ltp": 22520.0,
+        "chain": [
+            {
+                "strike": strike,
+                "ce": {
+                    "token": 50000 + int(strike / 100),
+                    "tsym": f"NIFTY26OCT{int(strike)}CE",
+                    "ltp": 120.0,
+                    "delta": 0.5,
+                    "iv": 0.14,
+                },
+            }
+            for strike in strikes
+        ],
+    }
+
+
+def _ready_index_reads(ctx):  # noqa: ANN001
+    ctx.client.get_candles = lambda *a, **k: {
+        "candles": [
+            {"timestamp": "2026-09-23T03:45:00Z", "open": 1, "high": 1, "low": 1, "close": 22520}
+        ]
+        * 30
+    }
+    ctx.client.calculate_indicator = lambda payload: {
+        "ready": True,
+        "values": {"rsi": [60.0, 60.0]},
+    }
+
+
+def test_the_duplicate_probe_is_skipped_when_it_is_not_the_held_structure(example):
+    """A probe that could open something NEW is not a probe: it is refused."""
+    run = _Run(
+        statuses=["refused"],
+        owned_work={"coverage": "known", "pending": [], "option_runs": []},
+        submitted=_close_submitted(),
+    )
+    ctx = _Ctx(_Client(_OptionsApi(chain=_spread_chain())), run)
+    # The run holds a structure the frozen selection no longer describes.
+    held = _run_row(
+        legs=[
+            {
+                "tradingsymbol": "NIFTY26OCT22400CE",
+                "transaction_type": "BUY",
+                "quantity": 50,
+                "lot_size": 50,
+            }
+        ]
+    )
+
+    report = example._duplicate_entry_probe(ctx, "NIFTY", held, "NRML", "exit_before_cutoff", 1.0)
+
+    assert "skipped" in report
+    assert not hasattr(run, "last_payload"), "the probe submitted an order it should not have"
+
+
+def test_the_duplicate_probe_reports_the_platforms_own_refusal(example):
+    run = _Run(
+        statuses=["refused"],
+        owned_work={"coverage": "known", "pending": [], "option_runs": []},
+        submitted=_close_submitted(),
+    )
+    run.execution_request = lambda request_id: {  # type: ignore[assignment]
+        "request_id": request_id,
+        "status": "refused",
+        "refusal_code": "OPTION_STRUCTURE_ALREADY_OPEN",
+    }
+    ctx = _Ctx(_Client(_OptionsApi(chain=_spread_chain())), run)
+    held = _run_row(
+        legs=[
+            {"tradingsymbol": "NIFTY26OCT22500CE", "transaction_type": "BUY", "quantity": 50},
+            {"tradingsymbol": "NIFTY26OCT22600CE", "transaction_type": "SELL", "quantity": 50},
+        ]
+    )
+
+    report = example._duplicate_entry_probe(ctx, "NIFTY", held, "NRML", "exit_before_cutoff", 1.0)
+
+    assert "OPTION_STRUCTURE_ALREADY_OPEN" in report
+    # The probe submits an ENTRY plan and nothing else: no close, no orders.
+    assert run.last_payload["payload"]["phase"] == "entry"
+    assert "-probe" in run.last_payload["evaluation_id"]
+
+
+def test_hold_after_entry_finishes_with_the_structure_held_and_no_close(example):
+    run = _Run(
+        statuses=["executed"],
+        owned_work={
+            "coverage": "known",
+            "pending": [],
+            "option_runs_coverage": {"coverage": "known", "truncated": False, "reason": ""},
+            "option_runs": [],
+        },
+        submitted=_close_submitted(),
+    )
+    ctx = _Ctx(
+        _Client(_OptionsApi(chain=_spread_chain())),
+        run,
+        params={"hold_after_entry": True, "deadline_seconds": 1.0},
+    )
+    _ready_index_reads(ctx)
+
+    assert example.main(ctx) == 0
+
+    assert run.last_payload["payload"]["phase"] == "entry"
+    assert any("hold_after_entry=true" in line for line in ctx.said)
+    assert not any("close requested" in line for line in ctx.said)
+
+
 def test_a_repeat_observation_with_pending_work_submits_nothing(example):
     run = _Run(
         statuses=["executed"],

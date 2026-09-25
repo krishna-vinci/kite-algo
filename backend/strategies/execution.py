@@ -1249,6 +1249,33 @@ class PaperPlanExecutor:
                     )
                 next_run = mark_entering(run)
             else:
+                # A protective exit stage the platform committed and has not
+                # resolved owns the run's next exit. A governed exit submitted
+                # beside it would be a second, possibly-overclosing order against
+                # a structure whose live stage is still unknown, so it is refused
+                # BY NAME and awaits reconciliation of that stage.
+                from backend.options.protection.staged_exit import (
+                    unresolved_stage_claim,
+                )
+
+                unresolved = unresolved_stage_claim(getattr(run, "orders", None) or [])
+                if unresolved is not None:
+                    raise ExecutionRefusal(
+                        "OPTION_PROTECTIVE_EXIT_UNRESOLVED",
+                        {
+                            "plan_id": plan_id,
+                            "option_run_id": run.strategy_run_id,
+                            "option_run_status": observed,
+                            "stage_digest": str(unresolved.get("stage_digest") or ""),
+                            "stage_state": str(unresolved.get("state") or ""),
+                            "stage_attempt": int(unresolved.get("attempt") or 1),
+                            "message": (
+                                "a protective exit stage is unresolved for this run; "
+                                "it is reconciled from the platform's own pre-send "
+                                "records before any other exit is submitted"
+                            ),
+                        },
+                    )
                 if observed == "exiting":
                     raise ExecutionRefusal(
                         "OPTION_RUN_EXIT_IN_FLIGHT",

@@ -29,6 +29,8 @@ from backend.strategies.continuation import (
     CONTINUATION_NOT_FINITE,
     CONTINUATION_NOT_NORMAL_COMPLETION,
     CONTINUATION_NOT_TRADE_CAPABLE,
+    CONTINUATION_OPTION_WORK_OUTSTANDING,
+    CONTINUATION_OPTION_WORK_UNKNOWN,
     CONTINUATION_PROCESS_CLEANUP_UNKNOWN,
     CONTINUATION_PROCESS_CLEANUP_UNRESOLVED,
     CONTINUATION_PROTECTION_IN_FLIGHT,
@@ -75,6 +77,9 @@ def _ev(**overrides) -> ContinuationEvidence:
         book_state="published",
         divergence_state="none",
         approval_state="none",
+        #: The options lane is its own axis. These pure assessments are about the
+        #: equity book, so they DECLARE the axis instead of leaving it unknown.
+        option_work_state="none",
     )
     base.update(overrides)
     return ContinuationEvidence(**base)
@@ -273,12 +278,86 @@ def test_unknown_exposure_refuses():
     assert result.reason_code == CONTINUATION_EXPOSURE_UNKNOWN
 
 
+def test_the_options_lane_is_its_own_axis_and_unknown_is_a_refusal():
+    """The equity projection never sees an option structure.
+
+    An evidence object that does not say what the options lane holds is UNKNOWN,
+    and unknown is a refusal - the one thing that must never happen is a
+    structure read as "no structure" because nobody looked.
+    """
+    result = assess_continuation(_ev(option_work_state="unknown"))
+    assert result.allowed is False
+    assert result.reason_code == CONTINUATION_OPTION_WORK_UNKNOWN
+    assert result.proof["option_work_state"] == "unknown"
+
+
+def test_option_work_in_flight_blocks_the_continuation():
+    """Entering/exiting/partial/cleanup are work, not a held structure."""
+    result = assess_continuation(_ev(option_work_state="outstanding", exposure_state="flat"))
+    assert result.allowed is False
+    assert result.reason_code == CONTINUATION_OPTION_WORK_OUTSTANDING
+    assert result.proof["option_work_state"] == "outstanding"
+
+
+def test_a_cleanly_held_option_structure_continues_as_held():
+    """It may continue, and it is NEVER flat: the run is still owned."""
+    result = assess_continuation(
+        _ev(option_work_state="held", exposure_state="flat", option_runs=["opt_run_1=held"])
+    )
+    assert result.allowed is True
+    assert result.case == CASE_CONTINUATION_ELIGIBLE
+    assert result.held is True
+    assert result.proof["held"] is True
+    assert result.proof["exposure_state"] == "flat"
+    assert result.proof["option_work_state"] == "held"
+    assert result.proof["option_runs"] == ["opt_run_1=held"]
+    assert result.case not in ("trading_settled_flat", "settled", "unsettled")
+
+
+def test_no_option_structure_is_not_held():
+    result = assess_continuation(_ev(option_work_state="none", exposure_state="flat"))
+    assert result.allowed is True
+    assert result.held is False
+
+
+def test_the_option_run_classification_fails_closed():
+    """Only ``entered`` with nothing in flight holds; everything else is work."""
+    from backend.strategies.continuation import ContinuationCollector
+
+    classify = ContinuationCollector._option_run_state
+    assert classify({"status": "entered"}) == "held"
+    assert classify({"status": "exited"}) == "finished"
+    assert classify({"status": "settled"}) == "finished"
+    for status in (
+        "created",
+        "entry_previewed",
+        "entering",
+        "partial_entry",
+        "cleanup_required",
+        "exit_previewed",
+        "exiting",
+        "partial_exit",
+        "teleported",
+    ):
+        assert classify({"status": status}) == "outstanding", status
+    # An unresolved protective exit stage is in-flight work whatever the status.
+    assert (
+        classify({"status": "entered", "protective_exit_unresolved": True})
+        == "outstanding"
+    )
+    # A partially filled leg is in-flight work too.
+    assert classify({"status": "entered", "pending_legs": [{"leg_id": "l1"}]}) == "outstanding"
+    assert classify({"status": "entered", "failed_legs": [{"leg_id": "l1"}]}) == "outstanding"
+
+
 def test_the_digest_moves_with_the_axes():
     base = continuation_digest(_ev())
     assert continuation_digest(_ev()) == base
     assert continuation_digest(_ev(barrier_version=8)) != base
     assert continuation_digest(_ev(projection_version=5)) != base
     assert continuation_digest(_ev(exposure_state="flat")) != base
+    assert continuation_digest(_ev(option_work_state="held")) != base
+    assert continuation_digest(_ev(option_runs=["opt_run_1=held"])) != base
 
 
 class _FakeBarrier:

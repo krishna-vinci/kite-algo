@@ -154,6 +154,10 @@ class OwnedOptionRunRow(BaseModel):
     underlying: str = ""
     expiry: str = ""
     structure_id: str = ""
+    #: The FROZEN structure identity of the plan that opened this run. A strategy
+    #: compares it (or, absent it, the leg identities) to tell "the structure I
+    #: already hold" from "a different structure".
+    structure_digest: str = ""
     expiry_policy: str = ""
     product: str = ""
     status: str = "unknown"
@@ -161,6 +165,9 @@ class OwnedOptionRunRow(BaseModel):
     completed_legs: List[str] = Field(default_factory=list)
     pending_legs: List[str] = Field(default_factory=list)
     failed_legs: List[str] = Field(default_factory=list)
+    #: Whether the run still owns a protective exit stage the platform committed
+    #: and has not resolved. It is in-flight work, not a settled outcome.
+    protective_exit_unresolved: bool = False
     coverage: str = "known"
 
 

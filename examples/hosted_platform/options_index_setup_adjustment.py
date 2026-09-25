@@ -21,6 +21,17 @@ The decision chain, in order:
    short liabilities first. A repeat observation sees outstanding work and sends
    nothing. A fresh structure re-entry is only defensible after a proven close.
 
+   Two evaluation-boundary parameters exist for the whole-platform acceptance
+   harness, and neither changes what the strategy is allowed to do:
+
+   * ``hold_after_entry`` stops this evaluation once its own entry has executed,
+     leaving the structure HELD for a LATER supervised evaluation to close. That
+     is the restart shape: a finite child is disposeable, its structure is not.
+   * ``duplicate_entry_probe`` asks the platform, once, whether a second entry
+     for the SAME held structure would be admitted. The strategy reports the
+     answer it receives; it does not act on it, and the close that follows is the
+     only order this evaluation submits.
+
 Stale or missing Greeks/quotes, an unpublished book, an unreadable option-run
 snapshot and a partially filled leg are named no-action states: the strategy says
 why it did nothing instead of guessing.
@@ -195,6 +206,14 @@ def main(ctx) -> int:  # noqa: ANN001 - the hosted contract is main(ctx)
     # are read from that index's catalog coordinate (space-free).
     underlying = str(params.get("underlying") or "NIFTY").strip().upper()
     index_exchange = str(params.get("index_exchange") or "NSE").strip().upper()
+    # Evaluation-boundary switches for the acceptance harness. They are NOT
+    # permissions: neither one lets this strategy submit an order it could not
+    # submit anyway. ``hold_after_entry`` ends the evaluation with the structure
+    # held; ``duplicate_entry_probe`` only ASKS the platform whether a second
+    # entry for the held structure would be admitted.
+    hold_after_entry = bool(params.get("hold_after_entry"))
+    duplicate_entry_probe = bool(params.get("duplicate_entry_probe"))
+    probe_done = False
     index_ticker = str(
         params.get("index_ticker")
         or (underlying if ":" in underlying else f"{index_exchange}:{underlying}50")
@@ -279,6 +298,17 @@ def main(ctx) -> int:  # noqa: ANN001 - the hosted contract is main(ctx)
                 # refused plan) and already named why: finishing is honest, and no
                 # close is attempted for a structure that was never confirmed.
                 return 0
+            if hold_after_entry:
+                # The restart shape: this evaluation ENTERS and finishes with the
+                # structure held. Nothing is closed here; a LATER supervised
+                # evaluation reads the same durable run and closes it.
+                _say(
+                    ctx,
+                    "entry executed and is held; this evaluation finishes without "
+                    "closing (hold_after_entry=true) and the structure is carried "
+                    "forward as held",
+                )
+                return 0
             continue
 
         if runs and not close_submitted:
@@ -298,6 +328,14 @@ def main(ctx) -> int:  # noqa: ANN001 - the hosted contract is main(ctx)
                     "status is not a closed structure",
                 )
                 return 2
+            if duplicate_entry_probe and not probe_done:
+                # Ask the platform whether a SECOND entry for the structure this
+                # strategy already holds would be admitted. The answer is a
+                # REFUSAL the platform owns (the admission guard), never something
+                # this strategy decides for itself; the probe places no order.
+                probe_done = True
+                _say(ctx, _duplicate_entry_probe(ctx, underlying, run, product, expiry_policy, deadline_seconds))
+                continue
             if _submit_close(ctx, underlying, run, product, deadline_seconds):
                 close_submitted = True
             else:
@@ -461,30 +499,26 @@ def _frozen_entry_legs(
     return long_leg, short_leg
 
 
-def _submit_entry(
+def _entry_proposal(
     ctx,  # noqa: ANN001
     underlying: str,
     long_leg: Dict[str, Any],
     short_leg: Dict[str, Any],
     product: str,
     expiry_policy: str,
-    deadline_seconds: float,
-) -> bool:
-    """Submit the governed entry and wait for its authoritative outcome.
-
-    ``True`` only when the request reached ``executed``; a missing binding, a
-    refusal, an unresolved dispatch or the deadline all return ``False`` after
-    naming the reason.
-    """
+    *,
+    suffix: str = "",
+) -> Optional[Dict[str, Any]]:
+    """The governed ``option_structure`` entry proposal for these frozen legs."""
     chain = ctx.client.options.get_chain(underlying)
     identity = ctx.run.attribution()
     strategy_id = str(identity.get("strategy_id") or "")
     account_scope = str(identity.get("account_id") or ctx.run.config.account_scope)
     if not identity.get("attributed") or not strategy_id:
         _say(ctx, "no action: this run has no persisted strategy binding")
-        return False
-    evaluation_id = f"opt-entry-{ctx.run_id}-{long_leg['tradingsymbol']}"
-    proposal = {
+        return None
+    evaluation_id = f"opt-entry{suffix}-{ctx.run_id}-{long_leg['tradingsymbol']}"
+    return {
         "evaluation_id": evaluation_id,
         "evaluation_kind": "run_now",
         "strategy_id": strategy_id,
@@ -518,6 +552,29 @@ def _submit_entry(
             ],
         },
     }
+
+
+def _submit_entry(
+    ctx,  # noqa: ANN001
+    underlying: str,
+    long_leg: Dict[str, Any],
+    short_leg: Dict[str, Any],
+    product: str,
+    expiry_policy: str,
+    deadline_seconds: float,
+) -> bool:
+    """Submit the governed entry and wait for its authoritative outcome.
+
+    ``True`` only when the request reached ``executed``; a missing binding, a
+    refusal, an unresolved dispatch or the deadline all return ``False`` after
+    naming the reason.
+    """
+    proposal = _entry_proposal(
+        ctx, underlying, long_leg, short_leg, product, expiry_policy
+    )
+    if proposal is None:
+        return False
+    evaluation_id = str(proposal["evaluation_id"])
     submitted = ctx.run.submit_and_request_execution(
         proposal, idempotency_key=f"opt-entry-{evaluation_id}"
     )
@@ -697,6 +754,34 @@ def _submit_close(
     return True
 
 
+def _request_row_until_terminal(  # noqa: ANN001
+    ctx, request_id: str, deadline_seconds: float
+) -> Dict[str, Any]:
+    """The request's own TERMINAL row, or the last row seen at the deadline.
+
+    ``queued`` and ``dispatching`` are in flight, not outcomes: the platform's
+    own terminal vocabulary (``executed``/``refused``/``rejected``/
+    ``dispatch_unresolved``) is the only thing this waits for.
+    """
+    if not request_id:
+        return {}
+    started = time.monotonic()
+    row: Dict[str, Any] = {}
+    while time.monotonic() - started < deadline_seconds:
+        row = dict(ctx.run.execution_request(request_id) or {})
+        status = str(row.get("status") or "")
+        if status in _TERMINAL_REQUEST_STATES:
+            _say(ctx, f"request {request_id} is now {status}")
+            return row
+        _say(
+            ctx,
+            f"waiting for request {request_id}: status={status or 'unknown'} "
+            f"mode={row.get('authorization_mode') or 'unknown'}",
+        )
+        time.sleep(2.0)
+    return row
+
+
 def _wait_for_request(ctx, request_id: str, deadline_seconds: float) -> bool:  # noqa: ANN001
     """Wait for an AUTHORITATIVE request state; ``queued``/``dispatching`` are not it.
 
@@ -704,19 +789,69 @@ def _wait_for_request(ctx, request_id: str, deadline_seconds: float) -> bool:  #
     dispatch or the deadline is ``False`` — the caller must not read any of those
     as a completed close.
     """
-    if not request_id:
-        return False
-    started = time.monotonic()
-    while time.monotonic() - started < deadline_seconds:
-        row = ctx.run.execution_request(request_id)
-        status = str(row.get("status") or "")
-        if status in _TERMINAL_REQUEST_STATES:
-            _say(ctx, f"request {request_id} is now {status}")
-            return status == "executed"
-        _say(
-            ctx,
-            f"waiting for request {request_id}: status={status or 'unknown'} "
-            f"mode={row.get('authorization_mode') or 'unknown'}",
+    row = _request_row_until_terminal(ctx, request_id, deadline_seconds)
+    return str(row.get("status") or "") == "executed"
+
+
+def _duplicate_entry_probe(  # noqa: ANN001
+    ctx,
+    underlying: str,
+    run: Dict[str, Any],
+    product: str,
+    expiry_policy: str,
+    deadline_seconds: float,
+) -> str:
+    """Ask the platform whether a second entry for the HELD structure is admitted.
+
+    The probe answers one question the strategy must not answer for itself: if
+    this evaluation re-issued its entry signal for a structure the strategy
+    already holds, would the platform refuse it? It is built from the SAME frozen
+    selection the entry used, and it is SKIPPED - never submitted - when the
+    freshly frozen legs are not the structure the held run carries, because a
+    probe that could open something new is not a probe.
+
+    The platform's own refusal code is what this reports; no order is placed by
+    the probe, and the caller goes on to submit the ONE close it owes.
+    """
+    held = sorted(
+        (
+            str(leg.get("tradingsymbol") or "").upper(),
+            str(leg.get("transaction_type") or "").upper(),
         )
-        time.sleep(2.0)
-    return False
+        for leg in list(run.get("legs") or [])
+        if isinstance(leg, dict)
+    )
+    if not held:
+        return "duplicate entry probe skipped: the held run carries no frozen legs"
+    resolved = _frozen_entry_legs(ctx, underlying, expiry_policy, product)
+    if resolved is None:
+        return "duplicate entry probe skipped: the entry legs could not be frozen"
+    long_leg, short_leg = resolved
+    probe_keys = sorted(
+        [
+            (str(long_leg["tradingsymbol"]).upper(), "BUY"),
+            (str(short_leg["tradingsymbol"]).upper(), "SELL"),
+        ]
+    )
+    if probe_keys != held:
+        return (
+            "duplicate entry probe skipped: the frozen entry "
+            f"{probe_keys} is not the structure this strategy holds {held}"
+        )
+    proposal = _entry_proposal(
+        ctx, underlying, long_leg, short_leg, product, expiry_policy, suffix="-probe"
+    )
+    if proposal is None:
+        return "duplicate entry probe skipped: this run has no persisted strategy binding"
+    submitted = ctx.run.submit_and_request_execution(
+        proposal, idempotency_key=f"opt-entry-probe-{proposal['evaluation_id']}"
+    )
+    request = dict(submitted.get("execution_request") or {})
+    request_id = str(request.get("request_id") or "")
+    row = _request_row_until_terminal(ctx, request_id, deadline_seconds)
+    status = str(row.get("status") or "unknown")
+    refusal = str(row.get("refusal_code") or "")
+    return (
+        f"duplicate entry probe answered {status} "
+        f"refusal_code={refusal or 'none'} request={request_id}"
+    )

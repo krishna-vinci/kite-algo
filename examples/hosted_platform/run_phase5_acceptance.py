@@ -842,6 +842,36 @@ SCENARIOS: Dict[str, Dict[str, Any]] = {
             "deadline_seconds": 240,
         },
     },
+    "options_restart_hold_close": {
+        # Phase B1: the SAME persistent strategy across a restart between the
+        # entry and its close. Job 1 freezes and ENTERS the structure, then
+        # finishes with it HELD. Job 2 is a fresh supervised child: it discovers
+        # that same durable option run from owned_work()["option_runs"], is
+        # REFUSED a second entry for it, submits no duplicate, and closes it.
+        "source": "options_index_setup_adjustment.py",
+        "schema": "options_index_setup.schema.json",
+        "options_recurring": True,
+        "autonomous": False,
+        "expects_manual": True,
+        "final_marker": "structure closed with no outstanding work",
+        "recurring_jobs": [
+            {"phase": "entry", "params": {"hold_after_entry": True}},
+            {"phase": "close", "params": {"duplicate_entry_probe": True}},
+        ],
+        "params": {
+            "underlying": "NIFTY",
+            "index_ticker": "NSE:NIFTY50",
+            "interval": "5minute",
+            "lookback": 40,
+            "rsi_period": 5,
+            "bullish_rsi_level": 40,
+            "long_offset_points": 0,
+            "short_offset_points": 100,
+            "product": "NRML",
+            "expiry_policy": "exit_before_cutoff",
+            "deadline_seconds": 240,
+        },
+    },
     "universe_equal_weight": {
         "source": "index_universe_equal_weight.py",
         "schema": "index_universe_equal_weight.schema.json",
@@ -2218,6 +2248,307 @@ def run_momentum_recurring_scenario(
     return scenario
 
 
+def run_options_recurring_scenario(
+    label: str,
+    spec: Dict[str, Any],
+    *,
+    app: Any,  # noqa: ANN001
+    session_factory,
+    operator,
+    base_url: str,
+    port: int,
+    timeout: float,
+) -> Dict[str, Any]:
+    """One persistent options strategy across an evaluation RESTART (Phase B1).
+
+    Two supervised children on the SAME durable strategy and version:
+
+    * job 1 freezes and ENTERS the structure, then finishes with it HELD (its own
+      child process is disposable; the structure is not);
+    * job 2 (a fresh process, after the runner restarted) discovers that same
+      durable option run from ``owned_work()["option_runs"]``, asks the platform
+      whether a SECOND entry for the held structure would be admitted, submits no
+      duplicate - and closes the one structure it owns.
+
+    The evidence is the platform's own: ONE option run, ONE entry edge, one close,
+    and the duplicate probe refused BY NAME. Nothing here is asserted from a
+    child's self-report.
+    """
+    source = (EXAMPLES / spec["source"]).read_text()
+    schema = json.loads((EXAMPLES / spec["schema"]).read_text())
+    account = account_for(label)
+
+    created = operator.post(
+        "/api/strategies",
+        json={
+            "name": f"options recurring {label}",
+            "description": "restart between the entry and its close",
+            "execution_mode": "paper",
+            "job_kind": "finite",
+            "account_scope": account,
+            "max_duration_s": 1800,
+            "progress_deadline_s": 900,
+            "stale_exit_policy": "none",
+        },
+    )
+    strategy_id = str(created["strategy_id"])
+    version = operator.post(
+        f"/api/strategies/{strategy_id}/versions",
+        json={
+            "source": source,
+            "parameters_schema": schema,
+            "capabilities": {"trade": True, "data": True},
+        },
+    )
+    version_id = str(version["version_id"])
+    operator.put(
+        f"/api/strategies/{strategy_id}/admission-policy",
+        json={"allocation_inr": float(spec.get("allocation_inr") or 500000.0)},
+    )
+
+    failures: List[str] = []
+    jobs_evidence: List[Dict[str, Any]] = []
+    phases: List[Dict[str, Any]] = []
+    job_specs = list(spec.get("recurring_jobs") or [])
+    requests_so_far = 0
+
+    for job_index, job_spec in enumerate(job_specs):
+        phase = str(job_spec.get("phase") or f"job{job_index}")
+        params = dict(spec["params"])
+        params.update(dict(job_spec.get("params") or {}))
+
+        # The production rebuild is what makes the previous evaluation's fills
+        # visible to this one, and what makes the attributed book authoritative.
+        _publish_positions(operator, strategy_id)
+        requests_before = len(_requests_for(session_factory, strategy_id))
+        orders_before = len(_paper_orders(session_factory, account))
+
+        job = operator.post(
+            f"/api/strategies/{strategy_id}/jobs",
+            json={
+                "version_id": version_id,
+                "job_kind": "finite",
+                "execution_mode": "paper",
+                "params": dict(params),
+                "idempotency_key": f"options-recurring-job-{uuid.uuid4().hex[:8]}",
+            },
+        )
+        body = job.get("job") if isinstance(job.get("job"), dict) else job
+        job_id = str(body.get("job_id") or body.get("id") or "")
+        if not job_id:
+            fail(f"{label}_{phase}_job", AssertionError("the operator API returned no job id"))
+            break
+        step(f"{label}_{phase}_job_created", job_index=job_index, job_id=job_id)
+
+        supervisor_result: Dict[str, Any] = {}
+
+        def _supervise() -> None:
+            try:
+                supervisor_result.update(
+                    acc.run_supervisor(
+                        base_url, port, WORKSPACE / f"{label}-{phase}", job_id
+                    )
+                )
+            except BaseException as exc:  # noqa: BLE001 - reported in the evidence
+                fail(f"{label}_{phase}_supervisor", exc)
+                supervisor_result["error"] = repr(exc)
+
+        thread = threading.Thread(target=_supervise, daemon=True)
+        thread.start()
+
+        deadline = time.monotonic() + timeout
+        child_exited = False
+        approvals_while_child_alive = 0
+        orders_before_approval: Optional[int] = None
+        requests_at_child_exit: List[Dict[str, Any]] = []
+        while time.monotonic() < deadline:
+            for row in _requests_for(session_factory, strategy_id):
+                status = str(row["status"])
+                if status == "awaiting_approval":
+                    if orders_before_approval is None:
+                        orders_before_approval = len(_paper_orders(session_factory, account))
+                    # The owner's decision goes through the REAL HTTP route while
+                    # the attempt that waits for it is still alive.
+                    try:
+                        operator.post(
+                            f"/api/strategies/{strategy_id}/execution-requests/"
+                            f"{row['request_id']}/approve",
+                            json={"reason": "phase5 options recurring approval"},
+                        )
+                        approvals_while_child_alive += 1
+                    except Exception as exc:  # noqa: BLE001 - reported, not hidden
+                        fail(f"{label}_{phase}_approve", exc)
+                elif status == "queued":
+                    _dispatch_once(app)
+                    _publish_positions(operator, strategy_id)
+            if supervisor_result:
+                child_exited = True
+                requests_at_child_exit = _requests_for(session_factory, strategy_id)
+                break
+            time.sleep(0.5)
+
+        attempt = _job_attempt(session_factory, job_id)
+        if not child_exited:
+            try:
+                operator.post(
+                    f"/api/strategies/{strategy_id}/jobs/{job_id}/stop",
+                    json={"attempt": attempt},
+                )
+            except Exception as exc:  # noqa: BLE001
+                fail(f"{label}_{phase}_stop", exc)
+            failures.append(f"{phase}: the supervised child never exited within {timeout}s")
+        thread.join(timeout=30)
+        # The continuation path must clear the finished attempt by itself: an
+        # operator reconciliation being REQUIRED would mean the held structure
+        # (or its restart) needed a human.
+        try:
+            operator.post(
+                f"/api/strategies/{strategy_id}/jobs/{job_id}/reconciliation",
+                json={"attempt": attempt},
+            )
+            failures.append(
+                f"{phase}: an operator reconciliation was required, so the healthy "
+                "completion did not clear its own block"
+            )
+        except Exception as exc:  # noqa: BLE001 - expected: HOSTED_JOB_NOT_BLOCKED
+            if "HOSTED_JOB_NOT_BLOCKED" not in str(exc):
+                failures.append(f"{phase}: unexpected reconciliation answer {str(exc)[:200]}")
+        try:
+            acc.wait_for_terminal_job(session_factory, job_id, deadline_s=60.0)
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f"{phase}: the job never reached a terminal state ({exc})")
+
+        outcome = str(supervisor_result.get("outcome") or "")
+        exit_code = supervisor_result.get("exit_code")
+        if outcome != "exited" or int(exit_code if exit_code is not None else -1) != 0:
+            failures.append(
+                f"{phase}: the child did not exit 0 on its own "
+                f"(outcome={outcome!r}, exit={exit_code!r})"
+            )
+        pending = [
+            str(row["status"])
+            for row in requests_at_child_exit[requests_before:]
+            if str(row["status"]) not in {"executed", "refused", "rejected"}
+        ]
+        if child_exited and pending:
+            failures.append(f"{phase}: the child exited with non-terminal requests {pending!r}")
+        if not approvals_while_child_alive:
+            failures.append(
+                f"{phase}: no owner approval reached the platform while the "
+                "attempt that waited for it was alive"
+            )
+        if orders_before_approval != orders_before:
+            failures.append(
+                f"{phase}: orders existed before the owner's decision "
+                f"({(orders_before_approval or 0) - orders_before} new since this "
+                "evaluation started)"
+            )
+
+        evidence = _collect_scenario_evidence(session_factory, strategy_id, account_id=account)
+        log_path = WORKSPACE / f"{label}-{phase}" / "logs" / f"{job_id}.log"
+        evidence["child_log"] = log_path.read_text()[-4000:] if log_path.exists() else ""
+        job_requests = _requests_for(session_factory, strategy_id)[requests_before:]
+        jobs_evidence.append(evidence)
+        phases.append(
+            {
+                "phase": phase,
+                "job_id": job_id,
+                "job_index": job_index,
+                "child_exited": child_exited,
+                "params": dict(params),
+                "requests": job_requests,
+                "orders": _paper_orders(session_factory, account)[orders_before:],
+                "option_runs": list(evidence.get("option_runs") or []),
+                "child_log_tail": str(evidence.get("child_log") or "")[-1200:],
+                "supervisor": dict(supervisor_result),
+            }
+        )
+        requests_so_far = len(_requests_for(session_factory, strategy_id))
+
+    # -- the whole-platform facts this scenario exists to prove ---------------
+    final_evidence = _collect_scenario_evidence(session_factory, strategy_id, account_id=account)
+    option_runs = list(final_evidence.get("option_runs") or [])
+    entry_edges = [row for row in option_runs if str(row.get("phase")) == "entry"]
+    exit_edges = [row for row in option_runs if str(row.get("phase")) == "exit"]
+    # One row per EDGE: the same run is reported once for its entry plan and once
+    # for its close plan, so the RUN count is the distinct id count.
+    distinct_runs = {str(row.get("option_run_id") or "") for row in option_runs}
+    if len(distinct_runs) != 1:
+        failures.append(
+            f"a restart across one structure produced {len(distinct_runs)} option runs "
+            f"(statuses={[str(row.get('run_status')) for row in option_runs]})"
+        )
+    if len(entry_edges) != 1:
+        failures.append(
+            f"{len(entry_edges)} entry edges exist; an equivalent structure must never "
+            "be opened twice"
+        )
+    if len(exit_edges) != 1:
+        failures.append(f"{len(exit_edges)} close plans were submitted; exactly one was owed")
+    closed = {str(row.get("run_status") or "").lower() for row in option_runs}
+    if not closed or not closed.issubset({"exited", "settled", "closed"}):
+        failures.append(f"the structure this strategy owns is not closed (statuses={sorted(closed)})")
+    if option_runs:
+        from sqlalchemy import text as _text
+
+        with session_factory() as session:
+            run = (
+                session.execute(
+                    _text(
+                        "SELECT status, legs, completed_legs FROM option_run_states "
+                        "WHERE strategy_run_id = :r"
+                    ),
+                    {"r": str(option_runs[0]["option_run_id"])},
+                )
+                .mappings()
+                .first()
+            )
+        phases.append({"phase": "_final_run", "run": dict(run) if run else {}})
+
+    probe = [
+        dict(row)
+        for row in _requests_for(session_factory, strategy_id)
+        if str(row.get("refusal_code") or "") == "OPTION_STRUCTURE_ALREADY_OPEN"
+    ]
+    if len(probe) != 1:
+        failures.append(
+            "the platform did not refuse exactly one duplicate-entry probe "
+            f"(refusals={probe!r})"
+        )
+    probes_expected = sum(
+        1
+        for job_spec in job_specs
+        if bool(dict(job_spec.get("params") or {}).get("duplicate_entry_probe"))
+    )
+    if probes_expected != len(probe):
+        failures.append(
+            f"{probes_expected} duplicate-entry probe(s) were requested but the "
+            f"platform refused {len(probe)}"
+        )
+
+    for failure in failures:
+        fail(f"{label}_acceptance", AssertionError(failure))
+
+    scenario = {
+        "strategy_id": strategy_id,
+        "autonomous": False,
+        "phases": phases,
+        "requests_total": requests_so_far,
+        "option_runs": option_runs,
+        "duplicate_entry_refusals": probe,
+        "jobs": jobs_evidence,
+        "acceptance": {"ok": not failures, "failures": failures},
+    }
+    RESULT["scenarios"][label] = scenario
+    step(
+        f"{label}_finished",
+        evaluations=len(phases),
+        option_runs=len(distinct_runs),
+        duplicate_entry_refusals=len(probe),
+    )
+    return scenario
+
+
 def _paper_available_funds(session_factory, account_id: str) -> Optional[float]:
     """The paper account's OWN free cash, straight from its durable row.
 
@@ -2285,6 +2616,7 @@ def _requests_for(session_factory, strategy_id: str) -> List[Dict[str, Any]]:
             for row in session.execute(
                 text(
                     "SELECT request_id, plan_id, status, authorization_mode, decision_kind"
+                    ", refusal_code"
                     "  FROM hosted_execution_requests WHERE strategy_id = :sid ORDER BY created_at"
                 ),
                 {"sid": strategy_id},
@@ -2956,7 +3288,18 @@ def main(argv: Optional[List[str]] = None) -> int:
                 step(f"{label}_not_scored", reason=str(spec["not_scored"]))
                 continue
             try:
-                if spec.get("recurring"):
+                if spec.get("options_recurring"):
+                    run_options_recurring_scenario(
+                        label,
+                        spec,
+                        app=app,
+                        session_factory=session_factory,
+                        operator=operator,
+                        base_url=base_url,
+                        port=port,
+                        timeout=args.timeout,
+                    )
+                elif spec.get("recurring"):
                     run_momentum_recurring_scenario(
                         label,
                         spec,

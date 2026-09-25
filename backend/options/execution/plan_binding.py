@@ -55,6 +55,17 @@ _BINDING_COLUMNS = (
     "phase",
 )
 
+#: A run in one of these states is FINISHED: it no longer holds (and can no
+#: longer move) the structure, so it is not a duplicate of a new entry.
+_TERMINAL_RUN_STATUSES = frozenset({"exited", "settled"})
+
+#: The durable vocabulary of ``backend.options.execution.models.OptionRunStatus``.
+#: A status outside it is UNKNOWN, which is never treated as "finished".
+_KNOWN_RUN_STATUSES = frozenset(
+    {"created", "entry_previewed", "entering", "entered", "partial_entry",
+     "cleanup_required", "exit_previewed", "exiting", "partial_exit"}
+) | _TERMINAL_RUN_STATUSES
+
 
 class PlanOptionRunBindingStore:
     """Insert-only binding store. A plan binds once; a retry returns the row."""
@@ -244,6 +255,176 @@ def _frozen_phase(plan: Mapping[str, Any], *, default: str) -> str:
             {"plan_id": str(plan.get("plan_id") or ""), "phase": phase},
         )
     return default
+
+
+def _frozen_structure_digest(plan: Mapping[str, Any]) -> str:
+    resolved = plan.get("resolved_plan") or {}
+    return str(resolved.get("structure_digest") or "")
+
+
+def _plan_leg_keys(legs: Any) -> list[tuple[str, str]]:
+    """The frozen legs of a plan as ``(identity, side)`` pairs.
+
+    Position is deliberately NOT part of the identity: a structure is a set of
+    legs, and a re-frozen plan that lists the same legs in another order is the
+    same structure.
+    """
+    keys: list[tuple[str, str]] = []
+    for leg in list(legs or []):
+        if not isinstance(leg, Mapping):
+            continue
+        identity = _leg_identity(leg)
+        if not identity:
+            continue
+        keys.append((identity, str(leg.get("side") or "").strip().upper()))
+    return sorted(keys)
+
+
+def _run_leg_keys(legs: Any) -> list[tuple[str, str]]:
+    """The durable run's legs as the same ``(identity, side)`` pairs."""
+    keys: list[tuple[str, str]] = []
+    for leg in list(legs or []):
+        if not isinstance(leg, Mapping):
+            continue
+        identity = _run_leg_identity(leg)
+        if not identity:
+            continue
+        keys.append((identity, str(leg.get("transaction_type") or "").strip().upper()))
+    return sorted(keys)
+
+
+def _same_structure(
+    plan: Mapping[str, Any], run_row: Mapping[str, Any]
+) -> Optional[bool]:
+    """Whether a discovered option run IS the structure this plan would open.
+
+    ``True``/``False``/``None`` - and ``None`` (unknown) is a refusal at the
+    caller, never "different". The frozen ``structure_digest`` decides it when
+    both sides carry one; otherwise the leg identity set decides it, and a side
+    whose legs cannot be read leaves the question open.
+    """
+    plan_digest = _frozen_structure_digest(plan)
+    run_digest = str(run_row.get("structure_digest") or "")
+    if plan_digest and run_digest:
+        return plan_digest == run_digest
+    plan_keys = _plan_leg_keys(_entry_legs(plan))
+    run_keys = _run_leg_keys(run_row.get("legs"))
+    if not plan_keys or not run_keys:
+        return None
+    return plan_keys == run_keys
+
+
+def _assert_no_equivalent_open_structure(
+    *,
+    plan: Mapping[str, Any],
+    plan_id: str,
+    strategy_id: str,
+    account_id: str,
+    execution_environment: str,
+    session: Any,
+) -> None:
+    """Refuse a duplicate equivalent option structure BEFORE a run is created.
+
+    A retry of the SAME plan is idempotent through its binding (the caller checks
+    that first). What this refuses is a DIFFERENT plan that would open the same
+    structure while this strategy already owns it, in the same account and
+    environment: a restarted strategy, a re-issued signal, or a second plan for
+    one structure. Only a structure that is provably finished (``exited`` /
+    ``settled``) stops blocking.
+
+    The discovery is the platform's OWN scope-derived option-run read, and it
+    fails closed: unknown or truncated discovery, a run whose identity cannot be
+    compared, or a run whose status is outside the durable vocabulary all refuse
+    rather than behave as "no runs".
+    """
+    from backend.strategies.execution_snapshot import OwnedWorkSnapshotService
+
+    try:
+        runs, coverage = OwnedWorkSnapshotService(
+            session_factory=lambda: session
+        ).option_runs_for_scope(
+            account_id=str(account_id),
+            strategy_id=str(strategy_id),
+            environment=str(execution_environment),
+            session=session,
+        )
+    except Exception as exc:  # noqa: BLE001 - an unreadable read is never "no runs"
+        raise PlanBindingRefusal(
+            "OPTION_STRUCTURE_DISCOVERY_UNKNOWN",
+            {
+                "plan_id": str(plan_id),
+                "strategy_id": str(strategy_id),
+                "account_id": str(account_id),
+                "execution_environment": str(execution_environment),
+                "reason": "option_run_discovery_failed",
+                "error": type(exc).__name__,
+            },
+        ) from exc
+
+    if str(coverage.get("coverage") or "unknown") != "known":
+        raise PlanBindingRefusal(
+            "OPTION_STRUCTURE_DISCOVERY_UNKNOWN",
+            {
+                "plan_id": str(plan_id),
+                "strategy_id": str(strategy_id),
+                "account_id": str(account_id),
+                "execution_environment": str(execution_environment),
+                "reason": str(coverage.get("reason") or "option_run_discovery_unknown"),
+                "truncated": bool(coverage.get("truncated")),
+                "count": int(coverage.get("count") or 0),
+            },
+        )
+
+    for row in list(runs or []):
+        run_status = str(row.get("status") or "").strip().lower()
+        option_run_id = str(row.get("option_run_id") or "")
+        if run_status in _TERMINAL_RUN_STATUSES:
+            # Finished structures do not block a new entry.
+            continue
+        same = _same_structure(plan, row)
+        if same is True:
+            raise PlanBindingRefusal(
+                "OPTION_STRUCTURE_ALREADY_OPEN",
+                {
+                    "plan_id": str(plan_id),
+                    "option_run_id": option_run_id,
+                    "option_run_status": run_status or "unknown",
+                    "originating_plan_id": row.get("originating_plan_id"),
+                    "structure_digest": _frozen_structure_digest(plan) or None,
+                    "message": (
+                        "this strategy already owns this structure in this account and "
+                        "environment; an equivalent structure is never opened twice"
+                    ),
+                },
+            )
+        if same is None:
+            raise PlanBindingRefusal(
+                "OPTION_RUN_IDENTITY_UNKNOWN",
+                {
+                    "plan_id": str(plan_id),
+                    "option_run_id": option_run_id,
+                    "option_run_status": run_status or "unknown",
+                    "message": (
+                        "a held option run of this strategy cannot be compared against "
+                        "the frozen structure; refusing to open a second one"
+                    ),
+                },
+            )
+        if run_status not in _KNOWN_RUN_STATUSES:
+            # A different structure in an unrecognised state is not evidence
+            # about THIS plan, but the read is not trustworthy either.
+            raise PlanBindingRefusal(
+                "OPTION_RUN_STATUS_UNKNOWN",
+                {
+                    "plan_id": str(plan_id),
+                    "option_run_id": option_run_id,
+                    "option_run_status": run_status or "unknown",
+                    "message": (
+                        "an option run of this strategy carries a status outside the "
+                        "durable vocabulary; the discovery is not complete"
+                    ),
+                },
+            )
 
 
 def _entry_legs(plan: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -535,6 +716,19 @@ def _create_entry_run_atomically(
     session = binding_store.session_factory()
     try:
         if _dialect_name(session) == "postgresql":
+            # Serialize this STRATEGY's entry admission before this PLAN's: two
+            # concurrent plans that would open the same structure must not both
+            # read "no equivalent run" and then both create one. The order is
+            # fixed (scope, then plan) so the two locks can never deadlock.
+            session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+                {
+                    "key": (
+                        f"option-scope:{strategy_id}:{account_id}:"
+                        f"{execution_environment}"
+                    )
+                },
+            )
             # Serialize the SAME plan's resolution across instances/restarts.
             session.execute(
                 text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
@@ -544,6 +738,17 @@ def _create_entry_run_atomically(
         if existing is not None:
             session.rollback()
             return _existing(existing)
+
+        # Before a NEW run exists: refuse a duplicate equivalent structure this
+        # strategy already holds. Unknown discovery refuses (never "no runs").
+        _assert_no_equivalent_open_structure(
+            plan=plan,
+            plan_id=plan_id,
+            strategy_id=strategy_id,
+            account_id=account_id,
+            execution_environment=execution_environment,
+            session=session,
+        )
 
         run = create_run_from_frozen_plan(
             plan,

@@ -66,6 +66,16 @@
       "minimum": 0,
       "default": 120,
       "description": "How long the child waits for an owner decision on an approval-based request."
+    },
+    "hold_after_entry": {
+      "type": "boolean",
+      "default": false,
+      "description": "Finish this evaluation once its own entry has executed, leaving the structure HELD for a LATER supervised evaluation to close. This is the restart shape: a finite child is disposable, its structure is not."
+    },
+    "duplicate_entry_probe": {
+      "type": "boolean",
+      "default": false,
+      "description": "Once, ask the platform whether a SECOND entry for the structure this strategy already holds would be admitted, and report the answer. The probe submits no order and is skipped when the freshly frozen legs are not the held structure."
     }
   },
   "required": ["underlying"]

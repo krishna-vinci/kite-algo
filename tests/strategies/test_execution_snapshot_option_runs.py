@@ -110,3 +110,34 @@ def test_edge_read_failure_reports_a_named_reason_without_sql_text():
     assert coverage["coverage"] == "unknown"
     assert coverage["reason"] == "option_run_read_failed"
     assert "strategy_plan_option_runs" not in coverage["reason"]
+
+
+def test_unreadable_leg_list_is_unknown_coverage_not_no_outstanding_legs():
+    class _GarbledStateSession:
+        def execute(self, statement, params=None):  # noqa: ANN001
+            if isinstance(statement, TextClause):
+                return _FakeResult(
+                    [
+                        {
+                            "strategy_run_id": "opt-1",
+                            "status": "entered",
+                            "legs": "[]",
+                            "completed_legs": "[]",
+                            "pending_legs": "not-json",
+                            "failed_legs": "[]",
+                            "orders": "[]",
+                        }
+                    ]
+                )
+            return _FakeResult([_edge("plan-1")])
+
+    rows, coverage = _service()._option_runs(
+        _GarbledStateSession(),
+        account_id=ACCOUNT,
+        strategy_id=STRATEGY,
+        environment=ENVIRONMENT,
+    )
+
+    assert rows == []
+    assert coverage["coverage"] == "unknown"
+    assert coverage["reason"] == "option_run_state_unreadable"

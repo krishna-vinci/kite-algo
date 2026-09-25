@@ -2368,6 +2368,337 @@ class ExecutorOptionRunBindingTests(ExecutorTestCase, unittest.IsolatedAsyncioTe
         return ExecutionRefusal
 
 
+class ExecutorOptionContinuityTests(ExecutorTestCase, unittest.IsolatedAsyncioTestCase):
+    """Phase B1: a held structure is never opened twice, and never closed twice.
+
+    Everything here goes through ``PaperPlanExecutor.execute`` - the same call the
+    owner's route makes - so the guard is proved on the production path rather
+    than by calling a helper.
+    """
+
+    SHORT_ID = "cccccccc-0000-0000-0000-0000000000b1"
+    HEDGE_ID = "cccccccc-0000-0000-0000-0000000000b2"
+    OTHER_HEDGE_ID = "cccccccc-0000-0000-0000-0000000000b3"
+
+    def _entry_legs(self):
+        short = self._option_leg(
+            side="SELL", symbol="NIFTY26OCT25000CE", instrument_id=self.SHORT_ID
+        )
+        hedge = self._option_leg(
+            side="BUY", symbol="NIFTY26OCT25500CE", instrument_id=self.HEDGE_ID
+        )
+        return short, hedge
+
+    @property
+    def _refusal(self):
+        from backend.strategies.execution import ExecutionRefusal
+
+        return ExecutionRefusal
+
+    def _binding_rows(self, plan_id):
+        with self.factory() as session:
+            return (
+                session.execute(
+                    text(
+                        "SELECT plan_id, option_run_id, phase FROM public.strategy_plan_option_runs "
+                        "WHERE plan_id = :p"
+                    ),
+                    {"p": plan_id},
+                )
+                .mappings()
+                .all()
+            )
+
+    def _run_row(self, option_run_id):
+        with self.factory() as session:
+            return (
+                session.execute(
+                    text(
+                        "SELECT strategy_run_id, status, orders FROM public.option_run_states "
+                        "WHERE strategy_run_id = :r"
+                    ),
+                    {"r": option_run_id},
+                )
+                .mappings()
+                .first()
+            )
+
+    def _run_count(self):
+        with self.factory() as session:
+            return int(
+                session.execute(text("SELECT COUNT(*) FROM public.option_run_states")).scalar() or 0
+            )
+
+    def _second_lane(self, plan_id, *, legs, run_id=None):
+        """A SECOND plan of the SAME strategy - a restarted/re-issued evaluation."""
+        run_id = run_id or f"run-{plan_id}"
+        self.seed_validated_plan(
+            plan_id, plan_kind="option_structure", legs=legs, run_id=run_id
+        )
+        self.seed_binding(run_id=run_id)
+        self.claim_reservation(plan_id=plan_id, requirement=15000.0)
+
+    def _exit_legs(self):
+        return [
+            self._option_leg(
+                side="SELL", symbol="NIFTY26OCT25500CE", instrument_id=self.HEDGE_ID
+            ),
+            self._option_leg(
+                side="BUY", symbol="NIFTY26OCT25000CE", instrument_id=self.SHORT_ID
+            ),
+        ]
+
+    def _seed_exit_plan(self, plan_id, *, reference):
+        legs = self._exit_legs()
+        self.seed_validated_plan(
+            plan_id, plan_kind="option_structure", legs=legs, run_id=f"run-{plan_id}"
+        )
+        self.seed_binding(run_id=f"run-{plan_id}")
+        with self.factory() as session:
+            session.execute(
+                text("UPDATE strategy_plans SET resolved_plan = :resolved WHERE plan_id = :p"),
+                {
+                    "p": plan_id,
+                    "resolved": json.dumps(
+                        {
+                            "target_kind": "option_structure",
+                            "legs": legs,
+                            "option_run": {"phase": "exit", "option_run_id": reference},
+                        }
+                    ),
+                },
+            )
+            session.commit()
+
+    async def _enter(self):
+        short, hedge = self._entry_legs()
+        self._seed_lane("plan-op", plan_kind="option_structure", legs=[short, hedge])
+        executor = self.build_executor(
+            paper_service=self.build_paper_service(starting_balance="1000000")
+        )
+        await executor.execute(_plan_view_for(self.factory, "plan-op"), actor=OWNER)
+        (binding,) = self._binding_rows("plan-op")
+        return executor, str(binding["option_run_id"])
+
+    async def test_a_second_equivalent_entry_never_opens_a_second_structure(self):
+        executor, option_run_id = await self._enter()
+        short, hedge = self._entry_legs()
+        # A DIFFERENT plan (a restarted strategy) freezing the SAME structure.
+        self._second_lane("plan-op-again", legs=[short, hedge])
+
+        with self.assertRaises(self._refusal) as ctx:
+            await executor.execute(_plan_view_for(self.factory, "plan-op-again"), actor=OWNER)
+
+        self.assertEqual(ctx.exception.reason_code, "OPTION_STRUCTURE_ALREADY_OPEN")
+        self.assertEqual(ctx.exception.detail.get("option_run_id"), option_run_id)
+        self.assertEqual(ctx.exception.detail.get("option_run_status"), "entered")
+        # Nothing was created for the refused plan, and the held run is untouched.
+        self.assertEqual(self._binding_rows("plan-op-again"), [])
+        self.assertEqual(self._run_count(), 1)
+        self.assertEqual(self._run_row(option_run_id)["status"], "entered")
+
+    async def test_a_different_structure_is_not_a_duplicate(self):
+        executor, option_run_id = await self._enter()
+        short = self._option_leg(
+            side="SELL", symbol="NIFTY26OCT25000CE", instrument_id=self.SHORT_ID
+        )
+        other_hedge = self._option_leg(
+            side="BUY", symbol="NIFTY26OCT26000CE", instrument_id=self.OTHER_HEDGE_ID
+        )
+        self._second_lane("plan-op-other", legs=[short, other_hedge])
+        self.claim_reservation(plan_id="plan-op-other", requirement=15000.0)
+
+        result = await executor.execute(_plan_view_for(self.factory, "plan-op-other"), actor=OWNER)
+
+        self.assertEqual(result["status"], "filled")
+        self.assertEqual(self._run_count(), 2)
+        self.assertNotEqual(
+            str(self._binding_rows("plan-op-other")[0]["option_run_id"]), option_run_id
+        )
+
+    async def test_a_finished_structure_does_not_block_a_new_entry(self):
+        executor, option_run_id = await self._enter()
+        # The structure is CLOSED through the executor's own close path.
+        self._seed_exit_plan("plan-exit", reference=option_run_id)
+        await executor.execute(_plan_view_for(self.factory, "plan-exit"), actor=OWNER)
+        self.assertEqual(self._run_row(option_run_id)["status"], "exited")
+
+        short, hedge = self._entry_legs()
+        self._second_lane("plan-op-next", legs=[short, hedge])
+        result = await executor.execute(_plan_view_for(self.factory, "plan-op-next"), actor=OWNER)
+
+        self.assertEqual(result["status"], "filled")
+        self.assertEqual(self._run_count(), 2)
+
+    async def test_a_partial_entry_holds_the_structure_and_blocks_a_second_one(self):
+        executor, option_run_id = await self._enter()
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "UPDATE public.option_run_states SET status = 'partial_entry', "
+                    "pending_legs = :pending WHERE strategy_run_id = :r"
+                ),
+                {"r": option_run_id, "pending": json.dumps([{"leg_id": "plan-op:2"}])},
+            )
+            session.commit()
+        short, hedge = self._entry_legs()
+        self._second_lane("plan-op-again", legs=[short, hedge])
+
+        with self.assertRaises(self._refusal) as ctx:
+            await executor.execute(_plan_view_for(self.factory, "plan-op-again"), actor=OWNER)
+
+        self.assertEqual(ctx.exception.reason_code, "OPTION_STRUCTURE_ALREADY_OPEN")
+        self.assertEqual(ctx.exception.detail.get("option_run_status"), "partial_entry")
+        self.assertEqual(self._run_count(), 1)
+
+    async def test_an_unrecognised_run_status_is_not_read_as_no_structure(self):
+        executor, option_run_id = await self._enter()
+        with self.factory() as session:
+            session.execute(
+                text("UPDATE public.option_run_states SET status = 'teleported' WHERE strategy_run_id = :r"),
+                {"r": option_run_id},
+            )
+            session.commit()
+        short = self._option_leg(
+            side="SELL", symbol="NIFTY26OCT25000CE", instrument_id=self.SHORT_ID
+        )
+        other_hedge = self._option_leg(
+            side="BUY", symbol="NIFTY26OCT26000CE", instrument_id=self.OTHER_HEDGE_ID
+        )
+        self._second_lane("plan-op-other", legs=[short, other_hedge])
+
+        with self.assertRaises(self._refusal) as ctx:
+            await executor.execute(_plan_view_for(self.factory, "plan-op-other"), actor=OWNER)
+
+        self.assertEqual(ctx.exception.reason_code, "OPTION_RUN_STATUS_UNKNOWN")
+        self.assertEqual(self._run_count(), 1)
+
+    async def test_unknown_discovery_refuses_a_new_entry(self):
+        executor, _option_run_id = await self._enter()
+        # A binding whose durable run row does not exist: the read is UNKNOWN, and
+        # unknown is not "no runs" - the hidden run may be the open one.
+        self.seed_validated_plan(
+            "plan-ghost", plan_kind="option_structure", legs=[*self._entry_legs()],
+            run_id="run-ghost",
+        )
+        self.seed_binding(run_id="run-ghost")
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT INTO public.strategy_plan_option_runs "
+                    "(plan_id, option_run_id, strategy_id, account_id, execution_environment, phase) "
+                    "VALUES ('plan-ghost', 'opt_run_ghost', :sid, :account, 'paper', 'entry')"
+                ),
+                {"sid": STRATEGY, "account": ACCOUNT},
+            )
+            session.commit()
+        short, hedge = self._entry_legs()
+        self._second_lane("plan-op-again", legs=[short, hedge])
+
+        with self.assertRaises(self._refusal) as ctx:
+            await executor.execute(_plan_view_for(self.factory, "plan-op-again"), actor=OWNER)
+
+        self.assertEqual(ctx.exception.reason_code, "OPTION_STRUCTURE_DISCOVERY_UNKNOWN")
+        self.assertEqual(self._run_count(), 1)
+
+    async def test_an_exit_before_the_entry_it_closes_is_refused(self):
+        """Run status stays part of the exit contract, not a formality."""
+        executor, option_run_id = await self._enter()
+        self._seed_exit_plan("plan-exit", reference=option_run_id)
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "UPDATE public.option_run_states SET status = 'partial_entry' "
+                    "WHERE strategy_run_id = :r"
+                ),
+                {"r": option_run_id},
+            )
+            session.commit()
+
+        with self.assertRaises(self._refusal) as ctx:
+            await executor.execute(_plan_view_for(self.factory, "plan-exit"), actor=OWNER)
+
+        self.assertEqual(ctx.exception.reason_code, "OPTION_EXIT_BEFORE_ENTRY")
+        self.assertEqual(self._run_row(option_run_id)["status"], "partial_entry")
+
+    async def test_an_exit_leg_with_a_different_product_is_refused(self):
+        """The product is part of the close contract, not a formatting detail."""
+        executor, option_run_id = await self._enter()
+        legs = self._exit_legs()
+        legs[0]["product"] = "MIS"
+        self.seed_validated_plan(
+            "plan-exit", plan_kind="option_structure", legs=legs, run_id="run-plan-exit"
+        )
+        self.seed_binding(run_id="run-plan-exit")
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "UPDATE strategy_plans SET resolved_plan = :resolved "
+                    "WHERE plan_id = 'plan-exit'"
+                ),
+                {
+                    "resolved": json.dumps(
+                        {
+                            "target_kind": "option_structure",
+                            "legs": legs,
+                            "option_run": {"phase": "exit", "option_run_id": option_run_id},
+                        }
+                    )
+                },
+            )
+            session.commit()
+
+        with self.assertRaises(self._refusal) as ctx:
+            await executor.execute(_plan_view_for(self.factory, "plan-exit"), actor=OWNER)
+
+        self.assertEqual(ctx.exception.reason_code, "OPTION_EXIT_CONTRACT_MISMATCH")
+        self.assertEqual(self._run_row(option_run_id)["status"], "entered")
+
+    async def test_an_unresolved_protective_stage_blocks_a_conflicting_governed_exit(self):
+        executor, option_run_id = await self._enter()
+        rows = json.loads(dict(self._run_row(option_run_id))["orders"] or "[]")
+        rows.append(
+            {
+                "stage_digest": "protect-stage-1",
+                "attempt": 1,
+                "state": "sending",
+                "legs": [{"index": 0, "tradingsymbol": "NIFTY26OCT25000CE"}],
+            }
+        )
+        with self.factory() as session:
+            session.execute(
+                text("UPDATE public.option_run_states SET orders = :orders WHERE strategy_run_id = :r"),
+                {"r": option_run_id, "orders": json.dumps(rows)},
+            )
+            session.commit()
+
+        self._seed_exit_plan("plan-exit", reference=option_run_id)
+        orders_before = len(executor._paper_service.repository.orders)
+
+        with self.assertRaises(self._refusal) as ctx:
+            await executor.execute(_plan_view_for(self.factory, "plan-exit"), actor=OWNER)
+
+        self.assertEqual(ctx.exception.reason_code, "OPTION_PROTECTIVE_EXIT_UNRESOLVED")
+        self.assertEqual(ctx.exception.detail.get("stage_digest"), "protect-stage-1")
+        self.assertEqual(len(executor._paper_service.repository.orders), orders_before)
+        self.assertEqual(self._run_row(option_run_id)["status"], "entered")
+
+        # Mutation pair: once the stage is RESOLVED, the same governed exit runs.
+        resolved = [dict(row) for row in rows]
+        resolved[-1]["state"] = "submitted"
+        with self.factory() as session:
+            session.execute(
+                text("UPDATE public.option_run_states SET orders = :orders WHERE strategy_run_id = :r"),
+                {"r": option_run_id, "orders": json.dumps(resolved)},
+            )
+            session.commit()
+
+        result = await executor.execute(_plan_view_for(self.factory, "plan-exit"), actor=OWNER)
+
+        self.assertEqual(result["status"], "filled")
+        self.assertEqual(self._run_row(option_run_id)["status"], "exited")
+
+
 class ExecutorRollSeamTests(ExecutorTestCase, unittest.IsolatedAsyncioTestCase):
     """R3 §13: the frozen plan says which half of a roll it is, and the executor
     enforces the contract on that artifact alone."""

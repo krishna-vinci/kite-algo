@@ -23,6 +23,7 @@ Three rules decide the shape of the answer:
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
@@ -134,6 +135,45 @@ def _run_legs_contradict_binding(
             if run_symbol and frozen_symbol and run_symbol == frozen_symbol:
                 return False
     return comparable
+
+
+def _protective_exit_unresolved(orders: Any) -> bool:
+    """Whether a run's own durable records still own an unresolved exit stage.
+
+    The rule lives with the staged-exit engine (``unresolved_stage_claim``); this
+    asks it rather than re-deriving it, so the snapshot and the exit path can
+    never disagree about what "unresolved" means. An unreadable rule is reported
+    as unresolved: not knowing is never proof that a committed stage settled.
+    """
+    try:
+        from backend.options.protection.staged_exit import unresolved_stage_claim
+    except Exception:  # noqa: BLE001 - an unimportable rule cannot prove resolution
+        return True
+    try:
+        return unresolved_stage_claim(orders) is not None
+    except Exception:  # noqa: BLE001 - an unreadable payload keeps the claim
+        return True
+
+
+def _json_list(value: Any) -> List[Any]:
+    """A JSON list from a driver that may hand it back as text.
+
+    PostgreSQL's ``jsonb`` arrives decoded; a text-shaped fixture (and any driver
+    without a codec) arrives as the JSON document itself. Without this, a stored
+    list would be read as a list of CHARACTERS, and "no outstanding leg" would
+    quietly become "two legs outstanding".
+
+    An unreadable value raises ``ValueError``: reading it as ``[]`` would turn
+    "cannot tell" into "no outstanding leg", so the caller reports unknown
+    coverage instead.
+    """
+    if value is None:
+        return []
+    if isinstance(value, (str, bytes, bytearray)):
+        value = json.loads(value)
+    if isinstance(value, list):
+        return list(value)
+    raise ValueError(f"expected a JSON list, got {type(value).__name__}")
 
 
 def _utcnow() -> datetime:
@@ -359,6 +399,42 @@ class OwnedWorkSnapshotService:
 
     # -- pending work -------------------------------------------------------
 
+    def option_runs_for_scope(
+        self,
+        *,
+        account_id: str,
+        strategy_id: str,
+        environment: str,
+        session: Optional[Any] = None,
+    ) -> tuple:
+        """This strategy's OWN option runs for one (account, strategy, env).
+
+        A thin public door onto the scope-derived read above, for callers that
+        must decide something BEFORE acting rather than report a book - the
+        plan/run binding edge asks it whether an equivalent structure is already
+        open, and the continuation collector asks it whether the options lane
+        still holds work. Both get the same answer, with the same coverage rule,
+        because it is literally the same read.
+
+        ``session`` lets a caller join an ALREADY-OPEN transaction (the entry
+        admission path holds a lock while it asks); omitted, one is opened and
+        closed here.
+        """
+        if session is not None:
+            return self._option_runs(
+                session,
+                account_id=str(account_id),
+                strategy_id=str(strategy_id),
+                environment=str(environment),
+            )
+        with self.session_factory() as opened:
+            return self._option_runs(
+                opened,
+                account_id=str(account_id),
+                strategy_id=str(strategy_id),
+                environment=str(environment),
+            )
+
     def _bound_runs(
         self, session: Any, *, account_id: str, strategy_id: str, environment: str
     ) -> List[str]:
@@ -567,7 +643,22 @@ class OwnedWorkSnapshotService:
             )
         except Exception:  # noqa: BLE001
             return [], {**unknown, "reason": "option_run_state_read_failed"}
-        state_by_id = {str(row["strategy_run_id"]): dict(row) for row in state_rows}
+        # ``jsonb`` is decoded by the driver on PostgreSQL and arrives as text
+        # elsewhere; normalise the list-shaped columns so "no outstanding leg"
+        # cannot be read as a list of characters.
+        try:
+            state_by_id = {
+                str(row["strategy_run_id"]): {
+                    **dict(row),
+                    "legs": _json_list(dict(row).get("legs")),
+                    "completed_legs": _json_list(dict(row).get("completed_legs")),
+                    "pending_legs": _json_list(dict(row).get("pending_legs")),
+                    "failed_legs": _json_list(dict(row).get("failed_legs")),
+                }
+                for row in state_rows
+            }
+        except ValueError:
+            return [], {**unknown, "reason": "option_run_state_unreadable"}
 
         rows: List[Dict[str, Any]] = []
         missing_state = False
@@ -600,6 +691,10 @@ class OwnedWorkSnapshotService:
                     "underlying": str(resolved.get("underlying") or ""),
                     "expiry": str(resolved.get("expiry") or ""),
                     "structure_id": str(resolved.get("structure_id") or ""),
+                    # The FROZEN structure identity of the edge that opened this
+                    # run. It is what makes "is this the same structure?" a
+                    # comparison of identities rather than of list positions.
+                    "structure_digest": str(resolved.get("structure_digest") or ""),
                     "expiry_policy": str(resolved.get("expiry_policy") or ""),
                     "product": str(
                         (state or {}).get("product") or resolved.get("product") or ""
@@ -609,6 +704,12 @@ class OwnedWorkSnapshotService:
                     "completed_legs": list((state or {}).get("completed_legs") or []),
                     "pending_legs": list((state or {}).get("pending_legs") or []),
                     "failed_legs": list((state or {}).get("failed_legs") or []),
+                    # An unresolved protective stage is in-flight work of the
+                    # run itself: the platform committed a stage and does not
+                    # know whether the broker took it.
+                    "protective_exit_unresolved": _protective_exit_unresolved(
+                        (state or {}).get("orders") or []
+                    ),
                     "coverage": "unknown" if state is None else "known",
                 }
             )

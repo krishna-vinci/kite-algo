@@ -22,6 +22,7 @@ shim, and CI (or any normal host) runs it unmodified.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -155,7 +156,13 @@ def _isolated_account_state(factory):
             # NOTE: ``strategy_execution_barrier_events`` is insert-only by
             # trigger, and the barrier is keyed per strategy, so neither needs
             # cleaning between scenarios.
-            "DELETE FROM public.algo_worker_runs WHERE account_scope = :a",
+            # ``strategy_run_bindings`` is insert-only by trigger and holds a
+            # composite FK to the run, so a BOUND run cannot be deleted (and must
+            # not be: it is immutable attribution history). Only unbound runs are
+            # cleaned, which is every run the launch path creates here.
+            "DELETE FROM public.algo_worker_runs r WHERE r.account_scope = :a "
+            "AND NOT EXISTS (SELECT 1 FROM public.strategy_run_bindings b "
+            " WHERE b.strategy_run_id = r.strategy_run_id)",
             "DELETE FROM public.algo_worker_tokens WHERE account_scope = :a",
         ):
             session.execute(text(statement), {"a": ACCOUNT})
@@ -200,7 +207,7 @@ def _version(repo, strategy_id):
     )
 
 
-def _launched_job(repo, factory, strategy, version):
+def _launched_job(repo, factory, strategy, version, *, run_id="run-1"):
     """A queued job driven through the real launch CAS to ``running``."""
     job = repo.create_job(
         strategy_id=strategy.id,
@@ -231,14 +238,14 @@ def _launched_job(repo, factory, strategy, version):
         expected_lease_epoch=1,
         expected_attempt=1,
         token_id="tok-1",
-        run_id="run-1",
+        run_id=run_id,
     ) is True
     assert repo.mark_running_and_handoff(
         job.id,
         lease_owner=LEASE_OWNER,
         expected_lease_epoch=1,
         expected_attempt=1,
-        run_id="run-1",
+        run_id=run_id,
     ) is True
     # The release path revokes the child token; model that durable fact so the
     # authority axis reads ``revoked`` rather than ``uncertain``.
@@ -250,10 +257,10 @@ def _launched_job(repo, factory, strategy, version):
                 "INSERT INTO public.algo_worker_runs "
                 "(strategy_run_id, token_id, template_id, account_scope, execution_mode, "
                 " status, runtime_state_json) "
-                "VALUES ('run-1', 'tok-1', 'tmpl-1', :a, 'paper', 'open', '{}'::jsonb) "
+                "VALUES (:run, 'tok-1', 'tmpl-1', :a, 'paper', 'open', '{}'::jsonb) "
                 "ON CONFLICT (strategy_run_id) DO NOTHING"
             ),
-            {"a": ACCOUNT},
+            {"a": ACCOUNT, "run": run_id},
         )
         session.execute(
             text(
@@ -357,6 +364,140 @@ def _release(repo, factory, job, *, completion, exit_code=None):
     )
 
 
+def _publish_flat_book(factory, strategy_id):
+    """A PUBLISHED book with no legs: the equity projection is genuinely flat."""
+    with factory() as session:
+        session.execute(
+            text(
+                "INSERT INTO strategy_projection_state "
+                "(account_id, strategy_id, execution_environment, projection_version, "
+                " last_rebuild_at, updated_at) "
+                "VALUES (:a, :s, 'paper', 1, now(), now()) "
+                "ON CONFLICT (account_id, strategy_id, execution_environment) DO UPDATE "
+                "SET projection_version = EXCLUDED.projection_version, "
+                "    last_rebuild_at = EXCLUDED.last_rebuild_at"
+            ),
+            {"a": ACCOUNT, "s": str(strategy_id)},
+        )
+        session.commit()
+
+
+OPTION_LEG_ID = "dddddddd-0000-0000-0000-000000000001"
+
+
+def _hold_option_structure(
+    factory, strategy_id, *, run_id, status="entered", orders=None, pending_legs=None
+):
+    """One durable option run this strategy owns, reached through its OWN edge.
+
+    This is the production shape: the strategy's bound worker run owns a frozen
+    plan, the plan's ``option_structure`` edge names the durable option run, and
+    the run carries the status (and any stage claims) under test.
+    """
+    option_run_id = f"opt_run_{uuid.uuid4().hex}"
+    plan_id = str(uuid.uuid4())
+    proposal_id = str(uuid.uuid4())
+    legs = [
+        {
+            "instrument_id": OPTION_LEG_ID,
+            "tradingsymbol": "NIFTY26OCT25000CE",
+            "transaction_type": "BUY",
+            "quantity": 75,
+            "metadata": {"instrument_id": OPTION_LEG_ID},
+        }
+    ]
+    with factory() as session:
+        session.execute(
+            text(
+                "INSERT INTO instrument_catalog_generations (id, status) "
+                "VALUES (CAST(:g AS uuid), 'published') ON CONFLICT (id) DO NOTHING"
+            ),
+            {"g": GENERATION_ID},
+        )
+        session.execute(
+            text(
+                "INSERT INTO public.option_run_states "
+                "(strategy_run_id, strategy_name, product, status, legs, metadata, orders, "
+                " pending_legs) "
+                "VALUES (:run, 'options-b1', 'NRML', :status, CAST(:legs AS jsonb), "
+                " CAST(:metadata AS jsonb), CAST(:orders AS jsonb), CAST(:pending AS jsonb))"
+            ),
+            {
+                "run": option_run_id,
+                "status": status,
+                "legs": json.dumps(legs),
+                "metadata": json.dumps({"strategy_id": str(strategy_id)}),
+                "orders": json.dumps(list(orders or [])),
+                "pending": json.dumps(list(pending_legs or [])),
+            },
+        )
+        session.execute(
+            text(
+                "INSERT INTO strategy_proposals "
+                "(proposal_id, strategy_id, account_id, evaluation_id, evaluation_kind, "
+                " strategy_run_id, target_kind, payload, payload_sha256, status) "
+                "VALUES (CAST(:p AS uuid), :s, :a, :p, 'run_now', :run, 'option_structure', "
+                " '{}', 'sha', 'validated')"
+            ),
+            {
+                "p": proposal_id,
+                "s": str(strategy_id),
+                "a": ACCOUNT,
+                "run": run_id,
+            },
+        )
+        session.execute(
+            text(
+                "INSERT INTO strategy_plans "
+                "(plan_id, proposal_id, strategy_id, account_id, plan_kind, plan_hash, "
+                " logical_plan, resolved_plan, pinned_catalog_generation) "
+                "VALUES (CAST(:p AS uuid), CAST(:prop AS uuid), :s, :a, 'option_structure', "
+                " 'hash', '{}', CAST(:resolved AS jsonb), CAST(:gen AS uuid))"
+            ),
+            {
+                "p": plan_id,
+                "prop": proposal_id,
+                "s": str(strategy_id),
+                "a": ACCOUNT,
+                "gen": GENERATION_ID,
+                "resolved": json.dumps(
+                    {
+                        "target_kind": "option_structure",
+                        "product": "NRML",
+                        "expiry_policy": "exit_before_cutoff",
+                        "legs": legs,
+                        "option_run": {"phase": "entry", "option_run_id": None},
+                    }
+                ),
+            },
+        )
+        session.execute(
+            text(
+                "INSERT INTO public.strategy_plan_option_runs "
+                "(plan_id, option_run_id, strategy_id, account_id, execution_environment, phase) "
+                "VALUES (CAST(:p AS uuid), :run, :s, :a, 'paper', 'entry')"
+            ),
+            {"p": plan_id, "run": option_run_id, "s": str(strategy_id), "a": ACCOUNT},
+        )
+        session.commit()
+    return option_run_id
+
+
+def _bind_worker_run(factory, *, run_id, strategy_id):
+    """The strategy's immutable run binding (the snapshot's derivation root)."""
+    with factory() as session:
+        session.execute(
+            text(
+                "INSERT INTO strategy_run_bindings "
+                "(strategy_run_id, strategy_id, owner_id, account_id, execution_environment, "
+                " bound_by, binding_source) "
+                "VALUES (:run, :s, :owner, :a, 'paper', 'test', 'hosted_job')"
+            ),
+            {"run": run_id, "s": str(strategy_id), "owner": OWNER, "a": ACCOUNT},
+        )
+        session.commit()
+
+
 # ---------------------------------------------------------------------------
 # the healthy handover
 # ---------------------------------------------------------------------------
@@ -403,6 +544,106 @@ def test_a_clean_finite_exit_clears_its_own_block_and_the_next_attempt_can_start
     )
     assert following is not None
     assert str(following.status) == "queued"
+
+
+def test_a_held_option_structure_continues_as_held_never_flat(factory):
+    """Phase B1 item 2: the options lane is its own axis.
+
+    The equity projection is genuinely flat (an option structure writes no equity
+    leg), so a verdict that only read that projection would call this book flat
+    and settle it. The durable option run says otherwise: the structure is HELD,
+    the attempt may continue, and the platform carries it forward as held.
+    """
+    repo = SqlAlchemyStrategyRepository(factory)
+    strategy = _strategy(repo)
+    version = _version(repo, strategy.id)
+    run_id = f"run-{uuid.uuid4().hex[:8]}"
+    job = _launched_job(repo, factory, strategy, version, run_id=run_id)
+    repo.report_process_cleanup(job.id, state="confirmed", actor=LEASE_OWNER, expected_attempt=1)
+    _publish_flat_book(factory, strategy.id)
+    _bind_worker_run(factory, run_id=run_id, strategy_id=strategy.id)
+    option_run_id = _hold_option_structure(
+        factory, strategy.id, run_id=run_id, status="entered"
+    )
+
+    response = _release(repo, factory, job, completion="exited", exit_code=0)
+
+    assert response["continuation"]["continued"] is True, response
+    assert response["continuation"]["held"] is True, response
+    assert response["replacement_blocked"] is False, response
+    audit = repo.list_reconciliations(job.id)
+    proof = dict(dict(audit[0].evidence_json or {}).get("continuation_proof") or {})
+    assert proof["held"] is True
+    assert proof["exposure_state"] == "flat"
+    assert proof["option_work_state"] == "held"
+    assert proof["option_runs"] == [f"{option_run_id}=held"]
+
+
+@pytest.mark.parametrize(
+    "status,orders",
+    [
+        ("partial_entry", None),
+        ("cleanup_required", None),
+        ("exiting", None),
+        # An unresolved protective exit stage keeps an ``entered`` run open.
+        (
+            "entered",
+            [{"stage_digest": "protect-1", "attempt": 1, "state": "sending"}],
+        ),
+    ],
+)
+def test_option_work_in_flight_blocks_the_continuation(factory, status, orders):
+    """Phase B1 item 2: in-flight option work is never cleared by a handover."""
+    repo = SqlAlchemyStrategyRepository(factory)
+    strategy = _strategy(repo)
+    version = _version(repo, strategy.id)
+    run_id = f"run-{uuid.uuid4().hex[:8]}"
+    job = _launched_job(repo, factory, strategy, version, run_id=run_id)
+    repo.report_process_cleanup(job.id, state="confirmed", actor=LEASE_OWNER, expected_attempt=1)
+    _publish_flat_book(factory, strategy.id)
+    _bind_worker_run(factory, run_id=run_id, strategy_id=strategy.id)
+    _hold_option_structure(factory, strategy.id, run_id=run_id, status=status, orders=orders)
+
+    response = _release(repo, factory, job, completion="exited", exit_code=0)
+
+    assert response["replacement_blocked"] is True, response
+    assert response["continuation"]["continued"] is False, response
+    assert (
+        response["continuation"]["reason_code"] == "CONTINUATION_OPTION_WORK_OUTSTANDING"
+    ), response
+    refreshed = repo.get_job_by_id(job.id)
+    assert str(refreshed.status) == "recovery_required"
+    assert refreshed.reconciled_at is None
+
+
+def test_unreadable_option_runs_are_never_read_as_no_structure(factory, monkeypatch):
+    """Unknown coverage refuses by name instead of handing over blind."""
+    repo = SqlAlchemyStrategyRepository(factory)
+    strategy = _strategy(repo)
+    version = _version(repo, strategy.id)
+    run_id = f"run-{uuid.uuid4().hex[:8]}"
+    job = _launched_job(repo, factory, strategy, version, run_id=run_id)
+    repo.report_process_cleanup(job.id, state="confirmed", actor=LEASE_OWNER, expected_attempt=1)
+    _publish_flat_book(factory, strategy.id)
+    _bind_worker_run(factory, run_id=run_id, strategy_id=strategy.id)
+
+    # The discovery itself is unreadable for this account, so the axis is unknown.
+    import backend.strategies.execution_snapshot as snapshot_module
+
+    class _UnreadableDiscovery:
+        def __init__(self, **_):
+            pass
+
+        def option_runs_for_scope(self, **_):
+            raise RuntimeError("option_run_discovery_failed")
+
+    monkeypatch.setattr(
+        snapshot_module, "OwnedWorkSnapshotService", _UnreadableDiscovery
+    )
+    response = _release(repo, factory, job, completion="exited", exit_code=0)
+
+    assert response["continuation"]["continued"] is False, response
+    assert response["continuation"]["reason_code"] == "CONTINUATION_OPTION_WORK_UNKNOWN", response
 
 
 # ---------------------------------------------------------------------------

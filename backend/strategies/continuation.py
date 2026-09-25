@@ -101,6 +101,8 @@ CONTINUATION_PROTECTION_OWNERSHIP_UNSUPPORTED = (
     "CONTINUATION_PROTECTION_OWNERSHIP_UNSUPPORTED"
 )
 CONTINUATION_EXPOSURE_UNKNOWN = "CONTINUATION_EXPOSURE_UNKNOWN"
+CONTINUATION_OPTION_WORK_OUTSTANDING = "CONTINUATION_OPTION_WORK_OUTSTANDING"
+CONTINUATION_OPTION_WORK_UNKNOWN = "CONTINUATION_OPTION_WORK_UNKNOWN"
 
 CONTINUATION_BLOCKERS = (
     CONTINUATION_NOT_BLOCKED,
@@ -125,6 +127,8 @@ CONTINUATION_BLOCKERS = (
     CONTINUATION_PROTECTION_UNKNOWN,
     CONTINUATION_PROTECTION_OWNERSHIP_UNSUPPORTED,
     CONTINUATION_EXPOSURE_UNKNOWN,
+    CONTINUATION_OPTION_WORK_OUTSTANDING,
+    CONTINUATION_OPTION_WORK_UNKNOWN,
 )
 
 #: How the supervised child ended. ``exited`` is the only shape continuation
@@ -138,6 +142,13 @@ _TERMINAL_CLEANUP = "confirmed"
 _AUTHORITY_REVOKED = "revoked"
 _SETTLED_WORK = ("none", "settled")
 _TERMINAL_REQUEST_STATUSES = ("executed", "refused", "rejected", "dispatch_unresolved")
+
+#: Option-run statuses that mean the structure is FINISHED. Everything else -
+#: including a status outside the durable vocabulary - is work.
+_OPTION_RUN_FINISHED = frozenset({"exited", "settled"})
+
+#: The only option-run status that holds a structure cleanly.
+_OPTION_RUN_HELD = "entered"
 
 
 def _utcnow() -> datetime:
@@ -204,13 +215,22 @@ class ContinuationEvidence:
     book_state: str = "unknown"  # published | not_published | unreadable
     divergence_state: str = "none"  # none | divergence | unknown
     approval_state: str = "none"  # none | outstanding | unknown
+    #: The OPTIONS lane keeps its OWN durable book, and the equity projection
+    #: does not see it. ``none | held | outstanding | unknown``: a structure that
+    #: is still being opened or closed, is only partially filled, needs cleanup,
+    #: or owns an unresolved protective stage is outstanding work; only a
+    #: cleanly held structure may continue, and it stays HELD.
+    option_work_state: str = "unknown"
+    #: One ``option_run_id=state`` entry per run this strategy owns, sorted so
+    #: the digest is stable. Evidence for the proof, never an input to the axes.
+    option_runs: List[str] = field(default_factory=list)
     unavailable: List[str] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
 
     @property
     def held(self) -> bool:
-        """An open book is ``held`` — never flat, never settled."""
-        return self.exposure_state == "open"
+        """An open book - or a held option structure - is never flat/settled."""
+        return self.exposure_state == "open" or self.option_work_state == "held"
 
     def to_dict(self) -> Dict[str, Any]:
         payload = asdict(self)
@@ -268,6 +288,8 @@ def continuation_digest(evidence: ContinuationEvidence) -> str:
         "book_state": evidence.book_state,
         "divergence_state": evidence.divergence_state,
         "approval_state": evidence.approval_state,
+        "option_work_state": evidence.option_work_state,
+        "option_runs": sorted(evidence.option_runs),
         "unavailable": sorted(evidence.unavailable),
     }
     encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":"), default=str)
@@ -296,6 +318,8 @@ def _proof(evidence: ContinuationEvidence) -> Dict[str, Any]:
         "book_state": evidence.book_state,
         "exposure_state": evidence.exposure_state,
         "held": evidence.held,
+        "option_work_state": evidence.option_work_state,
+        "option_runs": sorted(evidence.option_runs),
         "completion_state": evidence.completion_state,
         "exit_code": evidence.exit_code,
         "desired_state": evidence.desired_state,
@@ -386,6 +410,19 @@ def assess_continuation(evidence: ContinuationEvidence) -> ContinuationAssessmen
     if evidence.work_state not in _SETTLED_WORK:
         return blocked(CONTINUATION_WORK_UNKNOWN)
 
+    # 9b. The OPTIONS lane's own durable book. An option structure writes no
+    #     equity leg, so the attribution projection above is BLIND to it: a
+    #     structure that is still entering (or partially entered), needs
+    #     cleanup, is exiting (or partially exited), or owns an unresolved
+    #     protective exit stage is outstanding work, and a successor must not be
+    #     handed the block while that work is in flight. A cleanly held structure
+    #     MAY continue - the successor reads the same durable run - but it stays
+    #     ``held`` and is never reported flat or settled.
+    if evidence.option_work_state == "outstanding":
+        return blocked(CONTINUATION_OPTION_WORK_OUTSTANDING)
+    if evidence.option_work_state not in ("none", "held"):
+        return blocked(CONTINUATION_OPTION_WORK_UNKNOWN)
+
     # 10. Recovery action owned by the runtime (an unfinished protective/repair
     #    action) is a blocker, never something continuation clears.
     if evidence.recovery_action_required:
@@ -443,6 +480,11 @@ def assess_continuation(evidence: ContinuationEvidence) -> ContinuationAssessmen
         "finite evaluation finished cleanly; book is "
         + ("held" if evidence.held else "flat")
     )
+    if evidence.option_work_state == "held":
+        notes.append(
+            "a cleanly held option structure is carried forward as HELD; the "
+            "options lane keeps its own book and is never reported flat"
+        )
     return ContinuationAssessment(
         allowed=True,
         case=CASE_CONTINUATION_ELIGIBLE,
@@ -664,6 +706,77 @@ class ContinuationCollector:
         ).first()
         return "outstanding" if row is not None else "none"
 
+    @staticmethod
+    def _option_run_state(row: Mapping[str, Any]) -> str:
+        """``held`` / ``finished`` / ``outstanding`` for ONE durable option run.
+
+        Only ``entered`` counts as a cleanly held structure, and only when nothing
+        about that run is still in flight: a partially filled leg, a failed leg,
+        or an unresolved protective exit stage all keep it outstanding. A status
+        outside the durable vocabulary is outstanding, never finished.
+        """
+        status = str(row.get("status") or "").strip().lower()
+        if bool(row.get("protective_exit_unresolved")):
+            return "outstanding"
+        if status in _OPTION_RUN_FINISHED:
+            return "finished"
+        outstanding_legs = len(list(row.get("pending_legs") or [])) + len(
+            list(row.get("failed_legs") or [])
+        )
+        if status == _OPTION_RUN_HELD and not outstanding_legs:
+            return "held"
+        return "outstanding"
+
+    def _option_run_work(
+        self,
+        *,
+        account_id: str,
+        strategy_id: str,
+        environment: str,
+        session: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """This strategy's OWN option runs, reduced to the continuation axis.
+
+        The read is the platform's scope-derived option-run discovery (the same
+        one ``owned_work()`` uses), so a strategy cannot name another account or
+        environment. Unknown or truncated coverage is reported as ``unknown``,
+        which the assessment refuses - it is never read as "no structures".
+        """
+        from backend.strategies.execution_snapshot import OwnedWorkSnapshotService
+
+        service = OwnedWorkSnapshotService(session_factory=self._session_factory)
+        runs, coverage = service.option_runs_for_scope(
+            account_id=str(account_id),
+            strategy_id=str(strategy_id),
+            environment=str(environment),
+            session=session,
+        )
+        if str(coverage.get("coverage") or "unknown") != "known":
+            return {
+                "state": "unknown",
+                "runs": [],
+                "reason": str(coverage.get("reason") or "option_run_discovery_unknown"),
+            }
+        classified = [
+            (
+                str(row.get("option_run_id") or ""),
+                self._option_run_state(row),
+            )
+            for row in list(runs or [])
+        ]
+        states = {state for _run_id, state in classified}
+        if "outstanding" in states:
+            aggregate = "outstanding"
+        elif "held" in states:
+            aggregate = "held"
+        else:
+            aggregate = "none"
+        return {
+            "state": aggregate,
+            "runs": sorted(f"{run_id}={state}" for run_id, state in classified),
+            "reason": "",
+        }
+
     # -- the collection ----------------------------------------------------
 
     def collect(
@@ -794,6 +907,27 @@ class ContinuationCollector:
             except SQLAlchemyError:
                 unavailable.append("strategy_approvals")
 
+            # the OPTIONS lane's own durable book (a separate axis: the equity
+            # projection below never sees an option structure)
+            option_work: Dict[str, Any] = {
+                "state": "unknown",
+                "runs": [],
+                "reason": "option_run_read_failed",
+            }
+            try:
+                option_work = self._option_run_work(
+                    account_id=account_id,
+                    strategy_id=strategy_id,
+                    environment=environment,
+                    session=session,
+                )
+            except Exception:  # noqa: BLE001 - an unreadable read is unknown, not "none"
+                option_work = {
+                    "state": "unknown",
+                    "runs": [],
+                    "reason": "option_run_read_failed",
+                }
+
             # pending commitments (evidence only; the barrier owns quiescence)
             pending = session.execute(
                 select(StrategyReservation.reservation_id).where(
@@ -837,6 +971,15 @@ class ContinuationCollector:
 
         if pending:
             notes.append(f"pending_commitments={len(pending)}")
+        if option_work.get("runs"):
+            notes.append(
+                "option_runs=" + ",".join(str(item) for item in option_work["runs"])
+            )
+        if option_work.get("state") == "unknown":
+            notes.append(
+                "this strategy's option runs could not be read completely "
+                f"(reason={option_work.get('reason') or 'unknown'})"
+            )
 
         return ContinuationEvidence(
             job_id=str(getattr(job, "id", "")),
@@ -867,6 +1010,8 @@ class ContinuationCollector:
             book_state=str(book.get("book_state") or "unknown"),
             divergence_state=divergence_state,
             approval_state=approval_state,
+            option_work_state=str(option_work.get("state") or "unknown"),
+            option_runs=[str(item) for item in list(option_work.get("runs") or [])],
             unavailable=sorted(set(unavailable)),
             notes=notes,
         )
