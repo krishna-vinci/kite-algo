@@ -180,6 +180,7 @@ notifications. Record in `documents/hosted-strategies-rollout-<lane>-<date>.md`.
 | B2.4 hardening (review findings) | done, reviewed | `724e1c6` |
 | B2.6b S2 owner exit | done, reviewed | `f092ffe` |
 | C1.1 S3 repair + funds under lock | done, reviewed | `7cf54c4` |
-| B2.6b S3 flatten + owner display | in progress | |
+| B2.6b S3 flatten + owner display | done | `b7c7159` |
+| **B2 paper gate** | **passed - 5/5 scenarios `ok=true`** | `documents/hosted-options-b2-completion-2026-09-26.md`; `examples/hosted_platform/evidence/phase5-20260925T183422Z.json` |
 | C1.2 design | in progress | |
 | Independent review: C1.1 + B2.4 | done (C1.1 clean; 3 B2.4 findings fixed) | |
