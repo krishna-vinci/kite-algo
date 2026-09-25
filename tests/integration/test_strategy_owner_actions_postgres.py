@@ -66,63 +66,11 @@ def _drop_db(name: str) -> None:
     conn.close()
 
 
-_PARENT_REVISION = "20260925_000048"
-
-
-def _complete_revision_chain(cfg) -> str | None:
-    """Make the revision chain walkable, returning a temp dir to clean up.
-
-    ``20260925_000049`` (this worktree's owner-action migration) names C1.1's
-    ``20260925_000048`` as its parent, and that file lands with the rebase. Until
-    then the chain has exactly one missing link, so this adds an EMPTY stub for it
-    in a temporary version location: the real migration still runs, and nothing is
-    written inside the repository. Once the parent is on disk this returns
-    ``None`` and the upgrade is the ordinary one.
-    """
-    import tempfile
-    import re
-    from pathlib import Path
-
-    versions = Path("backend/alembic/versions").resolve()
-    # ``revision = "<parent>"`` means the parent exists on disk; a file that only
-    # names it as ITS down_revision (this worktree's own migration) does not.
-    declares_parent = re.compile(
-        r'^\s*revision\s*=\s*"' + _PARENT_REVISION + r'"', re.MULTILINE
-    )
-    if any(
-        declares_parent.search(path.read_text(encoding="utf-8"))
-        for path in versions.glob("*.py")
-    ):
-        return None
-    stub_dir = tempfile.mkdtemp(prefix="alembic-parent-stub-")
-    (Path(stub_dir) / "20260925_000048_stub.py").write_text(
-        "revision = \"20260925_000048\"\n"
-        "down_revision = \"20260925_000047\"\n"
-        "branch_labels = None\n"
-        "depends_on = None\n\n\n"
-        "def upgrade():\n    pass\n\n\n"
-        "def downgrade():\n    pass\n",
-        encoding="utf-8",
-    )
-    # ``Config.get_version_locations_list`` reads the FILE config (not
-    # ``set_main_option``), and needs an explicit separator so the ':' splits.
-    cfg.file_config.set("alembic", "version_locations", f"{stub_dir}:{versions}")
-    cfg.file_config.set("alembic", "path_separator", "os")
-    return stub_dir
-
-
 def _upgrade(cfg) -> None:
-    """Upgrade the disposable database to head, tolerating the missing parent."""
-    import shutil
-
+    """Upgrade the disposable database to the migration head."""
     from alembic import command
 
-    stub_dir = _complete_revision_chain(cfg)
-    try:
-        command.upgrade(cfg, "head")
-    finally:
-        if stub_dir is not None:
-            shutil.rmtree(stub_dir, ignore_errors=True)
+    command.upgrade(cfg, "head")
 
 
 @pytest.fixture(scope="module")
