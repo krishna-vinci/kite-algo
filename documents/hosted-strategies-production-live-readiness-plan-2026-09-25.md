@@ -137,6 +137,7 @@ notifications. Record in `documents/hosted-strategies-rollout-<lane>-<date>.md`.
    (`HOSTED_JOB_NOT_BLOCKED`). Fix the expectation during B2.2/B2.3 harness work.
 2. `tests/options/test_options_execution_durable_store.py` fixture misses required `tradingsymbol`. Small fix
    inside B2.1.
+4. An adjust plan whose process died with a `submitted` event that has no outcome keeps its run `adjusting`: takeover and repair both refuse by name (`OPTION_RUN_ADJUST_IN_FLIGHT` / `adjust_in_flight`). It needs an operator disposition for the unanswered step. That lands with the repair UI in B2.6.
 3. One hosted execution API test stalls in the dirty checkout but passes from a clean worktree.
 
 ## Progress
@@ -146,4 +147,9 @@ notifications. Record in `documents/hosted-strategies-rollout-<lane>-<date>.md`.
 | B1 | done, reviewed | `eb2cb00` |
 | B2.1a | done, reviewed | `83567dc` |
 | B2.1b | done, reviewed | `22766f8` |
-| B2.2 | design review | |
+| B2.2 design | accepted | `e5664b3` |
+| B2.2 S1 compile freeze | done, reviewed | `4c04079` |
+| B2.2 S2 adjust engine | done, reviewed | `199bbfb` |
+| B2.2 S3 adjust gates | done, reviewed | `8b5cf33` |
+| B2.2 S4 roll + takeover | done, reviewed | `59a10d5` |
+| B2.2 S5 example + harness | next | |
