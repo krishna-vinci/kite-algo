@@ -1966,9 +1966,12 @@ async def test_live_adjust_with_a_stale_generation_is_refused_at_admission(pg, l
 
 @pytest.mark.asyncio
 async def test_live_adjust_owner_unknown_blocks_increases_but_admits_reductions(
-    pg, live_env
+    pg, live_env, monkeypatch
 ):
     """Unknown ownership refuses an increasing adjust; a reduce-only one runs."""
+    # Stamp the chain fresh on read: the harness clock is frozen while the chain
+    # freshness bound is real-time, so a slow run would read its snapshot stale.
+    _fresh_options_manager(monkeypatch)
     _seed_catalog(pg["factory"])
     clock = _clock()
     broker_calls = []
