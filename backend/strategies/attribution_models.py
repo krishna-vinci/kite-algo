@@ -806,10 +806,10 @@ class StrategyProposalJournal(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "event IN ('received', 'idempotent_retry', 'conflict', "
-            "'validation_refused', 'plan_created')",
-            name="ck_proposal_journal_event",
-        ),
+                "event IN ('received', 'idempotent_retry', 'conflict', "
+                "'validation_refused', 'plan_created', 'owner_action')",
+                name="ck_proposal_journal_event",
+            ),
         Index("idx_proposal_journal_strategy", "strategy_id", "created_at"),
     )
 
@@ -1158,6 +1158,9 @@ PLAN_EXECUTION_EVENTS = (
     "rejected",
     "failed",
     "no_op",
+    #: A terminal cancellation of an unanswered step (B2.6b owner dispositions).
+    #: ``plan_binding``'s fold already reads it as a terminal outcome.
+    "cancelled",
 )
 
 #: Plan kinds the paper executor can act on: every kind the compiler registry
@@ -1203,10 +1206,10 @@ class StrategyPlanExecutionEvent(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "event IN ('submitted', 'filled', 'partially_filled', 'rejected', 'failed', "
-            "'no_op')",
-            name="ck_spee_event",
-        ),
+                "event IN ('submitted', 'filled', 'partially_filled', 'rejected', 'failed', "
+                "'no_op', 'cancelled')",
+                name="ck_spee_event",
+            ),
         # Declared because ``strategy_plans`` IS in this metadata: it orders the
         # unit of work so a plan exists before its first execution event. The
         # ON DELETE RESTRICT keeps the trail attached to its plan forever.

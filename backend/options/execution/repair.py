@@ -99,6 +99,7 @@ def assess_option_run_repair(
     *,
     adjust_owner: Optional[Mapping[str, Any]] = None,
     ledger_consistent: Optional[bool] = None,
+    unresolved_step_reader: Any = None,
 ) -> Dict[str, Any]:
     """Classify one option run from its OWN confirmed evidence. Side-effect free.
 
@@ -113,6 +114,12 @@ def assess_option_run_repair(
     that cannot supply it, or supplies anything but ``finished``, cannot be told
     that the run is stranded: the verdict is ``ambiguous`` with the reason
     ``adjust_in_flight`` rather than a close the platform might race.
+
+    ``unresolved_step_reader`` names the step(s) this verdict is waiting on, so an
+    ``ambiguous`` run is addressable without a second opinion about what
+    "unresolved" means: the WHICH comes from the fold's own evidence
+    (:func:`unresolved_step_coordinates`), and the reader only supplies the step's
+    own newest trail word and linked order id.
     """
     option_run_id = str(getattr(run, "strategy_run_id", "") or "")
     status = str(getattr(run, "status", "") or "").strip().lower()
@@ -245,7 +252,53 @@ def assess_option_run_repair(
         "detail": close_detail,
         "unattributable_trades": unattributable,
         "unreadable_fills": unreadable,
+        "unresolved_steps": unresolved_step_coordinates(
+            owner_state, step_detail_reader=unresolved_step_reader
+        ),
     }
+
+
+def unresolved_step_coordinates(
+    adjust_owner: Optional[Mapping[str, Any]],
+    *,
+    step_detail_reader: Any = None,
+) -> List[Dict[str, Any]]:
+    """The adjust owner plans' unresolved steps, with their trail coordinates.
+
+    The WHICH is the shared fold's answer, read through
+    ``option_adjust_owner_state``'s per-plan evidence
+    (``plan_binding.option_plan_execution_state``): only a plan whose own
+    execution is ``in_flight`` names unresolved steps, and a step the fold cannot
+    explain is never invented here. ``state`` / ``order_id`` come from the step's
+    OWN newest trail row through ``step_detail_reader`` - a plain read of the row
+    the fold already reads, not a second verdict about whether the step is
+    unresolved. Without a reader they are ``""`` / ``None`` rather than guessed.
+    """
+    plans = dict((adjust_owner or {}).get("plans") or {})
+    out: List[Dict[str, Any]] = []
+    for plan_id in sorted(str(value) for value in plans):
+        entry = dict(plans.get(plan_id) or {})
+        evidence = dict(entry.get("evidence") or {})
+        step_numbers = {
+            int(value) for value in (evidence.get("unresolved_steps") or [])
+        }
+        for step_no in sorted(step_numbers):
+            detail: Dict[str, Any] = {}
+            if step_detail_reader is not None:
+                try:
+                    detail = dict(step_detail_reader(str(plan_id), int(step_no)) or {})
+                except Exception:  # noqa: BLE001 - an unreadable row is not a state
+                    detail = {}
+            order_id = detail.get("order_id")
+            out.append(
+                {
+                    "plan_id": str(plan_id),
+                    "step_no": int(step_no),
+                    "state": str(detail.get("state") or ""),
+                    "order_id": None if order_id in (None, "") else str(order_id),
+                }
+            )
+    return out
 
 
 def _repair_exiting(run: OptionRunState, *, pending_legs: List[str]) -> OptionRunState:
@@ -350,11 +403,16 @@ class OptionRunRepairService:
         staged_exit: Any,
         adjust_owner_reader: Any = None,
         ledger_consistency_reader: Any = None,
+        unresolved_step_reader: Any = None,
     ) -> None:
         self._run_store = run_store
         self._staged_exit = staged_exit
         self._adjust_owner_reader = adjust_owner_reader
         self._ledger_consistency_reader = ledger_consistency_reader
+        #: Names the coordinates of the steps an ``adjust_in_flight`` verdict is
+        #: waiting on. Absent, the assessment still reports the refusal; it just
+        #: cannot say which plan/step it means.
+        self._unresolved_step_reader = unresolved_step_reader
 
     def _ledger_consistent(self, run: Any) -> Optional[bool]:
         if self._ledger_consistency_reader is None:
@@ -398,6 +456,7 @@ class OptionRunRepairService:
             self._staged_exit,
             adjust_owner=self._adjust_owner(option_run_id),
             ledger_consistent=self._ledger_consistent(self._run(option_run_id)),
+            unresolved_step_reader=self._unresolved_step_reader,
         )
 
     def plan(
@@ -414,6 +473,7 @@ class OptionRunRepairService:
             self._staged_exit,
             adjust_owner=self._adjust_owner(option_run_id),
             ledger_consistent=self._ledger_consistent(run),
+            unresolved_step_reader=self._unresolved_step_reader,
         )
         if str(evidence_digest or "") != str(assessment.get("evidence_digest") or ""):
             raise OptionRunRepairRefusal(

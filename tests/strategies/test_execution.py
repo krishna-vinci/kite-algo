@@ -623,7 +623,9 @@ class ExecutionEventSchemaTests(ExecutionTestCase):
 
         self.assertEqual(
             PLAN_EXECUTION_EVENTS,
-            ("submitted", "filled", "partially_filled", "rejected", "failed", "no_op")
+            # B2.6b adds the terminal word a cancelled order needs: the same
+            # vocabulary ``plan_binding`` already reads as terminal.
+            ("submitted", "filled", "partially_filled", "rejected", "failed", "no_op", "cancelled")
         )
 
     def test_an_event_references_a_real_plan(self):

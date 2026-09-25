@@ -75,6 +75,7 @@ from backend.api.schemas.strategies import (
     OptionRunRepairActionResponse,
     OptionRunRepairAssessmentResponse,
     OptionRunRepairPlanLeg,
+    OptionRunRepairUnresolvedStep,
     RollEventRow,
     RollListResponse,
     RollCreateRequest,
@@ -1313,6 +1314,15 @@ def _option_run_repair_assessment(assessment: Dict[str, Any]) -> OptionRunRepair
         ],
         evidence=dict(assessment.get("evidence") or {}),
         detail=dict(assessment.get("detail") or {}),
+        unresolved_steps=[
+            OptionRunRepairUnresolvedStep(
+                plan_id=str(step.get("plan_id") or ""),
+                step_no=int(step.get("step_no") or 0),
+                state=str(step.get("state") or ""),
+                order_id=step.get("order_id"),
+            )
+            for step in (assessment.get("unresolved_steps") or [])
+        ],
     )
 
 

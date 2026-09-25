@@ -10,7 +10,7 @@ here leaves the router with the two handlers and their response mapping.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from fastapi import HTTPException
 
@@ -103,7 +103,51 @@ def build_option_run_repair_service(request: Any, session_factory: Any) -> Optio
         staged_exit=staged,
         adjust_owner_reader=option_adjust_owner_reader(session_factory),
         ledger_consistency_reader=option_run_ledger_consistency_reader(session_factory),
+        unresolved_step_reader=option_run_unresolved_step_reader(session_factory),
     )
+
+
+def option_run_unresolved_step_reader(
+    session_factory: Any,
+) -> Callable[[str, int], Dict[str, Any]]:
+    """The coordinates of ONE plan step: its own newest trail word and order id.
+
+    The assessment's WHICH-step answer comes from the plan-execution fold; this
+    reader only reads the row that fold already read, so an ``adjust_in_flight``
+    refusal can name the plan/step an owner has to dispose of (B2.6b §4) without
+    a second derivation of ``unresolved``. ``{}`` means the row could not be
+    read - never an invented word.
+    """
+    from sqlalchemy import select
+
+    from backend.strategies.attribution_models import StrategyPlanExecutionEvent
+
+    def _read(plan_id: str, step_no: int) -> Dict[str, Any]:
+        with session_factory() as session:
+            rows = session.execute(
+                select(
+                    StrategyPlanExecutionEvent.event,
+                    StrategyPlanExecutionEvent.paper_order_id,
+                    StrategyPlanExecutionEvent.broker_order_id,
+                )
+                .where(
+                    StrategyPlanExecutionEvent.plan_id == str(plan_id),
+                    StrategyPlanExecutionEvent.step_no == int(step_no),
+                )
+                .order_by(
+                    StrategyPlanExecutionEvent.created_at,
+                    StrategyPlanExecutionEvent.id,
+                )
+            ).all()
+        if not rows:
+            return {}
+        event, paper_order_id, broker_order_id = rows[-1]
+        return {
+            "state": str(event or ""),
+            "order_id": str(paper_order_id or broker_order_id or "") or None,
+        }
+
+    return _read
 
 
 def repair_audit_job(repo: Any, run: Any) -> Any:

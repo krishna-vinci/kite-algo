@@ -2454,7 +2454,7 @@ CREATE TABLE IF NOT EXISTS public.strategy_job_reconciliations (
     evidence_json JSONB NOT NULL DEFAULT '{}'::jsonb,
     actor_id TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT ck_strategy_job_reconciliations_outcome CHECK (outcome IN ('reconciled', 'blocked', 'continuation', 'option_run_repair')),
+    CONSTRAINT ck_strategy_job_reconciliations_outcome CHECK (outcome IN ('reconciled', 'blocked', 'continuation', 'option_run_repair', 'owner_action')),
     CONSTRAINT ck_strategy_job_reconciliations_attempt CHECK (attempt > 0)
 );
 CREATE INDEX IF NOT EXISTS idx_strategy_job_reconciliations_job
@@ -3009,7 +3009,8 @@ CREATE TABLE IF NOT EXISTS public.strategy_proposal_journal (
     detail JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT ck_proposal_journal_event CHECK (
-        event IN ('received', 'idempotent_retry', 'conflict', 'validation_refused', 'plan_created')
+        event IN ('received', 'idempotent_retry', 'conflict', 'validation_refused', 'plan_created',
+                  'owner_action')
     )
 );
 CREATE INDEX IF NOT EXISTS idx_proposal_journal_strategy
@@ -3447,7 +3448,7 @@ ALTER TABLE public.strategy_plan_execution_events DROP CONSTRAINT IF EXISTS ck_s
 ALTER TABLE public.strategy_plan_execution_events
     ADD CONSTRAINT ck_spee_event
     CHECK (event IN ('submitted', 'filled', 'partially_filled', 'rejected', 'failed',
-                     'no_op', 'residual_abandoned', 'release_recovered'));
+                     'no_op', 'residual_abandoned', 'release_recovered', 'cancelled'));
 
 -- The parent row is mutable (a detection has a lifecycle); the log is not.
 CREATE OR REPLACE FUNCTION forbid_strategy_corporate_action_log_mutation() RETURNS trigger AS $$

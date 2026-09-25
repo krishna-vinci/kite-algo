@@ -17,6 +17,10 @@ import type {
   AuthorizationModeResponse,
   AuthorizationStatus,
   CalendarSessions,
+  CancelPendingPayload,
+  DeadSubmissionActionPayload,
+  DeadSubmissionActionResult,
+  DeadSubmissionEvidence,
   ExecutionGrant,
   ExecutionGrantRevokeResponse,
   ExecutionRequestDecisionResponse,
@@ -39,6 +43,8 @@ import type {
   OptionRunRepairActionPayload,
   OptionRunRepairActionResult,
   OptionRunRepairAssessment,
+  OwnerActionResult,
+  PendingWorkPreview,
   PlanDetail,
   ReconciliationAction,
   ReconciliationInspection,
@@ -414,6 +420,70 @@ export async function submitOptionRunRepair(
 ): Promise<OptionRunRepairActionResult> {
   return apiFetch<OptionRunRepairActionResult>(
     `${BASE}/${encodeURIComponent(strategyId)}/option-runs/${encodeURIComponent(optionRunId)}/repair`,
+    { method: "POST", json: payload },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// B2.6b: owner-facing safe actions (cancel pending work, dead-submission
+// disposition)
+// ---------------------------------------------------------------------------
+
+/**
+ * A preview of exactly what "Cancel pending work" would act on, with a stable
+ * `evidence_digest` the POST must carry. Never rendered as final until the
+ * POST response is read.
+ */
+export async function fetchPendingWork(strategyId: string): Promise<PendingWorkPreview> {
+  return apiFetch<PendingWorkPreview>(
+    `${BASE}/${encodeURIComponent(strategyId)}/owner-actions/pending-work`,
+  );
+}
+
+/**
+ * Cancel only the qualifying, exposure-increasing pending entry work named by
+ * the preview's own digest. A 409 names the refusal (e.g. the preview's
+ * evidence changed underneath the owner); the caller re-reads the preview
+ * after either outcome.
+ */
+export async function cancelPendingWork(
+  strategyId: string,
+  payload: CancelPendingPayload,
+): Promise<OwnerActionResult> {
+  return apiFetch<OwnerActionResult>(
+    `${BASE}/${encodeURIComponent(strategyId)}/owner-actions/cancel-pending`,
+    { method: "POST", json: payload },
+  );
+}
+
+/**
+ * Platform evidence for one unanswered plan-step submission, plus the ONLY
+ * dispositions the server will accept for it. The owner never types an
+ * outcome; they pick from `allowed_dispositions`.
+ */
+export async function fetchDeadSubmission(
+  strategyId: string,
+  planId: string,
+  stepNo: number,
+): Promise<DeadSubmissionEvidence> {
+  return apiFetch<DeadSubmissionEvidence>(
+    `${BASE}/${encodeURIComponent(strategyId)}/plans/${encodeURIComponent(planId)}/steps/${encodeURIComponent(String(stepNo))}/dead-submission`,
+  );
+}
+
+/**
+ * Record one allowed terminal disposition for a dead plan-step submission,
+ * pinned to the digest read from `fetchDeadSubmission`. This resolves the
+ * step so takeover/repair can proceed; it never sends an order itself.
+ */
+export async function resolveDeadSubmission(
+  strategyId: string,
+  planId: string,
+  stepNo: number,
+  payload: DeadSubmissionActionPayload,
+): Promise<DeadSubmissionActionResult> {
+  return apiFetch<DeadSubmissionActionResult>(
+    `${BASE}/${encodeURIComponent(strategyId)}/plans/${encodeURIComponent(planId)}/steps/${encodeURIComponent(String(stepNo))}/dead-submission`,
     { method: "POST", json: payload },
   );
 }

@@ -29,4 +29,7 @@ export const hostedKeys = {
     ["hosted", "option-run", strategyId, optionRunId] as const,
   optionRunRepair: (strategyId: string, optionRunId: string) =>
     ["hosted", "option-run-repair", strategyId, optionRunId] as const,
+  pendingWork: (strategyId: string) => ["hosted", "pending-work", strategyId] as const,
+  deadSubmission: (strategyId: string, planId: string, stepNo: number) =>
+    ["hosted", "dead-submission", strategyId, planId, stepNo] as const,
 };

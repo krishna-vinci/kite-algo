@@ -753,6 +753,19 @@ export type OptionRunRepairPlanLeg = {
 
 export type OptionRunRepairState = "flat" | "residual" | "ambiguous" | "not_repairable" | string;
 
+/**
+ * One plan step the repair assessment could not resolve on its own. Populated
+ * only while the assessment is `ambiguous` with reason `adjust_in_flight`;
+ * `state` is the step's newest trail word (`submitted`, `partially_filled`,
+ * …), or `""` when the platform cannot read it.
+ */
+export type OptionRunRepairUnresolvedStep = {
+  plan_id: string;
+  step_no: number;
+  state: string;
+  order_id: string | null;
+};
+
 export type OptionRunRepairAssessment = {
   option_run_id: string;
   status: string;
@@ -763,6 +776,8 @@ export type OptionRunRepairAssessment = {
   close_plan: OptionRunRepairPlanLeg[];
   evidence: Record<string, unknown>;
   detail: Record<string, unknown>;
+  /** Additive; servers that predate this field report no unresolved steps. */
+  unresolved_steps?: OptionRunRepairUnresolvedStep[];
 };
 
 export type OptionRunRepairActionPayload = {
@@ -778,4 +793,88 @@ export type OptionRunRepairActionResult = {
   evidence_digest: string;
   audit_id: string | null;
   submission: Record<string, unknown>;
+};
+
+// ---------------------------------------------------------------------------
+// B2.6b: owner-facing safe actions (cancel pending work, dead-submission
+// disposition). All routes are under `/api/strategies/{strategy_id}`.
+// ---------------------------------------------------------------------------
+
+/** Server classification; the UI never re-derives eligibility itself. */
+export type PendingWorkEligibility = "eligible" | "ineligible" | string;
+
+export type PendingWorkItem = {
+  plan_id: string;
+  step_no: number;
+  order_id: string | null;
+  remaining_quantity: number | null;
+  eligibility: PendingWorkEligibility;
+  /** Human-readable via `withRefusalCopy`; null only when eligible. */
+  reason_code: string | null;
+};
+
+/** `"unknown"` coverage means this candidate set is NOT proven complete. */
+export type PendingWorkCoverage = "known" | "unknown";
+
+export type PendingWorkPreview = {
+  coverage: PendingWorkCoverage | string;
+  evidence_digest: string;
+  items: PendingWorkItem[];
+};
+
+export type CancelPendingPayload = {
+  /** Pinned to the digest read from the preview; a stale digest refuses. */
+  evidence_digest: string;
+  reason: "owner_cancel" | string;
+};
+
+export type OwnerActionStatus = "complete" | "accepted" | "blocked" | string;
+
+/** The shared owner-action response envelope from design §5. */
+export type OwnerActionResult = {
+  status: OwnerActionStatus;
+  action_id: string;
+  evidence_digest: string;
+  items: PendingWorkItem[];
+  refusal?: string | null;
+  audit_id?: string | null;
+};
+
+/**
+ * One unanswered plan-step submission's terminal outcome. Only these five are
+ * ever recognized; the owner picks among what the server allows, never types
+ * one.
+ */
+export type DeadSubmissionDisposition =
+  | "filled"
+  | "rejected"
+  | "cancelled"
+  | "failed_never_submitted"
+  | "failed_residual_abandoned"
+  | string;
+
+export type DeadSubmissionEvidence = {
+  trail_state: string;
+  source: string;
+  status: string;
+  filled_quantity: number | null;
+  remaining_quantity: number | null;
+  /** ONLY these are offered as choices; never invented client-side. */
+  allowed_dispositions: DeadSubmissionDisposition[];
+  evidence_digest: string;
+};
+
+export type DeadSubmissionActionPayload = {
+  evidence_digest: string;
+  disposition: DeadSubmissionDisposition;
+  reason: string;
+};
+
+export type DeadSubmissionActionResult = {
+  status: OwnerActionStatus;
+  action_id: string;
+  evidence_digest: string;
+  refusal?: string | null;
+  audit_id?: string | null;
+  detail?: Record<string, unknown>;
 };

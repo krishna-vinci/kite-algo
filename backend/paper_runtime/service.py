@@ -305,6 +305,103 @@ class PaperTradingService:
             async with self._account_lock(position.account_scope):
                 await self._mark_to_market(position, tick)
 
+    async def cancel_order(self, *, account_scope: str, paper_order_id: str) -> Dict[str, Any]:
+        """Cancel a paper order's unexecuted remainder (the paper cancel boundary).
+
+        A paper order that is ``open`` or ``partially_filled`` still has a
+        remainder that is not the book's: cancelling it makes the order terminal
+        WITHOUT touching the quantity that already filled. A ``filled`` order has
+        nothing to cancel, and an already-terminal order returns its own status
+        unchanged, so a repeated cancel is safe (the caller still verifies the
+        terminal state from its own durable read rather than from this answer).
+
+        Returns the platform's own words - ``status`` plus the order payload - and
+        never fabricates a fill, a rejection or a zero remainder.
+        """
+        async with self._account_lock(account_scope):
+            order = await asyncio.to_thread(
+                self.repository.get_order, account_scope, str(paper_order_id)
+            )
+            if order is None:
+                return {
+                    "mode": "paper",
+                    "status": "unknown",
+                    "reason": "paper_order_unknown",
+                    "order_id": str(paper_order_id),
+                }
+            current = str(order.status or "")
+            terminal = {
+                PaperOrderStatus.FILLED.value,
+                PaperOrderStatus.CANCELLED.value,
+                PaperOrderStatus.REJECTED.value,
+                PaperOrderStatus.EXPIRED.value,
+            }
+            if current in terminal:
+                return {
+                    "mode": "paper",
+                    "status": current,
+                    "order": order.model_dump(mode="json"),
+                }
+            progress = await self._cancel_fill_remainder(
+                account_scope=account_scope, paper_order_id=str(paper_order_id)
+            )
+            filled = (
+                int(progress["filled_quantity"]) if progress else int(order.filled_quantity or 0)
+            )
+            cancelled = order.model_copy(
+                update={
+                    "status": PaperOrderStatus.CANCELLED,
+                    "filled_quantity": filled,
+                    "pending_quantity": 0,
+                    "completed_at": _utcnow(),
+                    "updated_at": _utcnow(),
+                }
+            )
+            cancelled = await asyncio.to_thread(self.repository.update_order, cancelled)
+            await publish_event(
+                "paper.orders.events",
+                paper_order_event_payload(event_type="cancelled", order=cancelled),
+            )
+            return {
+                "mode": "paper",
+                "status": PaperOrderStatus.CANCELLED.value,
+                "order": cancelled.model_dump(mode="json"),
+                "progress": progress,
+            }
+
+    async def _cancel_fill_remainder(
+        self, *, account_scope: str, paper_order_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Mark the order's progress row cancelled with a ZERO remainder.
+
+        ``None`` means the order never had a progress row, which is the
+        pre-G12 instant-fill shape: the order row alone already says everything.
+        """
+        store = self._fill_progress_store()
+        progress = await asyncio.to_thread(
+            store.cancel, account_scope=str(account_scope), paper_order_id=str(paper_order_id)
+        )
+        if progress is None:
+            return None
+        return {
+            "paper_order_id": progress.paper_order_id,
+            "filled_quantity": int(progress.filled_quantity),
+            "remaining_quantity": int(progress.remaining_quantity),
+            "status": str(progress.status),
+        }
+
+    def _fill_progress_store(self) -> Any:
+        """The service's fill-progress store, bound to ITS repository's database."""
+        from backend.paper_runtime.partial_fills import PaperFillProgressStore
+
+        store = getattr(self, "_fill_progress", None)
+        if store is None:
+            store = PaperFillProgressStore(
+                session_factory=getattr(self.repository, "session_factory", None)
+            )
+            self._fill_progress = store
+        return store
+
     async def list_orders(self, account_scope: str, *, strategy_tag: str | None = None, algo_instance_id: str | None = None, limit: int = 200) -> List[PaperOrder]:
         orders = await asyncio.to_thread(self.repository.list_orders, account_scope, limit=limit)
         return [order for order in orders if self._matches_attribution(order.metadata, strategy_tag=strategy_tag, algo_instance_id=algo_instance_id)]
@@ -971,11 +1068,7 @@ class PaperTradingService:
         Only the order row differs afterwards, because its status is what says
         there is more to do.
         """
-        from backend.paper_runtime.partial_fills import (
-            PaperFillProgressStore,
-            next_tranche,
-            partial_fill_ratio,
-        )
+        from backend.paper_runtime.partial_fills import next_tranche, partial_fill_ratio
 
         ratio = partial_fill_ratio()
         if ratio >= 1.0 or not order.account_scope:
@@ -985,15 +1078,10 @@ class PaperTradingService:
                 fill_price=fill_price, existing_position=existing_position,
             )
 
-        store = getattr(self, "_fill_progress", None)
-        if store is None:
-            # Bind to the repository's session factory, not the ambient default:
-            # the service's database is whatever its repository was built with, and
-            # a store that reached for SessionLocal would write to a different one.
-            store = PaperFillProgressStore(
-                session_factory=getattr(self.repository, "session_factory", None)
-            )
-            self._fill_progress = store
+        # Bind to the repository's session factory, not the ambient default: the
+        # service's database is whatever its repository was built with, and a
+        # store that reached for SessionLocal would write to a different one.
+        store = self._fill_progress_store()
         progress = await asyncio.to_thread(
             store.start,
             account_scope=order.account_scope,

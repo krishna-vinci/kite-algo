@@ -28,6 +28,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   Table,
@@ -38,16 +39,22 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import {
+  useCancelPendingWork,
+  useDeadSubmission,
   useHostedJobs,
   useOptionRun,
   useOptionRunRepairAssessment,
   useOptionRuns,
+  usePendingWork,
+  useResolveDeadSubmission,
   useStopHostedJob,
   useSubmitOptionRunRepair,
 } from "@/features/strategies/hooks/use-hosted-strategies-queries";
 import {
+  deadSubmissionDispositionLabel,
   formatTimestamp,
   hostedErrorMessage,
+  hostedRefusalCode,
   optionLegStateLabel,
   optionLegStateTone,
   optionRunStatusLabel,
@@ -55,10 +62,13 @@ import {
   withRefusalCopy,
 } from "@/features/strategies/lib/format";
 import type {
+  DeadSubmissionDisposition,
+  DeadSubmissionEvidence,
   HostedJobSummary,
   OptionRun,
   OptionRunLeg,
   OptionRunRepairActionPayload,
+  PendingWorkItem,
 } from "@/lib/hosted-strategies/types";
 
 // ---------------------------------------------------------------------------
@@ -219,6 +229,170 @@ function OptionRunDetailSection({
 }
 
 // ---------------------------------------------------------------------------
+// Dead-submission disposition (B2.6b §4)
+// ---------------------------------------------------------------------------
+
+function DeadSubmissionEvidencePanel({ evidence }: Readonly<{ evidence: DeadSubmissionEvidence }>) {
+  return (
+    <dl className="grid gap-2 text-xs sm:grid-cols-2">
+      <div>
+        <dt className="text-muted-foreground">Trail state</dt>
+        <dd>{evidence.trail_state}</dd>
+      </div>
+      <div>
+        <dt className="text-muted-foreground">Source</dt>
+        <dd>{evidence.source}</dd>
+      </div>
+      <div>
+        <dt className="text-muted-foreground">Platform status</dt>
+        <dd>{evidence.status}</dd>
+      </div>
+      <div>
+        <dt className="text-muted-foreground">Filled quantity</dt>
+        <dd>{evidence.filled_quantity ?? "—"}</dd>
+      </div>
+      <div>
+        <dt className="text-muted-foreground">Remaining quantity</dt>
+        <dd>{evidence.remaining_quantity ?? "—"}</dd>
+      </div>
+    </dl>
+  );
+}
+
+/**
+ * Resolve one unanswered plan-step submission. The owner never types an
+ * outcome: only the `allowed_dispositions` the server names for THIS step's
+ * own evidence are offered, and the POST is pinned to that evidence's digest.
+ * Resolving it does not send an order; it lets takeover/repair proceed.
+ */
+export function ResolveDeadSubmissionDialog({
+  strategyId,
+  planId,
+  stepNo,
+  open,
+  onOpenChange,
+}: Readonly<{
+  strategyId: string;
+  planId: string;
+  stepNo: number;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}>) {
+  const evidenceQuery = useDeadSubmission(strategyId, planId, stepNo, open);
+  const mutation = useResolveDeadSubmission(strategyId, planId, stepNo);
+  const [disposition, setDisposition] = useState<DeadSubmissionDisposition | null>(null);
+  const [reason, setReason] = useState("");
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  const evidence = evidenceQuery.data;
+
+  function reset() {
+    setDisposition(null);
+    setReason("");
+    setActionError(null);
+  }
+
+  async function confirm() {
+    if (!evidence || !disposition) return;
+    setActionError(null);
+    try {
+      await mutation.mutateAsync({
+        evidence_digest: evidence.evidence_digest,
+        disposition,
+        reason: reason.trim(),
+      });
+      toast.success("Disposition recorded. Takeover/repair can proceed once this settles.");
+      onOpenChange(false);
+      reset();
+    } catch (error) {
+      setActionError(hostedErrorMessage(error));
+    } finally {
+      void evidenceQuery.refetch();
+    }
+  }
+
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={(openState) => {
+        onOpenChange(openState);
+        if (!openState) reset();
+      }}
+    >
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Resolve unanswered step</DialogTitle>
+          <DialogDescription>
+            This records what the platform can already prove about one unanswered submission. It does not
+            send any order. You can only choose from the platform&apos;s own allowed outcomes below.
+          </DialogDescription>
+        </DialogHeader>
+        {evidenceQuery.isLoading ? (
+          <Skeleton className="h-24 w-full rounded-md" />
+        ) : evidenceQuery.isError || !evidence ? (
+          <Alert variant="destructive">
+            <AlertTitle>Could not load this step&apos;s evidence</AlertTitle>
+            <AlertDescription>{hostedErrorMessage(evidenceQuery.error)}</AlertDescription>
+          </Alert>
+        ) : (
+          <>
+            <DeadSubmissionEvidencePanel evidence={evidence} />
+            {evidence.allowed_dispositions.length === 0 ? (
+              <p className="text-xs text-muted-foreground">
+                The platform does not offer any disposition for this step yet.
+              </p>
+            ) : (
+              <div className="flex flex-col gap-2">
+                <p className="text-xs font-medium">Choose the outcome the platform allows:</p>
+                <div className="flex flex-wrap gap-2" role="radiogroup" aria-label="Allowed disposition">
+                  {evidence.allowed_dispositions.map((option) => (
+                    <Button
+                      key={option}
+                      type="button"
+                      size="sm"
+                      variant={disposition === option ? "default" : "outline"}
+                      aria-pressed={disposition === option}
+                      onClick={() => setDisposition(option)}
+                      data-testid={`dead-submission-disposition-${option}`}
+                    >
+                      {deadSubmissionDispositionLabel(option)}
+                    </Button>
+                  ))}
+                </div>
+              </div>
+            )}
+            <Input
+              aria-label="Reason"
+              placeholder="Reason"
+              value={reason}
+              onChange={(event) => setReason(event.target.value)}
+            />
+          </>
+        )}
+        {actionError ? (
+          <p className="text-xs text-destructive" data-testid="dead-submission-error">
+            {actionError}
+          </p>
+        ) : null}
+        <DialogFooter>
+          <Button variant="outline" onClick={() => onOpenChange(false)}>
+            Close
+          </Button>
+          <Button
+            onClick={confirm}
+            disabled={!evidence || !disposition || !reason.trim() || mutation.isPending}
+            data-testid="dead-submission-confirm"
+          >
+            {mutation.isPending ? <Loader2Icon className="size-3 animate-spin" aria-hidden /> : null}
+            Confirm disposition
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Repair panel
 // ---------------------------------------------------------------------------
 
@@ -230,8 +404,10 @@ function OptionRunRepairPanel({
   const mutation = useSubmitOptionRunRepair(strategyId, optionRunId);
   const [confirmAction, setConfirmAction] = useState<OptionRunRepairActionPayload["action"] | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [resolveStep, setResolveStep] = useState<{ planId: string; stepNo: number } | null>(null);
 
   const assessment = assessmentQuery.data;
+  const unresolvedSteps = assessment?.unresolved_steps ?? [];
 
   async function confirm() {
     if (!assessment || !confirmAction) return;
@@ -319,6 +495,53 @@ function OptionRunRepairPanel({
               </p>
             ) : null}
           </div>
+          {unresolvedSteps.length > 0 ? (
+            <div
+              className="flex flex-col gap-2 border-t pt-3"
+              data-testid={`option-resolve-dead-submission-${optionRunId}`}
+            >
+              <h5 className="text-xs font-medium">Unanswered step{unresolvedSteps.length > 1 ? "s" : ""}</h5>
+              <p className="text-xs text-muted-foreground">
+                This run is ambiguous because a step of its adjust may still be submitting. If the platform
+                can prove a step below is actually dead — never reached the broker, or already terminal —
+                resolving it lets takeover/repair proceed. It does not send any order, and it cannot be typed
+                in: only the platform&apos;s own allowed outcomes are offered.
+              </p>
+              <div className="flex flex-col gap-2">
+                {unresolvedSteps.map((step) => (
+                  <div
+                    key={`${step.plan_id}-${step.step_no}`}
+                    className="flex flex-wrap items-center gap-2 text-xs"
+                  >
+                    <span className="font-mono">
+                      {step.plan_id} · step {step.step_no}
+                    </span>
+                    <span className="text-muted-foreground">{step.state || "unreadable"}</span>
+                    <span className="font-mono text-muted-foreground">{step.order_id ?? "—"}</span>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => setResolveStep({ planId: step.plan_id, stepNo: step.step_no })}
+                      data-testid={`option-resolve-dead-submission-trigger-${step.plan_id}-${step.step_no}`}
+                    >
+                      Resolve unanswered step
+                    </Button>
+                  </div>
+                ))}
+              </div>
+              {resolveStep ? (
+                <ResolveDeadSubmissionDialog
+                  strategyId={strategyId}
+                  planId={resolveStep.planId}
+                  stepNo={resolveStep.stepNo}
+                  open
+                  onOpenChange={(openState) => {
+                    if (!openState) setResolveStep(null);
+                  }}
+                />
+              ) : null}
+            </div>
+          ) : null}
           {actionError ? (
             <p className="text-xs text-destructive" data-testid="option-repair-error">
               {actionError}
@@ -461,6 +684,192 @@ function OptionRunsCoverageWarning({ coverageReason }: Readonly<{ coverageReason
 }
 
 // ---------------------------------------------------------------------------
+// Cancel pending work (B2.6b §1)
+// ---------------------------------------------------------------------------
+
+function PendingWorkPreviewTable({ items }: Readonly<{ items: PendingWorkItem[] }>) {
+  const eligible = items.filter((item) => item.eligibility === "eligible");
+  const ineligible = items.filter((item) => item.eligibility !== "eligible");
+  return (
+    <div className="flex flex-col gap-4">
+      <p className="text-xs text-muted-foreground">
+        Protective (hedge) orders and exit/reduction orders are never cancelled by this action.
+      </p>
+      <div>
+        <h5 className="text-xs font-medium">Eligible to cancel ({eligible.length})</h5>
+        {eligible.length === 0 ? (
+          <p className="mt-1 text-xs text-muted-foreground">
+            No pending entry work currently qualifies for cancellation.
+          </p>
+        ) : (
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Plan / step</TableHead>
+                <TableHead>Order id</TableHead>
+                <TableHead>Remaining qty</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {eligible.map((item) => (
+                <TableRow key={`${item.plan_id}-${item.step_no}`} data-testid="pending-work-eligible-row">
+                  <TableCell className="font-mono text-xs">
+                    {item.plan_id} · step {item.step_no}
+                  </TableCell>
+                  <TableCell className="font-mono text-xs">{item.order_id ?? "—"}</TableCell>
+                  <TableCell className="text-sm">{item.remaining_quantity ?? "—"}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        )}
+      </div>
+      <div>
+        <h5 className="text-xs font-medium">Not cancellable ({ineligible.length})</h5>
+        {ineligible.length === 0 ? (
+          <p className="mt-1 text-xs text-muted-foreground">Every candidate qualifies.</p>
+        ) : (
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Plan / step</TableHead>
+                <TableHead>Order id</TableHead>
+                <TableHead>Remaining qty</TableHead>
+                <TableHead>Reason</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {ineligible.map((item) => (
+                <TableRow key={`${item.plan_id}-${item.step_no}`} data-testid="pending-work-ineligible-row">
+                  <TableCell className="font-mono text-xs">
+                    {item.plan_id} · step {item.step_no}
+                  </TableCell>
+                  <TableCell className="font-mono text-xs">{item.order_id ?? "—"}</TableCell>
+                  <TableCell className="text-sm">{item.remaining_quantity ?? "—"}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground">
+                    {item.reason_code ? withRefusalCopy(item.reason_code) : "Not eligible."}
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function CancelPendingWorkControl({ strategyId }: Readonly<{ strategyId: string }>) {
+  const [open, setOpen] = useState(false);
+  const previewQuery = usePendingWork(strategyId, open);
+  const mutation = useCancelPendingWork(strategyId);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [promptRefresh, setPromptRefresh] = useState(false);
+
+  const preview = previewQuery.data;
+  const coverageUnknown = preview?.coverage === "unknown";
+  const eligibleCount = preview?.items.filter((item) => item.eligibility === "eligible").length ?? 0;
+  const confirmDisabled = mutation.isPending || !preview || coverageUnknown || eligibleCount === 0;
+
+  async function confirmCancel() {
+    if (!preview) return;
+    setActionError(null);
+    setPromptRefresh(false);
+    try {
+      await mutation.mutateAsync({ evidence_digest: preview.evidence_digest, reason: "owner_cancel" });
+      toast.success("Cancellation submitted for the eligible pending work.");
+      setOpen(false);
+    } catch (error) {
+      setActionError(hostedErrorMessage(error));
+      setPromptRefresh(hostedRefusalCode(error) === "CANCEL_EVIDENCE_CHANGED");
+    } finally {
+      void previewQuery.refetch();
+    }
+  }
+
+  return (
+    <>
+      <Button
+        size="sm"
+        variant="outline"
+        onClick={() => setOpen(true)}
+        data-testid="option-control-cancel-pending"
+      >
+        Cancel pending work
+      </Button>
+      <Dialog
+        open={open}
+        onOpenChange={(openState) => {
+          setOpen(openState);
+          if (!openState) {
+            setActionError(null);
+            setPromptRefresh(false);
+          }
+        }}
+      >
+        <DialogContent className="sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>Cancel pending work</DialogTitle>
+            <DialogDescription>
+              Cancels only pending, exposure-increasing entry orders this strategy owns. Protective (hedge)
+              orders and exit/reduction orders are never cancelled by this action.
+            </DialogDescription>
+          </DialogHeader>
+          {previewQuery.isLoading ? (
+            <Skeleton className="h-24 w-full rounded-md" />
+          ) : previewQuery.isError || !preview ? (
+            <Alert variant="destructive">
+              <AlertTitle>Could not load the preview</AlertTitle>
+              <AlertDescription>{hostedErrorMessage(previewQuery.error)}</AlertDescription>
+            </Alert>
+          ) : (
+            <>
+              {coverageUnknown ? (
+                <Alert variant="destructive" data-testid="pending-work-coverage-warning">
+                  <AlertTitle>Coverage unknown</AlertTitle>
+                  <AlertDescription>
+                    The platform could not prove it read every candidate, so cancellation stays disabled
+                    until it can.
+                  </AlertDescription>
+                </Alert>
+              ) : null}
+              <PendingWorkPreviewTable items={preview.items} />
+            </>
+          )}
+          {actionError ? (
+            <div className="flex flex-col gap-2" data-testid="cancel-pending-error">
+              <p className="text-xs text-destructive">{actionError}</p>
+              {promptRefresh ? (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => void previewQuery.refetch()}
+                  data-testid="cancel-pending-refresh"
+                >
+                  Refresh preview
+                </Button>
+              ) : null}
+            </div>
+          ) : null}
+          {!coverageUnknown && preview && eligibleCount === 0 ? (
+            <p className="text-xs text-muted-foreground">Nothing eligible to cancel right now.</p>
+          ) : null}
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setOpen(false)}>
+              Close
+            </Button>
+            <Button onClick={confirmCancel} disabled={confirmDisabled} data-testid="cancel-pending-confirm">
+              {mutation.isPending ? <Loader2Icon className="size-3 animate-spin" aria-hidden /> : null}
+              Confirm cancel
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Four controls
 // ---------------------------------------------------------------------------
 
@@ -482,12 +891,12 @@ export function OptionsControls({
   strategyId,
   jobs,
 }: Readonly<{ strategyId: string; jobs: HostedJobSummary[] }>) {
-  // The only owner-facing route among the four that already exists is the
-  // per-attempt job stop (`POST /{strategy_id}/jobs/{job_id}/stop`); its own
-  // note is explicit that it "does not cancel orders or flatten" — exactly
-  // the "stop evaluator" semantics asked for here. Cancel-pending, exit
-  // structure and flatten have no owner-facing route yet, so those three stay
-  // disabled rather than invent one.
+  // Stop evaluator uses the existing per-attempt job stop
+  // (`POST /{strategy_id}/jobs/{job_id}/stop`); its own note is explicit that
+  // it "does not cancel orders or flatten" — exactly the "stop evaluator"
+  // semantics asked for here. Cancel pending work (B2.6b §1) is wired below.
+  // Exit structure and flatten have no owner-facing route yet, so those two
+  // stay disabled rather than invent one.
   const activeJob = jobs.find((job) =>
     ["queued", "starting", "running", "fencing"].includes(job.status),
   );
@@ -525,10 +934,7 @@ export function OptionsControls({
         title="Cancel pending work"
         description="Cancels pending entries only; never protective or exit orders."
       >
-        <Button size="sm" variant="outline" disabled data-testid="option-control-cancel-pending">
-          Cancel pending work
-        </Button>
-        <p className="text-xs text-muted-foreground">Not available yet.</p>
+        <CancelPendingWorkControl strategyId={strategyId} />
       </ControlCard>
       <ControlCard title="Exit structure" description="Governed exit of one option run.">
         <Button size="sm" variant="outline" disabled data-testid="option-control-exit-structure">

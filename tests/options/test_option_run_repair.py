@@ -353,6 +353,74 @@ def test_an_adjusting_run_whose_plan_is_still_submitting_is_ambiguous():
     assert REASON_ADJUST_IN_FLIGHT in unread["reasons"]
 
 
+def test_an_adjusting_run_names_the_unanswered_step_an_owner_must_dispose_of():
+    """B2.6b: the ``adjust_in_flight`` refusal carries its own coordinates.
+
+    The options UI cannot otherwise learn WHICH plan/step is unanswered, so an
+    ``ambiguous`` assessment lists them: the plan ids and step numbers come from
+    the plan-execution fold (`option_adjust_owner_state` -> 
+    `option_plan_execution_state`), and each step's own trail row supplies the
+    word and the order it links.
+    """
+    run = _run("adjusting", trades=[_trade("leg_short", "SELL", 75)])
+    submitting = {
+        "state": "in_flight",
+        "plan_ids": ["plan-adjust"],
+        "plans": {
+            "plan-adjust": {
+                "state": "in_flight",
+                "evidence": {
+                    "plan_id": "plan-adjust",
+                    "submitted_events": 1,
+                    "unresolved_steps": [1],
+                },
+            }
+        },
+    }
+    seen: list = []
+
+    def _reader(plan_id, step_no):
+        seen.append((plan_id, step_no))
+        return {"state": "submitted", "order_id": None}
+
+    assessment = assess_option_run_repair(
+        run, _staged_exit(), adjust_owner=submitting, unresolved_step_reader=_reader
+    )
+    assert assessment["state"] == STATE_AMBIGUOUS
+    assert REASON_ADJUST_IN_FLIGHT in assessment["reasons"]
+    assert assessment["unresolved_steps"] == [
+        {"plan_id": "plan-adjust", "step_no": 1, "state": "submitted", "order_id": None}
+    ]
+    assert seen == [("plan-adjust", 1)]
+
+    # The service path the route uses carries the same coordinates.
+    service = OptionRunRepairService(
+        run_store=_FakeRunStore(run),
+        staged_exit=_staged_exit(),
+        adjust_owner_reader=lambda _run_id: dict(submitting),
+        unresolved_step_reader=_reader,
+    )
+    inspection = service.assessment(run.strategy_run_id)
+    assert inspection["unresolved_steps"] == assessment["unresolved_steps"]
+
+    # A plan the fold does not report as unfinished names no steps, and a caller
+    # with no reader still gets the refusal - with no invented word.
+    finished = {
+        "state": "finished",
+        "plan_ids": ["plan-adjust"],
+        "plans": {"plan-adjust": {"state": "finished", "evidence": {"plan_id": "plan-adjust"}}},
+    }
+    assert (
+        assess_option_run_repair(
+            run, _staged_exit(), adjust_owner=finished, unresolved_step_reader=_reader
+        )["unresolved_steps"]
+        == []
+    )
+    assert assess_option_run_repair(run, _staged_exit(), adjust_owner=submitting)[
+        "unresolved_steps"
+    ] == [{"plan_id": "plan-adjust", "step_no": 1, "state": "", "order_id": None}]
+
+
 def test_a_run_whose_plan_fill_remains_working_is_ambiguous():
     """A live remainder is in-flight work, never repairable residual evidence."""
     run = _run("adjusting", trades=[_trade("leg_short", "SELL", 75)])

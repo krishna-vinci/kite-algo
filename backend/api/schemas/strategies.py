@@ -1071,6 +1071,25 @@ class OptionRunRepairPlanLeg(BaseModel):
     order_type: Optional[str] = None
 
 
+class OptionRunRepairUnresolvedStep(BaseModel):
+    """One plan step whose execution has no outcome yet.
+
+    The *which* comes from the plan-execution fold
+    (``plan_binding.option_plan_execution_state``), never from a second
+    derivation; ``state`` is the step's own newest trail word (``submitted``,
+    ``partially_filled``, ...) and ``order_id`` the order that row links, so the
+    owner can address exactly that step.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    plan_id: str
+    step_no: int
+    #: The step's newest trail word; ``""`` when that row could not be read.
+    state: str = ""
+    order_id: Optional[str] = None
+
+
 class OptionRunRepairAssessmentResponse(BaseModel):
     """The read-only repair verdict for one option run.
 
@@ -1078,6 +1097,10 @@ class OptionRunRepairAssessmentResponse(BaseModel):
     caller: ``flat`` (nothing held - close it), ``residual`` (some leg still open
     - the close plan is the repair), ``ambiguous`` (the platform cannot explain
     the run - escalate by name) or ``not_repairable`` (wrong status).
+
+    ``unresolved_steps`` names the plan steps an ``ambiguous`` run is waiting on,
+    so an owner can act on them (B2.6b's dead-submission disposition) instead of
+    guessing which plan/step the refusal means. Empty when there are none.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -1091,6 +1114,7 @@ class OptionRunRepairAssessmentResponse(BaseModel):
     close_plan: List[OptionRunRepairPlanLeg] = Field(default_factory=list)
     evidence: Dict[str, Any] = Field(default_factory=dict)
     detail: Dict[str, Any] = Field(default_factory=dict)
+    unresolved_steps: List[OptionRunRepairUnresolvedStep] = Field(default_factory=list)
 
 
 class OptionRunRepairActionRequest(BaseModel):

@@ -149,6 +149,29 @@ const ERROR_COPY: Record<string, string> = {
   OPTION_RUN_REPAIR_STATE_CHANGED:
     "This run's state changed before the repair could commit. Re-check before repairing.",
   OPTION_RUN_REPAIR_AUDIT_UNAVAILABLE: "This run has no hosted job to record the repair against.",
+  // B2.6b: owner-facing safe actions (cancel pending work, exit, flatten,
+  // dead-submission disposition).
+  CANCEL_EVIDENCE_CHANGED:
+    "This pending-work preview changed since it was read. Refresh the preview before cancelling.",
+  CANCEL_ORDER_NOT_OWNED:
+    "This order could not be proven to belong to this strategy, account and environment, so it was refused.",
+  CANCEL_PROTECTIVE_ORDER_FORBIDDEN:
+    "This is protective (hedge) work. This action never cancels protective orders.",
+  CANCEL_REDUCTION_FORBIDDEN:
+    "This is exit, reduction, adjust, roll or square-off work. This action never cancels risk-reducing work.",
+  OPTION_RUN_STATE_CHANGED: "This run's state changed before the request could commit. Re-check before retrying.",
+  OPTION_RUN_EVIDENCE_AMBIGUOUS:
+    "The platform cannot read this run's own fills well enough to act automatically; it needs manual review.",
+  DEAD_SUBMISSION_EVIDENCE_UNAVAILABLE:
+    "The platform has no readable evidence for this step yet, so no disposition can be recorded.",
+  DEAD_SUBMISSION_EVIDENCE_CHANGED:
+    "This step's evidence changed since it was read. Re-check before resolving it.",
+  DEAD_SUBMISSION_OPEN_REMAINDER: "This step still has an open remainder, so it is not a dead submission yet.",
+  DEAD_SUBMISSION_PROTECTIVE_FORBIDDEN:
+    "This is staged protective exit work; it resolves through the protective exit, not this disposition.",
+  FLATTEN_EVALUATION_ACTIVE: "An active evaluation could not be proven stopped, so flatten was refused.",
+  FLATTEN_LIVE_NONOPTION_UNSUPPORTED:
+    "Live flatten for non-option positions is not supported yet; option work already completed is still reported as done.",
 };
 
 function withCopy(code: string): string {
@@ -195,6 +218,25 @@ export function hostedErrorMessage(error: unknown): string {
   }
   if (error instanceof Error) return error.message;
   return "Request failed";
+}
+
+/**
+ * The machine-readable refusal code from a 409 `ApiClientError`, or null.
+ * Used where the UI must react to ONE specific named refusal (e.g. prompting
+ * a preview refresh on `CANCEL_EVIDENCE_CHANGED`) rather than just showing
+ * `hostedErrorMessage`'s prose.
+ */
+export function hostedRefusalCode(error: unknown): string | null {
+  if (!(error instanceof ApiClientError)) return null;
+  const body = error.body as unknown;
+  if (!body || typeof body !== "object") return null;
+  const detail = (body as { detail?: unknown }).detail;
+  if (typeof detail === "string") return detail;
+  if (detail && typeof detail === "object") {
+    const reason = (detail as Record<string, unknown>).rejection_reason;
+    if (typeof reason === "string") return reason;
+  }
+  return null;
 }
 
 /**
@@ -452,6 +494,24 @@ export function optionLegStateTone(state: string | null | undefined): string {
     default:
       return "text-muted-foreground";
   }
+}
+
+// ---------------------------------------------------------------------------
+// B2.6b: owner-facing safe actions (cancel pending work, dead-submission)
+// ---------------------------------------------------------------------------
+
+/** The ONLY outcomes the dead-submission disposition ever accepts. */
+export const DEAD_SUBMISSION_DISPOSITION_LABELS: Record<string, string> = {
+  filled: "Filled — proven fills cover the full requested quantity",
+  rejected: "Rejected — broker/paper terminal rejection, zero filled",
+  cancelled: "Cancelled — terminal cancellation, any proven fill preserved",
+  failed_never_submitted: "Never submitted — durable records prove it never reached the order path",
+  failed_residual_abandoned: "Residual abandoned — terminal order, zero remaining, fills recorded",
+};
+
+export function deadSubmissionDispositionLabel(value: string | null | undefined): string {
+  const key = String(value ?? "").trim();
+  return DEAD_SUBMISSION_DISPOSITION_LABELS[key] ?? (key ? key : "Unknown");
 }
 
 export function schedulePolicyCopy(schedule: {

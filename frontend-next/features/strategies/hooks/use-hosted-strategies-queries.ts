@@ -6,11 +6,13 @@ import { hostedKeys } from "@/features/strategies/hooks/keys";
 import { anyJobStillMoving } from "@/features/strategies/lib/modes";
 import {
   approveExecutionRequest,
+  cancelPendingWork,
   checkSourceReadiness,
   createHostedStrategy,
   createHostedVersion,
   fetchAdmissionPolicy,
   fetchAuthorization,
+  fetchDeadSubmission,
   fetchExecutionGrants,
   fetchExecutionRequests,
   fetchHostedJob,
@@ -28,11 +30,13 @@ import {
   fetchOptionRun,
   fetchOptionRunRepair,
   fetchOptionRuns,
+  fetchPendingWork,
   fetchPlan,
   inspectHostedReconciliation,
   issueExecutionGrant,
   reconcileHostedJob,
   rejectExecutionRequest,
+  resolveDeadSubmission,
   revokeExecutionGrant,
   runHostedStrategy,
   saveAdmissionPolicy,
@@ -421,6 +425,59 @@ export function useSubmitOptionRunRepair(strategyId: string, optionRunId: string
     onSuccess: () => {
       void client.invalidateQueries({ queryKey: hostedKeys.optionRunRepair(strategyId, optionRunId) });
       void client.invalidateQueries({ queryKey: hostedKeys.optionRun(strategyId, optionRunId) });
+      void client.invalidateQueries({ queryKey: hostedKeys.optionRuns(strategyId) });
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// B2.6b: owner-facing safe actions (cancel pending work, dead-submission)
+// ---------------------------------------------------------------------------
+
+/**
+ * The cancel-pending preview. `enabled` lets the caller defer the GET until
+ * the confirmation dialog actually opens, rather than loading it eagerly.
+ */
+export function usePendingWork(strategyId: string | null, enabled = true) {
+  return useQuery({
+    queryKey: hostedKeys.pendingWork(strategyId ?? ""),
+    queryFn: () => fetchPendingWork(strategyId as string),
+    enabled: Boolean(strategyId) && enabled,
+  });
+}
+
+export function useCancelPendingWork(strategyId: string) {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (payload: Parameters<typeof cancelPendingWork>[1]) =>
+      cancelPendingWork(strategyId, payload),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: hostedKeys.pendingWork(strategyId) });
+      void client.invalidateQueries({ queryKey: hostedKeys.optionRuns(strategyId) });
+    },
+  });
+}
+
+export function useDeadSubmission(
+  strategyId: string | null,
+  planId: string | null,
+  stepNo: number | null,
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: hostedKeys.deadSubmission(strategyId ?? "", planId ?? "", stepNo ?? -1),
+    queryFn: () => fetchDeadSubmission(strategyId as string, planId as string, stepNo as number),
+    enabled: Boolean(strategyId && planId && stepNo !== null) && enabled,
+  });
+}
+
+export function useResolveDeadSubmission(strategyId: string, planId: string, stepNo: number) {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (payload: Parameters<typeof resolveDeadSubmission>[3]) =>
+      resolveDeadSubmission(strategyId, planId, stepNo, payload),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: hostedKeys.deadSubmission(strategyId, planId, stepNo) });
       void client.invalidateQueries({ queryKey: hostedKeys.optionRuns(strategyId) });
     },
   });

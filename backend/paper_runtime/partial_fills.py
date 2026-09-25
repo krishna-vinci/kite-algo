@@ -183,6 +183,12 @@ class PaperFillProgressStore:
             session.close()
 
     def cancel(self, *, account_scope: str, paper_order_id: str) -> Optional[FillProgress]:
+        """Cancel the unexecuted remainder: terminal status AND zero remaining.
+
+        The remainder is what a cancel removes, so leaving it non-zero would make
+        the row claim an order that still has work to do. The filled quantity is
+        never touched - a cancel preserves what already filled.
+        """
         session = self.session_factory()
         try:
             row = session.execute(
@@ -194,6 +200,7 @@ class PaperFillProgressStore:
             if row is None:
                 return None
             row.status = "cancelled"
+            row.remaining_quantity = 0
             row.updated_at = _utcnow()
             session.commit()
             return self._view(row)
