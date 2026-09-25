@@ -358,7 +358,7 @@ class StrategyJobReconciliation(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "outcome IN ('reconciled', 'blocked', 'continuation')",
+            "outcome IN ('reconciled', 'blocked', 'continuation', 'option_run_repair')",
             name="ck_strategy_job_reconciliations_outcome",
         ),
         CheckConstraint("attempt > 0", name="ck_strategy_job_reconciliations_attempt"),

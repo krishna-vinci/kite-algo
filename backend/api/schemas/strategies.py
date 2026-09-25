@@ -1054,6 +1054,64 @@ class OptionSettlementResponse(BaseModel):
     evidence: List[OptionSettlementEvidenceRow] = Field(default_factory=list)
 
 
+class OptionRunRepairPlanLeg(BaseModel):
+    """One bounded, risk-reducing close action the repair would submit."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    tradingsymbol: str
+    transaction_type: str
+    quantity: int
+    exchange: Optional[str] = None
+    product: Optional[str] = None
+    order_type: Optional[str] = None
+
+
+class OptionRunRepairAssessmentResponse(BaseModel):
+    """The read-only repair verdict for one option run.
+
+    ``state`` is DERIVED from the run's own confirmed fills, never asserted by a
+    caller: ``flat`` (nothing held - close it), ``residual`` (some leg still open
+    - the close plan is the repair), ``ambiguous`` (the platform cannot explain
+    the run - escalate by name) or ``not_repairable`` (wrong status).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    option_run_id: str
+    status: str
+    state: str
+    reason_code: Optional[str] = None
+    reasons: List[str] = Field(default_factory=list)
+    evidence_digest: str
+    close_plan: List[OptionRunRepairPlanLeg] = Field(default_factory=list)
+    evidence: Dict[str, Any] = Field(default_factory=dict)
+    detail: Dict[str, Any] = Field(default_factory=dict)
+
+
+class OptionRunRepairActionRequest(BaseModel):
+    """A pinned repair action: the digest must still describe the run."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    action: str
+    evidence_digest: str
+
+
+class OptionRunRepairActionResponse(BaseModel):
+    """What the repair actually did, and the evidence digest it acted on."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    option_run_id: str
+    action: str
+    state: str
+    run_status: str
+    evidence_digest: str
+    audit_id: Optional[str] = None
+    submission: Dict[str, Any] = Field(default_factory=dict)
+
+
 # ---------------------------------------------------------------------------
 # first-run source readiness (Slice: hosted data foundation)
 # ---------------------------------------------------------------------------

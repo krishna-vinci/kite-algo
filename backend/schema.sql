@@ -2453,7 +2453,7 @@ CREATE TABLE IF NOT EXISTS public.strategy_job_reconciliations (
     evidence_json JSONB NOT NULL DEFAULT '{}'::jsonb,
     actor_id TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT ck_strategy_job_reconciliations_outcome CHECK (outcome IN ('reconciled', 'blocked', 'continuation')),
+    CONSTRAINT ck_strategy_job_reconciliations_outcome CHECK (outcome IN ('reconciled', 'blocked', 'continuation', 'option_run_repair')),
     CONSTRAINT ck_strategy_job_reconciliations_attempt CHECK (attempt > 0)
 );
 CREATE INDEX IF NOT EXISTS idx_strategy_job_reconciliations_job

@@ -71,6 +71,10 @@ from backend.api.schemas.strategies import (
     ReservationResponse,
     OptionSettlementEvidenceRow,
     OptionSettlementResponse,
+    OptionRunRepairActionRequest,
+    OptionRunRepairActionResponse,
+    OptionRunRepairAssessmentResponse,
+    OptionRunRepairPlanLeg,
     RollEventRow,
     RollListResponse,
     RollCreateRequest,
@@ -130,6 +134,14 @@ from backend.api.services.hosted_strategy_authz import (
     authorized_account_scopes,
     is_account_authorized,
 )
+from backend.api.services.option_run_repair import (
+    build_option_run_repair_service,
+    option_run_repair_scope,
+    record_repair_audit,
+    repair_audit_job,
+    require_residual_close_available,
+    submit_residual_close,
+)
 from backend.app.auth import AppUser, require_app_user
 from backend.strategies import service
 from backend.strategies import readiness
@@ -140,6 +152,13 @@ from backend.strategies.attribution import (
 )
 from backend.strategies.reconciliation import assess, evidence_digest
 from backend.strategies.plan_pipeline import PipelineRefusal, PlanExecutionPipeline
+from backend.options.execution.repair import (
+    ACTION_CLOSE_RESIDUAL,
+    REASON_ACTION_MISMATCH,
+    REASON_LIVE_UNSUPPORTED,
+    REPAIR_ACTIONS,
+    OptionRunRepairRefusal,
+)
 from backend.strategies.repository import (
     SqlAlchemyStrategyRepository,
     StrategyConflict,
@@ -1323,6 +1342,166 @@ async def get_option_run_settlement(
         option_run_id=option_run_id,
         settled=bool(rows),
         evidence=[OptionSettlementEvidenceRow(**row) for row in rows],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Option-run repair (B2.1b) - the governed way out of a partial/cleanup run
+# ---------------------------------------------------------------------------
+
+
+def _option_run_repair_plan_leg(order: Dict[str, Any]) -> OptionRunRepairPlanLeg:
+    return OptionRunRepairPlanLeg(
+        tradingsymbol=str(order.get("tradingsymbol") or ""),
+        transaction_type=str(order.get("transaction_type") or ""),
+        quantity=int(order.get("quantity") or 0),
+        exchange=None if order.get("exchange") is None else str(order.get("exchange")),
+        product=None if order.get("product") is None else str(order.get("product")),
+        order_type=None if order.get("order_type") is None else str(order.get("order_type")),
+    )
+
+
+def _option_run_repair_assessment(assessment: Dict[str, Any]) -> OptionRunRepairAssessmentResponse:
+    return OptionRunRepairAssessmentResponse(
+        option_run_id=str(assessment.get("option_run_id") or ""),
+        status=str(assessment.get("status") or ""),
+        state=str(assessment.get("state") or ""),
+        reason_code=assessment.get("reason_code"),
+        reasons=list(assessment.get("reasons") or []),
+        evidence_digest=str(assessment.get("evidence_digest") or ""),
+        close_plan=[
+            _option_run_repair_plan_leg(dict(order or {}))
+            for order in (assessment.get("close_plan") or [])
+        ],
+        evidence=dict(assessment.get("evidence") or {}),
+        detail=dict(assessment.get("detail") or {}),
+    )
+
+
+@router.get(
+    "/{strategy_id}/option-runs/{option_run_id}/repair",
+    response_model=OptionRunRepairAssessmentResponse,
+)
+async def inspect_option_run_repair(
+    strategy_id: str,
+    option_run_id: str,
+    request: Request,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_strategies_db),
+):
+    """The read-only repair verdict for one run. Owner-only.
+
+    Nothing is refreshed here: the verdict is derived from the run's own confirmed
+    fills, and the returned digest is what a POST must still match.
+    """
+    _ = request
+    option_run_repair_scope(repo, owner, strategy_id, option_run_id, session_factory)
+    service = build_option_run_repair_service(request, session_factory)
+    try:
+        assessment = service.assessment(option_run_id)
+    except OptionRunRepairRefusal as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.as_detail()) from exc
+    return _option_run_repair_assessment(assessment)
+
+
+@router.post(
+    "/{strategy_id}/option-runs/{option_run_id}/repair",
+    response_model=OptionRunRepairActionResponse,
+)
+async def repair_option_run(
+    strategy_id: str,
+    option_run_id: str,
+    request: Request,
+    payload: OptionRunRepairActionRequest,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_strategies_db),
+):
+    """Apply one governed repair, or refuse by name.
+
+    The server alone decides what the run holds: a caller-supplied ``flat`` /
+    ``residual`` assertion is never accepted, and the digest the operator read
+    must still describe the run. ``close_flat`` closes a provably flat run;
+    ``close_residual`` submits the risk-reducing close through the staged
+    structure exit and moves the run to ``exiting`` (later fill reconciliation
+    completes it). An ambiguous run is refused by name and nothing changes.
+    """
+    enforce_same_origin(request)
+    scope = option_run_repair_scope(repo, owner, strategy_id, option_run_id, session_factory)
+    action = str(payload.action or "")
+    if action not in REPAIR_ACTIONS:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "rejection_reason": REASON_ACTION_MISMATCH,
+                "action": action,
+                "supported": list(REPAIR_ACTIONS),
+            },
+        )
+    if action == ACTION_CLOSE_RESIDUAL and str(scope["execution_environment"]) == "live":
+        # This phase has no live staged-exit submission path the operator route
+        # may drive; fail closed instead of inventing one.
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "rejection_reason": REASON_LIVE_UNSUPPORTED,
+                "option_run_id": str(option_run_id),
+                "execution_environment": "live",
+                "message": "a live residual close has no governed submission path yet",
+            },
+        )
+    service = build_option_run_repair_service(request, session_factory)
+    try:
+        next_run, assessment = service.plan(
+            option_run_id=option_run_id,
+            action=action,
+            evidence_digest=str(payload.evidence_digest or ""),
+        )
+    except OptionRunRepairRefusal as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.as_detail()) from exc
+    # Everything that can refuse is checked BEFORE the run moves, so a refusal
+    # never leaves a repaired run that the operator cannot see as repaired.
+    job = repair_audit_job(repo, next_run)
+    if job is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "rejection_reason": "OPTION_RUN_REPAIR_AUDIT_UNAVAILABLE",
+                "option_run_id": str(option_run_id),
+                "worker_run_id": str(dict(next_run.metadata or {}).get("worker_run_id") or "") or None,
+                "message": "this run has no hosted job to record the repair against",
+            },
+        )
+    if action == ACTION_CLOSE_RESIDUAL:
+        require_residual_close_available(request, next_run)
+    try:
+        committed = service.commit(next_run, allowed_from=str(assessment.get("status") or ""))
+    except OptionRunRepairRefusal as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.as_detail()) from exc
+    submission: Dict[str, Any] = {}
+    if action == ACTION_CLOSE_RESIDUAL:
+        submission = await submit_residual_close(
+            request, session_factory, run=committed, scope=scope
+        )
+    audit_id = record_repair_audit(
+        repo,
+        job=job,
+        owner=owner,
+        strategy_id=strategy_id,
+        action=action,
+        committed=committed,
+        assessment=assessment,
+        submission=submission,
+    )
+    return OptionRunRepairActionResponse(
+        option_run_id=str(committed.strategy_run_id),
+        action=action,
+        state=str(assessment.get("state") or ""),
+        run_status=str(committed.status),
+        evidence_digest=str(assessment.get("evidence_digest") or ""),
+        audit_id=audit_id,
+        submission=submission,
     )
 
 
