@@ -2157,6 +2157,44 @@ class ExecutorOptionRunBindingTests(ExecutorTestCase, unittest.IsolatedAsyncioTe
                 .first()
             )
 
+    def _seed_paper_order_statuses(self, plan_id, *, partial_status="partially_filled"):
+        """Give stub order ids runtime rows the takeover rule must consult."""
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "CREATE TABLE IF NOT EXISTS public.paper_orders ("
+                    "account_scope TEXT, order_id TEXT PRIMARY KEY, "
+                    "instrument_token INTEGER, exchange TEXT, product TEXT, "
+                    "transaction_type TEXT, quantity INTEGER, status TEXT, "
+                    "metadata_json TEXT)"
+                )
+            )
+            for event in self.events(plan_id):
+                if event["event"] not in ("filled", "partially_filled", "rejected"):
+                    continue
+                if event["event"] == "rejected" and not event["paper_order_id"]:
+                    continue
+                session.execute(
+                    text(
+                        "INSERT INTO public.paper_orders "
+                        "(account_scope, order_id, instrument_token, exchange, product, "
+                        " transaction_type, quantity, status, metadata_json) VALUES "
+                        "(:scope, :order_id, 738561, 'NSE', 'NRML', 'buy', 75, :status, '{}')"
+                    ),
+                    {
+                        "scope": ACCOUNT,
+                        "order_id": event["paper_order_id"],
+                        "status": "cancelled"
+                        if event["event"] == "partially_filled"
+                        and partial_status == "cancelled"
+                        else event["event"],
+                    },
+                )
+            session.commit()
+
+    def _seed_terminal_paper_orders(self, plan_id="plan-roll"):
+        return self._seed_paper_order_statuses(plan_id, partial_status="cancelled")
+
     def _run_count(self):
         with self.factory() as session:
             return int(
@@ -2535,6 +2573,8 @@ class ExecutorOptionRunBindingTests(ExecutorTestCase, unittest.IsolatedAsyncioTe
         generation=1,
         expiry="2026-10-29",
         protection_policy=None,
+        max_loss=None,
+        structure_units=None,
         underlying=None,
         expiry_policy=None,
     ):
@@ -2561,6 +2601,10 @@ class ExecutorOptionRunBindingTests(ExecutorTestCase, unittest.IsolatedAsyncioTe
             resolved["expiry_policy"] = expiry_policy
         if protection_policy is not None:
             resolved["protection_policy"] = protection_policy
+        if max_loss is not None:
+            resolved["max_loss"] = max_loss
+        if structure_units is not None:
+            resolved["structure_units"] = structure_units
         with self.factory() as session:
             session.execute(
                 text("UPDATE strategy_plans SET resolved_plan = :resolved WHERE plan_id = :p"),
@@ -2594,6 +2638,7 @@ class ExecutorOptionRunBindingTests(ExecutorTestCase, unittest.IsolatedAsyncioTe
         self._seed_adjust_plan(
             "plan-adjust", reference=option_run_id, legs=self._adjust_legs(units=2)
         )
+        self.claim_reservation(plan_id="plan-adjust")
         # Resolve WITHOUT executing: the edge validates, binds, and creates nothing.
         binding_store = PlanOptionRunBindingStore(session_factory=self.factory)
         target = resolve_plan_option_run(
@@ -2987,6 +3032,78 @@ class ExecutorOptionRunBindingTests(ExecutorTestCase, unittest.IsolatedAsyncioTe
         self.assertEqual(run["status"], "entered")
         self.assertEqual(json.loads(run["metadata"]).get("structure_generation", 1), 1)
 
+    async def test_takeover_refuses_a_roll_with_a_working_partial_remainder(self):
+        """A ``partially_filled`` trail is not finished while its order works."""
+        executor, option_run_id = await self._enter_a_structure()
+        self._seed_adjust_plan(
+            "plan-roll",
+            reference=option_run_id,
+            legs=self._roll_legs(units=2),
+            expiry="2026-11-26",
+        )
+        self.claim_reservation(plan_id="plan-roll")
+        executor._paper_service = _PartialFillStubService(partial_side="SELL")
+        await executor.execute(_plan_view_for(self.factory, "plan-roll"), actor=OWNER)
+        self._seed_paper_order_statuses("plan-roll")
+
+        executor._paper_service = self.build_paper_service(starting_balance="1000000")
+        self._seed_adjust_plan(
+            "plan-roll-successor",
+            reference=option_run_id,
+            legs=self._roll_legs(units=2),
+            expiry="2026-11-26",
+        )
+        self.claim_reservation(plan_id="plan-roll-successor")
+        with self.assertRaises(self._refusal) as ctx:
+            await executor.execute(
+                _plan_view_for(self.factory, "plan-roll-successor"), actor=OWNER
+            )
+
+        self.assertEqual(ctx.exception.reason_code, "OPTION_RUN_ADJUST_IN_FLIGHT")
+        self.assertEqual(
+            ctx.exception.detail["adjust_owner_state"]["state"], "in_flight"
+        )
+        self.assertEqual(
+            ctx.exception.detail["adjust_owner_state"]["plans"]["plan-roll"][
+                "evidence"
+            ]["unresolved_steps"],
+            [1],
+        )
+        self.assertEqual(self._run_row(option_run_id)["status"], "adjusting")
+        self.assertEqual(
+            json.loads(self._run_row(option_run_id)["metadata"]).get(
+                "structure_generation", 1
+            ),
+            1,
+        )
+
+    async def test_takeover_admits_a_roll_once_its_partial_remainder_is_cancelled(self):
+        """The terminal paper order, not the old partial word, closes the pass."""
+        executor, option_run_id = await self._enter_a_structure()
+        self._seed_adjust_plan(
+            "plan-roll",
+            reference=option_run_id,
+            legs=self._roll_legs(units=2),
+            expiry="2026-11-26",
+        )
+        self.claim_reservation(plan_id="plan-roll")
+        executor._paper_service = _PartialFillStubService(partial_side="SELL")
+        await executor.execute(_plan_view_for(self.factory, "plan-roll"), actor=OWNER)
+        self._seed_paper_order_statuses("plan-roll", partial_status="cancelled")
+
+        executor._paper_service = self.build_paper_service(starting_balance="1000000")
+        self._seed_adjust_plan(
+            "plan-roll-2",
+            reference=option_run_id,
+            legs=self._roll_legs(units=2),
+            expiry="2026-11-26",
+        )
+        self.claim_reservation(plan_id="plan-roll-2")
+        result = await executor.execute(_plan_view_for(self.factory, "plan-roll-2"), actor=OWNER)
+
+        self.assertEqual(result["status"], "filled")
+        self.assertEqual(self._run_row(option_run_id)["status"], "entered")
+
     async def test_a_new_adjust_plan_takes_over_a_finished_roll(self):
         """A withheld roll is SUPERSEDED, never stranded: the successor finishes it."""
         executor, option_run_id = await self._enter_a_structure()
@@ -3000,6 +3117,7 @@ class ExecutorOptionRunBindingTests(ExecutorTestCase, unittest.IsolatedAsyncioTe
         executor._paper_service = _PartialFillStubService(partial_side="SELL")
         await executor.execute(_plan_view_for(self.factory, "plan-roll"), actor=OWNER)
         self.assertEqual(self._run_row(option_run_id)["status"], "adjusting")
+        self._seed_terminal_paper_orders()
 
         # A SECOND plan on the SAME basis takes the run over: the delta is
         # re-derived from the run's own confirmed fills, so only the remainder of
@@ -3067,6 +3185,7 @@ class ExecutorOptionRunBindingTests(ExecutorTestCase, unittest.IsolatedAsyncioTe
         self.claim_reservation(plan_id="plan-roll")
         executor._paper_service = _PartialFillStubService(partial_side="SELL")
         await executor.execute(_plan_view_for(self.factory, "plan-roll"), actor=OWNER)
+        self._seed_terminal_paper_orders()
         # A committed submission with no outcome yet: the pass has NOT closed.
         self._seed_unfinished_submission("plan-roll")
 
@@ -3195,6 +3314,133 @@ class ExecutorOptionRunBindingTests(ExecutorTestCase, unittest.IsolatedAsyncioTe
         run = self._run_row(option_run_id)
         self.assertEqual(run["status"], "entered")
         self.assertEqual(json.loads(run["metadata"]).get("structure_generation", 1), 1)
+
+    async def test_a_crash_after_a_fill_still_leaves_the_fill_in_the_run_ledger(self):
+        """The next leg's send can never race the previous leg's durable ledger."""
+        executor, option_run_id = await self._enter_two_units()
+        self._seed_adjust_plan(
+            "plan-crash", reference=option_run_id, legs=self._adjust_legs(units=1)
+        )
+        self.claim_reservation(plan_id="plan-crash")
+
+        def crash_before_settlement(*args, **kwargs):
+            raise RuntimeError("worker crashed before settlement")
+
+        executor._settle_option_run = crash_before_settlement
+        with self.assertRaises(RuntimeError):
+            await executor.execute(_plan_view_for(self.factory, "plan-crash"), actor=OWNER)
+        del executor._settle_option_run
+
+        run = self._run_row(option_run_id)
+        self.assertEqual(run["status"], "adjusting")
+        crash_trades = json.loads(run["trades"])
+        crash_order_ids = {
+            row["paper_order_id"]
+            for row in self.events("plan-crash")
+            if row["event"] in ("filled", "partially_filled")
+        }
+        self.assertEqual(
+            crash_order_ids,
+            crash_order_ids & {row["order_id"] for row in crash_trades},
+        )
+        self._seed_paper_order_statuses("plan-crash")
+
+        # A successor reads the ledger the crashed worker already durably wrote,
+        # derives zero remaining delta, and completes instead of re-selling 75.
+        self._seed_adjust_plan(
+            "plan-successor", reference=option_run_id, legs=self._adjust_legs(units=1)
+        )
+        self.claim_reservation(plan_id="plan-successor")
+        result = await executor.execute(
+            _plan_view_for(self.factory, "plan-successor"), actor=OWNER
+        )
+        self.assertEqual(result["status"], "no_op")
+        self.assertEqual(
+            [row["event"] for row in self.events("plan-successor")],
+            ["no_op", "no_op"],
+        )
+
+    async def test_an_adjust_refuses_when_the_plan_trail_and_run_ledger_disagree(self):
+        """A stale ledger is incomplete evidence, never silently rederived."""
+        executor, option_run_id = await self._enter_a_structure()
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "UPDATE public.option_run_states SET trades = '[]' "
+                    "WHERE strategy_run_id = :r"
+                ),
+                {"r": option_run_id},
+            )
+            session.commit()
+        self._seed_adjust_plan(
+            "plan-adjust", reference=option_run_id, legs=self._adjust_legs(units=2)
+        )
+
+        with self.assertRaises(self._refusal) as ctx:
+            await executor.execute(_plan_view_for(self.factory, "plan-adjust"), actor=OWNER)
+
+        self.assertEqual(ctx.exception.reason_code, "OPTION_RUN_LEDGER_INCOMPLETE")
+        self.assertEqual(
+            [row["refusal_reason"] for row in self.events("plan-adjust")],
+            ["OPTION_RUN_LEDGER_INCOMPLETE"],
+        )
+        self.assertEqual(self._run_row(option_run_id)["status"], "entered")
+
+    async def test_a_second_generation_one_adjust_refuses_after_the_first_completes(self):
+        """A plan frozen on the old basis cannot win the post-completion CAS."""
+        executor, option_run_id = await self._enter_a_structure()
+        for plan_id in ("plan-a", "plan-b"):
+            self._seed_adjust_plan(
+                plan_id,
+                reference=option_run_id,
+                legs=self._adjust_legs(units=2),
+                generation=1,
+            )
+            self.claim_reservation(plan_id=plan_id)
+
+        first = await executor.execute(_plan_view_for(self.factory, "plan-a"), actor=OWNER)
+        self.assertEqual(first["status"], "filled")
+        self.assertEqual(json.loads(self._run_row(option_run_id)["metadata"])["structure_generation"], 2)
+
+        with self.assertRaises(self._refusal) as ctx:
+            await executor.execute(_plan_view_for(self.factory, "plan-b"), actor=OWNER)
+
+        self.assertEqual(ctx.exception.reason_code, "OPTION_ADJUSTMENT_STALE_BASIS")
+        self.assertEqual(
+            [row["refusal_reason"] for row in self.events("plan-b")],
+            ["OPTION_ADJUSTMENT_STALE_BASIS"],
+        )
+        self.assertEqual(json.loads(self._run_row(option_run_id)["metadata"])["structure_generation"], 2)
+
+    async def test_adjust_completion_replaces_generation_scoped_protection(self):
+        """Absent frozen fields leave the old generation; present fields replace."""
+        executor, option_run_id = await self._enter_a_structure()
+        self._seed_run_protection(
+            option_run_id,
+            {
+                "protection_policy": {"kind": "old", "naked": False},
+                "max_loss": 100,
+                "structure_units": 1,
+                "stale_only": "must disappear",
+            },
+        )
+        self._seed_adjust_plan(
+            "plan-adjust",
+            reference=option_run_id,
+            legs=self._adjust_legs(units=2),
+            protection_policy={"kind": "combined_premium_stop", "naked": False},
+            max_loss=250,
+            structure_units=2,
+        )
+        self.claim_reservation(plan_id="plan-adjust")
+        result = await executor.execute(_plan_view_for(self.factory, "plan-adjust"), actor=OWNER)
+
+        self.assertEqual(result["status"], "filled")
+        protection = json.loads(self._run_row(option_run_id)["protection"])
+        self.assertEqual(protection["protection_policy"]["kind"], "combined_premium_stop")
+        self.assertEqual(protection["max_loss"], 250)
+        self.assertEqual(protection["structure_units"], 2)
+        self.assertNotIn("stale_only", protection)
 
     async def test_a_declared_naked_adjust_still_withholds_the_unproven_release(self):
         """The sanctioned ``naked`` declaration admits the plan - the exit rule

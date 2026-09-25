@@ -1,0 +1,3102 @@
+{
+  "steps": [
+    {
+      "step": "database_created",
+      "at": 1790345702.466783,
+      "database": "kite_accept_78a363e5fc"
+    },
+    {
+      "step": "fixtures_seeded",
+      "at": 1790345708.0149353
+    },
+    {
+      "step": "api_serving",
+      "at": 1790345711.10856,
+      "base": "http://127.0.0.1:48527"
+    },
+    {
+      "step": "operator_login",
+      "at": 1790345711.1530278
+    },
+    {
+      "step": "options_restart_hold_close_entry_job_created",
+      "at": 1790345711.8171494,
+      "job_index": 0,
+      "job_id": "hsj_7779ef55b63e424f96e6329827c02b51"
+    },
+    {
+      "step": "options_restart_hold_close_close_job_created",
+      "at": 1790345720.7393172,
+      "job_index": 1,
+      "job_id": "hsj_b8ed9f7d752541a19aab58246f69a344"
+    },
+    {
+      "step": "options_restart_hold_close_finished",
+      "at": 1790345727.941639,
+      "evaluations": 3,
+      "option_runs": 1,
+      "duplicate_entry_refusals": 1
+    },
+    {
+      "step": "options_dynamic_resize_roll_entry_job_created",
+      "at": 1790345728.3582523,
+      "job_index": 0,
+      "job_id": "hsj_f31b682ff14d45778cfafab760b7f21b"
+    },
+    {
+      "step": "options_dynamic_resize_roll_resize_job_created",
+      "at": 1790345737.1107929,
+      "job_index": 1,
+      "job_id": "hsj_0671b04b18f84d1bb4db37447d99988b"
+    },
+    {
+      "step": "options_dynamic_resize_roll_roll_job_created",
+      "at": 1790345747.8290737,
+      "job_index": 2,
+      "job_id": "hsj_493242e68ea54b4087bb9c24031465c3"
+    },
+    {
+      "step": "options_dynamic_resize_roll_exit_job_created",
+      "at": 1790345758.5049403,
+      "job_index": 3,
+      "job_id": "hsj_9ee1d2a1daba422a93a7f027315bb363"
+    },
+    {
+      "step": "options_dynamic_resize_roll_finished",
+      "at": 1790345766.4471529,
+      "evaluations": 4,
+      "generations": [
+        1,
+        2,
+        3,
+        3
+      ],
+      "option_runs": 1
+    }
+  ],
+  "scenarios": {
+    "options_restart_hold_close": {
+      "strategy_id": "hs_34814f07934c44d7bda0eb3c7c0c5b64",
+      "autonomous": false,
+      "phases": [
+        {
+          "phase": "entry",
+          "job_id": "hsj_7779ef55b63e424f96e6329827c02b51",
+          "job_index": 0,
+          "child_exited": true,
+          "params": {
+            "underlying": "NIFTY",
+            "index_ticker": "NSE:NIFTY50",
+            "interval": "5minute",
+            "lookback": 40,
+            "rsi_period": 5,
+            "bullish_rsi_level": 40,
+            "long_offset_points": 0,
+            "short_offset_points": 100,
+            "product": "NRML",
+            "expiry_policy": "exit_before_cutoff",
+            "deadline_seconds": 240,
+            "hold_after_entry": true
+          },
+          "requests": [
+            {
+              "request_id": "45b12f71-9f57-453c-b393-7d61fde3a117",
+              "plan_id": "1ffb5902-267e-4217-8972-ec8e6c196fc2",
+              "status": "executed",
+              "authorization_mode": "approval_based",
+              "decision_kind": "manual",
+              "refusal_code": null
+            }
+          ],
+          "orders": [
+            {
+              "tradingsymbol": "NIFTY26OCT22500CE",
+              "transaction_type": "buy",
+              "quantity": 50,
+              "status": "filled",
+              "average_price": "1500.000000"
+            },
+            {
+              "tradingsymbol": "NIFTY26OCT22600CE",
+              "transaction_type": "sell",
+              "quantity": 50,
+              "status": "filled",
+              "average_price": "1500.000000"
+            }
+          ],
+          "option_runs": [
+            {
+              "option_run_id": "opt_run_84dfd868b5f14965a575ee40a2593051",
+              "phase": "entry",
+              "run_status": "entered",
+              "product": "NRML",
+              "legs": [
+                {
+                  "lots": 1,
+                  "leg_id": "1ffb5902-267e-4217-8972-ec8e6c196fc2:1",
+                  "strike": 22500.0,
+                  "product": "NRML",
+                  "exchange": "NFO",
+                  "lot_size": 50,
+                  "metadata": {
+                    "role": "entry",
+                    "ratio": 1,
+                    "instrument_id": "d72a79c7-917d-5103-8ee4-3378da3eb587"
+                  },
+                  "quantity": 50,
+                  "expiry_key": "2026-10-29",
+                  "order_type": "MARKET",
+                  "option_type": "CE",
+                  "tradingsymbol": "NIFTY26OCT22500CE",
+                  "transaction_type": "BUY"
+                },
+                {
+                  "lots": 1,
+                  "leg_id": "1ffb5902-267e-4217-8972-ec8e6c196fc2:2",
+                  "strike": 22600.0,
+                  "product": "NRML",
+                  "exchange": "NFO",
+                  "lot_size": 50,
+                  "metadata": {
+                    "role": "entry",
+                    "ratio": 1,
+                    "instrument_id": "330b82a8-2e57-55d1-91e2-a3a3f592b7f8"
+                  },
+                  "quantity": 50,
+                  "expiry_key": "2026-10-29",
+                  "order_type": "MARKET",
+                  "option_type": "CE",
+                  "tradingsymbol": "NIFTY26OCT22600CE",
+                  "transaction_type": "SELL"
+                }
+              ],
+              "completed_legs": [
+                "1ffb5902-267e-4217-8972-ec8e6c196fc2:1",
+                "1ffb5902-267e-4217-8972-ec8e6c196fc2:2"
+              ]
+            }
+          ],
+          "child_log_tail": "[strategy] NIFTY rsi=100.0 >= 40.0: bullish setup confirmed\n[strategy] frozen bull call spread NIFTY26OCT22500CE / NIFTY26OCT22600CE expiry=2026-10-29 policy=exit_before_cutoff product=NRML premium=60.0 delta=0.96/0.84 iv=0.14/0.14\n[strategy] entry requested: 45b12f71-9f57-453c-b393-7d61fde3a117 status=awaiting_approval\n[strategy] waiting for request 45b12f71-9f57-453c-b393-7d61fde3a117: status=awaiting_approval mode=approval_based\n[strategy] waiting for request 45b12f71-9f57-453c-b393-7d61fde3a117: status=dispatching mode=approval_based\n[strategy] request 45b12f71-9f57-453c-b393-7d61fde3a117 is now executed\n[strategy] entry executed and is held; this evaluation finishes without closing (hold_after_entry=true) and the structure is carried forward as held\n",
+          "supervisor": {
+            "job_id": "hsj_7779ef55b63e424f96e6329827c02b51",
+            "outcome": "exited",
+            "stop": "exited",
+            "log_overflow": false,
+            "log_ref": "/home/krishna/kite-algo-worktrees/b2-2-hardening/.phase5-workspace/options_restart_hold_close-entry/logs/hsj_7779ef55b63e424f96e6329827c02b51.log",
+            "exit_code": 0,
+            "process_cleanup_reported": true,
+            "logs_shipped": true,
+            "terminal": "recovery_required",
+            "replacement_blocked": false,
+            "clean_exit": true,
+            "continuation": {
+              "attempted": true,
+              "continued": true,
+              "held": true,
+              "case": "continuation_eligible",
+              "reason_code": "CONTINUATION_ELIGIBLE",
+              "blocking_reasons": [],
+              "job_id": "hsj_7779ef55b63e424f96e6329827c02b51",
+              "audit_id": "hsr_16798a4cef434f8f87aa7fb1a4cf9efd",
+              "barrier_version": 4,
+              "projection_version": 2,
+              "worker_run_closed": true,
+              "assessment": {
+                "allowed": true,
+                "case": "continuation_eligible",
+                "reason_code": "CONTINUATION_ELIGIBLE",
+                "blocking_reasons": [],
+                "held": true,
+                "notes": [
+                  "option_runs=opt_run_84dfd868b5f14965a575ee40a2593051=held",
+                  "finite evaluation finished cleanly; book is held",
+                  "a cleanly held option structure is carried forward as HELD; the options lane keeps its own book and is never reported flat"
+                ],
+                "proof": {
+                  "kind": "evaluation_continuation",
+                  "owner_id": "app:admin",
+                  "strategy_id": "hs_34814f07934c44d7bda0eb3c7c0c5b64",
+                  "account_id": "kite:paper-options_restart_hold_close",
+                  "execution_environment": "paper",
+                  "predecessor": {
+                    "job_id": "hsj_7779ef55b63e424f96e6329827c02b51",
+                    "attempt": 1,
+                    "lease_epoch": 1,
+                    "run_id": "run_efc938281ab247469419dc27e55e547d"
+                  },
+                  "barrier_version": 4,
+                  "projection_version": 2,
+                  "book_state": "published",
+                  "exposure_state": "open",
+                  "held": true,
+                  "option_work_state": "held",
+                  "option_runs": [
+                    "opt_run_84dfd868b5f14965a575ee40a2593051=held"
+                  ],
+                  "completion_state": "exited",
+                  "exit_code": 0,
+                  "desired_state": "started",
+                  "protection_enabled": false,
+                  "evidence_digest": "d46c3349caf622b5991d9d7dfefb9ffa8438f0afa80dbf6e31167b0b251bc248"
+                }
+              }
+            }
+          }
+        },
+        {
+          "phase": "close",
+          "job_id": "hsj_b8ed9f7d752541a19aab58246f69a344",
+          "job_index": 1,
+          "child_exited": true,
+          "params": {
+            "underlying": "NIFTY",
+            "index_ticker": "NSE:NIFTY50",
+            "interval": "5minute",
+            "lookback": 40,
+            "rsi_period": 5,
+            "bullish_rsi_level": 40,
+            "long_offset_points": 0,
+            "short_offset_points": 100,
+            "product": "NRML",
+            "expiry_policy": "exit_before_cutoff",
+            "deadline_seconds": 240,
+            "duplicate_entry_probe": true
+          },
+          "requests": [
+            {
+              "request_id": "eacd1882-e048-41a3-a375-ecafab554fb8",
+              "plan_id": "19b251c9-390a-4d92-923f-ba2b2a1d3785",
+              "status": "refused",
+              "authorization_mode": "approval_based",
+              "decision_kind": null,
+              "refusal_code": "OPTION_STRUCTURE_ALREADY_OPEN"
+            },
+            {
+              "request_id": "7eb3bd40-7636-47c2-a702-14b98c5a1b10",
+              "plan_id": "bcc74c2d-5a9b-49e0-a14e-19ab13407487",
+              "status": "executed",
+              "authorization_mode": "approval_based",
+              "decision_kind": "manual",
+              "refusal_code": null
+            }
+          ],
+          "orders": [
+            {
+              "tradingsymbol": "NIFTY26OCT22600CE",
+              "transaction_type": "buy",
+              "quantity": 50,
+              "status": "filled",
+              "average_price": "1500.000000"
+            },
+            {
+              "tradingsymbol": "NIFTY26OCT22500CE",
+              "transaction_type": "sell",
+              "quantity": 50,
+              "status": "filled",
+              "average_price": "1500.000000"
+            }
+          ],
+          "option_runs": [
+            {
+              "option_run_id": "opt_run_84dfd868b5f14965a575ee40a2593051",
+              "phase": "entry",
+              "run_status": "exited",
+              "product": "NRML",
+              "legs": [
+                {
+                  "lots": 1,
+                  "leg_id": "1ffb5902-267e-4217-8972-ec8e6c196fc2:1",
+                  "strike": 22500.0,
+                  "product": "NRML",
+                  "exchange": "NFO",
+                  "lot_size": 50,
+                  "metadata": {
+                    "role": "entry",
+                    "ratio": 1,
+                    "instrument_id": "d72a79c7-917d-5103-8ee4-3378da3eb587"
+                  },
+                  "quantity": 50,
+                  "expiry_key": "2026-10-29",
+                  "order_type": "MARKET",
+                  "option_type": "CE",
+                  "tradingsymbol": "NIFTY26OCT22500CE",
+                  "transaction_type": "BUY"
+                },
+                {
+                  "lots": 1,
+                  "leg_id": "1ffb5902-267e-4217-8972-ec8e6c196fc2:2",
+                  "strike": 22600.0,
+                  "product": "NRML",
+                  "exchange": "NFO",
+                  "lot_size": 50,
+                  "metadata": {
+                    "role": "entry",
+                    "ratio": 1,
+                    "instrument_id": "330b82a8-2e57-55d1-91e2-a3a3f592b7f8"
+                  },
+                  "quantity": 50,
+                  "expiry_key": "2026-10-29",
+                  "order_type": "MARKET",
+                  "option_type": "CE",
+                  "tradingsymbol": "NIFTY26OCT22600CE",
+                  "transaction_type": "SELL"
+                }
+              ],
+              "completed_legs": [
+                "1ffb5902-267e-4217-8972-ec8e6c196fc2:1",
+                "1ffb5902-267e-4217-8972-ec8e6c196fc2:2"
+              ]
+            },
+            {
+              "option_run_id": "opt_run_84dfd868b5f14965a575ee40a2593051",
+              "phase": "exit",
+              "run_status": "exited",
+              "product": "NRML",
+              "legs": [
+                {
+                  "lots": 1,
+                  "leg_id": "1ffb5902-267e-4217-8972-ec8e6c196fc2:1",
+                  "strike": 22500.0,
+                  "product": "NRML",
+                  "exchange": "NFO",
+                  "lot_size": 50,
+                  "metadata": {
+                    "role": "entry",
+                    "ratio": 1,
+                    "instrument_id": "d72a79c7-917d-5103-8ee4-3378da3eb587"
+                  },
+                  "quantity": 50,
+                  "expiry_key": "2026-10-29",
+                  "order_type": "MARKET",
+                  "option_type": "CE",
+                  "tradingsymbol": "NIFTY26OCT22500CE",
+                  "transaction_type": "BUY"
+                },
+                {
+                  "lots": 1,
+                  "leg_id": "1ffb5902-267e-4217-8972-ec8e6c196fc2:2",
+                  "strike": 22600.0,
+                  "product": "NRML",
+                  "exchange": "NFO",
+                  "lot_size": 50,
+                  "metadata": {
+                    "role": "entry",
+                    "ratio": 1,
+                    "instrument_id": "330b82a8-2e57-55d1-91e2-a3a3f592b7f8"
+                  },
+                  "quantity": 50,
+                  "expiry_key": "2026-10-29",
+                  "order_type": "MARKET",
+                  "option_type": "CE",
+                  "tradingsymbol": "NIFTY26OCT22600CE",
+                  "transaction_type": "SELL"
+                }
+              ],
+              "completed_legs": [
+                "1ffb5902-267e-4217-8972-ec8e6c196fc2:1",
+                "1ffb5902-267e-4217-8972-ec8e6c196fc2:2"
+              ]
+            }
+          ],
+          "child_log_tail": "[strategy] NIFTY rsi=100.0 >= 40.0: bullish setup confirmed\n[strategy] frozen bull call spread NIFTY26OCT22500CE / NIFTY26OCT22600CE expiry=2026-10-29 policy=exit_before_cutoff product=NRML premium=60.0 delta=0.96/0.84 iv=0.14/0.14\n[strategy] request eacd1882-e048-41a3-a375-ecafab554fb8 is now refused\n[strategy] duplicate entry probe answered refused refusal_code=OPTION_STRUCTURE_ALREADY_OPEN request=eacd1882-e048-41a3-a375-ecafab554fb8\n[strategy] structure close requested for run opt_run_84dfd868b5f14965a575ee40a2593051: 7eb3bd40-7636-47c2-a702-14b98c5a1b10 status=awaiting_approval\n[strategy] waiting for request 7eb3bd40-7636-47c2-a702-14b98c5a1b10: status=awaiting_approval mode=approval_based\n[strategy] request 7eb3bd40-7636-47c2-a702-14b98c5a1b10 is now executed\n[strategy] structure closed with no outstanding work (runs ['opt_run_84dfd868b5f14965a575ee40a2593051'] are closed with no outstanding work)\n",
+          "supervisor": {
+            "job_id": "hsj_b8ed9f7d752541a19aab58246f69a344",
+            "outcome": "exited",
+            "stop": "exited",
+            "log_overflow": false,
+            "log_ref": "/home/krishna/kite-algo-worktrees/b2-2-hardening/.phase5-workspace/options_restart_hold_close-close/logs/hsj_b8ed9f7d752541a19aab58246f69a344.log",
+            "exit_code": 0,
+            "process_cleanup_reported": true,
+            "logs_shipped": true,
+            "terminal": "recovery_required",
+            "replacement_blocked": false,
+            "clean_exit": true,
+            "continuation": {
+              "attempted": true,
+              "continued": true,
+              "held": false,
+              "case": "continuation_eligible",
+              "reason_code": "CONTINUATION_ELIGIBLE",
+              "blocking_reasons": [],
+              "job_id": "hsj_b8ed9f7d752541a19aab58246f69a344",
+              "audit_id": "hsr_72036899578548a693ffba2cec937bfc",
+              "barrier_version": 8,
+              "projection_version": 3,
+              "worker_run_closed": true,
+              "assessment": {
+                "allowed": true,
+                "case": "continuation_eligible",
+                "reason_code": "CONTINUATION_ELIGIBLE",
+                "blocking_reasons": [],
+                "held": false,
+                "notes": [
+                  "option_runs=opt_run_84dfd868b5f14965a575ee40a2593051=finished",
+                  "finite evaluation finished cleanly; book is flat"
+                ],
+                "proof": {
+                  "kind": "evaluation_continuation",
+                  "owner_id": "app:admin",
+                  "strategy_id": "hs_34814f07934c44d7bda0eb3c7c0c5b64",
+                  "account_id": "kite:paper-options_restart_hold_close",
+                  "execution_environment": "paper",
+                  "predecessor": {
+                    "job_id": "hsj_b8ed9f7d752541a19aab58246f69a344",
+                    "attempt": 1,
+                    "lease_epoch": 1,
+                    "run_id": "run_b53b07f970984f37a74647fa11ad3d3e"
+                  },
+                  "barrier_version": 8,
+                  "projection_version": 3,
+                  "book_state": "published",
+                  "exposure_state": "flat",
+                  "held": false,
+                  "option_work_state": "none",
+                  "option_runs": [
+                    "opt_run_84dfd868b5f14965a575ee40a2593051=finished"
+                  ],
+                  "completion_state": "exited",
+                  "exit_code": 0,
+                  "desired_state": "started",
+                  "protection_enabled": false,
+                  "evidence_digest": "1cedb02546a4f0d62877af6c0969b47cdac976251023bccba569168015a3673b"
+                }
+              }
+            }
+          }
+        },
+        {
+          "phase": "_final_run",
+          "run": {
+            "status": "exited",
+            "legs": [
+              {
+                "lots": 1,
+                "leg_id": "1ffb5902-267e-4217-8972-ec8e6c196fc2:1",
+                "strike": 22500.0,
+                "product": "NRML",
+                "exchange": "NFO",
+                "lot_size": 50,
+                "metadata": {
+                  "role": "entry",
+                  "ratio": 1,
+                  "instrument_id": "d72a79c7-917d-5103-8ee4-3378da3eb587"
+                },
+                "quantity": 50,
+                "expiry_key": "2026-10-29",
+                "order_type": "MARKET",
+                "option_type": "CE",
+                "tradingsymbol": "NIFTY26OCT22500CE",
+                "transaction_type": "BUY"
+              },
+              {
+                "lots": 1,
+                "leg_id": "1ffb5902-267e-4217-8972-ec8e6c196fc2:2",
+                "strike": 22600.0,
+                "product": "NRML",
+                "exchange": "NFO",
+                "lot_size": 50,
+                "metadata": {
+                  "role": "entry",
+                  "ratio": 1,
+                  "instrument_id": "330b82a8-2e57-55d1-91e2-a3a3f592b7f8"
+                },
+                "quantity": 50,
+                "expiry_key": "2026-10-29",
+                "order_type": "MARKET",
+                "option_type": "CE",
+                "tradingsymbol": "NIFTY26OCT22600CE",
+                "transaction_type": "SELL"
+              }
+            ],
+            "completed_legs": [
+              "1ffb5902-267e-4217-8972-ec8e6c196fc2:1",
+              "1ffb5902-267e-4217-8972-ec8e6c196fc2:2"
+            ]
+          }
+        }
+      ],
+      "requests_total": 3,
+      "option_runs": [
+        {
+          "option_run_id": "opt_run_84dfd868b5f14965a575ee40a2593051",
+          "phase": "entry",
+          "run_status": "exited",
+          "product": "NRML",
+          "legs": [
+            {
+              "lots": 1,
+              "leg_id": "1ffb5902-267e-4217-8972-ec8e6c196fc2:1",
+              "strike": 22500.0,
+              "product": "NRML",
+              "exchange": "NFO",
+              "lot_size": 50,
+              "metadata": {
+                "role": "entry",
+                "ratio": 1,
+                "instrument_id": "d72a79c7-917d-5103-8ee4-3378da3eb587"
+              },
+              "quantity": 50,
+              "expiry_key": "2026-10-29",
+              "order_type": "MARKET",
+              "option_type": "CE",
+              "tradingsymbol": "NIFTY26OCT22500CE",
+              "transaction_type": "BUY"
+            },
+            {
+              "lots": 1,
+              "leg_id": "1ffb5902-267e-4217-8972-ec8e6c196fc2:2",
+              "strike": 22600.0,
+              "product": "NRML",
+              "exchange": "NFO",
+              "lot_size": 50,
+              "metadata": {
+                "role": "entry",
+                "ratio": 1,
+                "instrument_id": "330b82a8-2e57-55d1-91e2-a3a3f592b7f8"
+              },
+              "quantity": 50,
+              "expiry_key": "2026-10-29",
+              "order_type": "MARKET",
+              "option_type": "CE",
+              "tradingsymbol": "NIFTY26OCT22600CE",
+              "transaction_type": "SELL"
+            }
+          ],
+          "completed_legs": [
+            "1ffb5902-267e-4217-8972-ec8e6c196fc2:1",
+            "1ffb5902-267e-4217-8972-ec8e6c196fc2:2"
+          ]
+        },
+        {
+          "option_run_id": "opt_run_84dfd868b5f14965a575ee40a2593051",
+          "phase": "exit",
+          "run_status": "exited",
+          "product": "NRML",
+          "legs": [
+            {
+              "lots": 1,
+              "leg_id": "1ffb5902-267e-4217-8972-ec8e6c196fc2:1",
+              "strike": 22500.0,
+              "product": "NRML",
+              "exchange": "NFO",
+              "lot_size": 50,
+              "metadata": {
+                "role": "entry",
+                "ratio": 1,
+                "instrument_id": "d72a79c7-917d-5103-8ee4-3378da3eb587"
+              },
+              "quantity": 50,
+              "expiry_key": "2026-10-29",
+              "order_type": "MARKET",
+              "option_type": "CE",
+              "tradingsymbol": "NIFTY26OCT22500CE",
+              "transaction_type": "BUY"
+            },
+            {
+              "lots": 1,
+              "leg_id": "1ffb5902-267e-4217-8972-ec8e6c196fc2:2",
+              "strike": 22600.0,
+              "product": "NRML",
+              "exchange": "NFO",
+              "lot_size": 50,
+              "metadata": {
+                "role": "entry",
+                "ratio": 1,
+                "instrument_id": "330b82a8-2e57-55d1-91e2-a3a3f592b7f8"
+              },
+              "quantity": 50,
+              "expiry_key": "2026-10-29",
+              "order_type": "MARKET",
+              "option_type": "CE",
+              "tradingsymbol": "NIFTY26OCT22600CE",
+              "transaction_type": "SELL"
+            }
+          ],
+          "completed_legs": [
+            "1ffb5902-267e-4217-8972-ec8e6c196fc2:1",
+            "1ffb5902-267e-4217-8972-ec8e6c196fc2:2"
+          ]
+        }
+      ],
+      "duplicate_entry_refusals": [
+        {
+          "request_id": "eacd1882-e048-41a3-a375-ecafab554fb8",
+          "plan_id": "19b251c9-390a-4d92-923f-ba2b2a1d3785",
+          "status": "refused",
+          "authorization_mode": "approval_based",
+          "decision_kind": null,
+          "refusal_code": "OPTION_STRUCTURE_ALREADY_OPEN"
+        }
+      ],
+      "jobs": [
+        {
+          "requests": [
+            {
+              "request_id": "45b12f71-9f57-453c-b393-7d61fde3a117",
+              "plan_id": "1ffb5902-267e-4217-8972-ec8e6c196fc2",
+              "status": "executed",
+              "authorization_mode": "approval_based",
+              "decision_kind": "manual",
+              "refusal_code": null,
+              "execution_detail": {
+                "note": "the request was dispatched; fills, settlement and protection are tracked by the execution trail",
+                "result": {
+                  "steps": [
+                    {
+                      "event": "filled",
+                      "detail": {
+                        "fill_price": "1500.000000",
+                        "tradingsymbol": "NIFTY26OCT22500CE"
+                      },
+                      "step_no": 1,
+                      "paper_order_id": "PAPER-B76392F18D52",
+                      "refusal_reason": null,
+                      "filled_quantity": 50
+                    },
+                    {
+                      "event": "filled",
+                      "detail": {
+                        "fill_price": "1500.000000",
+                        "tradingsymbol": "NIFTY26OCT22600CE"
+                      },
+                      "step_no": 2,
+                      "paper_order_id": "PAPER-6897095D736F",
+                      "refusal_reason": null,
+                      "filled_quantity": 50
+                    }
+                  ],
+                  "status": "filled",
+                  "plan_id": "1ffb5902-267e-4217-8972-ec8e6c196fc2",
+                  "reservation_id": "414d7466-4a69-456e-b7c6-8a4252bd6b33",
+                  "paper_order_ids": [
+                    "PAPER-B76392F18D52",
+                    "PAPER-6897095D736F"
+                  ]
+                },
+                "grant_id": null,
+                "approval_id": null,
+                "environment": "paper",
+                "decision_kind": "manual",
+                "outcome_state": "filled",
+                "reservation_id": "414d7466-4a69-456e-b7c6-8a4252bd6b33",
+                "authorization_mode": "approval_based"
+              }
+            }
+          ],
+          "plans": [
+            {
+              "plan_id": "1ffb5902-267e-4217-8972-ec8e6c196fc2",
+              "plan_kind": "option_structure",
+              "logical_plan": {
+                "legs": [
+                  {
+                    "side": "BUY",
+                    "ratio": 1,
+                    "strike": 22500.0,
+                    "option_type": "CE"
+                  },
+                  {
+                    "side": "SELL",
+                    "ratio": 1,
+                    "strike": 22600.0,
+                    "option_type": "CE"
+                  }
+                ],
+                "expiry": "2026-10-29",
+                "product": "NRML",
+                "option_run": {
+                  "phase": "entry",
+                  "option_run_id": null
+                },
+                "underlying": "NIFTY",
+                "target_kind": "option_structure",
+                "structure_id": "bull-call-NIFTY26OCT22500CE-NIFTY26OCT22600CE",
+                "expiry_policy": "exit_before_cutoff"
+              },
+              "resolved_plan": {
+                "legs": [
+                  {
+                    "side": "BUY",
+                    "ratio": 1,
+                    "expiry": "2026-10-29",
+                    "strike": 22500.0,
+                    "product": "NRML",
+                    "exchange": "NFO",
+                    "lot_size": 50,
+                    "quantity": 50,
+                    "selection": null,
+                    "option_type": "CE",
+                    "broker_token": 50004,
+                    "broker_symbol": "NIFTY26OCT22500CE",
+                    "instrument_id": "d72a79c7-917d-5103-8ee4-3378da3eb587",
+                    "tradingsymbol": "NIFTY26OCT22500CE",
+                    "broker_exchange": "NFO",
+                    "instrument_type": "CE",
+                    "reference_price": 230.0,
+                    "signed_quantity": 50
+                  },
+                  {
+                    "side": "SELL",
+                    "ratio": 1,
+                    "expiry": "2026-10-29",
+                    "strike": 22600.0,
+                    "product": "NRML",
+                    "exchange": "NFO",
+                    "lot_size": 50,
+                    "quantity": 50,
+                    "selection": null,
+                    "option_type": "CE",
+                    "broker_token": 50008,
+                    "broker_symbol": "NIFTY26OCT22600CE",
+                    "instrument_id": "330b82a8-2e57-55d1-91e2-a3a3f592b7f8",
+                    "tradingsymbol": "NIFTY26OCT22600CE",
+                    "broker_exchange": "NFO",
+                    "instrument_type": "CE",
+                    "reference_price": 170.0,
+                    "signed_quantity": -50
+                  }
+                ],
+                "expiry": "2026-10-29",
+                "option_run": {
+                  "phase": "entry",
+                  "option_run_id": null
+                },
+                "underlying": "NIFTY",
+                "target_kind": "option_structure",
+                "structure_id": "bull-call-NIFTY26OCT22500CE-NIFTY26OCT22600CE",
+                "expiry_policy": "exit_before_cutoff",
+                "structure_digest": "1becd529d8730ce3ea0af7eddf101aacc561eac72cfae977a071fbbe0d7434a8",
+                "catalog_generation": "c16f4ada-16b7-46da-b87c-181c2d774e17"
+              }
+            }
+          ],
+          "reservations": [
+            {
+              "plan_id": "1ffb5902-267e-4217-8972-ec8e6c196fc2",
+              "status": "consumed",
+              "reserved_notional_inr": 20000.0,
+              "released_at": null,
+              "release_reason": null
+            }
+          ],
+          "execution_events": [
+            {
+              "plan_id": "1ffb5902-267e-4217-8972-ec8e6c196fc2",
+              "step_no": 1,
+              "event": "submitted",
+              "filled_quantity": null,
+              "refusal_reason": null,
+              "detail": {
+                "side": "BUY",
+                "quantity": 50,
+                "instrument_id": "d72a79c7-917d-5103-8ee4-3378da3eb587",
+                "tradingsymbol": "NIFTY26OCT22500CE",
+                "reservation_id": "414d7466-4a69-456e-b7c6-8a4252bd6b33",
+                "strategy_run_id": "run_efc938281ab247469419dc27e55e547d"
+              }
+            },
+            {
+              "plan_id": "1ffb5902-267e-4217-8972-ec8e6c196fc2",
+              "step_no": 1,
+              "event": "filled",
+              "filled_quantity": 50,
+              "refusal_reason": null,
+              "detail": {
+                "fill_price": "1500.000000",
+                "tradingsymbol": "NIFTY26OCT22500CE"
+              }
+            },
+            {
+              "plan_id": "1ffb5902-267e-4217-8972-ec8e6c196fc2",
+              "step_no": 2,
+              "event": "submitted",
+              "filled_quantity": null,
+              "refusal_reason": null,
+              "detail": {
+                "side": "SELL",
+                "quantity": -50,
+                "instrument_id": "330b82a8-2e57-55d1-91e2-a3a3f592b7f8",
+                "tradingsymbol": "NIFTY26OCT22600CE",
+                "reservation_id": "414d7466-4a69-456e-b7c6-8a4252bd6b33",
+                "strategy_run_id": "run_efc938281ab247469419dc27e55e547d"
+              }
+            },
+            {
+              "plan_id": "1ffb5902-267e-4217-8972-ec8e6c196fc2",
+              "step_no": 2,
+              "event": "filled",
+              "filled_quantity": 50,
+              "refusal_reason": null,
+              "detail": {
+                "fill_price": "1500.000000",
+                "tradingsymbol": "NIFTY26OCT22600CE"
+              }
+            }
+          ],
+          "paper_orders": [
+            {
+              "order_id": "PAPER-B76392F18D52",
+              "tradingsymbol": "NIFTY26OCT22500CE",
+              "transaction_type": "buy",
+              "quantity": 50,
+              "status": "filled"
+            },
+            {
+              "order_id": "PAPER-6897095D736F",
+              "tradingsymbol": "NIFTY26OCT22600CE",
+              "transaction_type": "sell",
+              "quantity": 50,
+              "status": "filled"
+            }
+          ],
+          "attributed_positions": [
+            {
+              "tradingsymbol": "NIFTY26OCT22600CE",
+              "product": "NRML",
+              "net_quantity": -50,
+              "projection_version": 2
+            },
+            {
+              "tradingsymbol": "NIFTY26OCT22500CE",
+              "product": "NRML",
+              "net_quantity": 50,
+              "projection_version": 2
+            }
+          ],
+          "jobs": [
+            {
+              "id": "hsj_7779ef55b63e424f96e6329827c02b51",
+              "status": "stopped",
+              "run_id": "run_efc938281ab247469419dc27e55e547d",
+              "attempt": 1,
+              "process_cleanup_state": "confirmed"
+            }
+          ],
+          "grants": [],
+          "option_runs": [
+            {
+              "option_run_id": "opt_run_84dfd868b5f14965a575ee40a2593051",
+              "phase": "entry",
+              "run_status": "entered",
+              "product": "NRML",
+              "legs": [
+                {
+                  "lots": 1,
+                  "leg_id": "1ffb5902-267e-4217-8972-ec8e6c196fc2:1",
+                  "strike": 22500.0,
+                  "product": "NRML",
+                  "exchange": "NFO",
+                  "lot_size": 50,
+                  "metadata": {
+                    "role": "entry",
+                    "ratio": 1,
+                    "instrument_id": "d72a79c7-917d-5103-8ee4-3378da3eb587"
+                  },
+                  "quantity": 50,
+                  "expiry_key": "2026-10-29",
+                  "order_type": "MARKET",
+                  "option_type": "CE",
+                  "tradingsymbol": "NIFTY26OCT22500CE",
+                  "transaction_type": "BUY"
+                },
+                {
+                  "lots": 1,
+                  "leg_id": "1ffb5902-267e-4217-8972-ec8e6c196fc2:2",
+                  "strike": 22600.0,
+                  "product": "NRML",
+                  "exchange": "NFO",
+                  "lot_size": 50,
+                  "metadata": {
+                    "role": "entry",
+                    "ratio": 1,
+                    "instrument_id": "330b82a8-2e57-55d1-91e2-a3a3f592b7f8"
+                  },
+                  "quantity": 50,
+                  "expiry_key": "2026-10-29",
+                  "order_type": "MARKET",
+                  "option_type": "CE",
+                  "tradingsymbol": "NIFTY26OCT22600CE",
+                  "transaction_type": "SELL"
+                }
+              ],
+              "completed_legs": [
+                "1ffb5902-267e-4217-8972-ec8e6c196fc2:1",
+                "1ffb5902-267e-4217-8972-ec8e6c196fc2:2"
+              ]
+            }
+          ],
+          "child_log": "[strategy] NIFTY rsi=100.0 >= 40.0: bullish setup confirmed\n[strategy] frozen bull call spread NIFTY26OCT22500CE / NIFTY26OCT22600CE expiry=2026-10-29 policy=exit_before_cutoff product=NRML premium=60.0 delta=0.96/0.84 iv=0.14/0.14\n[strategy] entry requested: 45b12f71-9f57-453c-b393-7d61fde3a117 status=awaiting_approval\n[strategy] waiting for request 45b12f71-9f57-453c-b393-7d61fde3a117: status=awaiting_approval mode=approval_based\n[strategy] waiting for request 45b12f71-9f57-453c-b393-7d61fde3a117: status=dispatching mode=approval_based\n[strategy] request 45b12f71-9f57-453c-b393-7d61fde3a117 is now executed\n[strategy] entry executed and is held; this evaluation finishes without closing (hold_after_entry=true) and the structure is carried forward as held\n"
+        },
+        {
+          "requests": [
+            {
+              "request_id": "45b12f71-9f57-453c-b393-7d61fde3a117",
+              "plan_id": "1ffb5902-267e-4217-8972-ec8e6c196fc2",
+              "status": "executed",
+              "authorization_mode": "approval_based",
+              "decision_kind": "manual",
+              "refusal_code": null,
+              "execution_detail": {
+                "note": "the request was dispatched; fills, settlement and protection are tracked by the execution trail",
+                "result": {
+                  "steps": [
+                    {
+                      "event": "filled",
+                      "detail": {
+                        "fill_price": "1500.000000",
+                        "tradingsymbol": "NIFTY26OCT22500CE"
+                      },
+                      "step_no": 1,
+                      "paper_order_id": "PAPER-B76392F18D52",
+                      "refusal_reason": null,
+                      "filled_quantity": 50
+                    },
+                    {
+                      "event": "filled",
+                      "detail": {
+                        "fill_price": "1500.000000",
+                        "tradingsymbol": "NIFTY26OCT22600CE"
+                      },
+                      "step_no": 2,
+                      "paper_order_id": "PAPER-6897095D736F",
+                      "refusal_reason": null,
+                      "filled_quantity": 50
+                    }
+                  ],
+                  "status": "filled",
+                  "plan_id": "1ffb5902-267e-4217-8972-ec8e6c196fc2",
+                  "reservation_id": "414d7466-4a69-456e-b7c6-8a4252bd6b33",
+                  "paper_order_ids": [
+                    "PAPER-B76392F18D52",
+                    "PAPER-6897095D736F"
+                  ]
+                },
+                "grant_id": null,
+                "approval_id": null,
+                "environment": "paper",
+                "decision_kind": "manual",
+                "outcome_state": "filled",
+                "reservation_id": "414d7466-4a69-456e-b7c6-8a4252bd6b33",
+                "authorization_mode": "approval_based"
+              }
+            },
+            {
+              "request_id": "eacd1882-e048-41a3-a375-ecafab554fb8",
+              "plan_id": "19b251c9-390a-4d92-923f-ba2b2a1d3785",
+              "status": "refused",
+              "authorization_mode": "approval_based",
+              "decision_kind": null,
+              "refusal_code": "OPTION_STRUCTURE_ALREADY_OPEN",
+              "execution_detail": {}
+            },
+            {
+              "request_id": "7eb3bd40-7636-47c2-a702-14b98c5a1b10",
+              "plan_id": "bcc74c2d-5a9b-49e0-a14e-19ab13407487",
+              "status": "executed",
+              "authorization_mode": "approval_based",
+              "decision_kind": "manual",
+              "refusal_code": null,
+              "execution_detail": {
+                "note": "the request was dispatched; fills, settlement and protection are tracked by the execution trail",
+                "result": {
+                  "steps": [
+                    {
+                      "event": "filled",
+                      "detail": {
+                        "fill_price": "1500.000000",
+                        "tradingsymbol": "NIFTY26OCT22600CE"
+                      },
+                      "step_no": 2,
+                      "paper_order_id": "PAPER-C8EF8308E7BF",
+                      "refusal_reason": null,
+                      "filled_quantity": 50
+                    },
+                    {
+                      "event": "filled",
+                      "detail": {
+                        "fill_price": "1500.000000",
+                        "tradingsymbol": "NIFTY26OCT22500CE"
+                      },
+                      "step_no": 1,
+                      "paper_order_id": "PAPER-F6D5541830C1",
+                      "refusal_reason": null,
+                      "filled_quantity": 50
+                    }
+                  ],
+                  "status": "filled",
+                  "plan_id": "bcc74c2d-5a9b-49e0-a14e-19ab13407487",
+                  "reservation_id": "6a342b69-32d2-4552-bd57-4f4eae50cbf3",
+                  "paper_order_ids": [
+                    "PAPER-C8EF8308E7BF",
+                    "PAPER-F6D5541830C1"
+                  ]
+                },
+                "grant_id": null,
+                "approval_id": null,
+                "environment": "paper",
+                "decision_kind": "manual",
+                "outcome_state": "filled",
+                "reservation_id": "6a342b69-32d2-4552-bd57-4f4eae50cbf3",
+                "authorization_mode": "approval_based"
+              }
+            }
+          ],
+          "plans": [
+            {
+              "plan_id": "1ffb5902-267e-4217-8972-ec8e6c196fc2",
+              "plan_kind": "option_structure",
+              "logical_plan": {
+                "legs": [
+                  {
+                    "side": "BUY",
+                    "ratio": 1,
+                    "strike": 22500.0,
+                    "option_type": "CE"
+                  },
+                  {
+                    "side": "SELL",
+                    "ratio": 1,
+                    "strike": 22600.0,
+                    "option_type": "CE"
+                  }
+                ],
+                "expiry": "2026-10-29",
+                "product": "NRML",
+                "option_run": {
+                  "phase": "entry",
+                  "option_run_id": null
+                },
+                "underlying": "NIFTY",
+                "target_kind": "option_structure",
+                "structure_id": "bull-call-NIFTY26OCT22500CE-NIFTY26OCT22600CE",
+                "expiry_policy": "exit_before_cutoff"
+              },
+              "resolved_plan": {
+                "legs": [
+                  {
+                    "side": "BUY",
+                    "ratio": 1,
+                    "expiry": "2026-10-29",
+                    "strike": 22500.0,
+                    "product": "NRML",
+                    "exchange": "NFO",
+                    "lot_size": 50,
+                    "quantity": 50,
+                    "selection": null,
+                    "option_type": "CE",
+                    "broker_token": 50004,
+                    "broker_symbol": "NIFTY26OCT22500CE",
+                    "instrument_id": "d72a79c7-917d-5103-8ee4-3378da3eb587",
+                    "tradingsymbol": "NIFTY26OCT22500CE",
+                    "broker_exchange": "NFO",
+                    "instrument_type": "CE",
+                    "reference_price": 230.0,
+                    "signed_quantity": 50
+                  },
+                  {
+                    "side": "SELL",
+                    "ratio": 1,
+                    "expiry": "2026-10-29",
+                    "strike": 22600.0,
+                    "product": "NRML",
+                    "exchange": "NFO",
+                    "lot_size": 50,
+                    "quantity": 50,
+                    "selection": null,
+                    "option_type": "CE",
+                    "broker_token": 50008,
+                    "broker_symbol": "NIFTY26OCT22600CE",
+                    "instrument_id": "330b82a8-2e57-55d1-91e2-a3a3f592b7f8",
+                    "tradingsymbol": "NIFTY26OCT22600CE",
+                    "broker_exchange": "NFO",
+                    "instrument_type": "CE",
+                    "reference_price": 170.0,
+                    "signed_quantity": -50
+                  }
+                ],
+                "expiry": "2026-10-29",
+                "option_run": {
+                  "phase": "entry",
+                  "option_run_id": null
+                },
+                "underlying": "NIFTY",
+                "target_kind": "option_structure",
+                "structure_id": "bull-call-NIFTY26OCT22500CE-NIFTY26OCT22600CE",
+                "expiry_policy": "exit_before_cutoff",
+                "structure_digest": "1becd529d8730ce3ea0af7eddf101aacc561eac72cfae977a071fbbe0d7434a8",
+                "catalog_generation": "c16f4ada-16b7-46da-b87c-181c2d774e17"
+              }
+            },
+            {
+              "plan_id": "19b251c9-390a-4d92-923f-ba2b2a1d3785",
+              "plan_kind": "option_structure",
+              "logical_plan": {
+                "legs": [
+                  {
+                    "side": "BUY",
+                    "ratio": 1,
+                    "strike": 22500.0,
+                    "option_type": "CE"
+                  },
+                  {
+                    "side": "SELL",
+                    "ratio": 1,
+                    "strike": 22600.0,
+                    "option_type": "CE"
+                  }
+                ],
+                "expiry": "2026-10-29",
+                "product": "NRML",
+                "option_run": {
+                  "phase": "entry",
+                  "option_run_id": null
+                },
+                "underlying": "NIFTY",
+                "target_kind": "option_structure",
+                "structure_id": "bull-call-NIFTY26OCT22500CE-NIFTY26OCT22600CE",
+                "expiry_policy": "exit_before_cutoff"
+              },
+              "resolved_plan": {
+                "legs": [
+                  {
+                    "side": "BUY",
+                    "ratio": 1,
+                    "expiry": "2026-10-29",
+                    "strike": 22500.0,
+                    "product": "NRML",
+                    "exchange": "NFO",
+                    "lot_size": 50,
+                    "quantity": 50,
+                    "selection": null,
+                    "option_type": "CE",
+                    "broker_token": 50004,
+                    "broker_symbol": "NIFTY26OCT22500CE",
+                    "instrument_id": "d72a79c7-917d-5103-8ee4-3378da3eb587",
+                    "tradingsymbol": "NIFTY26OCT22500CE",
+                    "broker_exchange": "NFO",
+                    "instrument_type": "CE",
+                    "reference_price": 230.0,
+                    "signed_quantity": 50
+                  },
+                  {
+                    "side": "SELL",
+                    "ratio": 1,
+                    "expiry": "2026-10-29",
+                    "strike": 22600.0,
+                    "product": "NRML",
+                    "exchange": "NFO",
+                    "lot_size": 50,
+                    "quantity": 50,
+                    "selection": null,
+                    "option_type": "CE",
+                    "broker_token": 50008,
+                    "broker_symbol": "NIFTY26OCT22600CE",
+                    "instrument_id": "330b82a8-2e57-55d1-91e2-a3a3f592b7f8",
+                    "tradingsymbol": "NIFTY26OCT22600CE",
+                    "broker_exchange": "NFO",
+                    "instrument_type": "CE",
+                    "reference_price": 170.0,
+                    "signed_quantity": -50
+                  }
+                ],
+                "expiry": "2026-10-29",
+                "option_run": {
+                  "phase": "entry",
+                  "option_run_id": null
+                },
+                "underlying": "NIFTY",
+                "target_kind": "option_structure",
+                "structure_id": "bull-call-NIFTY26OCT22500CE-NIFTY26OCT22600CE",
+                "expiry_policy": "exit_before_cutoff",
+                "structure_digest": "1becd529d8730ce3ea0af7eddf101aacc561eac72cfae977a071fbbe0d7434a8",
+                "catalog_generation": "c16f4ada-16b7-46da-b87c-181c2d774e17"
+              }
+            },
+            {
+              "plan_id": "bcc74c2d-5a9b-49e0-a14e-19ab13407487",
+              "plan_kind": "option_structure",
+              "logical_plan": {
+                "legs": [
+                  {
+                    "side": "SELL",
+                    "ratio": 1,
+                    "strike": 22500.0,
+                    "option_type": "CE"
+                  },
+                  {
+                    "side": "BUY",
+                    "ratio": 1,
+                    "strike": 22600.0,
+                    "option_type": "CE"
+                  }
+                ],
+                "expiry": "2026-10-29",
+                "product": "NRML",
+                "option_run": {
+                  "phase": "exit",
+                  "option_run_id": "opt_run_84dfd868b5f14965a575ee40a2593051"
+                },
+                "underlying": "NIFTY",
+                "target_kind": "option_structure",
+                "structure_id": "bull-call-NIFTY26OCT22500CE-NIFTY26OCT22600CE",
+                "expiry_policy": "exit_before_cutoff"
+              },
+              "resolved_plan": {
+                "legs": [
+                  {
+                    "side": "SELL",
+                    "ratio": 1,
+                    "expiry": "2026-10-29",
+                    "strike": 22500.0,
+                    "product": "NRML",
+                    "exchange": "NFO",
+                    "lot_size": 50,
+                    "quantity": 50,
+                    "selection": null,
+                    "option_type": "CE",
+                    "broker_token": 50004,
+                    "broker_symbol": "NIFTY26OCT22500CE",
+                    "instrument_id": "d72a79c7-917d-5103-8ee4-3378da3eb587",
+                    "tradingsymbol": "NIFTY26OCT22500CE",
+                    "broker_exchange": "NFO",
+                    "instrument_type": "CE",
+                    "reference_price": 230.0,
+                    "signed_quantity": -50
+                  },
+                  {
+                    "side": "BUY",
+                    "ratio": 1,
+                    "expiry": "2026-10-29",
+                    "strike": 22600.0,
+                    "product": "NRML",
+                    "exchange": "NFO",
+                    "lot_size": 50,
+                    "quantity": 50,
+                    "selection": null,
+                    "option_type": "CE",
+                    "broker_token": 50008,
+                    "broker_symbol": "NIFTY26OCT22600CE",
+                    "instrument_id": "330b82a8-2e57-55d1-91e2-a3a3f592b7f8",
+                    "tradingsymbol": "NIFTY26OCT22600CE",
+                    "broker_exchange": "NFO",
+                    "instrument_type": "CE",
+                    "reference_price": 170.0,
+                    "signed_quantity": 50
+                  }
+                ],
+                "expiry": "2026-10-29",
+                "option_run": {
+                  "phase": "exit",
+                  "option_run_id": "opt_run_84dfd868b5f14965a575ee40a2593051"
+                },
+                "underlying": "NIFTY",
+                "target_kind": "option_structure",
+                "structure_id": "bull-call-NIFTY26OCT22500CE-NIFTY26OCT22600CE",
+                "expiry_policy": "exit_before_cutoff",
+                "structure_digest": "88365469aa055b11ee6aaf47a8d78e4c7d59df7a37e6766108c5f31c1ef1f17f",
+                "catalog_generation": "c16f4ada-16b7-46da-b87c-181c2d774e17"
+              }
+            }
+          ],
+          "reservations": [
+            {
+              "plan_id": "1ffb5902-267e-4217-8972-ec8e6c196fc2",
+              "status": "consumed",
+              "reserved_notional_inr": 20000.0,
+              "released_at": null,
+              "release_reason": null
+            },
+            {
+              "plan_id": "bcc74c2d-5a9b-49e0-a14e-19ab13407487",
+              "status": "consumed",
+              "reserved_notional_inr": 40000.0,
+              "released_at": null,
+              "release_reason": null
+            }
+          ],
+          "execution_events": [
+            {
+              "plan_id": "1ffb5902-267e-4217-8972-ec8e6c196fc2",
+              "step_no": 1,
+              "event": "submitted",
+              "filled_quantity": null,
+              "refusal_reason": null,
+              "detail": {
+                "side": "BUY",
+                "quantity": 50,
+                "instrument_id": "d72a79c7-917d-5103-8ee4-3378da3eb587",
+                "tradingsymbol": "NIFTY26OCT22500CE",
+                "reservation_id": "414d7466-4a69-456e-b7c6-8a4252bd6b33",
+                "strategy_run_id": "run_efc938281ab247469419dc27e55e547d"
+              }
+            },
+            {
+              "plan_id": "1ffb5902-267e-4217-8972-ec8e6c196fc2",
+              "step_no": 1,
+              "event": "filled",
+              "filled_quantity": 50,
+              "refusal_reason": null,
+              "detail": {
+                "fill_price": "1500.000000",
+                "tradingsymbol": "NIFTY26OCT22500CE"
+              }
+            },
+            {
+              "plan_id": "1ffb5902-267e-4217-8972-ec8e6c196fc2",
+              "step_no": 2,
+              "event": "submitted",
+              "filled_quantity": null,
+              "refusal_reason": null,
+              "detail": {
+                "side": "SELL",
+                "quantity": -50,
+                "instrument_id": "330b82a8-2e57-55d1-91e2-a3a3f592b7f8",
+                "tradingsymbol": "NIFTY26OCT22600CE",
+                "reservation_id": "414d7466-4a69-456e-b7c6-8a4252bd6b33",
+                "strategy_run_id": "run_efc938281ab247469419dc27e55e547d"
+              }
+            },
+            {
+              "plan_id": "1ffb5902-267e-4217-8972-ec8e6c196fc2",
+              "step_no": 2,
+              "event": "filled",
+              "filled_quantity": 50,
+              "refusal_reason": null,
+              "detail": {
+                "fill_price": "1500.000000",
+                "tradingsymbol": "NIFTY26OCT22600CE"
+              }
+            },
+            {
+              "plan_id": "bcc74c2d-5a9b-49e0-a14e-19ab13407487",
+              "step_no": 2,
+              "event": "submitted",
+              "filled_quantity": null,
+              "refusal_reason": null,
+              "detail": {
+                "side": "BUY",
+                "quantity": 50,
+                "instrument_id": "330b82a8-2e57-55d1-91e2-a3a3f592b7f8",
+                "tradingsymbol": "NIFTY26OCT22600CE",
+                "reservation_id": "6a342b69-32d2-4552-bd57-4f4eae50cbf3",
+                "strategy_run_id": "run_b53b07f970984f37a74647fa11ad3d3e"
+              }
+            },
+            {
+              "plan_id": "bcc74c2d-5a9b-49e0-a14e-19ab13407487",
+              "step_no": 2,
+              "event": "filled",
+              "filled_quantity": 50,
+              "refusal_reason": null,
+              "detail": {
+                "fill_price": "1500.000000",
+                "tradingsymbol": "NIFTY26OCT22600CE"
+              }
+            },
+            {
+              "plan_id": "bcc74c2d-5a9b-49e0-a14e-19ab13407487",
+              "step_no": 1,
+              "event": "submitted",
+              "filled_quantity": null,
+              "refusal_reason": null,
+              "detail": {
+                "side": "SELL",
+                "quantity": -50,
+                "instrument_id": "d72a79c7-917d-5103-8ee4-3378da3eb587",
+                "tradingsymbol": "NIFTY26OCT22500CE",
+                "reservation_id": "6a342b69-32d2-4552-bd57-4f4eae50cbf3",
+                "strategy_run_id": "run_b53b07f970984f37a74647fa11ad3d3e"
+              }
+            },
+            {
+              "plan_id": "bcc74c2d-5a9b-49e0-a14e-19ab13407487",
+              "step_no": 1,
+              "event": "filled",
+              "filled_quantity": 50,
+              "refusal_reason": null,
+              "detail": {
+                "fill_price": "1500.000000",
+                "tradingsymbol": "NIFTY26OCT22500CE"
+              }
+            }
+          ],
+          "paper_orders": [
+            {
+              "order_id": "PAPER-B76392F18D52",
+              "tradingsymbol": "NIFTY26OCT22500CE",
+              "transaction_type": "buy",
+              "quantity": 50,
+              "status": "filled"
+            },
+            {
+              "order_id": "PAPER-6897095D736F",
+              "tradingsymbol": "NIFTY26OCT22600CE",
+              "transaction_type": "sell",
+              "quantity": 50,
+              "status": "filled"
+            },
+            {
+              "order_id": "PAPER-C8EF8308E7BF",
+              "tradingsymbol": "NIFTY26OCT22600CE",
+              "transaction_type": "buy",
+              "quantity": 50,
+              "status": "filled"
+            },
+            {
+              "order_id": "PAPER-F6D5541830C1",
+              "tradingsymbol": "NIFTY26OCT22500CE",
+              "transaction_type": "sell",
+              "quantity": 50,
+              "status": "filled"
+            }
+          ],
+          "attributed_positions": [],
+          "jobs": [
+            {
+              "id": "hsj_7779ef55b63e424f96e6329827c02b51",
+              "status": "stopped",
+              "run_id": "run_efc938281ab247469419dc27e55e547d",
+              "attempt": 1,
+              "process_cleanup_state": "confirmed"
+            },
+            {
+              "id": "hsj_b8ed9f7d752541a19aab58246f69a344",
+              "status": "stopped",
+              "run_id": "run_b53b07f970984f37a74647fa11ad3d3e",
+              "attempt": 1,
+              "process_cleanup_state": "confirmed"
+            }
+          ],
+          "grants": [],
+          "option_runs": [
+            {
+              "option_run_id": "opt_run_84dfd868b5f14965a575ee40a2593051",
+              "phase": "entry",
+              "run_status": "exited",
+              "product": "NRML",
+              "legs": [
+                {
+                  "lots": 1,
+                  "leg_id": "1ffb5902-267e-4217-8972-ec8e6c196fc2:1",
+                  "strike": 22500.0,
+                  "product": "NRML",
+                  "exchange": "NFO",
+                  "lot_size": 50,
+                  "metadata": {
+                    "role": "entry",
+                    "ratio": 1,
+                    "instrument_id": "d72a79c7-917d-5103-8ee4-3378da3eb587"
+                  },
+                  "quantity": 50,
+                  "expiry_key": "2026-10-29",
+                  "order_type": "MARKET",
+                  "option_type": "CE",
+                  "tradingsymbol": "NIFTY26OCT22500CE",
+                  "transaction_type": "BUY"
+                },
+                {
+                  "lots": 1,
+                  "leg_id": "1ffb5902-267e-4217-8972-ec8e6c196fc2:2",
+                  "strike": 22600.0,
+                  "product": "NRML",
+                  "exchange": "NFO",
+                  "lot_size": 50,
+                  "metadata": {
+                    "role": "entry",
+                    "ratio": 1,
+                    "instrument_id": "330b82a8-2e57-55d1-91e2-a3a3f592b7f8"
+                  },
+                  "quantity": 50,
+                  "expiry_key": "2026-10-29",
+                  "order_type": "MARKET",
+                  "option_type": "CE",
+                  "tradingsymbol": "NIFTY26OCT22600CE",
+                  "transaction_type": "SELL"
+                }
+              ],
+              "completed_legs": [
+                "1ffb5902-267e-4217-8972-ec8e6c196fc2:1",
+                "1ffb5902-267e-4217-8972-ec8e6c196fc2:2"
+              ]
+            },
+            {
+              "option_run_id": "opt_run_84dfd868b5f14965a575ee40a2593051",
+              "phase": "exit",
+              "run_status": "exited",
+              "product": "NRML",
+              "legs": [
+                {
+                  "lots": 1,
+                  "leg_id": "1ffb5902-267e-4217-8972-ec8e6c196fc2:1",
+                  "strike": 22500.0,
+                  "product": "NRML",
+                  "exchange": "NFO",
+                  "lot_size": 50,
+                  "metadata": {
+                    "role": "entry",
+                    "ratio": 1,
+                    "instrument_id": "d72a79c7-917d-5103-8ee4-3378da3eb587"
+                  },
+                  "quantity": 50,
+                  "expiry_key": "2026-10-29",
+                  "order_type": "MARKET",
+                  "option_type": "CE",
+                  "tradingsymbol": "NIFTY26OCT22500CE",
+                  "transaction_type": "BUY"
+                },
+                {
+                  "lots": 1,
+                  "leg_id": "1ffb5902-267e-4217-8972-ec8e6c196fc2:2",
+                  "strike": 22600.0,
+                  "product": "NRML",
+                  "exchange": "NFO",
+                  "lot_size": 50,
+                  "metadata": {
+                    "role": "entry",
+                    "ratio": 1,
+                    "instrument_id": "330b82a8-2e57-55d1-91e2-a3a3f592b7f8"
+                  },
+                  "quantity": 50,
+                  "expiry_key": "2026-10-29",
+                  "order_type": "MARKET",
+                  "option_type": "CE",
+                  "tradingsymbol": "NIFTY26OCT22600CE",
+                  "transaction_type": "SELL"
+                }
+              ],
+              "completed_legs": [
+                "1ffb5902-267e-4217-8972-ec8e6c196fc2:1",
+                "1ffb5902-267e-4217-8972-ec8e6c196fc2:2"
+              ]
+            }
+          ],
+          "child_log": "[strategy] NIFTY rsi=100.0 >= 40.0: bullish setup confirmed\n[strategy] frozen bull call spread NIFTY26OCT22500CE / NIFTY26OCT22600CE expiry=2026-10-29 policy=exit_before_cutoff product=NRML premium=60.0 delta=0.96/0.84 iv=0.14/0.14\n[strategy] request eacd1882-e048-41a3-a375-ecafab554fb8 is now refused\n[strategy] duplicate entry probe answered refused refusal_code=OPTION_STRUCTURE_ALREADY_OPEN request=eacd1882-e048-41a3-a375-ecafab554fb8\n[strategy] structure close requested for run opt_run_84dfd868b5f14965a575ee40a2593051: 7eb3bd40-7636-47c2-a702-14b98c5a1b10 status=awaiting_approval\n[strategy] waiting for request 7eb3bd40-7636-47c2-a702-14b98c5a1b10: status=awaiting_approval mode=approval_based\n[strategy] request 7eb3bd40-7636-47c2-a702-14b98c5a1b10 is now executed\n[strategy] structure closed with no outstanding work (runs ['opt_run_84dfd868b5f14965a575ee40a2593051'] are closed with no outstanding work)\n"
+        }
+      ],
+      "acceptance": {
+        "ok": true,
+        "failures": []
+      }
+    },
+    "options_dynamic_resize_roll": {
+      "strategy_id": "hs_7749c99f2d1b4912aa8496b751676013",
+      "autonomous": false,
+      "option_run_id": "opt_run_7d153e73a1e74fdc8ca78261d099101b",
+      "phases": [
+        {
+          "phase": "entry",
+          "job_id": "hsj_f31b682ff14d45778cfafab760b7f21b",
+          "job_index": 0,
+          "child_exited": true,
+          "params": {
+            "underlying": "NIFTY",
+            "product": "NRML",
+            "expiry_policy": "exit_before_cutoff",
+            "short_offset_points": 0,
+            "wing_width_points": 100,
+            "base_units": 1,
+            "deadline_seconds": 240
+          },
+          "requests": [
+            {
+              "request_id": "74f02519-6b5f-4b08-bf0d-84da853f6aac",
+              "plan_id": "53b8f3b0-96d0-45e3-b35d-28525c32f464",
+              "status": "executed",
+              "authorization_mode": "approval_based",
+              "decision_kind": "manual",
+              "refusal_code": null,
+              "refusal_detail": {},
+              "execution_detail": {
+                "note": "the request was dispatched; fills, settlement and protection are tracked by the execution trail",
+                "result": {
+                  "steps": [
+                    {
+                      "event": "filled",
+                      "detail": {
+                        "fill_price": "1500.000000",
+                        "tradingsymbol": "NIFTY26OCT22600CE"
+                      },
+                      "step_no": 3,
+                      "paper_order_id": "PAPER-B05A6C6AEB01",
+                      "refusal_reason": null,
+                      "filled_quantity": 50
+                    },
+                    {
+                      "event": "filled",
+                      "detail": {
+                        "fill_price": "1500.000000",
+                        "tradingsymbol": "NIFTY26OCT22400PE"
+                      },
+                      "step_no": 4,
+                      "paper_order_id": "PAPER-C399C4FC6536",
+                      "refusal_reason": null,
+                      "filled_quantity": 50
+                    },
+                    {
+                      "event": "filled",
+                      "detail": {
+                        "fill_price": "1500.000000",
+                        "tradingsymbol": "NIFTY26OCT22500CE"
+                      },
+                      "step_no": 1,
+                      "paper_order_id": "PAPER-AFD0553C90E0",
+                      "refusal_reason": null,
+                      "filled_quantity": 50
+                    },
+                    {
+                      "event": "filled",
+                      "detail": {
+                        "fill_price": "1500.000000",
+                        "tradingsymbol": "NIFTY26OCT22500PE"
+                      },
+                      "step_no": 2,
+                      "paper_order_id": "PAPER-8A0254C2DBCF",
+                      "refusal_reason": null,
+                      "filled_quantity": 50
+                    }
+                  ],
+                  "status": "filled",
+                  "plan_id": "53b8f3b0-96d0-45e3-b35d-28525c32f464",
+                  "reservation_id": "369cd610-7a5d-48b6-a249-e29a82fdc07d",
+                  "paper_order_ids": [
+                    "PAPER-B05A6C6AEB01",
+                    "PAPER-C399C4FC6536",
+                    "PAPER-AFD0553C90E0",
+                    "PAPER-8A0254C2DBCF"
+                  ]
+                },
+                "grant_id": null,
+                "approval_id": null,
+                "environment": "paper",
+                "decision_kind": "manual",
+                "outcome_state": "filled",
+                "reservation_id": "369cd610-7a5d-48b6-a249-e29a82fdc07d",
+                "authorization_mode": "approval_based"
+              }
+            }
+          ],
+          "orders": [
+            {
+              "tradingsymbol": "NIFTY26OCT22600CE",
+              "transaction_type": "buy",
+              "quantity": 50,
+              "status": "filled",
+              "average_price": "1500.000000"
+            },
+            {
+              "tradingsymbol": "NIFTY26OCT22400PE",
+              "transaction_type": "buy",
+              "quantity": 50,
+              "status": "filled",
+              "average_price": "1500.000000"
+            },
+            {
+              "tradingsymbol": "NIFTY26OCT22500CE",
+              "transaction_type": "sell",
+              "quantity": 50,
+              "status": "filled",
+              "average_price": "1500.000000"
+            },
+            {
+              "tradingsymbol": "NIFTY26OCT22500PE",
+              "transaction_type": "sell",
+              "quantity": 50,
+              "status": "filled",
+              "average_price": "1500.000000"
+            }
+          ],
+          "checkpoint": {
+            "status": "entered",
+            "generation": 1,
+            "leg_units": [
+              1,
+              1,
+              1,
+              1
+            ],
+            "expiry": "2026-10-29"
+          },
+          "child_log_tail": "[strategy] entry requested: 74f02519-6b5f-4b08-bf0d-84da853f6aac status=awaiting_approval\n[strategy] entry answer status=executed refusal_code=none\n[strategy] dynamic straddle held: generation=1 units=1 expiry=2026-10-29 status=entered after entry\n",
+          "supervisor": {
+            "job_id": "hsj_f31b682ff14d45778cfafab760b7f21b",
+            "outcome": "exited",
+            "stop": "exited",
+            "log_overflow": false,
+            "log_ref": "/home/krishna/kite-algo-worktrees/b2-2-hardening/.phase5-workspace/options_dynamic_resize_roll-entry/logs/hsj_f31b682ff14d45778cfafab760b7f21b.log",
+            "exit_code": 0,
+            "process_cleanup_reported": true,
+            "logs_shipped": true,
+            "terminal": "recovery_required",
+            "replacement_blocked": false,
+            "clean_exit": true,
+            "continuation": {
+              "attempted": true,
+              "continued": true,
+              "held": true,
+              "case": "continuation_eligible",
+              "reason_code": "CONTINUATION_ELIGIBLE",
+              "blocking_reasons": [],
+              "job_id": "hsj_f31b682ff14d45778cfafab760b7f21b",
+              "audit_id": "hsr_6012994ba4c24f15b8144b1fcdb1af0a",
+              "barrier_version": 8,
+              "projection_version": 2,
+              "worker_run_closed": true,
+              "assessment": {
+                "allowed": true,
+                "case": "continuation_eligible",
+                "reason_code": "CONTINUATION_ELIGIBLE",
+                "blocking_reasons": [],
+                "held": true,
+                "notes": [
+                  "option_runs=opt_run_7d153e73a1e74fdc8ca78261d099101b=held",
+                  "finite evaluation finished cleanly; book is held",
+                  "a cleanly held option structure is carried forward as HELD; the options lane keeps its own book and is never reported flat"
+                ],
+                "proof": {
+                  "kind": "evaluation_continuation",
+                  "owner_id": "app:admin",
+                  "strategy_id": "hs_7749c99f2d1b4912aa8496b751676013",
+                  "account_id": "kite:paper-options_dynamic_resize_roll",
+                  "execution_environment": "paper",
+                  "predecessor": {
+                    "job_id": "hsj_f31b682ff14d45778cfafab760b7f21b",
+                    "attempt": 1,
+                    "lease_epoch": 1,
+                    "run_id": "run_2fd1d5fb8ac042bbab41bb839658adeb"
+                  },
+                  "barrier_version": 8,
+                  "projection_version": 2,
+                  "book_state": "published",
+                  "exposure_state": "open",
+                  "held": true,
+                  "option_work_state": "held",
+                  "option_runs": [
+                    "opt_run_7d153e73a1e74fdc8ca78261d099101b=held"
+                  ],
+                  "completion_state": "exited",
+                  "exit_code": 0,
+                  "desired_state": "started",
+                  "protection_enabled": false,
+                  "evidence_digest": "8ba01af8d619edd01f3435ff1fd2f80b5cb550da4fa79e37915a229a4c9b48b5"
+                }
+              }
+            }
+          }
+        },
+        {
+          "phase": "resize",
+          "job_id": "hsj_0671b04b18f84d1bb4db37447d99988b",
+          "job_index": 1,
+          "child_exited": true,
+          "params": {
+            "underlying": "NIFTY",
+            "product": "NRML",
+            "expiry_policy": "exit_before_cutoff",
+            "short_offset_points": 0,
+            "wing_width_points": 100,
+            "base_units": 1,
+            "deadline_seconds": 240,
+            "resize_units": 2,
+            "force_resize": true,
+            "duplicate_entry_probe": true,
+            "stale_basis_probe": true
+          },
+          "requests": [
+            {
+              "request_id": "859a4764-941c-4683-9c31-9f1364feabf4",
+              "plan_id": "034f6b5b-aeb7-4771-a9b3-aefdcae1d8e5",
+              "status": "executed",
+              "authorization_mode": "approval_based",
+              "decision_kind": "manual",
+              "refusal_code": null,
+              "refusal_detail": {},
+              "execution_detail": {
+                "note": "the request was dispatched; fills, settlement and protection are tracked by the execution trail",
+                "result": {
+                  "steps": [
+                    {
+                      "event": "filled",
+                      "detail": {
+                        "fill_price": "1500.000000",
+                        "tradingsymbol": "NIFTY26OCT22600CE"
+                      },
+                      "step_no": 3,
+                      "paper_order_id": "PAPER-46A087B9A4A6",
+                      "refusal_reason": null,
+                      "filled_quantity": 50
+                    },
+                    {
+                      "event": "filled",
+                      "detail": {
+                        "fill_price": "1500.000000",
+                        "tradingsymbol": "NIFTY26OCT22400PE"
+                      },
+                      "step_no": 4,
+                      "paper_order_id": "PAPER-E7914655FA32",
+                      "refusal_reason": null,
+                      "filled_quantity": 50
+                    },
+                    {
+                      "event": "filled",
+                      "detail": {
+                        "fill_price": "1500.000000",
+                        "tradingsymbol": "NIFTY26OCT22500CE"
+                      },
+                      "step_no": 1,
+                      "paper_order_id": "PAPER-9D1F32441375",
+                      "refusal_reason": null,
+                      "filled_quantity": 50
+                    },
+                    {
+                      "event": "filled",
+                      "detail": {
+                        "fill_price": "1500.000000",
+                        "tradingsymbol": "NIFTY26OCT22500PE"
+                      },
+                      "step_no": 2,
+                      "paper_order_id": "PAPER-A6BCD61743F0",
+                      "refusal_reason": null,
+                      "filled_quantity": 50
+                    }
+                  ],
+                  "status": "filled",
+                  "plan_id": "034f6b5b-aeb7-4771-a9b3-aefdcae1d8e5",
+                  "reservation_id": "0dc7ec15-a8c9-48d0-926b-4840b219a69b",
+                  "paper_order_ids": [
+                    "PAPER-46A087B9A4A6",
+                    "PAPER-E7914655FA32",
+                    "PAPER-9D1F32441375",
+                    "PAPER-A6BCD61743F0"
+                  ]
+                },
+                "grant_id": null,
+                "approval_id": null,
+                "environment": "paper",
+                "decision_kind": "manual",
+                "outcome_state": "filled",
+                "reservation_id": "0dc7ec15-a8c9-48d0-926b-4840b219a69b",
+                "authorization_mode": "approval_based"
+              }
+            },
+            {
+              "request_id": "bf819098-7556-4107-818e-428f62093bd1",
+              "plan_id": "6ec562e5-17ba-41a3-9db6-a0890b0cb6c8",
+              "status": "refused",
+              "authorization_mode": "approval_based",
+              "decision_kind": null,
+              "refusal_code": "OPTION_STRUCTURE_ALREADY_OPEN",
+              "refusal_detail": {
+                "stage": "request",
+                "message": "this strategy already owns this structure in this account and environment; an equivalent structure is never opened twice",
+                "plan_id": "6ec562e5-17ba-41a3-9db6-a0890b0cb6c8",
+                "checked_at": "2026-09-25T14:15:44.173618+00:00",
+                "option_run_id": "opt_run_7d153e73a1e74fdc8ca78261d099101b",
+                "structure_digest": "666eeff4f018d36beda458160962bf94a33c248a5df93df2fac068363fad7314",
+                "option_run_status": "entered",
+                "originating_plan_id": "53b8f3b0-96d0-45e3-b35d-28525c32f464"
+              },
+              "execution_detail": {}
+            },
+            {
+              "request_id": "9af19039-df0c-47a3-9a90-63b38efee0c0",
+              "plan_id": "548ce73a-22af-4d2c-86c4-583fefd43806",
+              "status": "refused",
+              "authorization_mode": "approval_based",
+              "decision_kind": null,
+              "refusal_code": "OPTION_ADJUSTMENT_STALE_BASIS",
+              "refusal_detail": {
+                "stage": "request",
+                "message": "the run has moved to a different leg generation than the one this adjust was approved against; it is never re-derived against a newer one",
+                "plan_id": "548ce73a-22af-4d2c-86c4-583fefd43806",
+                "checked_at": "2026-09-25T14:15:44.924889+00:00",
+                "option_run_id": "opt_run_7d153e73a1e74fdc8ca78261d099101b",
+                "based_on_generation": 1,
+                "structure_generation": 2
+              },
+              "execution_detail": {}
+            }
+          ],
+          "orders": [
+            {
+              "tradingsymbol": "NIFTY26OCT22600CE",
+              "transaction_type": "buy",
+              "quantity": 50,
+              "status": "filled",
+              "average_price": "1500.000000"
+            },
+            {
+              "tradingsymbol": "NIFTY26OCT22400PE",
+              "transaction_type": "buy",
+              "quantity": 50,
+              "status": "filled",
+              "average_price": "1500.000000"
+            },
+            {
+              "tradingsymbol": "NIFTY26OCT22500CE",
+              "transaction_type": "sell",
+              "quantity": 50,
+              "status": "filled",
+              "average_price": "1500.000000"
+            },
+            {
+              "tradingsymbol": "NIFTY26OCT22500PE",
+              "transaction_type": "sell",
+              "quantity": 50,
+              "status": "filled",
+              "average_price": "1500.000000"
+            }
+          ],
+          "checkpoint": {
+            "status": "entered",
+            "generation": 2,
+            "leg_units": [
+              2,
+              2,
+              2,
+              2
+            ],
+            "expiry": "2026-10-29"
+          },
+          "child_log_tail": "[strategy] resize decided: resizing 1 -> 2 units (net delta 0.07999999999999996, threshold 0.5, forced=True)\n[strategy] resize adjust requested: 859a4764-941c-4683-9c31-9f1364feabf4 status=awaiting_approval\n[strategy] resize answer status=executed refusal_code=none\n[strategy] duplicate entry probe answered status=refused refusal_code=OPTION_STRUCTURE_ALREADY_OPEN request=bf819098-7556-4107-818e-428f62093bd1\n[strategy] stale basis probe answered status=refused refusal_code=OPTION_ADJUSTMENT_STALE_BASIS request=9af19039-df0c-47a3-9a90-63b38efee0c0\n[strategy] dynamic straddle held: generation=2 units=2 expiry=2026-10-29 status=entered after resize\n",
+          "supervisor": {
+            "job_id": "hsj_0671b04b18f84d1bb4db37447d99988b",
+            "outcome": "exited",
+            "stop": "exited",
+            "log_overflow": false,
+            "log_ref": "/home/krishna/kite-algo-worktrees/b2-2-hardening/.phase5-workspace/options_dynamic_resize_roll-resize/logs/hsj_0671b04b18f84d1bb4db37447d99988b.log",
+            "exit_code": 0,
+            "process_cleanup_reported": true,
+            "logs_shipped": true,
+            "terminal": "recovery_required",
+            "replacement_blocked": false,
+            "clean_exit": true,
+            "continuation": {
+              "attempted": true,
+              "continued": true,
+              "held": true,
+              "case": "continuation_eligible",
+              "reason_code": "CONTINUATION_ELIGIBLE",
+              "blocking_reasons": [],
+              "job_id": "hsj_0671b04b18f84d1bb4db37447d99988b",
+              "audit_id": "hsr_6eaa5e8838684858a2245abbadccba3e",
+              "barrier_version": 16,
+              "projection_version": 3,
+              "worker_run_closed": true,
+              "assessment": {
+                "allowed": true,
+                "case": "continuation_eligible",
+                "reason_code": "CONTINUATION_ELIGIBLE",
+                "blocking_reasons": [],
+                "held": true,
+                "notes": [
+                  "option_runs=opt_run_7d153e73a1e74fdc8ca78261d099101b=held",
+                  "finite evaluation finished cleanly; book is held",
+                  "a cleanly held option structure is carried forward as HELD; the options lane keeps its own book and is never reported flat"
+                ],
+                "proof": {
+                  "kind": "evaluation_continuation",
+                  "owner_id": "app:admin",
+                  "strategy_id": "hs_7749c99f2d1b4912aa8496b751676013",
+                  "account_id": "kite:paper-options_dynamic_resize_roll",
+                  "execution_environment": "paper",
+                  "predecessor": {
+                    "job_id": "hsj_0671b04b18f84d1bb4db37447d99988b",
+                    "attempt": 1,
+                    "lease_epoch": 1,
+                    "run_id": "run_3629dd0cc02e405f9defe08b992b53a8"
+                  },
+                  "barrier_version": 16,
+                  "projection_version": 3,
+                  "book_state": "published",
+                  "exposure_state": "open",
+                  "held": true,
+                  "option_work_state": "held",
+                  "option_runs": [
+                    "opt_run_7d153e73a1e74fdc8ca78261d099101b=held"
+                  ],
+                  "completion_state": "exited",
+                  "exit_code": 0,
+                  "desired_state": "started",
+                  "protection_enabled": false,
+                  "evidence_digest": "c86b61f115879857219b7089a7b0e1647a5f87093d0afa40877d0f7be5bcab0d"
+                }
+              }
+            }
+          }
+        },
+        {
+          "phase": "roll",
+          "job_id": "hsj_493242e68ea54b4087bb9c24031465c3",
+          "job_index": 2,
+          "child_exited": true,
+          "params": {
+            "underlying": "NIFTY",
+            "product": "NRML",
+            "expiry_policy": "exit_before_cutoff",
+            "short_offset_points": 0,
+            "wing_width_points": 100,
+            "base_units": 1,
+            "deadline_seconds": 240,
+            "roll_to_expiry": "2026-11-26"
+          },
+          "requests": [
+            {
+              "request_id": "98df2d1e-47b4-480d-bf37-581f030eccf2",
+              "plan_id": "858e2d9d-4023-4490-ba0d-301398342cf8",
+              "status": "executed",
+              "authorization_mode": "approval_based",
+              "decision_kind": "manual",
+              "refusal_code": null,
+              "refusal_detail": {},
+              "execution_detail": {
+                "note": "the request was dispatched; fills, settlement and protection are tracked by the execution trail",
+                "result": {
+                  "steps": [
+                    {
+                      "event": "filled",
+                      "detail": {
+                        "fill_price": "1500.000000",
+                        "tradingsymbol": "NIFTY26NOV22600CE"
+                      },
+                      "step_no": 3,
+                      "paper_order_id": "PAPER-772431118FD3",
+                      "refusal_reason": null,
+                      "filled_quantity": 100
+                    },
+                    {
+                      "event": "filled",
+                      "detail": {
+                        "fill_price": "1500.000000",
+                        "tradingsymbol": "NIFTY26NOV22400PE"
+                      },
+                      "step_no": 4,
+                      "paper_order_id": "PAPER-F70EFC57A037",
+                      "refusal_reason": null,
+                      "filled_quantity": 100
+                    },
+                    {
+                      "event": "filled",
+                      "detail": {
+                        "fill_price": "1500.000000",
+                        "tradingsymbol": "NIFTY26NOV22500CE"
+                      },
+                      "step_no": 1,
+                      "paper_order_id": "PAPER-5B0155035795",
+                      "refusal_reason": null,
+                      "filled_quantity": 100
+                    },
+                    {
+                      "event": "filled",
+                      "detail": {
+                        "fill_price": "1500.000000",
+                        "tradingsymbol": "NIFTY26NOV22500PE"
+                      },
+                      "step_no": 2,
+                      "paper_order_id": "PAPER-4AC4DFF39D0F",
+                      "refusal_reason": null,
+                      "filled_quantity": 100
+                    },
+                    {
+                      "event": "filled",
+                      "detail": {
+                        "fill_price": "1500.000000",
+                        "tradingsymbol": "NIFTY26OCT22500CE"
+                      },
+                      "step_no": 5,
+                      "paper_order_id": "PAPER-5FEAC440B49B",
+                      "refusal_reason": null,
+                      "filled_quantity": 100
+                    },
+                    {
+                      "event": "filled",
+                      "detail": {
+                        "fill_price": "1500.000000",
+                        "tradingsymbol": "NIFTY26OCT22500PE"
+                      },
+                      "step_no": 6,
+                      "paper_order_id": "PAPER-5AEAABF002EF",
+                      "refusal_reason": null,
+                      "filled_quantity": 100
+                    },
+                    {
+                      "event": "filled",
+                      "detail": {
+                        "fill_price": "1500.000000",
+                        "tradingsymbol": "NIFTY26OCT22600CE"
+                      },
+                      "step_no": 7,
+                      "paper_order_id": "PAPER-AA137BBDE5B3",
+                      "refusal_reason": null,
+                      "filled_quantity": 100
+                    },
+                    {
+                      "event": "filled",
+                      "detail": {
+                        "fill_price": "1500.000000",
+                        "tradingsymbol": "NIFTY26OCT22400PE"
+                      },
+                      "step_no": 8,
+                      "paper_order_id": "PAPER-27C24AFE5B47",
+                      "refusal_reason": null,
+                      "filled_quantity": 100
+                    }
+                  ],
+                  "status": "filled",
+                  "plan_id": "858e2d9d-4023-4490-ba0d-301398342cf8",
+                  "reservation_id": "d7268e10-9c99-4129-9f30-55629b2ec05d",
+                  "paper_order_ids": [
+                    "PAPER-772431118FD3",
+                    "PAPER-F70EFC57A037",
+                    "PAPER-5B0155035795",
+                    "PAPER-4AC4DFF39D0F",
+                    "PAPER-5FEAC440B49B",
+                    "PAPER-5AEAABF002EF",
+                    "PAPER-AA137BBDE5B3",
+                    "PAPER-27C24AFE5B47"
+                  ]
+                },
+                "grant_id": null,
+                "approval_id": null,
+                "environment": "paper",
+                "decision_kind": "manual",
+                "outcome_state": "filled",
+                "reservation_id": "d7268e10-9c99-4129-9f30-55629b2ec05d",
+                "authorization_mode": "approval_based"
+              }
+            }
+          ],
+          "orders": [
+            {
+              "tradingsymbol": "NIFTY26NOV22600CE",
+              "transaction_type": "buy",
+              "quantity": 100,
+              "status": "filled",
+              "average_price": "1500.000000"
+            },
+            {
+              "tradingsymbol": "NIFTY26NOV22400PE",
+              "transaction_type": "buy",
+              "quantity": 100,
+              "status": "filled",
+              "average_price": "1500.000000"
+            },
+            {
+              "tradingsymbol": "NIFTY26NOV22500CE",
+              "transaction_type": "sell",
+              "quantity": 100,
+              "status": "filled",
+              "average_price": "1500.000000"
+            },
+            {
+              "tradingsymbol": "NIFTY26NOV22500PE",
+              "transaction_type": "sell",
+              "quantity": 100,
+              "status": "filled",
+              "average_price": "1500.000000"
+            },
+            {
+              "tradingsymbol": "NIFTY26OCT22500CE",
+              "transaction_type": "buy",
+              "quantity": 100,
+              "status": "filled",
+              "average_price": "1500.000000"
+            },
+            {
+              "tradingsymbol": "NIFTY26OCT22500PE",
+              "transaction_type": "buy",
+              "quantity": 100,
+              "status": "filled",
+              "average_price": "1500.000000"
+            },
+            {
+              "tradingsymbol": "NIFTY26OCT22600CE",
+              "transaction_type": "sell",
+              "quantity": 100,
+              "status": "filled",
+              "average_price": "1500.000000"
+            },
+            {
+              "tradingsymbol": "NIFTY26OCT22400PE",
+              "transaction_type": "sell",
+              "quantity": 100,
+              "status": "filled",
+              "average_price": "1500.000000"
+            }
+          ],
+          "checkpoint": {
+            "status": "entered",
+            "generation": 3,
+            "leg_units": [
+              2,
+              2,
+              2,
+              2
+            ],
+            "expiry": "2026-11-26"
+          },
+          "child_log_tail": "[strategy] roll decided: rolling 2026-10-29 to 2026-11-26 (34d to expiry)\n[strategy] roll adjust requested: 98df2d1e-47b4-480d-bf37-581f030eccf2 status=awaiting_approval\n[strategy] roll answer status=executed refusal_code=none\n[strategy] dynamic straddle held: generation=3 units=2 expiry=2026-11-26 status=entered after roll\n",
+          "supervisor": {
+            "job_id": "hsj_493242e68ea54b4087bb9c24031465c3",
+            "outcome": "exited",
+            "stop": "exited",
+            "log_overflow": false,
+            "log_ref": "/home/krishna/kite-algo-worktrees/b2-2-hardening/.phase5-workspace/options_dynamic_resize_roll-roll/logs/hsj_493242e68ea54b4087bb9c24031465c3.log",
+            "exit_code": 0,
+            "process_cleanup_reported": true,
+            "logs_shipped": true,
+            "terminal": "recovery_required",
+            "replacement_blocked": false,
+            "clean_exit": true,
+            "continuation": {
+              "attempted": true,
+              "continued": true,
+              "held": true,
+              "case": "continuation_eligible",
+              "reason_code": "CONTINUATION_ELIGIBLE",
+              "blocking_reasons": [],
+              "job_id": "hsj_493242e68ea54b4087bb9c24031465c3",
+              "audit_id": "hsr_970a8a238e284f7ab1ea329556d1a45f",
+              "barrier_version": 32,
+              "projection_version": 4,
+              "worker_run_closed": true,
+              "assessment": {
+                "allowed": true,
+                "case": "continuation_eligible",
+                "reason_code": "CONTINUATION_ELIGIBLE",
+                "blocking_reasons": [],
+                "held": true,
+                "notes": [
+                  "option_runs=opt_run_7d153e73a1e74fdc8ca78261d099101b=held",
+                  "finite evaluation finished cleanly; book is held",
+                  "a cleanly held option structure is carried forward as HELD; the options lane keeps its own book and is never reported flat"
+                ],
+                "proof": {
+                  "kind": "evaluation_continuation",
+                  "owner_id": "app:admin",
+                  "strategy_id": "hs_7749c99f2d1b4912aa8496b751676013",
+                  "account_id": "kite:paper-options_dynamic_resize_roll",
+                  "execution_environment": "paper",
+                  "predecessor": {
+                    "job_id": "hsj_493242e68ea54b4087bb9c24031465c3",
+                    "attempt": 1,
+                    "lease_epoch": 1,
+                    "run_id": "run_59f1fe587c514a87a0e17f14e81cf4b1"
+                  },
+                  "barrier_version": 32,
+                  "projection_version": 4,
+                  "book_state": "published",
+                  "exposure_state": "open",
+                  "held": true,
+                  "option_work_state": "held",
+                  "option_runs": [
+                    "opt_run_7d153e73a1e74fdc8ca78261d099101b=held"
+                  ],
+                  "completion_state": "exited",
+                  "exit_code": 0,
+                  "desired_state": "started",
+                  "protection_enabled": false,
+                  "evidence_digest": "7ff1132d4031c5fcf1884fd418d628fd1b693d4f9357c3bc62cb624412c799af"
+                }
+              }
+            }
+          }
+        },
+        {
+          "phase": "exit",
+          "job_id": "hsj_9ee1d2a1daba422a93a7f027315bb363",
+          "job_index": 3,
+          "child_exited": true,
+          "params": {
+            "underlying": "NIFTY",
+            "product": "NRML",
+            "expiry_policy": "exit_before_cutoff",
+            "short_offset_points": 0,
+            "wing_width_points": 100,
+            "base_units": 1,
+            "deadline_seconds": 240,
+            "exit_position": true
+          },
+          "requests": [
+            {
+              "request_id": "cb6b0ff5-ffb5-4214-bbe1-18e13e99a899",
+              "plan_id": "41933a6a-815b-4c4c-9fd8-680e98340523",
+              "status": "executed",
+              "authorization_mode": "approval_based",
+              "decision_kind": "manual",
+              "refusal_code": null,
+              "refusal_detail": {},
+              "execution_detail": {
+                "note": "the request was dispatched; fills, settlement and protection are tracked by the execution trail",
+                "result": {
+                  "steps": [
+                    {
+                      "event": "filled",
+                      "detail": {
+                        "fill_price": "1500.000000",
+                        "tradingsymbol": "NIFTY26NOV22500CE"
+                      },
+                      "step_no": 1,
+                      "paper_order_id": "PAPER-9D6F911FDDE5",
+                      "refusal_reason": null,
+                      "filled_quantity": 100
+                    },
+                    {
+                      "event": "filled",
+                      "detail": {
+                        "fill_price": "1500.000000",
+                        "tradingsymbol": "NIFTY26NOV22500PE"
+                      },
+                      "step_no": 2,
+                      "paper_order_id": "PAPER-702BA8B08446",
+                      "refusal_reason": null,
+                      "filled_quantity": 100
+                    },
+                    {
+                      "event": "filled",
+                      "detail": {
+                        "fill_price": "1500.000000",
+                        "tradingsymbol": "NIFTY26NOV22600CE"
+                      },
+                      "step_no": 3,
+                      "paper_order_id": "PAPER-4AC8C1D522C3",
+                      "refusal_reason": null,
+                      "filled_quantity": 100
+                    },
+                    {
+                      "event": "filled",
+                      "detail": {
+                        "fill_price": "1500.000000",
+                        "tradingsymbol": "NIFTY26NOV22400PE"
+                      },
+                      "step_no": 4,
+                      "paper_order_id": "PAPER-1D1E4643AFB8",
+                      "refusal_reason": null,
+                      "filled_quantity": 100
+                    }
+                  ],
+                  "status": "filled",
+                  "plan_id": "41933a6a-815b-4c4c-9fd8-680e98340523",
+                  "reservation_id": "f5c17e3d-4c04-427f-833a-f3e6028c5598",
+                  "paper_order_ids": [
+                    "PAPER-9D6F911FDDE5",
+                    "PAPER-702BA8B08446",
+                    "PAPER-4AC8C1D522C3",
+                    "PAPER-1D1E4643AFB8"
+                  ]
+                },
+                "grant_id": null,
+                "approval_id": null,
+                "environment": "paper",
+                "decision_kind": "manual",
+                "outcome_state": "filled",
+                "reservation_id": "f5c17e3d-4c04-427f-833a-f3e6028c5598",
+                "authorization_mode": "approval_based"
+              }
+            }
+          ],
+          "orders": [
+            {
+              "tradingsymbol": "NIFTY26NOV22500CE",
+              "transaction_type": "buy",
+              "quantity": 100,
+              "status": "filled",
+              "average_price": "1500.000000"
+            },
+            {
+              "tradingsymbol": "NIFTY26NOV22500PE",
+              "transaction_type": "buy",
+              "quantity": 100,
+              "status": "filled",
+              "average_price": "1500.000000"
+            },
+            {
+              "tradingsymbol": "NIFTY26NOV22600CE",
+              "transaction_type": "sell",
+              "quantity": 100,
+              "status": "filled",
+              "average_price": "1500.000000"
+            },
+            {
+              "tradingsymbol": "NIFTY26NOV22400PE",
+              "transaction_type": "sell",
+              "quantity": 100,
+              "status": "filled",
+              "average_price": "1500.000000"
+            }
+          ],
+          "checkpoint": {
+            "status": "exited",
+            "generation": 3,
+            "leg_units": [
+              2,
+              2,
+              2,
+              2
+            ],
+            "expiry": "2026-11-26"
+          },
+          "child_log_tail": "[strategy] exit requested: cb6b0ff5-ffb5-4214-bbe1-18e13e99a899 status=awaiting_approval\n[strategy] exit answer status=executed refusal_code=none\n[strategy] dynamic straddle exited: 1 option run(s) closed, no structure held\n",
+          "supervisor": {
+            "job_id": "hsj_9ee1d2a1daba422a93a7f027315bb363",
+            "outcome": "exited",
+            "stop": "exited",
+            "log_overflow": false,
+            "log_ref": "/home/krishna/kite-algo-worktrees/b2-2-hardening/.phase5-workspace/options_dynamic_resize_roll-exit/logs/hsj_9ee1d2a1daba422a93a7f027315bb363.log",
+            "exit_code": 0,
+            "process_cleanup_reported": true,
+            "logs_shipped": true,
+            "terminal": "recovery_required",
+            "replacement_blocked": false,
+            "clean_exit": true,
+            "continuation": {
+              "attempted": true,
+              "continued": true,
+              "held": false,
+              "case": "continuation_eligible",
+              "reason_code": "CONTINUATION_ELIGIBLE",
+              "blocking_reasons": [],
+              "job_id": "hsj_9ee1d2a1daba422a93a7f027315bb363",
+              "audit_id": "hsr_23c80854601447269751dd74eeb7c60b",
+              "barrier_version": 40,
+              "projection_version": 5,
+              "worker_run_closed": true,
+              "assessment": {
+                "allowed": true,
+                "case": "continuation_eligible",
+                "reason_code": "CONTINUATION_ELIGIBLE",
+                "blocking_reasons": [],
+                "held": false,
+                "notes": [
+                  "option_runs=opt_run_7d153e73a1e74fdc8ca78261d099101b=finished",
+                  "finite evaluation finished cleanly; book is flat"
+                ],
+                "proof": {
+                  "kind": "evaluation_continuation",
+                  "owner_id": "app:admin",
+                  "strategy_id": "hs_7749c99f2d1b4912aa8496b751676013",
+                  "account_id": "kite:paper-options_dynamic_resize_roll",
+                  "execution_environment": "paper",
+                  "predecessor": {
+                    "job_id": "hsj_9ee1d2a1daba422a93a7f027315bb363",
+                    "attempt": 1,
+                    "lease_epoch": 1,
+                    "run_id": "run_9be70bbf16a442cc9ed408e31ce5fae0"
+                  },
+                  "barrier_version": 40,
+                  "projection_version": 5,
+                  "book_state": "published",
+                  "exposure_state": "flat",
+                  "held": false,
+                  "option_work_state": "none",
+                  "option_runs": [
+                    "opt_run_7d153e73a1e74fdc8ca78261d099101b=finished"
+                  ],
+                  "completion_state": "exited",
+                  "exit_code": 0,
+                  "desired_state": "started",
+                  "protection_enabled": false,
+                  "evidence_digest": "e9ec2fd5bc21741125341713a0ba88856cdea4fda31746dcb443b64a699b455a"
+                }
+              }
+            }
+          }
+        }
+      ],
+      "checkpoints": [
+        {
+          "phase": "entry",
+          "status": "entered",
+          "generation": 1,
+          "leg_units": [
+            1,
+            1,
+            1,
+            1
+          ],
+          "expiry": "2026-10-29"
+        },
+        {
+          "phase": "resize",
+          "status": "entered",
+          "generation": 2,
+          "leg_units": [
+            2,
+            2,
+            2,
+            2
+          ],
+          "expiry": "2026-10-29"
+        },
+        {
+          "phase": "roll",
+          "status": "entered",
+          "generation": 3,
+          "leg_units": [
+            2,
+            2,
+            2,
+            2
+          ],
+          "expiry": "2026-11-26"
+        },
+        {
+          "phase": "exit",
+          "status": "exited",
+          "generation": 3,
+          "leg_units": [
+            2,
+            2,
+            2,
+            2
+          ],
+          "expiry": "2026-11-26"
+        }
+      ],
+      "facts": {
+        "run_count": 1,
+        "edges": [
+          {
+            "phase": "entry"
+          },
+          {
+            "phase": "adjust"
+          },
+          {
+            "phase": "adjust"
+          },
+          {
+            "phase": "exit"
+          }
+        ],
+        "final": {
+          "status": "exited",
+          "generation": 3,
+          "leg_units": [
+            2,
+            2,
+            2,
+            2
+          ],
+          "leg_expiries": [
+            "2026-11-26",
+            "2026-11-26",
+            "2026-11-26",
+            "2026-11-26"
+          ],
+          "open_by_leg": {
+            "53b8f3b0-96d0-45e3-b35d-28525c32f464:3": 0,
+            "53b8f3b0-96d0-45e3-b35d-28525c32f464:4": 0,
+            "53b8f3b0-96d0-45e3-b35d-28525c32f464:1": 0,
+            "53b8f3b0-96d0-45e3-b35d-28525c32f464:2": 0,
+            "858e2d9d-4023-4490-ba0d-301398342cf8:3": 0,
+            "858e2d9d-4023-4490-ba0d-301398342cf8:4": 0,
+            "858e2d9d-4023-4490-ba0d-301398342cf8:1": 0,
+            "858e2d9d-4023-4490-ba0d-301398342cf8:2": 0
+          },
+          "released_leg_ids": [
+            "53b8f3b0-96d0-45e3-b35d-28525c32f464:1",
+            "53b8f3b0-96d0-45e3-b35d-28525c32f464:2",
+            "53b8f3b0-96d0-45e3-b35d-28525c32f464:3",
+            "53b8f3b0-96d0-45e3-b35d-28525c32f464:4"
+          ],
+          "held_leg_ids": [
+            "858e2d9d-4023-4490-ba0d-301398342cf8:1",
+            "858e2d9d-4023-4490-ba0d-301398342cf8:2",
+            "858e2d9d-4023-4490-ba0d-301398342cf8:3",
+            "858e2d9d-4023-4490-ba0d-301398342cf8:4"
+          ]
+        },
+        "checkpoints": [
+          {
+            "phase": "entry",
+            "status": "entered",
+            "generation": 1,
+            "leg_units": [
+              1,
+              1,
+              1,
+              1
+            ],
+            "expiry": "2026-10-29"
+          },
+          {
+            "phase": "resize",
+            "status": "entered",
+            "generation": 2,
+            "leg_units": [
+              2,
+              2,
+              2,
+              2
+            ],
+            "expiry": "2026-10-29"
+          },
+          {
+            "phase": "roll",
+            "status": "entered",
+            "generation": 3,
+            "leg_units": [
+              2,
+              2,
+              2,
+              2
+            ],
+            "expiry": "2026-11-26"
+          },
+          {
+            "phase": "exit",
+            "status": "exited",
+            "generation": 3,
+            "leg_units": [
+              2,
+              2,
+              2,
+              2
+            ],
+            "expiry": "2026-11-26"
+          }
+        ],
+        "refusals": [
+          {
+            "request_id": "bf819098-7556-4107-818e-428f62093bd1",
+            "status": "refused",
+            "refusal_code": "OPTION_STRUCTURE_ALREADY_OPEN",
+            "decision_kind": "",
+            "stage": "request"
+          },
+          {
+            "request_id": "9af19039-df0c-47a3-9a90-63b38efee0c0",
+            "status": "refused",
+            "refusal_code": "OPTION_ADJUSTMENT_STALE_BASIS",
+            "decision_kind": "",
+            "stage": "request"
+          }
+        ]
+      },
+      "requests": [
+        {
+          "request_id": "74f02519-6b5f-4b08-bf0d-84da853f6aac",
+          "plan_id": "53b8f3b0-96d0-45e3-b35d-28525c32f464",
+          "status": "executed",
+          "authorization_mode": "approval_based",
+          "decision_kind": "manual",
+          "refusal_code": null,
+          "refusal_detail": {},
+          "execution_detail": {
+            "note": "the request was dispatched; fills, settlement and protection are tracked by the execution trail",
+            "result": {
+              "steps": [
+                {
+                  "event": "filled",
+                  "detail": {
+                    "fill_price": "1500.000000",
+                    "tradingsymbol": "NIFTY26OCT22600CE"
+                  },
+                  "step_no": 3,
+                  "paper_order_id": "PAPER-B05A6C6AEB01",
+                  "refusal_reason": null,
+                  "filled_quantity": 50
+                },
+                {
+                  "event": "filled",
+                  "detail": {
+                    "fill_price": "1500.000000",
+                    "tradingsymbol": "NIFTY26OCT22400PE"
+                  },
+                  "step_no": 4,
+                  "paper_order_id": "PAPER-C399C4FC6536",
+                  "refusal_reason": null,
+                  "filled_quantity": 50
+                },
+                {
+                  "event": "filled",
+                  "detail": {
+                    "fill_price": "1500.000000",
+                    "tradingsymbol": "NIFTY26OCT22500CE"
+                  },
+                  "step_no": 1,
+                  "paper_order_id": "PAPER-AFD0553C90E0",
+                  "refusal_reason": null,
+                  "filled_quantity": 50
+                },
+                {
+                  "event": "filled",
+                  "detail": {
+                    "fill_price": "1500.000000",
+                    "tradingsymbol": "NIFTY26OCT22500PE"
+                  },
+                  "step_no": 2,
+                  "paper_order_id": "PAPER-8A0254C2DBCF",
+                  "refusal_reason": null,
+                  "filled_quantity": 50
+                }
+              ],
+              "status": "filled",
+              "plan_id": "53b8f3b0-96d0-45e3-b35d-28525c32f464",
+              "reservation_id": "369cd610-7a5d-48b6-a249-e29a82fdc07d",
+              "paper_order_ids": [
+                "PAPER-B05A6C6AEB01",
+                "PAPER-C399C4FC6536",
+                "PAPER-AFD0553C90E0",
+                "PAPER-8A0254C2DBCF"
+              ]
+            },
+            "grant_id": null,
+            "approval_id": null,
+            "environment": "paper",
+            "decision_kind": "manual",
+            "outcome_state": "filled",
+            "reservation_id": "369cd610-7a5d-48b6-a249-e29a82fdc07d",
+            "authorization_mode": "approval_based"
+          }
+        },
+        {
+          "request_id": "859a4764-941c-4683-9c31-9f1364feabf4",
+          "plan_id": "034f6b5b-aeb7-4771-a9b3-aefdcae1d8e5",
+          "status": "executed",
+          "authorization_mode": "approval_based",
+          "decision_kind": "manual",
+          "refusal_code": null,
+          "refusal_detail": {},
+          "execution_detail": {
+            "note": "the request was dispatched; fills, settlement and protection are tracked by the execution trail",
+            "result": {
+              "steps": [
+                {
+                  "event": "filled",
+                  "detail": {
+                    "fill_price": "1500.000000",
+                    "tradingsymbol": "NIFTY26OCT22600CE"
+                  },
+                  "step_no": 3,
+                  "paper_order_id": "PAPER-46A087B9A4A6",
+                  "refusal_reason": null,
+                  "filled_quantity": 50
+                },
+                {
+                  "event": "filled",
+                  "detail": {
+                    "fill_price": "1500.000000",
+                    "tradingsymbol": "NIFTY26OCT22400PE"
+                  },
+                  "step_no": 4,
+                  "paper_order_id": "PAPER-E7914655FA32",
+                  "refusal_reason": null,
+                  "filled_quantity": 50
+                },
+                {
+                  "event": "filled",
+                  "detail": {
+                    "fill_price": "1500.000000",
+                    "tradingsymbol": "NIFTY26OCT22500CE"
+                  },
+                  "step_no": 1,
+                  "paper_order_id": "PAPER-9D1F32441375",
+                  "refusal_reason": null,
+                  "filled_quantity": 50
+                },
+                {
+                  "event": "filled",
+                  "detail": {
+                    "fill_price": "1500.000000",
+                    "tradingsymbol": "NIFTY26OCT22500PE"
+                  },
+                  "step_no": 2,
+                  "paper_order_id": "PAPER-A6BCD61743F0",
+                  "refusal_reason": null,
+                  "filled_quantity": 50
+                }
+              ],
+              "status": "filled",
+              "plan_id": "034f6b5b-aeb7-4771-a9b3-aefdcae1d8e5",
+              "reservation_id": "0dc7ec15-a8c9-48d0-926b-4840b219a69b",
+              "paper_order_ids": [
+                "PAPER-46A087B9A4A6",
+                "PAPER-E7914655FA32",
+                "PAPER-9D1F32441375",
+                "PAPER-A6BCD61743F0"
+              ]
+            },
+            "grant_id": null,
+            "approval_id": null,
+            "environment": "paper",
+            "decision_kind": "manual",
+            "outcome_state": "filled",
+            "reservation_id": "0dc7ec15-a8c9-48d0-926b-4840b219a69b",
+            "authorization_mode": "approval_based"
+          }
+        },
+        {
+          "request_id": "bf819098-7556-4107-818e-428f62093bd1",
+          "plan_id": "6ec562e5-17ba-41a3-9db6-a0890b0cb6c8",
+          "status": "refused",
+          "authorization_mode": "approval_based",
+          "decision_kind": null,
+          "refusal_code": "OPTION_STRUCTURE_ALREADY_OPEN",
+          "refusal_detail": {
+            "stage": "request",
+            "message": "this strategy already owns this structure in this account and environment; an equivalent structure is never opened twice",
+            "plan_id": "6ec562e5-17ba-41a3-9db6-a0890b0cb6c8",
+            "checked_at": "2026-09-25T14:15:44.173618+00:00",
+            "option_run_id": "opt_run_7d153e73a1e74fdc8ca78261d099101b",
+            "structure_digest": "666eeff4f018d36beda458160962bf94a33c248a5df93df2fac068363fad7314",
+            "option_run_status": "entered",
+            "originating_plan_id": "53b8f3b0-96d0-45e3-b35d-28525c32f464"
+          },
+          "execution_detail": {}
+        },
+        {
+          "request_id": "9af19039-df0c-47a3-9a90-63b38efee0c0",
+          "plan_id": "548ce73a-22af-4d2c-86c4-583fefd43806",
+          "status": "refused",
+          "authorization_mode": "approval_based",
+          "decision_kind": null,
+          "refusal_code": "OPTION_ADJUSTMENT_STALE_BASIS",
+          "refusal_detail": {
+            "stage": "request",
+            "message": "the run has moved to a different leg generation than the one this adjust was approved against; it is never re-derived against a newer one",
+            "plan_id": "548ce73a-22af-4d2c-86c4-583fefd43806",
+            "checked_at": "2026-09-25T14:15:44.924889+00:00",
+            "option_run_id": "opt_run_7d153e73a1e74fdc8ca78261d099101b",
+            "based_on_generation": 1,
+            "structure_generation": 2
+          },
+          "execution_detail": {}
+        },
+        {
+          "request_id": "98df2d1e-47b4-480d-bf37-581f030eccf2",
+          "plan_id": "858e2d9d-4023-4490-ba0d-301398342cf8",
+          "status": "executed",
+          "authorization_mode": "approval_based",
+          "decision_kind": "manual",
+          "refusal_code": null,
+          "refusal_detail": {},
+          "execution_detail": {
+            "note": "the request was dispatched; fills, settlement and protection are tracked by the execution trail",
+            "result": {
+              "steps": [
+                {
+                  "event": "filled",
+                  "detail": {
+                    "fill_price": "1500.000000",
+                    "tradingsymbol": "NIFTY26NOV22600CE"
+                  },
+                  "step_no": 3,
+                  "paper_order_id": "PAPER-772431118FD3",
+                  "refusal_reason": null,
+                  "filled_quantity": 100
+                },
+                {
+                  "event": "filled",
+                  "detail": {
+                    "fill_price": "1500.000000",
+                    "tradingsymbol": "NIFTY26NOV22400PE"
+                  },
+                  "step_no": 4,
+                  "paper_order_id": "PAPER-F70EFC57A037",
+                  "refusal_reason": null,
+                  "filled_quantity": 100
+                },
+                {
+                  "event": "filled",
+                  "detail": {
+                    "fill_price": "1500.000000",
+                    "tradingsymbol": "NIFTY26NOV22500CE"
+                  },
+                  "step_no": 1,
+                  "paper_order_id": "PAPER-5B0155035795",
+                  "refusal_reason": null,
+                  "filled_quantity": 100
+                },
+                {
+                  "event": "filled",
+                  "detail": {
+                    "fill_price": "1500.000000",
+                    "tradingsymbol": "NIFTY26NOV22500PE"
+                  },
+                  "step_no": 2,
+                  "paper_order_id": "PAPER-4AC4DFF39D0F",
+                  "refusal_reason": null,
+                  "filled_quantity": 100
+                },
+                {
+                  "event": "filled",
+                  "detail": {
+                    "fill_price": "1500.000000",
+                    "tradingsymbol": "NIFTY26OCT22500CE"
+                  },
+                  "step_no": 5,
+                  "paper_order_id": "PAPER-5FEAC440B49B",
+                  "refusal_reason": null,
+                  "filled_quantity": 100
+                },
+                {
+                  "event": "filled",
+                  "detail": {
+                    "fill_price": "1500.000000",
+                    "tradingsymbol": "NIFTY26OCT22500PE"
+                  },
+                  "step_no": 6,
+                  "paper_order_id": "PAPER-5AEAABF002EF",
+                  "refusal_reason": null,
+                  "filled_quantity": 100
+                },
+                {
+                  "event": "filled",
+                  "detail": {
+                    "fill_price": "1500.000000",
+                    "tradingsymbol": "NIFTY26OCT22600CE"
+                  },
+                  "step_no": 7,
+                  "paper_order_id": "PAPER-AA137BBDE5B3",
+                  "refusal_reason": null,
+                  "filled_quantity": 100
+                },
+                {
+                  "event": "filled",
+                  "detail": {
+                    "fill_price": "1500.000000",
+                    "tradingsymbol": "NIFTY26OCT22400PE"
+                  },
+                  "step_no": 8,
+                  "paper_order_id": "PAPER-27C24AFE5B47",
+                  "refusal_reason": null,
+                  "filled_quantity": 100
+                }
+              ],
+              "status": "filled",
+              "plan_id": "858e2d9d-4023-4490-ba0d-301398342cf8",
+              "reservation_id": "d7268e10-9c99-4129-9f30-55629b2ec05d",
+              "paper_order_ids": [
+                "PAPER-772431118FD3",
+                "PAPER-F70EFC57A037",
+                "PAPER-5B0155035795",
+                "PAPER-4AC4DFF39D0F",
+                "PAPER-5FEAC440B49B",
+                "PAPER-5AEAABF002EF",
+                "PAPER-AA137BBDE5B3",
+                "PAPER-27C24AFE5B47"
+              ]
+            },
+            "grant_id": null,
+            "approval_id": null,
+            "environment": "paper",
+            "decision_kind": "manual",
+            "outcome_state": "filled",
+            "reservation_id": "d7268e10-9c99-4129-9f30-55629b2ec05d",
+            "authorization_mode": "approval_based"
+          }
+        },
+        {
+          "request_id": "cb6b0ff5-ffb5-4214-bbe1-18e13e99a899",
+          "plan_id": "41933a6a-815b-4c4c-9fd8-680e98340523",
+          "status": "executed",
+          "authorization_mode": "approval_based",
+          "decision_kind": "manual",
+          "refusal_code": null,
+          "refusal_detail": {},
+          "execution_detail": {
+            "note": "the request was dispatched; fills, settlement and protection are tracked by the execution trail",
+            "result": {
+              "steps": [
+                {
+                  "event": "filled",
+                  "detail": {
+                    "fill_price": "1500.000000",
+                    "tradingsymbol": "NIFTY26NOV22500CE"
+                  },
+                  "step_no": 1,
+                  "paper_order_id": "PAPER-9D6F911FDDE5",
+                  "refusal_reason": null,
+                  "filled_quantity": 100
+                },
+                {
+                  "event": "filled",
+                  "detail": {
+                    "fill_price": "1500.000000",
+                    "tradingsymbol": "NIFTY26NOV22500PE"
+                  },
+                  "step_no": 2,
+                  "paper_order_id": "PAPER-702BA8B08446",
+                  "refusal_reason": null,
+                  "filled_quantity": 100
+                },
+                {
+                  "event": "filled",
+                  "detail": {
+                    "fill_price": "1500.000000",
+                    "tradingsymbol": "NIFTY26NOV22600CE"
+                  },
+                  "step_no": 3,
+                  "paper_order_id": "PAPER-4AC8C1D522C3",
+                  "refusal_reason": null,
+                  "filled_quantity": 100
+                },
+                {
+                  "event": "filled",
+                  "detail": {
+                    "fill_price": "1500.000000",
+                    "tradingsymbol": "NIFTY26NOV22400PE"
+                  },
+                  "step_no": 4,
+                  "paper_order_id": "PAPER-1D1E4643AFB8",
+                  "refusal_reason": null,
+                  "filled_quantity": 100
+                }
+              ],
+              "status": "filled",
+              "plan_id": "41933a6a-815b-4c4c-9fd8-680e98340523",
+              "reservation_id": "f5c17e3d-4c04-427f-833a-f3e6028c5598",
+              "paper_order_ids": [
+                "PAPER-9D6F911FDDE5",
+                "PAPER-702BA8B08446",
+                "PAPER-4AC8C1D522C3",
+                "PAPER-1D1E4643AFB8"
+              ]
+            },
+            "grant_id": null,
+            "approval_id": null,
+            "environment": "paper",
+            "decision_kind": "manual",
+            "outcome_state": "filled",
+            "reservation_id": "f5c17e3d-4c04-427f-833a-f3e6028c5598",
+            "authorization_mode": "approval_based"
+          }
+        }
+      ],
+      "acceptance": {
+        "ok": true,
+        "failures": [],
+        "axes": {
+          "option_runs": 1,
+          "edge_phases": [
+            "entry",
+            "adjust",
+            "adjust",
+            "exit"
+          ],
+          "generations": [
+            1,
+            2,
+            3,
+            3
+          ],
+          "final_status": "exited",
+          "held_expiry": [
+            "2026-11-26"
+          ],
+          "duplicate_entry_refusals": 1,
+          "stale_basis_refusals": 1
+        }
+      }
+    }
+  },
+  "errors": [],
+  "inputs": {
+    "nifty500_momentum.py": "55b143dd5fc1394758da56c839dd409093686cee12d2ef503fad46a1bd92c130",
+    "nifty500_momentum.schema.json": "f089cc7dda38736653bda8630e0dfe45456b9db5c8ed3d46e81ce2f538a8da18",
+    "run_phase5_acceptance.py": "d17053133296db2a2a01c649062a63377ef78427bc76373cbb249a93c9ea35a1",
+    "started_at": "2026-09-25T14:15:02.364929+00:00"
+  },
+  "ok": true
+}

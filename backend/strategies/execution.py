@@ -314,55 +314,9 @@ class PaperPlanExecutor:
             # sell-to-close hedge is not a short awaiting release. Entry uses the
             # existing option engine's buy-first planner; exits use its exit
             # builder's rule (close short liabilities first). One engine, reused.
-            from backend.options.execution.planner import build_entry_order_plan
-            from backend.options.protection.exit_builder import build_structure_exit_orders
-
-            entry_steps = [step for step in steps_spec if step[1].get("_increases_exposure")]
-            exit_steps = [step for step in steps_spec if not step[1].get("_increases_exposure")]
-            entry_steps = self._ordered_entry_steps(entry_steps, build_entry_order_plan)
-            exit_steps = self._ordered_exit_steps(exit_steps, build_structure_exit_orders)
-            if str((option_target or {}).get("phase") or "") == "adjust":
-                if bool((option_target or {}).get("_adjust_roll")):
-                    # A ROLL is ACQUIRE-first: the new generation is opened and
-                    # proven before the old one is released, so the structure is
-                    # never briefly unheld. Both halves keep their own ordering
-                    # (hedge before its dependent short; short close before the
-                    # hedge release it defends) - the same two builders as entry
-                    # and exit, applied to the two stages.
-                    acquire_numbers = {
-                        int(number)
-                        for number in (
-                            (option_target or {}).get("_adjust_roll_acquire_steps") or []
-                        )
-                    }
-                    acquiring = [
-                        step for step in steps_spec if int(step[0]) in acquire_numbers
-                    ]
-                    releasing = [
-                        step for step in steps_spec if int(step[0]) not in acquire_numbers
-                    ]
-                    step_order = self._ordered_entry_steps(
-                        acquiring, build_entry_order_plan
-                    ) + self._ordered_exit_steps(releasing, build_structure_exit_orders)
-                else:
-                    # An ADJUST reduces first and increases second: a reduction
-                    # frees the run's own hedge only against its PROVEN short
-                    # closure, while every increase is released only against a
-                    # confirmed hedge fill. The two orderings are the entry and exit
-                    # builders' own; nothing is re-derived here.
-                    step_order = exit_steps + entry_steps
-            else:
-                step_order = entry_steps + exit_steps
-            hedge_required = sum(
-                abs(int(quantity)) for _, _, quantity, side in entry_steps if side == "BUY"
+            entry_steps, exit_steps, step_order, hedge_required, short_exit_symbols = (
+                self._option_execution_order(steps_spec, option_target)
             )
-            # Symbols the plan closes a SHORT on: their proven closure is what a
-            # hedge release must be measured against (the exit builder decides it).
-            short_exit_symbols = {
-                str(leg.get("tradingsymbol") or ""): abs(int(leg.get("_current_quantity") or 0))
-                for _, leg, _quantity, _side in exit_steps
-                if int(leg.get("_current_quantity") or 0) < 0
-            }
 
         # Entering/exiting is persisted BEFORE the first submission: the durable
         # run must never read as "created" while orders are already in flight. A
@@ -440,6 +394,39 @@ class PaperPlanExecutor:
         )
         if option_target is not None and option_touches_run:
             option_target = self._begin_option_run(option_target, plan_id=plan_id, actor=actor)
+            if plan_kind == "option_structure":
+                # The CAS is the fence. Re-read the durable row and size every
+                # order AFTER ownership is won, so a pre-CAS snapshot can never
+                # become executable work.
+                option_run_store = self._option_runs()
+                option_target["run"] = option_run_store.get_run(
+                    option_target["run"].strategy_run_id
+                )
+                roll_context_keys = (
+                    "_adjust_desired_legs",
+                    "_adjust_previous_legs",
+                    "_adjust_release_legs",
+                    "_adjust_roll",
+                    "_adjust_roll_acquire_steps",
+                    "_adjust_roll_expiries",
+                    "_adjust_roll_release_steps",
+                )
+                original_roll_context = {
+                    key: option_target[key]
+                    for key in roll_context_keys
+                    if key in option_target
+                }
+                steps_spec = self._option_run_steps(plan, option_target)
+                for key, value in original_roll_context.items():
+                    option_target[key] = value
+                entry_steps, exit_steps, step_order, hedge_required, short_exit_symbols = (
+                    self._option_execution_order(steps_spec, option_target)
+                )
+                roll_acquire_legs = {
+                    int(step[0]): step
+                    for step in step_order
+                    if int(step[0]) in roll_acquire_numbers
+                }
 
         outcomes: List[Dict[str, Any]] = []
         order_ids: List[str] = []
@@ -727,6 +714,8 @@ class PaperPlanExecutor:
             submission = await self._submit_step(
                 plan, reservation, actor, step_no=step_no, leg=leg, quantity=quantity,
                 side=side, binding=binding, at=_stamp(),
+                option_phase=str((option_target or {}).get("phase") or "") or None,
+                option_run_id=str((option_target or {}).get("option_run_id") or "") or None,
             )
             outcomes.append(submission["outcome"])
             submitted_any = True
@@ -1091,6 +1080,42 @@ class PaperPlanExecutor:
 
         return sorted(steps, key=_key)
 
+    def _option_execution_order(
+        self, steps_spec: List[Any], target: Mapping[str, Any]
+    ) -> tuple[List[Any], List[Any], List[Any], int, Dict[str, int]]:
+        """Apply the option planners to one read of the run's own ledger."""
+        from backend.options.execution.planner import build_entry_order_plan
+        from backend.options.protection.exit_builder import build_structure_exit_orders
+
+        entry_steps = [step for step in steps_spec if step[1].get("_increases_exposure")]
+        exit_steps = [step for step in steps_spec if not step[1].get("_increases_exposure")]
+        entry_steps = self._ordered_entry_steps(entry_steps, build_entry_order_plan)
+        exit_steps = self._ordered_exit_steps(exit_steps, build_structure_exit_orders)
+        if str((target or {}).get("phase") or "") == "adjust":
+            if bool((target or {}).get("_adjust_roll")):
+                acquire_numbers = {
+                    int(number)
+                    for number in (target or {}).get("_adjust_roll_acquire_steps") or []
+                }
+                acquiring = [step for step in steps_spec if int(step[0]) in acquire_numbers]
+                releasing = [step for step in steps_spec if int(step[0]) not in acquire_numbers]
+                step_order = self._ordered_entry_steps(
+                    acquiring, build_entry_order_plan
+                ) + self._ordered_exit_steps(releasing, build_structure_exit_orders)
+            else:
+                step_order = exit_steps + entry_steps
+        else:
+            step_order = entry_steps + exit_steps
+        hedge_required = sum(
+            abs(int(quantity)) for _, _, quantity, side in entry_steps if side == "BUY"
+        )
+        short_exit_symbols = {
+            str(leg.get("tradingsymbol") or ""): abs(int(leg.get("_current_quantity") or 0))
+            for _, leg, _quantity, _side in exit_steps
+            if int(leg.get("_current_quantity") or 0) < 0
+        }
+        return entry_steps, exit_steps, step_order, hedge_required, short_exit_symbols
+
     @staticmethod
     def _roll_binding(plan: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
         """The roll role the FROZEN plan declares, or ``None``.
@@ -1226,20 +1251,27 @@ class PaperPlanExecutor:
     def _adjusted_protection(run: Any, plan: Mapping[str, Any]) -> Dict[str, Any]:
         """The run's protection block, re-pointed at the generation it now holds.
 
-        A roll moves the structure onto a new expiry, so every frozen field the
-        block carries is rewritten - the digest and the policy as ever, and an
-        explicit ``expiry`` when the run's own block declares one (the entry edge
-        writes it beside the policy only when it has it).
+        These are the frozen DESIRED-generation facts, so replacement is exact:
+        a field the new plan does not name is removed, never inherited from the
+        generation it replaces.
         """
         resolved = plan.get("resolved_plan") or {}
-        protection = dict(getattr(run, "protection", None) or {})
-        keys = ["structure_digest", "structure_id", "underlying", "expiry_policy"]
-        if "expiry" in protection:
-            keys.append("expiry")
+        protection = {}
+        keys = [
+            "expiry",
+            "expiry_policy",
+            "max_loss",
+            "protection_policy",
+            "structure_digest",
+            "structure_id",
+            "structure_units",
+            "underlying",
+        ]
         for key in keys:
-            value = resolved.get(key)
-            if value not in (None, ""):
-                protection[key] = value
+            if key in resolved:
+                protection[key] = resolved[key]
+            else:
+                protection.pop(key, None)
         return protection
 
     def _option_run_steps(
@@ -1329,6 +1361,46 @@ class PaperPlanExecutor:
             side = "BUY" if quantity > 0 else "SELL"
             steps.append((index, leg, quantity, side))
         return steps
+
+    def _record_option_leg_evidence(
+        self,
+        *,
+        option_run_id: str,
+        leg: Mapping[str, Any],
+        phase: str,
+        side: str,
+        quantity: int,
+        outcome: Mapping[str, Any],
+        order: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Append one leg's order and fills before any later leg is submitted."""
+        event = str(outcome.get("event") or "")
+        order_id = str(outcome.get("paper_order_id") or "") or None
+        if not order_id:
+            return
+        leg_id = str(leg.get("_run_leg_id") or "")
+        common = {
+            "leg_id": leg_id,
+            "tradingsymbol": str(
+                order.get("tradingsymbol") or leg.get("tradingsymbol") or ""
+            ),
+            "transaction_type": str(side).upper(),
+            "quantity": abs(int(quantity or 0)),
+            "phase": str(phase),
+            "order_id": order_id,
+        }
+        filled = int(outcome.get("filled_quantity") or 0)
+        orders = []
+        trades = []
+        if event in ("filled", "partially_filled", "rejected", "failed"):
+            orders.append({**common, "status": event, "filled_quantity": filled})
+        if filled > 0 and event in ("filled", "partially_filled"):
+            trades.append({**common, "quantity": filled})
+        if not orders and not trades:
+            return
+        self._option_runs().record_leg_evidence_once(
+            str(option_run_id), orders=orders, trades=trades
+        )
 
     def _validate_option_exit_leg(
         self,
@@ -2000,8 +2072,33 @@ class PaperPlanExecutor:
                 },
             ) from exc
 
-        if not store.save_run_if_status(next_run, allowed_from=(observed,)):
+        expected_generation = int(
+            target.get("expected_structure_generation")
+        ) if phase == "adjust" and target.get("expected_structure_generation") is not None else None
+        if not store.save_run_if_status(
+            next_run,
+            allowed_from=(observed,),
+            expected_generation=expected_generation,
+        ):
             # Another plan (or another instance) moved the run first.
+            current_run = store.get_run(run.strategy_run_id)
+            if (
+                phase == "adjust"
+                and str(current_run.status) == observed
+                and expected_generation is not None
+                and self._option_run_generation(current_run) != expected_generation
+            ):
+                raise ExecutionRefusal(
+                    "OPTION_ADJUSTMENT_STALE_BASIS",
+                    {
+                        "plan_id": plan_id,
+                        "option_run_id": run.strategy_run_id,
+                        "based_on_generation": expected_generation,
+                        "structure_generation": self._option_run_generation(current_run),
+                        "observed_status": observed,
+                        "message": "another adjust moved the run to a newer leg generation",
+                    },
+                )
             raise ExecutionRefusal(
                 "OPTION_RUN_STATE_CHANGED",
                 {
@@ -2104,10 +2201,13 @@ class PaperPlanExecutor:
         run = target["run"]
         # Record the evidence FIRST: the run's next state is derived from the
         # position it actually holds afterwards, never from the plan's intent.
-        if orders:
-            run = store.record_orders(run.strategy_run_id, orders)
-        if trades:
-            run = store.record_trades(run.strategy_run_id, trades)
+        durable_run = store.get_run(run.strategy_run_id)
+        run.orders = durable_run.orders
+        run.trades = durable_run.trades
+        if orders or trades:
+            run = store.record_leg_evidence_once(
+                run.strategy_run_id, orders=orders, trades=trades
+            )
         try:
             if phase == "entry":
                 if failed:
@@ -2798,6 +2898,8 @@ class PaperPlanExecutor:
         side: str,
         binding: Mapping[str, Any],
         at: datetime,
+        option_phase: Optional[str] = None,
+        option_run_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Submit one step through the paper runtime; record both trail events.
 
@@ -2985,6 +3087,16 @@ class PaperPlanExecutor:
                 actor_id=actor,
                 detail={"runtime_status": status or "unknown", "ref": ref},
                 at=outcome_at,
+            )
+        if option_phase is not None and order_id:
+            self._record_option_leg_evidence(
+                option_run_id=str(option_run_id or ""),
+                leg=leg,
+                phase=option_phase,
+                side=side,
+                quantity=quantity,
+                outcome=outcome,
+                order=order,
             )
         return {"outcome": outcome, "order_id": order_id}
 

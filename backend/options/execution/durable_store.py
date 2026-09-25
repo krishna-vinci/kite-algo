@@ -385,6 +385,7 @@ class DurableOptionRunStore:
         run: OptionRunState,
         *,
         allowed_from: "list[str] | tuple[str, ...]",
+        expected_generation: int | None = None,
         db: Any = None,
     ) -> bool:
         """Compare-and-set the run's status: the per-RUN execution ownership.
@@ -393,7 +394,9 @@ class DurableOptionRunStore:
         exits), so a blind status write would let both exits win the same
         transition and overclose the structure. This CAS makes the transition
         itself the ownership token: exactly one caller moves the run out of the
-        status it observed, and the loser refuses instead of trading.
+        status it observed, and the loser refuses instead of trading. An adjust
+        also pins the frozen leg generation, so a plan cannot win a status race
+        and then trade against a newer structure.
         """
         self._require_id(run.strategy_run_id)
         allowed = [str(status) for status in allowed_from]
@@ -432,6 +435,21 @@ class DurableOptionRunStore:
             }
             for index, status in enumerate(allowed):
                 params[f"status_{index}"] = status
+            params["expected_generation"] = (
+                None if expected_generation is None else str(int(expected_generation))
+            )
+            if expected_generation is None:
+                generation_predicate = "1 = 1"
+            elif self._dialect_name(session) == "sqlite":
+                generation_predicate = (
+                    "COALESCE(json_extract(metadata, '$.structure_generation'), '1') "
+                    "= :expected_generation"
+                )
+            else:
+                generation_predicate = (
+                    "COALESCE(metadata->>'structure_generation', '1') "
+                    "= :expected_generation"
+                )
             result = session.execute(
                 text(
                     f"""
@@ -451,6 +469,7 @@ class DurableOptionRunStore:
                         updated_at = {self._now_expression(session)}
                     WHERE strategy_run_id = :strategy_run_id
                       AND status IN ({placeholders})
+                      AND {generation_predicate}
                     """
                 ),
                 params,
@@ -535,6 +554,58 @@ class DurableOptionRunStore:
                 self._update_run_in_session(session, run)
             session.commit()
             return appended, skipped
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def record_leg_evidence_once(
+        self,
+        strategy_run_id: str,
+        *,
+        orders: list[dict] | None = None,
+        trades: list[dict] | None = None,
+    ) -> OptionRunState:
+        """Append order/trade evidence once, keyed by its paper order id.
+
+        The read and append happen under the run row lock. This is the one
+        ledger path used both immediately after a leg outcome and again during
+        settlement, so a crash between those points cannot double-book a fill.
+        """
+        self._require_id(strategy_run_id)
+        session = self._session_factory()
+        try:
+            run = self._get_run_in_session(session, strategy_run_id, for_update=True)
+            order_keys = {
+                str((row or {}).get("order_id") or "")
+                for row in (run.orders or [])
+                if isinstance(row, dict)
+            }
+            trade_keys = {
+                str((row or {}).get("order_id") or "")
+                for row in (run.trades or [])
+                if isinstance(row, dict)
+            }
+            appended_orders = [
+                dict(order or {})
+                for order in (orders or [])
+                if str((order or {}).get("order_id") or "") not in order_keys
+            ]
+            appended_trades = []
+            for trade in (trades or []):
+                key = str((trade or {}).get("order_id") or "")
+                if key and key not in trade_keys:
+                    trade_keys.add(key)
+                    appended_trades.append(dict(trade or {}))
+            if appended_orders:
+                run.orders.extend(appended_orders)
+            if appended_trades:
+                run.trades.extend(appended_trades)
+            if appended_orders or appended_trades:
+                self._update_run_in_session(session, run)
+            session.commit()
+            return run
         except Exception:
             session.rollback()
             raise

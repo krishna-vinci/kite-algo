@@ -8,6 +8,7 @@ PostgreSQL and proved here, on a disposable database (port 15433).
 
 from __future__ import annotations
 
+import json
 import os
 import uuid
 
@@ -935,6 +936,48 @@ class TestAdjustEdge:
         )
         _resolve(factory, owner_plan, strategy_id=strategy_id)
         with factory() as session:
+            order_id = f"paper-{owner_plan}"
+            session.execute(
+                text(
+                    "INSERT INTO public.paper_accounts (account_scope) "
+                    "VALUES (:account) ON CONFLICT DO NOTHING"
+                ),
+                {"account": ACCOUNT},
+            )
+            session.execute(
+                text(
+                    "INSERT INTO public.paper_orders (account_scope, order_id, "
+                    "instrument_token, exchange, tradingsymbol, product, "
+                    "transaction_type, quantity, status, metadata_json) VALUES "
+                    "(:account, :order_id, 7001, 'NFO', :symbol, 'NRML', 'sell', 75, "
+                    "'filled', '{}')"
+                ),
+                {
+                    "account": ACCOUNT,
+                    "order_id": order_id,
+                    "symbol": entry_legs[0]["broker_symbol"],
+                },
+            )
+            session.execute(
+                text(
+                    "UPDATE public.option_run_states "
+                    "SET trades = :trades WHERE strategy_run_id = :r"
+                ),
+                {
+                    "r": option_run_id,
+                    "trades": json.dumps(
+                        [
+                            {
+                                "order_id": order_id,
+                                "tradingsymbol": entry_legs[0]["broker_symbol"],
+                                "transaction_type": "SELL",
+                                "quantity": 75,
+                                "leg_id": f"{owner_plan}:1",
+                            }
+                        ]
+                    ),
+                },
+            )
             session.execute(
                 text(
                     "UPDATE public.option_run_states SET status = 'adjusting' "
@@ -942,14 +985,23 @@ class TestAdjustEdge:
                 ),
                 {"r": option_run_id},
             )
-            for event in ("submitted", "filled"):
+            for event, detail in (
+                ("submitted", {"side": "SELL"}),
+                ("filled", {"tradingsymbol": entry_legs[0]["broker_symbol"]}),
+            ):
                 session.execute(
                     text(
                         "INSERT INTO public.strategy_plan_execution_events "
-                        "(plan_id, step_no, event, filled_quantity, actor_id, detail) "
-                        "VALUES (:plan, 1, :event, 75, 'test', '{}')"
+                        "(plan_id, step_no, event, paper_order_id, filled_quantity, "
+                        " actor_id, detail) VALUES (:plan, 1, :event, :order_id, 75, "
+                        "'test', :detail)"
                     ),
-                    {"plan": owner_plan, "event": event},
+                    {
+                        "plan": owner_plan,
+                        "event": event,
+                        "order_id": order_id if event == "filled" else None,
+                        "detail": json.dumps(detail),
+                    },
                 )
             session.commit()
 
@@ -985,7 +1037,13 @@ class TestAdjustEdge:
         # EXACTLY ONE edge was written. The loser refused by name, because the
         # winner's own edge - a plan with no committed submission yet - is an
         # owner that has not finished, so the same remainder is never sized twice.
-        assert len(won) == 1, won
+        assert len(won) == 1, (
+            won,
+            [
+                (type(exc).__name__, getattr(exc, "reason_code", str(exc)))
+                for exc in refused
+            ],
+        )
         assert won[0][1] == option_run_id
         assert len(refused) == 1, refused
         assert isinstance(refused[0], PlanBindingRefusal), refused

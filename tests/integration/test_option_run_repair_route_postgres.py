@@ -345,23 +345,63 @@ class _Env:
             phase="adjust",
             worker_run_id=self.run_id,
         )
+        order_id = f"paper-{plan_id}"
         with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT INTO public.paper_accounts (account_scope) "
+                    "VALUES (:scope) ON CONFLICT DO NOTHING"
+                ),
+                {"scope": ACCOUNT},
+            )
+            session.execute(
+                text(
+                    "INSERT INTO public.paper_orders (account_scope, order_id, "
+                    "instrument_token, exchange, tradingsymbol, product, "
+                    "transaction_type, quantity, status, metadata_json) VALUES "
+                    "(:scope, :order_id, 900001, 'NFO', :symbol, 'NRML', 'sell', 75, "
+                    "'filled', '{}')"
+                ),
+                {
+                    "scope": ACCOUNT,
+                    "order_id": order_id,
+                    "symbol": SHORT_SYMBOL,
+                },
+            )
+            session.execute(
+                text(
+                    "UPDATE public.option_run_states "
+                    "SET trades = jsonb_set(trades, '{0,order_id}', "
+                    "to_jsonb(CAST(:order_id AS text))) "
+                    "WHERE strategy_run_id = :run"
+                ),
+                {"order_id": order_id, "run": option_run_id},
+            )
             session.execute(
                 text(
                     "INSERT INTO public.strategy_plan_execution_events "
                     "(plan_id, step_no, event, actor_id, detail) "
-                    "VALUES (:plan, 1, 'submitted', :actor, '{}')"
+                    "VALUES (:plan, 1, 'submitted', :actor, :detail)"
                 ),
-                {"plan": plan_id, "actor": OWNER},
+                {
+                    "plan": plan_id,
+                    "actor": OWNER,
+                    "detail": json.dumps({"side": "SELL", "strategy_run_id": option_run_id}),
+                },
             )
             if finished:
                 session.execute(
                     text(
                         "INSERT INTO public.strategy_plan_execution_events "
-                        "(plan_id, step_no, event, filled_quantity, actor_id, detail) "
-                        "VALUES (:plan, 1, 'filled', 75, :actor, '{}')"
+                        "(plan_id, step_no, event, paper_order_id, filled_quantity, actor_id, detail) "
+                        "VALUES (:plan, 1, 'filled', :order_id, 75, :actor, :detail)"
                     ),
-                    {"plan": plan_id, "actor": OWNER},
+                    {
+                        "plan": plan_id,
+                        "order_id": order_id,
+                        "actor": OWNER,
+                        "detail": json.dumps({"tradingsymbol": SHORT_SYMBOL}),
+                    },
                 )
             session.commit()
         return plan_id
@@ -689,7 +729,7 @@ async def test_an_adjusting_run_repairs_once_its_owning_plan_is_finished(pg, mon
         # state: finished, so the residual close is the governed way out.
         assert body["status"] == "adjusting"
         assert body["evidence"]["adjust_owner"]["state"] == "finished", body
-        assert body["state"] == "residual", body
+        assert body["state"] == "residual", (body["state"], body["reasons"])
 
         repair = await client.post(
             _repair_url(env.strategy_id, option_run_id),

@@ -18,6 +18,7 @@ re-checked against what the platform persisted.
 
 from __future__ import annotations
 
+import json
 from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from sqlalchemy import text
@@ -636,6 +637,177 @@ PLAN_EXECUTION_UNKNOWN = "unknown"
 #: vocabulary and the executor's own ``PLAN_ALREADY_EXECUTED`` proof.
 _PLAN_TRAIL_SUBMITTED = "submitted"
 
+#: The outcome words that can close a paper order, and the runtime statuses
+#: that agree with them. ``failed`` is deliberately absent: it is the executor's
+#: word for an UNKNOWN result, not proof that the order stopped.
+_PLAN_TRAIL_TERMINAL_OUTCOMES = frozenset({"filled", "rejected", "cancelled", "no_op"})
+_PAPER_ORDER_PENDING_STATUSES = frozenset({"pending", "open", "partially_filled"})
+_PAPER_ORDER_TERMINAL_STATUSES = frozenset(
+    {"filled", "cancelled", "rejected", "expired"}
+)
+
+
+def _paper_order_status(paper_order_id: str, *, session: Any) -> Optional[str]:
+    """The current status of one paper order, or ``None`` when unreadable."""
+    if not paper_order_id:
+        return None
+    try:
+        row = session.execute(
+            text("SELECT status FROM public.paper_orders WHERE order_id = :order_id"),
+            {"order_id": str(paper_order_id)},
+        ).first()
+    except Exception:
+        return None
+    if row is None:
+        return None
+    return str(row[0] or "").strip().lower() or None
+
+
+def _plan_step_is_closed(
+    event: str, paper_order_id: str, *, session: Any
+) -> tuple[bool, Optional[str]]:
+    """Whether one outcome is enough to prove its paper order stopped.
+
+    A no-op never reaches the runtime. Every order-backed outcome is checked
+    against the order's CURRENT status: a partial fill is closed only after that
+    remainder is terminal, and an unreadable runtime row is never promoted to
+    terminal evidence.
+    """
+    event = str(event or "").strip().lower()
+    if event == "no_op":
+        return True, None
+    if event not in _PLAN_TRAIL_TERMINAL_OUTCOMES and event != "partially_filled":
+        return False, None
+    if event == "rejected" and not paper_order_id:
+        # A gate rejection was never committed to the runtime, so there is no
+        # order to reconcile and the step itself is terminal.
+        return True, None
+    if not paper_order_id:
+        if event in ("filled", "cancelled"):
+            # The outcome word is terminal evidence itself for an older or
+            # orderless trail; only ``failed`` remains an unknown result.
+            return True, None
+        return False, "paper_order_id_missing"
+    status = _paper_order_status(paper_order_id, session=session)
+    if status is None:
+        return False, "paper_order_status_unreadable"
+    if status in _PAPER_ORDER_PENDING_STATUSES:
+        return False, "paper_order_still_working"
+    if status not in _PAPER_ORDER_TERMINAL_STATUSES:
+        return False, "paper_order_status_unknown"
+    # A terminal runtime row is the proof that closes even an earlier partial.
+    return True, None
+
+
+def option_run_ledger_consistent(
+    run: Any,
+    plan_ids: Any,
+    *,
+    session: Any,
+) -> bool:
+    """Whether run trades account for every fill in the named plans' trails.
+
+    The comparison is by paper order id, so a repeated reader cannot mistake a
+    second copy of a trade for payment of the same fill. A missing, unreadable,
+    wrong-symbol or wrong-side trade is inconsistent; this reader never repairs
+    the ledger or invents evidence.
+    """
+    wanted = [str(plan_id) for plan_id in (plan_ids or []) if str(plan_id or "")]
+    try:
+        raw_trades = (
+            getattr(run, "trades", None)
+            if hasattr(run, "trades")
+            else (run or {}).get("trades")
+        )
+        if isinstance(raw_trades, str):
+            raw_trades = json.loads(raw_trades)
+        trades = [
+            dict(trade or {})
+            for trade in (raw_trades or [])
+            if isinstance(trade, Mapping)
+        ]
+        placeholders = ", ".join(f":plan{index}" for index in range(len(wanted)))
+        params = {f"plan{index}": plan_id for index, plan_id in enumerate(wanted)}
+        rows = session.execute(
+            text(
+                "SELECT plan_id, step_no, event, paper_order_id, filled_quantity, detail "
+                f"FROM strategy_plan_execution_events WHERE plan_id IN ({placeholders}) "
+                "ORDER BY created_at, id"
+            ),
+            params,
+        ).all()
+    except Exception:
+        return False
+    if not wanted:
+        return True
+
+    sides: dict[tuple[str, int], str] = {}
+    expected: dict[str, dict[str, Any]] = {}
+    fill_rows: list[tuple[str, int, str, str, int, Mapping[str, Any]]] = []
+    # Scan submissions first: two rows written in one transaction can share
+    # created_at, and id is not an execution-order key.
+    for row in rows:
+        if str(row[2] or "").strip().lower() != "submitted":
+            continue
+        raw_detail = row[5] or {}
+        if isinstance(raw_detail, str):
+            raw_detail = json.loads(raw_detail)
+        sides[(str(row[0] or ""), int(row[1] or 0))] = str(
+            dict(raw_detail).get("side") or ""
+        ).strip().upper()
+    for row in rows:
+        event = str(row[2] or "").strip().lower()
+        if event == "submitted":
+            continue
+        fill_rows.append(
+            (str(row[0] or ""), int(row[1] or 0), event, str(row[3] or ""), int(row[4] or 0), row[5] or {})
+        )
+    for plan_id, step_no, event, order_id, filled, raw_detail in fill_rows:
+        try:
+            filled = int(filled or 0)
+        except (TypeError, ValueError):
+            return False
+        if isinstance(raw_detail, str):
+            raw_detail = json.loads(raw_detail)
+        detail = dict(raw_detail)
+        if event not in ("filled", "partially_filled") or filled <= 0:
+            continue
+        if not order_id:
+            return False
+        symbol = str(detail.get("tradingsymbol") or "").strip().upper()
+        if not symbol:
+            return False
+        evidence = expected.setdefault(
+            order_id,
+            {"quantity": 0, "tradingsymbol": symbol, "transaction_type": ""},
+        )
+        if evidence["tradingsymbol"] != symbol:
+            return False
+        evidence["quantity"] += filled
+        side = sides.get((plan_id, step_no), "")
+        if side:
+            evidence["transaction_type"] = side
+
+    actual: dict[str, dict[str, Any]] = {}
+    for trade in trades:
+        order_id = str(trade.get("order_id") or "")
+        if not order_id or order_id not in expected:
+            continue
+        symbol = str(trade.get("tradingsymbol") or "").strip().upper()
+        side = str(trade.get("transaction_type") or "").strip().upper()
+        try:
+            quantity = int(trade.get("quantity") or 0)
+        except (TypeError, ValueError):
+            return False
+        row = actual.setdefault(
+            order_id,
+            {"quantity": 0, "tradingsymbol": symbol, "transaction_type": side},
+        )
+        row["quantity"] += abs(quantity)
+        if row["tradingsymbol"] != symbol or row["transaction_type"] != side:
+            return False
+    return all(actual.get(order_id) == evidence for order_id, evidence in expected.items())
+
 
 def option_plan_execution_state(plan_id: str, *, session: Any) -> Dict[str, Any]:
     """Whether ONE plan's own execution has FINISHED, from durable records only.
@@ -647,9 +819,9 @@ def option_plan_execution_state(plan_id: str, *, session: Any) -> Dict[str, Any]
     when its own committed work has all been answered.
 
     * ``finished`` - the plan committed at least one submission and every
-      submission it made carries an outcome (``filled`` / ``partially_filled`` /
-      ``rejected`` / ``failed`` / ``no_op``). Its pass has closed, so the run's
-      own confirmed fills are the only authority for what is still missing.
+      order-backed pass is proven terminal in the paper runtime. A
+      ``partially_filled`` outcome stays open until that exact paper order is
+      cancelled/terminal; an unreadable order is ``unknown``.
     * ``in_flight`` - a committed submission has NO outcome yet: the broker may or
       may not have taken it, so nothing may be re-derived on top of it.
     * ``unknown`` - no committed submission, or the trail cannot be read. The plan
@@ -661,7 +833,7 @@ def option_plan_execution_state(plan_id: str, *, session: Any) -> Dict[str, Any]
     try:
         rows = session.execute(
             text(
-                "SELECT step_no, event FROM strategy_plan_execution_events "
+                "SELECT step_no, event, paper_order_id FROM strategy_plan_execution_events "
                 "WHERE plan_id = :plan ORDER BY created_at, id"
             ),
             {"plan": plan},
@@ -675,24 +847,38 @@ def option_plan_execution_state(plan_id: str, *, session: Any) -> Dict[str, Any]
                 "error": type(exc).__name__,
             },
         }
-    # A step is closed by ANY outcome event, and open while it carries a committed
-    # submission with none: the two sets are what make the fold independent of row
-    # order, because two rows written by one transaction can share ``created_at``.
+    # A step is closed by a TERMINAL outcome AND the runtime agreeing that its
+    # paper order stopped. The two layers make the fold independent of row order
+    # and prevent a later fill from landing behind a "partially filled" outcome.
     submitted: set[int] = set()
     closed: set[int] = set()
+    unreadable_reasons: list[str] = []
     for row in rows:
         step_no = int(row[0] or 0)
         event = str(row[1] or "")
         if event == _PLAN_TRAIL_SUBMITTED:
             submitted.add(step_no)
-        else:
+            continue
+        closed_by_step, reason = _plan_step_is_closed(event, str(row[2] or ""), session=session)
+        if closed_by_step:
             closed.add(step_no)
+        elif reason == "paper_order_still_working":
+            # This is exactly in-flight evidence, not an unreadable read: leave
+            # the submitted step unresolved so the fold reports ``in_flight``.
+            pass
+        else:
+            unreadable_reasons.append(reason or f"outcome_not_terminal:{event}")
     evidence = {
         "plan_id": plan,
         "events": len(rows),
         "submitted_events": len(submitted),
         "steps": sorted(submitted | closed),
     }
+    if unreadable_reasons:
+        return {
+            "state": PLAN_EXECUTION_UNKNOWN,
+            "evidence": {**evidence, "reasons": sorted(set(unreadable_reasons))},
+        }
     if not rows or not submitted:
         return {
             "state": PLAN_EXECUTION_UNKNOWN,
@@ -714,6 +900,18 @@ def option_adjust_owner_plan_ids(option_run_id: str, *, session: Any) -> List[st
             "SELECT plan_id FROM public.strategy_plan_option_runs "
             "WHERE option_run_id = :run AND phase = 'adjust' "
             "ORDER BY created_at, plan_id"
+        ),
+        {"run": str(option_run_id)},
+    ).all()
+    return [str(row[0]) for row in rows if str(row[0] or "")]
+
+
+def option_run_bound_plan_ids(option_run_id: str, *, session: Any) -> List[str]:
+    """Every plan edge that owns work in ONE option run, oldest first."""
+    rows = session.execute(
+        text(
+            "SELECT plan_id FROM public.strategy_plan_option_runs "
+            "WHERE option_run_id = :run ORDER BY created_at, plan_id"
         ),
         {"run": str(option_run_id)},
     ).all()
@@ -857,6 +1055,33 @@ def assess_option_adjust_admissibility(
                 ),
             },
         )
+    # The scope projection intentionally reports lifecycle shape, not the full
+    # ledger. The one ledger rule needs the run's own trades, so read them from
+    # the same durable row before any takeover decision is made.
+    try:
+        ledger_row = session.execute(
+            text(
+                "SELECT trades FROM public.option_run_states "
+                "WHERE strategy_run_id = :run"
+            ),
+            {"run": option_run_id},
+        ).first()
+    except Exception as exc:
+        raise PlanBindingRefusal(
+            "OPTION_RUN_LEDGER_INCOMPLETE",
+            {
+                "plan_id": plan_id,
+                "option_run_id": option_run_id,
+                "reason": "ledger_read_failed",
+                "error": type(exc).__name__,
+            },
+        ) from exc
+    if ledger_row is None:
+        raise PlanBindingRefusal(
+            "OPTION_RUN_MISSING",
+            {"plan_id": plan_id, "option_run_id": option_run_id},
+        )
+    referenced = {**dict(referenced), "trades": ledger_row[0]}
     run_status = str(referenced.get("status") or "").strip().lower()
     owned_by_this_plan = bool(plan_id) and plan_id in {
         str(value) for value in (referenced.get("plan_ids") or [])
@@ -924,6 +1149,33 @@ def assess_option_adjust_admissibility(
                 ),
             },
         )
+    try:
+        bound_plan_ids = option_run_bound_plan_ids(option_run_id, session=session)
+        if not option_run_ledger_consistent(referenced, bound_plan_ids, session=session):
+            raise PlanBindingRefusal(
+                "OPTION_RUN_LEDGER_INCOMPLETE",
+                {
+                    "plan_id": plan_id,
+                    "option_run_id": option_run_id,
+                    "bound_plan_ids": bound_plan_ids,
+                    "message": (
+                        "the run's confirmed fills do not reconcile with its bound "
+                        "plan trails; it is never mutated or silently repaired"
+                    ),
+                },
+            )
+    except PlanBindingRefusal:
+        raise
+    except Exception as exc:
+        raise PlanBindingRefusal(
+            "OPTION_RUN_LEDGER_INCOMPLETE",
+            {
+                "plan_id": plan_id,
+                "option_run_id": option_run_id,
+                "reason": "ledger_read_failed",
+                "error": type(exc).__name__,
+            },
+        ) from exc
     if bool(referenced.get("protective_exit_unresolved")):
         raise PlanBindingRefusal(
             "OPTION_PROTECTIVE_EXIT_UNRESOLVED",
@@ -1030,7 +1282,10 @@ def create_run_from_frozen_plan(
         ],
         protection={
             "expiry_policy": resolved.get("expiry_policy"),
+            "max_loss": resolved.get("max_loss"),
+            "protection_policy": resolved.get("protection_policy"),
             "structure_digest": resolved.get("structure_digest"),
+            "structure_units": resolved.get("structure_units"),
             "structure_id": resolved.get("structure_id"),
             "underlying": resolved.get("underlying"),
         },
@@ -1274,7 +1529,19 @@ def _resolve_adjust_binding(
         raise
     finally:
         session.close()
-    return {"phase": "adjust", "option_run_id": run.strategy_run_id, "run": run, "binding": binding}
+    try:
+        expected_generation = int(
+            _frozen_option_run_block(plan).get("based_on_generation")
+        )
+    except (TypeError, ValueError):
+        expected_generation = None
+    return {
+        "phase": "adjust",
+        "option_run_id": run.strategy_run_id,
+        "run": run,
+        "binding": binding,
+        "expected_structure_generation": expected_generation,
+    }
 
 
 def resolve_plan_option_run(
@@ -1321,7 +1588,21 @@ def resolve_plan_option_run(
                 "OPTION_RUN_MISSING",
                 {"plan_id": plan_id, "option_run_id": str(existing.get("option_run_id"))},
             ) from exc
-        return {"phase": str(existing.get("phase")), "option_run_id": run.strategy_run_id, "run": run, "binding": dict(existing)}
+        expected_generation = None
+        if str(existing.get("phase")) == "adjust":
+            try:
+                expected_generation = int(
+                    _frozen_option_run_block(plan).get("based_on_generation")
+                )
+            except (TypeError, ValueError):
+                expected_generation = None
+        return {
+            "phase": str(existing.get("phase")),
+            "option_run_id": run.strategy_run_id,
+            "run": run,
+            "binding": dict(existing),
+            "expected_structure_generation": expected_generation,
+        }
 
     if phase == "entry":
         return _create_entry_run_atomically(

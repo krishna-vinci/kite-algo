@@ -16,6 +16,7 @@ from backend.options.execution.repair import (
     REASON_ADJUST_IN_FLIGHT,
     REASON_AMBIGUOUS,
     REASON_EVIDENCE_CHANGED,
+    REASON_LEDGER_INCOMPLETE,
     REASON_NOT_REPAIRABLE,
     STATE_AMBIGUOUS,
     STATE_FLAT,
@@ -350,6 +351,42 @@ def test_an_adjusting_run_whose_plan_is_still_submitting_is_ambiguous():
     unread = assess_option_run_repair(run, _staged_exit())
     assert unread["state"] == STATE_AMBIGUOUS
     assert REASON_ADJUST_IN_FLIGHT in unread["reasons"]
+
+
+def test_a_run_whose_plan_fill_remains_working_is_ambiguous():
+    """A live remainder is in-flight work, never repairable residual evidence."""
+    run = _run("adjusting", trades=[_trade("leg_short", "SELL", 75)])
+    working = {
+        "state": "in_flight",
+        "plan_ids": ["plan-roll"],
+        "plans": {"plan-roll": {"state": "in_flight", "evidence": {"unresolved_steps": [1]}}},
+    }
+    assessment = assess_option_run_repair(
+        run, _staged_exit(), adjust_owner=working, ledger_consistent=True
+    )
+    assert assessment["state"] == STATE_AMBIGUOUS
+    assert assessment["reason_code"] == REASON_AMBIGUOUS
+    assert REASON_ADJUST_IN_FLIGHT in assessment["reasons"]
+
+
+def test_a_ledger_trail_disagreement_is_ambiguous_as_ledger_incomplete():
+    run = _run("adjusting", trades=[_trade("leg_short", "SELL", 75)])
+    owner = {"state": "finished", "plan_ids": ["plan-roll"], "plans": {}}
+    assessment = assess_option_run_repair(
+        run, _staged_exit(), adjust_owner=owner, ledger_consistent=False
+    )
+    assert assessment["state"] == STATE_AMBIGUOUS
+    assert assessment["reason_code"] == REASON_AMBIGUOUS
+    assert REASON_LEDGER_INCOMPLETE in assessment["reasons"]
+
+    service = OptionRunRepairService(
+        run_store=_FakeRunStore(run),
+        staged_exit=_staged_exit(),
+        adjust_owner_reader=lambda _run_id: owner,
+        ledger_consistency_reader=lambda _run: False,
+    )
+    inspection = service.assessment(run.strategy_run_id)
+    assert REASON_LEDGER_INCOMPLETE in inspection["reasons"]
 
 
 def test_a_non_repairable_status_refuses_and_does_not_change_the_run():

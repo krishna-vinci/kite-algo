@@ -86,6 +86,9 @@ def build_option_run_repair_service(request: Any, session_factory: Any) -> Optio
     """
     from backend.options.execution.durable_store import DurableOptionRunStore
     from backend.options.execution.repair import option_adjust_owner_reader
+    from backend.options.execution.repair import (
+        option_run_ledger_consistency_reader,
+    )
     from backend.options.protection.staged_exit import StagedStructureExit
 
     run_store = getattr(_app_state(request), "option_run_store", None)
@@ -99,6 +102,7 @@ def build_option_run_repair_service(request: Any, session_factory: Any) -> Optio
         run_store=run_store,
         staged_exit=staged,
         adjust_owner_reader=option_adjust_owner_reader(session_factory),
+        ledger_consistency_reader=option_run_ledger_consistency_reader(session_factory),
     )
 
 

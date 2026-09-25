@@ -59,6 +59,7 @@ REASON_LIVE_UNSUPPORTED = "OPTION_RUN_REPAIR_LIVE_UNSUPPORTED"
 #: The assessment reason an ``adjusting`` run carries while the plan that owns
 #: its adjust may still be submitting (or cannot be proven finished).
 REASON_ADJUST_IN_FLIGHT = "adjust_in_flight"
+REASON_LEDGER_INCOMPLETE = "ledger_incomplete"
 
 ACTION_CLOSE_FLAT = "close_flat"
 ACTION_CLOSE_RESIDUAL = "close_residual"
@@ -93,7 +94,11 @@ class OptionRunRepairRefusal(RuntimeError):
 
 
 def assess_option_run_repair(
-    run: Any, staged_exit: Any, *, adjust_owner: Optional[Mapping[str, Any]] = None
+    run: Any,
+    staged_exit: Any,
+    *,
+    adjust_owner: Optional[Mapping[str, Any]] = None,
+    ledger_consistent: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Classify one option run from its OWN confirmed evidence. Side-effect free.
 
@@ -181,6 +186,8 @@ def assess_option_run_repair(
         # An unreadable book is never "flat" and never a residual: the run is
         # escalated, not guessed at.
         reasons.append("unreadable_fills")
+    if ledger_consistent is False:
+        reasons.append(REASON_LEDGER_INCOMPLETE)
 
     # An ``adjusting`` run is mid-mutation: it is only repairable once the plan
     # that owns its adjust has provably finished executing. While that plan may
@@ -285,6 +292,24 @@ def option_adjust_owner_reader(session_factory: Any) -> Callable[[str], Dict[str
     return _read
 
 
+def option_run_ledger_consistency_reader(session_factory: Any) -> Callable[[Any], bool]:
+    """The shared trail-vs-ledger rule, read through every bound plan edge."""
+
+    def _read(run: Any) -> bool:
+        from .plan_binding import (
+            option_run_bound_plan_ids,
+            option_run_ledger_consistent,
+        )
+
+        with session_factory() as session:
+            plan_ids = option_run_bound_plan_ids(
+                str(getattr(run, "strategy_run_id", "") or ""), session=session
+            )
+            return option_run_ledger_consistent(run, plan_ids, session=session)
+
+    return _read
+
+
 def pending_leg_ids(run: OptionRunState, close_plan: List[Dict[str, Any]]) -> List[str]:
     """The run leg ids a residual close is working on, in plan order."""
     by_symbol = {
@@ -319,11 +344,25 @@ class OptionRunRepairService:
     """
 
     def __init__(
-        self, *, run_store: Any, staged_exit: Any, adjust_owner_reader: Any = None
+        self,
+        *,
+        run_store: Any,
+        staged_exit: Any,
+        adjust_owner_reader: Any = None,
+        ledger_consistency_reader: Any = None,
     ) -> None:
         self._run_store = run_store
         self._staged_exit = staged_exit
         self._adjust_owner_reader = adjust_owner_reader
+        self._ledger_consistency_reader = ledger_consistency_reader
+
+    def _ledger_consistent(self, run: Any) -> Optional[bool]:
+        if self._ledger_consistency_reader is None:
+            return None
+        try:
+            return bool(self._ledger_consistency_reader(run))
+        except Exception:
+            return False
 
     def _adjust_owner(self, option_run_id: str) -> Optional[Dict[str, Any]]:
         """The execution state of the plan(s) that own this run's adjust phase.
@@ -358,6 +397,7 @@ class OptionRunRepairService:
             self._run(option_run_id),
             self._staged_exit,
             adjust_owner=self._adjust_owner(option_run_id),
+            ledger_consistent=self._ledger_consistent(self._run(option_run_id)),
         )
 
     def plan(
@@ -370,7 +410,10 @@ class OptionRunRepairService:
         """
         run = self._run(option_run_id)
         assessment = assess_option_run_repair(
-            run, self._staged_exit, adjust_owner=self._adjust_owner(option_run_id)
+            run,
+            self._staged_exit,
+            adjust_owner=self._adjust_owner(option_run_id),
+            ledger_consistent=self._ledger_consistent(run),
         )
         if str(evidence_digest or "") != str(assessment.get("evidence_digest") or ""):
             raise OptionRunRepairRefusal(

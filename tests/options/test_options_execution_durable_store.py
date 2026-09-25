@@ -114,6 +114,14 @@ class _FakeSession:
             row = self._rows_by_id.get(strategy_run_id)
             if row is None:
                 return _FakeResult(rowcount=0)
+            expected_generation = bound.get("expected_generation")
+            if expected_generation is not None:
+                metadata = row["metadata"]
+                if isinstance(metadata, str):
+                    metadata = json.loads(metadata)
+                current_generation = str(metadata.get("structure_generation") or 1)
+                if current_generation != str(expected_generation):
+                    return _FakeResult(rowcount=0)
             row.update(
                 {
                     "strategy_name": bound["strategy_name"],
@@ -206,6 +214,32 @@ def test_save_run_updates_json_fields_and_status():
     assert "UPDATE public.option_run_states" in update_sql
     assert update_params["status"] == "entered"
     assert json.loads(update_params["orders"]) == [{"order_id": "o1"}]
+
+
+def test_save_run_if_status_generation_predicate_match_wins_and_mismatch_loses():
+    session = _FakeSession()
+    store = DurableOptionRunStore(session_factory=lambda: session)
+    seeded = OptionRunState.from_create_request(_create_request(), strategy_run_id="opt_run_cas")
+    seeded.status = "entered"
+    seeded.metadata["structure_generation"] = 1
+    session.seed_run(seeded)
+
+    winner = store.get_run("opt_run_cas")
+    winner.status = "adjusting"
+    assert store.save_run_if_status(
+        winner, allowed_from=("entered",), expected_generation=1
+    )
+    assert session.committed == 1
+    update_sql, update_params = session.calls[-1]
+    assert "COALESCE(metadata->>'structure_generation', '1')" in update_sql
+    assert update_params["expected_generation"] == "1"
+
+    stale = store.get_run("opt_run_cas")
+    stale.status = "entered"
+    assert not store.save_run_if_status(
+        stale, allowed_from=("adjusting",), expected_generation=2
+    )
+    assert store.get_run("opt_run_cas").status == "adjusting"
 
 
 def test_record_orders_and_trades_are_append_only():
