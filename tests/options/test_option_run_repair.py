@@ -275,6 +275,217 @@ def test_a_fill_the_run_cannot_attribute_is_ambiguous():
     assert "unattributable_trades" in assessment["reasons"]
 
 
+# --------------------------------------------------------------- rolled runs
+
+ROLL_SHORT = "NIFTY26NOV25000CE"
+ROLL_HEDGE = "NIFTY26NOV30000CE"
+
+
+def _roll_leg(leg_id: str, symbol: str, side: str, quantity: int = 75) -> dict:
+    return {
+        "leg_id": leg_id,
+        "tradingsymbol": symbol,
+        "transaction_type": side,
+        "quantity": quantity,
+        "exchange": "NFO",
+        "product": "NRML",
+    }
+
+
+def _roll_fill(leg_id: str, symbol: str, side: str, quantity: int = 75) -> dict:
+    return {
+        "leg_id": leg_id,
+        "transaction_type": side,
+        "quantity": quantity,
+        "tradingsymbol": symbol,
+    }
+
+
+def _rolled_run(
+    status: str = "entered",
+    *,
+    trades: list,
+    released_legs: list | None = None,
+    history: list | None = None,
+) -> OptionRunState:
+    """A run right AFTER a completed roll.
+
+    The HELD legs are the new generation, and the generation the roll RELEASED
+    is recorded in the run's own metadata (``structure_generation_history``) -
+    exactly what the paper/live roll writers leave behind. The released
+    generation's confirmed fills stay on the run's ledger under their OLD ids.
+    """
+    held = [
+        _roll_leg("roll:1", ROLL_SHORT, "SELL"),
+        _roll_leg("roll:2", ROLL_HEDGE, "BUY"),
+    ]
+    released = (
+        released_legs
+        if released_legs is not None
+        else [_roll_leg("old:1", SHORT, "SELL"), _roll_leg("old:2", HEDGE, "BUY")]
+    )
+    recorded = (
+        history
+        if history is not None
+        else [{"generation": 1, "structure_digest": "digest-old", "legs": released}]
+    )
+    return OptionRunState(
+        strategy_run_id="opt_run_1",
+        strategy_name="bull_put_spread",
+        product="NRML",
+        status=status,
+        legs=held,
+        orders=[],
+        trades=list(trades),
+        metadata={
+            "worker_run_id": "worker_1",
+            "account_id": "acc_1",
+            "structure_generation": 2,
+            "structure_digest": "digest-new",
+            "structure_generation_history": recorded,
+        },
+    )
+
+
+def _released_generation_fills() -> list:
+    """The released generation's own ledger: opened and released, ZERO per leg."""
+    return [
+        _roll_fill("old:1", SHORT, "SELL"),
+        _roll_fill("old:1", SHORT, "BUY"),
+        _roll_fill("old:2", HEDGE, "BUY"),
+        _roll_fill("old:2", HEDGE, "SELL"),
+    ]
+
+
+def test_a_rolled_run_whose_released_generation_nets_flat_is_not_ambiguous():
+    """After a roll the released legs' fills are this run's OWN evidence."""
+    run = _rolled_run(
+        "entered",
+        trades=[
+            *_released_generation_fills(),
+            _roll_fill("roll:1", ROLL_SHORT, "SELL"),
+            _roll_fill("roll:2", ROLL_HEDGE, "BUY"),
+        ],
+    )
+    assessment = assess_option_run_repair(run, _staged_exit(), owner_exit=True)
+    assert assessment["state"] == STATE_RESIDUAL
+    assert assessment["reason_code"] is None
+    assert assessment["reasons"] == []
+    assert assessment["unattributable_trades"] == []
+    # The released generation nets to zero, so only the HELD short is planned -
+    # short first, its hedge withheld until that short is proven gone.
+    assert [
+        (order["tradingsymbol"], order["transaction_type"], order["quantity"])
+        for order in assessment["close_plan"]
+    ] == [(ROLL_SHORT, "BUY", 75)]
+    assert [row["reason"] for row in assessment["withheld_hedges"]] == [
+        "short_not_proven_closed"
+    ]
+    # The released legs are still part of the run's own book, at zero.
+    assert assessment["evidence"]["open_by_leg"]["old:1"] == 0
+    assert assessment["evidence"]["open_by_leg"]["old:2"] == 0
+
+
+def test_a_released_leg_that_does_not_net_flat_is_residual_exposure_in_the_plan():
+    """A released leg still netting non-zero is real exposure, not a silent zero."""
+    run = _rolled_run(
+        "entered",
+        # The old short was never released; everything else nets flat, so the
+        # ONLY residual exposure is the OLD short.
+        trades=[
+            _roll_fill("old:1", SHORT, "SELL"),
+            _roll_fill("old:2", HEDGE, "BUY"),
+            _roll_fill("old:2", HEDGE, "SELL"),
+            _roll_fill("roll:1", ROLL_SHORT, "SELL"),
+            _roll_fill("roll:1", ROLL_SHORT, "BUY"),
+            _roll_fill("roll:2", ROLL_HEDGE, "BUY"),
+            _roll_fill("roll:2", ROLL_HEDGE, "SELL"),
+        ],
+    )
+    assessment = assess_option_run_repair(run, _staged_exit(), owner_exit=True)
+    assert assessment["state"] == STATE_RESIDUAL
+    assert assessment["reasons"] == []
+    assert assessment["evidence"]["open_by_leg"]["old:1"] == -75
+    assert [
+        (order["tradingsymbol"], order["transaction_type"], order["quantity"])
+        for order in assessment["close_plan"]
+    ] == [(SHORT, "BUY", 75)]
+
+    # The plan names the OLD leg as the one being closed, so the staged exit can
+    # attribute the covering fill back onto it.
+    service, _store = _service(run)
+    planned, _detail = service.plan(
+        option_run_id=run.strategy_run_id,
+        action=ACTION_OWNER_EXIT,
+        evidence_digest=assessment["evidence_digest"],
+        owner_exit=True,
+    )
+    assert planned.status == "exiting"
+    assert planned.pending_legs == ["old:1"]
+
+
+def test_a_leg_an_adjust_kept_is_planned_once_even_though_it_is_in_the_history():
+    """A kept leg is in the held set AND the recorded generation: still ONE leg."""
+    kept_short = _roll_leg("roll:1", ROLL_SHORT, "SELL")
+    run = _rolled_run(
+        "entered",
+        released_legs=[kept_short, _roll_leg("old:2", HEDGE, "BUY")],
+        trades=[
+            _roll_fill("roll:1", ROLL_SHORT, "SELL"),
+            _roll_fill("roll:2", ROLL_HEDGE, "BUY"),
+            _roll_fill("old:2", HEDGE, "BUY"),
+            _roll_fill("old:2", HEDGE, "SELL"),
+        ],
+    )
+    assessment = assess_option_run_repair(run, _staged_exit(), owner_exit=True)
+    assert assessment["state"] == STATE_RESIDUAL
+    # The kept short is planned ONCE: its history entry must not double it into
+    # a second covering order.
+    assert [
+        (order["tradingsymbol"], order["transaction_type"], order["quantity"])
+        for order in assessment["close_plan"]
+    ] == [(ROLL_SHORT, "BUY", 75)]
+
+    service, _store = _service(run)
+    planned, _detail = service.plan(
+        option_run_id=run.strategy_run_id,
+        action=ACTION_OWNER_EXIT,
+        evidence_digest=assessment["evidence_digest"],
+        owner_exit=True,
+    )
+    assert planned.pending_legs == ["roll:1"]
+
+
+def test_a_trade_on_an_unknown_leg_stays_ambiguous_after_a_roll():
+    run = _rolled_run(
+        "entered",
+        trades=[
+            *_released_generation_fills(),
+            _roll_fill("roll:1", ROLL_SHORT, "SELL"),
+            _roll_fill("roll:2", ROLL_HEDGE, "BUY"),
+            _roll_fill("leg_not_mine", SHORT, "BUY"),
+        ],
+    )
+    assessment = assess_option_run_repair(run, _staged_exit(), owner_exit=True)
+    assert assessment["state"] == STATE_AMBIGUOUS
+    assert assessment["reason_code"] == REASON_AMBIGUOUS
+    assert "unattributable_trades" in assessment["reasons"]
+    assert [row["leg_id"] for row in assessment["unattributable_trades"]] == [
+        "leg_not_mine"
+    ]
+
+
+def test_an_unreadable_leg_history_is_ambiguous():
+    """A history the run cannot read is a refusal, never a smaller book."""
+    run = _rolled_run("entered", trades=[_roll_fill("roll:1", ROLL_SHORT, "SELL")])
+    run.metadata["structure_generation_history"] = "not-a-list"
+    assessment = assess_option_run_repair(run, _staged_exit(), owner_exit=True)
+    assert assessment["state"] == STATE_AMBIGUOUS
+    assert assessment["reason_code"] == REASON_AMBIGUOUS
+    assert "unreadable_fills" in assessment["reasons"]
+    assert "leg_history" in [row["stage"] for row in assessment["unreadable_fills"]]
+
+
 def test_an_adjusting_run_is_repairable_once_its_owning_plan_finished():
     """A leg generation that stopped mid-flight is stranded work too."""
     run = _run(

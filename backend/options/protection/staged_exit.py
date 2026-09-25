@@ -144,6 +144,81 @@ def unresolved_stage_claim(orders: Any) -> Optional[Dict[str, Any]]:
     return None
 
 
+#: The ``metadata`` key a ROLL keeps the legs it RELEASED under (B2.2 S2/S4):
+#: a bounded list of ``{"generation", "structure_digest", "legs"}`` entries.
+#: Both roll writers use it - paper ``_option_run_generation`` and the live
+#: lane ledger - so the reader below is the one place that knows its shape.
+STRUCTURE_GENERATION_HISTORY = "structure_generation_history"
+
+
+class UnreadableLegHistory(RuntimeError):
+    """A run's recorded earlier leg generations cannot be read."""
+
+
+def _recorded_history_legs(run: Any) -> List[Dict[str, Any]]:
+    """The legs of every earlier generation ``run`` recorded, in written order.
+
+    Raises :class:`UnreadableLegHistory` when the record exists but cannot be
+    read. A run whose released legs cannot be read is treated as AMBIGUOUS,
+    never as a run holding FEWER legs than it does: a trade on an unread leg id
+    would otherwise look like a foreign fill.
+    """
+    metadata = getattr(run, "metadata", None)
+    if metadata is None:
+        return []
+    if not isinstance(metadata, Mapping):
+        raise UnreadableLegHistory("option run metadata is not a mapping")
+    raw = metadata.get(STRUCTURE_GENERATION_HISTORY)
+    if raw is None:
+        return []
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, (list, tuple)):
+        raise UnreadableLegHistory("structure_generation_history is not a list")
+    legs: List[Dict[str, Any]] = []
+    for entry in raw:
+        if not isinstance(entry, Mapping):
+            raise UnreadableLegHistory("generation entry is not a mapping")
+        entry_legs = entry.get("legs")
+        if entry_legs is None:
+            continue
+        if isinstance(entry_legs, (str, bytes)) or not isinstance(
+            entry_legs, (list, tuple)
+        ):
+            raise UnreadableLegHistory("generation legs are not a list")
+        for leg in entry_legs:
+            if not isinstance(leg, Mapping):
+                raise UnreadableLegHistory("generation leg is not a mapping")
+            legs.append(dict(leg))
+    return legs
+
+
+def known_run_legs(run: Any) -> List[Dict[str, Any]]:
+    """Every leg the run still accounts for: the held ones, then the released.
+
+    A run's OWN trades outlive a roll: the roll re-keys ``run.legs`` to the new
+    generation, but the old generation's confirmed fills keep their old leg
+    ids. Those legs are still the run's own book - a released one nets to ZERO,
+    and a released one that nets NON-ZERO is residual exposure the exit must
+    close - so one helper answers for the repair path, the owner exit and this
+    protection exit alike (:meth:`StagedStructureExit.known_run_legs`).
+
+    A leg is returned ONCE. An adjust that KEEPS a leg records the generation it
+    kept it from, so that leg is in the held set AND in the history - and it is
+    still one leg. Returning it twice would plan its close twice and read its
+    proof as double, which is exactly the oversize the bounded exit prevents.
+    """
+    current = [dict(leg or {}) for leg in (getattr(run, "legs", []) or [])]
+    known: List[Dict[str, Any]] = []
+    seen: set = set()
+    for leg in current + _recorded_history_legs(run):
+        leg_id = str(leg.get("leg_id") or "")
+        if leg_id:
+            if leg_id in seen:
+                continue
+            seen.add(leg_id)
+        known.append(leg)
+    return known
+
+
 class StagedStructureExit:
     """Derive and submit ONE stage of a bounded structure exit."""
 
@@ -844,8 +919,26 @@ class StagedStructureExit:
     # -- evidence -----------------------------------------------------------
 
     @staticmethod
+    def known_run_legs(run: Any) -> List[Dict[str, Any]]:
+        """The run's held legs PLUS the generations its own metadata recorded.
+
+        One definition (:func:`known_run_legs`), so the repair/owner-exit
+        assessment and this exit engine can never disagree about the book a
+        rolled run still owns.
+        """
+        return known_run_legs(run)
+
+    @staticmethod
     def own_open_by_leg(run: Any) -> Dict[str, int]:
-        """The run's OWN open quantity per leg, from its recorded trades."""
+        """The run's OWN open quantity per leg, from its recorded trades.
+
+        Keyed by every leg id the run's own fills carry, so a released
+        generation's legs appear too: a released leg reads ZERO, and a non-zero
+        one is real residual exposure the close plan acts on. This is a
+        PER-LEG net, not an attribution verdict - what belongs to the run is
+        ``known_run_legs``, and a leg in neither set is the repair path's to
+        refuse.
+        """
         open_by_leg: Dict[str, int] = {}
         for trade in getattr(run, "trades", []) or []:
             leg_id = str((trade or {}).get("leg_id") or "")
@@ -947,7 +1040,7 @@ class StagedStructureExit:
         open_by_leg = self.own_open_by_leg(run)
         all_closed = True
         proven: Dict[str, int] = {}
-        for leg in getattr(run, "legs", []) or []:
+        for leg in self.known_run_legs(run):
             leg = dict(leg or {})
             if str(leg.get("transaction_type") or "").upper() != "SELL":
                 continue
@@ -963,13 +1056,18 @@ class StagedStructureExit:
         return all_closed, proven
 
     def own_positions(self, run: Any) -> List[Dict[str, Any]]:
-        """The run's own positions as the exit builder's row shape (SIGNED)."""
+        """The run's own positions as the exit builder's row shape (SIGNED).
+
+        Built from ``known_run_legs`` - the held legs and every generation a roll
+        released - so a released short that still nets non-zero becomes a real
+        close row (short-first) instead of vanishing with the old generation.
+        """
         peak_by_leg = self.own_peak_by_leg(run)
         open_by_leg = self.own_open_by_leg(run)
         outstanding_buy, outstanding_sell = self.outstanding_by_symbol(run)
         shorts_closed, proven_by_symbol = self.short_closure_state(run)
         rows: List[Dict[str, Any]] = []
-        for leg in getattr(run, "legs", []) or []:
+        for leg in self.known_run_legs(run):
             leg = dict(leg or {})
             leg_id = str(leg.get("leg_id") or "")
             peak = int(peak_by_leg.get(leg_id, 0))
@@ -1027,9 +1125,14 @@ class StagedStructureExit:
         return list(orders), {"positions": len(positions), **dict(detail or {})}
 
     def run_is_flat(self, run: Any) -> bool:
-        """Whether the run's OWN confirmed fills say it holds nothing."""
+        """Whether the run's OWN confirmed fills say it holds nothing.
+
+        Every KNOWN leg counts, the released generations included: a rolled run
+        whose old generation still nets non-zero is NOT flat, and calling it flat
+        is what would let that residual be ignored.
+        """
         open_by_leg = self.own_open_by_leg(run)
-        for leg in getattr(run, "legs", []) or []:
+        for leg in self.known_run_legs(run):
             leg_id = str((leg or {}).get("leg_id") or "")
             if int(open_by_leg.get(leg_id, 0)) != 0:
                 return False
@@ -1196,14 +1299,23 @@ class StagedStructureExit:
             if str(row.get("stage_digest")) == digest
             and str(row.get("state")) != STAGE_SENDING
         )
-        run_legs = {
-            str((leg or {}).get("tradingsymbol") or ""): {
-                "leg_id": str((leg or {}).get("leg_id") or ""),
-                "instrument_token": (leg or {}).get("instrument_token"),
-                "product": str((leg or {}).get("product") or ""),
+        # The exit builder's rows carry the CONTRACT, so the claim resolves the
+        # run's own leg id BY SYMBOL. Resolve against ``known_run_legs`` - the
+        # held legs and the generations a roll released - because a released leg
+        # that still nets non-zero is a real close row, and a claim that cannot
+        # name its leg would record the confirmation against nothing. Current
+        # legs win a shared symbol: the HELD leg is the one being traded.
+        run_legs: Dict[str, Dict[str, Any]] = {}
+        for leg in self.known_run_legs(run):
+            leg = dict(leg or {})
+            symbol = str(leg.get("tradingsymbol") or "")
+            if not symbol or symbol in run_legs:
+                continue
+            run_legs[symbol] = {
+                "leg_id": str(leg.get("leg_id") or ""),
+                "instrument_token": leg.get("instrument_token"),
+                "product": str(leg.get("product") or ""),
             }
-            for leg in (getattr(run, "legs", []) or [])
-        }
         legs = self._stage_legs(
             orders=orders,
             digest=digest,

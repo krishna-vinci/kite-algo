@@ -284,6 +284,8 @@ def _seed_run(
     orders: list | None = None,
     environment: str = "paper",
     worker_run_id: str = WORKER_RUN,
+    legs: list | None = None,
+    metadata: dict | None = None,
 ) -> str:
     store = DurableOptionRunStore(session_factory=session_factory)
     plan_id = str(plan_id or f"plan-{option_run_id}")
@@ -292,7 +294,7 @@ def _seed_run(
             strategy_run_id=option_run_id,
             strategy_name=strategy_id,
             product="NRML",
-            legs=_legs(),
+            legs=list(legs) if legs is not None else _legs(),
             protection={"structure_digest": "digest-exit"},
             metadata={
                 "strategy_id": strategy_id,
@@ -301,6 +303,7 @@ def _seed_run(
                 "worker_run_id": worker_run_id,
                 "plan_id": plan_id,
                 "source": "hosted_plan_execution",
+                **dict(metadata or {}),
             },
         )
     )
@@ -534,6 +537,122 @@ async def test_a_clean_entered_run_admits_one_short_stage_with_the_hedge_withhel
     assert len(claims) == 1
     assert claims[0]["state"] == "submitted"
     assert [leg["tradingsymbol"] for leg in claims[0]["legs"]] == [SHORT]
+
+
+@pytest.mark.asyncio
+async def test_a_rolled_run_admits_the_owner_exit_against_its_released_generation(
+    session_factory, monkeypatch
+):
+    """After a completed roll the owner exit still sees the run's OWN book.
+
+    The roll re-keys the run's HELD legs to the new generation; the released
+    generation is recorded in the run's own metadata history, and its fills keep
+    the OLD leg ids. Those ids are this run's own evidence, so the GET must not
+    read them as foreign (ambiguous), and the POST must submit the short-first
+    stage for the HELD short.
+    """
+    old_short, old_hedge = SHORT, HEDGE
+    new_short, new_hedge = "NIFTY26DEC22500CE", "NIFTY26DEC21500PE"
+    held = [
+        {
+            "leg_id": "roll:1",
+            "tradingsymbol": new_short,
+            "transaction_type": "SELL",
+            "quantity": 75,
+            "exchange": "NFO",
+            "product": "NRML",
+        },
+        {
+            "leg_id": "roll:2",
+            "tradingsymbol": new_hedge,
+            "transaction_type": "BUY",
+            "quantity": 75,
+            "exchange": "NFO",
+            "product": "NRML",
+        },
+    ]
+    released = [
+        {
+            "leg_id": "old:1",
+            "tradingsymbol": old_short,
+            "transaction_type": "SELL",
+            "quantity": 75,
+            "exchange": "NFO",
+            "product": "NRML",
+        },
+        {
+            "leg_id": "old:2",
+            "tradingsymbol": old_hedge,
+            "transaction_type": "BUY",
+            "quantity": 75,
+            "exchange": "NFO",
+            "product": "NRML",
+        },
+    ]
+    trades = [
+        # The released generation, proved empty by the roll, under its OLD ids.
+        {"leg_id": "old:1", "tradingsymbol": old_short, "transaction_type": "SELL", "quantity": 75},
+        {"leg_id": "old:1", "tradingsymbol": old_short, "transaction_type": "BUY", "quantity": 75},
+        {"leg_id": "old:2", "tradingsymbol": old_hedge, "transaction_type": "BUY", "quantity": 75},
+        {"leg_id": "old:2", "tradingsymbol": old_hedge, "transaction_type": "SELL", "quantity": 75},
+        # The held generation, filled by the roll's acquire half.
+        {"leg_id": "roll:1", "tradingsymbol": new_short, "transaction_type": "SELL", "quantity": 75},
+        {"leg_id": "roll:2", "tradingsymbol": new_hedge, "transaction_type": "BUY", "quantity": 75},
+    ]
+
+    store = DurableOptionRunStore(session_factory=session_factory)
+    paper = _FakePaperBoundary()
+    async with _client(session_factory, monkeypatch, store, paper) as client:
+        strategy_id = await _strategy(client)
+        run_id = _seed_run(
+            session_factory,
+            strategy_id=strategy_id,
+            legs=held,
+            trades=trades,
+            metadata={
+                "structure_generation": 2,
+                "structure_digest": "digest-new",
+                "structure_generation_history": [
+                    {
+                        "generation": 1,
+                        "structure_digest": "digest-old",
+                        "legs": released,
+                    }
+                ],
+            },
+        )
+
+        inspection = await client.get(_exit_url(strategy_id, run_id))
+        assert inspection.status_code == 200, inspection.text
+        body = inspection.json()
+        # NOT ambiguous: the released generation's fills belong to THIS run.
+        assert body["state"] == "residual", body
+        assert [
+            (row["tradingsymbol"], row["transaction_type"], row["quantity"])
+            for row in body["close_plan"]
+        ] == [(new_short, "BUY", 75)]
+
+        accepted = await client.post(
+            _exit_url(strategy_id, run_id),
+            json={"evidence_digest": body["evidence_digest"], "reason": "owner_exit"},
+        )
+        assert accepted.status_code == 200, accepted.text
+        payload = accepted.json()
+        assert payload["status"] == "accepted", payload
+        assert payload["run_status"] == "exiting"
+        assert [
+            (row["tradingsymbol"], row["transaction_type"], row["quantity"], row["state"])
+            for row in payload["items"]
+        ] == [(new_short, "BUY", 75, "submitted")]
+
+    # The stage attributes its cover to the HELD leg, not to nothing.
+    assert len(paper.calls) == 1
+    order = paper.calls[0]["order"]
+    assert order["tradingsymbol"] == new_short
+    assert order["transaction_type"] == "BUY"
+    claims = _stage_claims(session_factory, run_id)
+    assert len(claims) == 1
+    assert [leg["leg_id"] for leg in claims[0]["legs"]] == ["roll:1"]
 
 
 @pytest.mark.asyncio

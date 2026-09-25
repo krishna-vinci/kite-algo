@@ -31,6 +31,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 from .lifecycle import mark_cleanup_required, mark_closed, mark_exit_previewed, mark_exiting
 from .models import OptionRunState, OptionRunStatus
 from .plan_binding import PLAN_EXECUTION_FINISHED, PLAN_EXECUTION_UNKNOWN
+from ..protection.staged_exit import known_run_legs
 
 #: Only a run the platform knows is unfinished-but-readable is repairable.
 #: ``adjusting`` joins them because a leg generation that stopped mid-flight is
@@ -170,6 +171,16 @@ def assess_option_run_repair(
     that the run is stranded: the verdict is ``ambiguous`` with the reason
     ``adjust_in_flight`` rather than a close the platform might race.
 
+    A ROLLED run is a run the platform can still explain: the roll re-keys
+    ``run.legs`` to the new generation, and the released generations stay in the
+    run's own bounded metadata history. A fill on a released leg id is therefore
+    the run's OWN evidence (``StagedStructureExit.known_run_legs`` is the one rule
+    for which legs those are). A released leg that nets to ZERO is gone; one that
+    nets NON-ZERO is residual exposure and joins the close plan. A leg id in
+    neither the held legs nor any recorded generation stays unattributable, and
+    an UNREADABLE history is ``ambiguous``: the platform will not read a book it
+    cannot reconstruct, and it will not guess a leg away.
+
     ``unresolved_step_reader`` names the step(s) this verdict is waiting on, so an
     ``ambiguous`` run is addressable without a second opinion about what
     "unresolved" means: the WHICH comes from the fold's own evidence
@@ -178,8 +189,14 @@ def assess_option_run_repair(
     """
     option_run_id = str(getattr(run, "strategy_run_id", "") or "")
     status = str(getattr(run, "status", "") or "").strip().lower()
-    legs = [dict(leg or {}) for leg in (getattr(run, "legs", []) or [])]
-    known_leg_ids = {str(leg.get("leg_id") or "") for leg in legs}
+    # The run's own legs INCLUDING the generations a roll released and recorded
+    # in its metadata (``StagedStructureExit.known_run_legs``). After a roll the
+    # held legs are the new generation, but the OLD generation's confirmed fills
+    # still carry its leg ids - and those ids are still THIS run's evidence, not
+    # a foreign fill. Reading the rule from the same helper the exit engine uses
+    # is what keeps the repair/owner-exit book and the protection book one.
+    legs: List[Dict[str, Any]] = []
+    known_leg_ids: set = set()
 
     reasons: List[str] = []
     unreadable: List[Dict[str, Any]] = []
@@ -194,6 +211,12 @@ def assess_option_run_repair(
     close_detail: Dict[str, Any] = {}
 
     try:
+        legs = [dict(leg or {}) for leg in staged_exit.known_run_legs(run)]
+        known_leg_ids = {str(leg.get("leg_id") or "") for leg in legs}
+    except Exception as exc:  # noqa: BLE001 - an unreadable history is not "flat"
+        unreadable.append({"stage": "leg_history", "error": type(exc).__name__})
+
+    try:
         unresolved = staged_exit.unresolved_stage(run)
         open_by_leg = _sorted_quantities(staged_exit.own_open_by_leg(run))
         buy, sell = staged_exit.outstanding_by_symbol(run)
@@ -205,9 +228,11 @@ def assess_option_run_repair(
         unreadable.append({"stage": "own_fills", "error": type(exc).__name__})
 
     if not unreadable:
-        # The run's OWN trades have to describe the run's OWN legs. A fill the run
-        # cannot attribute is not evidence about it, and netting it (or ignoring it)
-        # could prove a short closed that is still open.
+        # The run's OWN trades have to describe the run's OWN legs - the held
+        # generation OR a generation a roll recorded as released. A fill in
+        # NEITHER is not evidence about this run, and netting it (or ignoring it)
+        # could prove a short closed that is still open; an unreadable history is
+        # the same refusal, because it may be hiding the leg that explains a fill.
         for trade in getattr(run, "trades", []) or []:
             row = dict(trade or {})
             leg_id = str(row.get("leg_id") or "")
@@ -493,10 +518,15 @@ def option_run_ledger_consistency_reader(session_factory: Any) -> Callable[[Any]
 
 def pending_leg_ids(run: OptionRunState, close_plan: List[Dict[str, Any]]) -> List[str]:
     """The run leg ids a residual close is working on, in plan order."""
-    by_symbol = {
-        str((leg or {}).get("tradingsymbol") or ""): str((leg or {}).get("leg_id") or "")
-        for leg in (getattr(run, "legs", []) or [])
-    }
+    # Resolved against the SAME known legs the close plan was derived from - the
+    # held generation and any generation a roll released - so a residual held by
+    # an old leg is recorded as that leg's pending close, not as none.
+    by_symbol: Dict[str, str] = {}
+    for leg in known_run_legs(run):
+        leg = dict(leg or {})
+        symbol = str(leg.get("tradingsymbol") or "")
+        if symbol and symbol not in by_symbol:
+            by_symbol[symbol] = str(leg.get("leg_id") or "")
     pending: List[str] = []
     for order in close_plan or []:
         order = dict(order or {})
