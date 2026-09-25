@@ -387,5 +387,238 @@ class OptionRunBindingFreezeTests(OptionStructureTestCase):
         self.assertEqual(ctx.exception.reason_code, "PAYLOAD_INVALID")
 
 
+class AdjustPhaseFreezeTests(OptionStructureTestCase):
+    """``adjust`` compiles and freezes the TARGET; S1 executes nothing."""
+
+    def _seed_hedge_and_short(self):
+        # Seeded once per test instance: the catalogue rows are shared by every
+        # payload the test compiles, so a second insert would collide.
+        if getattr(self, "_seeded", False):
+            return
+        self.option(strike=25000, option_type="CE", token=501)
+        self.option(strike=24800, option_type="PE", token=502)
+        self._seeded = True
+
+    def _hedge_and_short(self):
+        self._seed_hedge_and_short()
+        return [
+            self.leg(strike=25000, option_type="CE", token=501, side="BUY", role="hedge"),
+            self.leg(strike=24800, option_type="PE", token=502, side="SELL", role="short"),
+        ]
+
+    def _adjust_payload(self, **overrides):
+        values = {
+            "phase": "adjust",
+            "option_run_id": "opt_run_abc123",
+            "based_on_generation": 3,
+            "structure_units": 2,
+            "protection_policy": {
+                "kind": "combined_premium_stop",
+                "stop_points": 40,
+                "naked": False,
+            },
+            "max_loss": {"basis": "worst_case_at_expiry", "max_loss_inr": 25000},
+        }
+        values.update(overrides)
+        return self.payload(self._hedge_and_short(), **values)
+
+    def test_an_adjust_payload_freezes_the_target(self):
+        plan = self.compile(self._adjust_payload())
+        resolved = plan.resolved
+        self.assertEqual(
+            resolved["option_run"],
+            {
+                "phase": "adjust",
+                "option_run_id": "opt_run_abc123",
+                "based_on_generation": 3,
+            },
+        )
+        self.assertEqual(resolved["structure_units"], 2)
+        self.assertEqual(
+            resolved["protection_policy"],
+            {"kind": "combined_premium_stop", "stop_points": 40, "naked": False},
+        )
+        self.assertEqual(
+            resolved["max_loss"], {"basis": "worst_case_at_expiry", "max_loss_inr": 25000}
+        )
+        # Effective size is lot_size * ratio * structure_units. ``desired_quantity``
+        # is the unsigned magnitude; ``side`` stays the authority on direction.
+        hedge, short = resolved["legs"]
+        self.assertEqual(hedge["desired_quantity"], 150)
+        self.assertEqual(hedge["signed_quantity"], 150)
+        self.assertEqual(hedge["role"], "hedge")
+        self.assertEqual(short["desired_quantity"], 150)
+        self.assertEqual(short["signed_quantity"], -150)
+        self.assertEqual(short["role"], "short")
+        # The logical plan carries the role and the frozen policies too.
+        self.assertEqual([leg["role"] for leg in plan.logical["legs"]], ["hedge", "short"])
+        self.assertEqual(plan.logical["protection_policy"], resolved["protection_policy"])
+        self.assertEqual(plan.logical["max_loss"], resolved["max_loss"])
+        self.assertEqual(plan.logical["option_run"]["phase"], "adjust")
+        self.assertEqual(plan.logical["option_run"]["option_run_id"], "opt_run_abc123")
+
+    def test_an_adjust_without_a_run_reference_is_refused(self):
+        from backend.strategies.compiler.base import ValidationRefusal
+
+        with self.assertRaises(ValidationRefusal) as ctx:
+            self.compile(self._adjust_payload(option_run_id=None))
+        self.assertEqual(ctx.exception.reason_code, "OPTION_ADJUSTMENT_REFERENCE_REQUIRED")
+
+    def test_an_adjust_without_a_basis_is_refused(self):
+        from backend.strategies.compiler.base import ValidationRefusal
+
+        with self.assertRaises(ValidationRefusal) as ctx:
+            self.compile(self._adjust_payload(based_on_generation=None))
+        self.assertEqual(ctx.exception.reason_code, "OPTION_ADJUSTMENT_BASIS_REQUIRED")
+
+    def test_an_invalid_basis_is_refused(self):
+        from backend.strategies.compiler.base import ValidationRefusal
+
+        for bad in (0, -1, 1.5, "soon"):
+            with self.subTest(basis=bad):
+                with self.assertRaises(ValidationRefusal) as ctx:
+                    self.compile(self._adjust_payload(based_on_generation=bad))
+                self.assertEqual(ctx.exception.reason_code, "PAYLOAD_INVALID")
+
+    def test_invalid_structure_units_are_refused(self):
+        from backend.strategies.compiler.base import ValidationRefusal
+
+        for bad in (0, -2, 1.5, "many"):
+            with self.subTest(units=bad):
+                with self.assertRaises(ValidationRefusal) as ctx:
+                    self.compile(self._adjust_payload(structure_units=bad))
+                self.assertEqual(ctx.exception.reason_code, "PAYLOAD_INVALID")
+
+    def test_a_bad_leg_role_is_refused(self):
+        from backend.strategies.compiler.base import ValidationRefusal
+
+        self.option(strike=25000, option_type="CE", token=501)
+        with self.assertRaises(ValidationRefusal) as ctx:
+            self.compile(
+                self.payload(
+                    [
+                        self.leg(
+                            strike=25000, option_type="CE", token=501,
+                            side="BUY", role="underwriter",
+                        )
+                    ]
+                )
+            )
+        self.assertEqual(ctx.exception.reason_code, "PAYLOAD_INVALID")
+        self.assertEqual(ctx.exception.detail["leg_index"], 0)
+
+    def test_a_non_boolean_naked_flag_is_refused(self):
+        from backend.strategies.compiler.base import ValidationRefusal
+
+        with self.assertRaises(ValidationRefusal) as ctx:
+            self.compile(self._adjust_payload(protection_policy={"naked": "yes"}))
+        self.assertEqual(ctx.exception.reason_code, "PAYLOAD_INVALID")
+
+    def test_a_non_object_policy_is_refused(self):
+        from backend.strategies.compiler.base import ValidationRefusal
+
+        for bad in ("stop", [1, 2]):
+            with self.subTest(policy=bad):
+                with self.assertRaises(ValidationRefusal) as ctx:
+                    self.compile(self._adjust_payload(protection_policy=bad))
+                self.assertEqual(ctx.exception.reason_code, "PAYLOAD_INVALID")
+        with self.assertRaises(ValidationRefusal) as ctx:
+            self.compile(self._adjust_payload(max_loss=25000))
+        self.assertEqual(ctx.exception.reason_code, "PAYLOAD_INVALID")
+
+    def test_adjust_is_never_inferred_from_a_reference(self):
+        # A reference implies EXIT, and nothing else. Only an explicit
+        # ``phase: "adjust"`` selects the adjust shape, so the basis and the
+        # per-leg target stay out of a payload that never declared it.
+        plan = self.compile(self._adjust_payload(phase=None))
+        self.assertEqual(
+            plan.resolved["option_run"],
+            {"phase": "exit", "option_run_id": "opt_run_abc123"},
+        )
+        self.assertNotIn("desired_quantity", plan.resolved["legs"][0])
+
+    def test_structure_units_do_not_change_the_shape_digest(self):
+        self.option(strike=25000, option_type="CE", token=501)
+        leg = self.leg(strike=25000, option_type="CE", token=501, side="SELL")
+        base = self.compile(self.payload([leg]))
+        explicit = self.compile(self.payload([leg], structure_units=1))
+        resized = self.compile(self.payload([leg], structure_units=4))
+        # Size is carried BESIDE the digest: a resize is not a new structure.
+        self.assertEqual(base.resolved["structure_digest"], explicit.resolved["structure_digest"])
+        self.assertEqual(base.resolved["structure_digest"], resized.resolved["structure_digest"])
+        self.assertNotIn("structure_units", base.resolved)
+        self.assertEqual(explicit.resolved["structure_units"], 1)
+        self.assertEqual(resized.resolved["legs"][0]["quantity"], 300)
+
+
+class LegacyFreezeCompatibilityTests(OptionStructureTestCase):
+    """A legacy entry/exit payload freezes BYTE-IDENTICALLY to the old output.
+
+    The constants are the canonical JSON the compiler produced before the adjust
+    phase, ``structure_units``, roles and the frozen policies existed. They are
+    the regression guard for "a defaulted key is only written when supplied".
+    """
+
+    ENTRY_RESOLVED = (
+        '{"catalog_generation":"11111111-1111-1111-1111-111111111111",'
+        '"expiry":"2026-10-29","expiry_policy":"allow_cash_settlement",'
+        '"legs":[{"broker_exchange":"NFO","broker_symbol":"NIFTY26OCT25000CE",'
+        '"broker_token":501,"exchange":"NFO","expiry":"2026-10-29",'
+        '"instrument_id":"opt-25000-CE","instrument_type":"CE","lot_size":75,'
+        '"option_type":"CE","product":"NRML","quantity":75,"ratio":1,'
+        '"reference_price":100.0,"selection":null,"side":"BUY","signed_quantity":75,'
+        '"strike":25000.0,"tradingsymbol":"NIFTY26OCT25000CE"}],'
+        '"option_run":{"option_run_id":null,"phase":"entry"},'
+        '"structure_digest":"9327b02a176d2af6f11e7a98d7a35778a36b26659338e625d9eb05430dd6e9b7",'
+        '"structure_id":"","target_kind":"option_structure","underlying":"NIFTY"}'
+    )
+    ENTRY_LOGICAL = (
+        '{"expiry":"2026-10-29","expiry_policy":"allow_cash_settlement",'
+        '"legs":[{"option_type":"CE","ratio":1,"side":"BUY","strike":25000.0}],'
+        '"option_run":{"option_run_id":null,"phase":"entry"},"product":"NRML",'
+        '"structure_id":"","target_kind":"option_structure","underlying":"NIFTY"}'
+    )
+    EXIT_RESOLVED = (
+        '{"catalog_generation":"11111111-1111-1111-1111-111111111111",'
+        '"expiry":"2026-10-29","expiry_policy":"allow_cash_settlement",'
+        '"legs":[{"broker_exchange":"NFO","broker_symbol":"NIFTY26OCT25000CE",'
+        '"broker_token":501,"exchange":"NFO","expiry":"2026-10-29",'
+        '"instrument_id":"opt-25000-CE","instrument_type":"CE","lot_size":75,'
+        '"option_type":"CE","product":"NRML","quantity":75,"ratio":1,'
+        '"reference_price":100.0,"selection":null,"side":"BUY","signed_quantity":75,'
+        '"strike":25000.0,"tradingsymbol":"NIFTY26OCT25000CE"}],'
+        '"option_run":{"option_run_id":"opt_run_abc123","phase":"exit"},'
+        '"structure_digest":"9327b02a176d2af6f11e7a98d7a35778a36b26659338e625d9eb05430dd6e9b7",'
+        '"structure_id":"","target_kind":"option_structure","underlying":"NIFTY"}'
+    )
+    EXIT_LOGICAL = (
+        '{"expiry":"2026-10-29","expiry_policy":"allow_cash_settlement",'
+        '"legs":[{"option_type":"CE","ratio":1,"side":"BUY","strike":25000.0}],'
+        '"option_run":{"option_run_id":"opt_run_abc123","phase":"exit"},'
+        '"product":"NRML","structure_id":"","target_kind":"option_structure",'
+        '"underlying":"NIFTY"}'
+    )
+
+    def _legacy_leg(self):
+        self.option(strike=25000, option_type="CE", token=501)
+        return self.leg(strike=25000, option_type="CE", token=501, side="BUY")
+
+    def test_a_legacy_entry_payload_freezes_exactly_as_before(self):
+        from backend.strategies.compiler.base import canonical_json
+
+        plan = self.compile(self.payload([self._legacy_leg()]))
+        self.assertEqual(canonical_json(plan.resolved), self.ENTRY_RESOLVED)
+        self.assertEqual(canonical_json(plan.logical), self.ENTRY_LOGICAL)
+
+    def test_a_legacy_exit_payload_freezes_exactly_as_before(self):
+        from backend.strategies.compiler.base import canonical_json
+
+        plan = self.compile(
+            self.payload([self._legacy_leg()], option_run_id="opt_run_abc123")
+        )
+        self.assertEqual(canonical_json(plan.resolved), self.EXIT_RESOLVED)
+        self.assertEqual(canonical_json(plan.logical), self.EXIT_LOGICAL)
+
+
 if __name__ == "__main__":
     unittest.main()

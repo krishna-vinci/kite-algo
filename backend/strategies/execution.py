@@ -1060,6 +1060,13 @@ class PaperPlanExecutor:
         """
         plan_id = str(plan.get("plan_id") or "")
         phase = str(target.get("phase") or "")
+        if phase == "adjust":
+            # Frozen in S1, executed in S2. Until then an adjust plan must never
+            # fall through to the entry or exit derivation.
+            raise ExecutionRefusal(
+                "OPTION_ADJUSTMENT_NOT_EXECUTABLE",
+                {"plan_id": plan_id, "phase": phase},
+            )
         run = target["run"]
         frozen = [dict(leg) for leg in (plan.get("resolved_plan") or {}).get("legs") or []]
         if not frozen:
@@ -1231,6 +1238,11 @@ class PaperPlanExecutor:
         _ = actor
         run = target["run"]
         phase = str(target.get("phase") or "")
+        if phase == "adjust":
+            raise ExecutionRefusal(
+                "OPTION_ADJUSTMENT_NOT_EXECUTABLE",
+                {"plan_id": plan_id, "phase": phase},
+            )
         store = self._option_runs()
         observed = str(run.status)
         try:
@@ -1353,6 +1365,11 @@ class PaperPlanExecutor:
 
         store = self._option_runs()
         phase = str(target.get("phase") or "")
+        if phase == "adjust":
+            raise ExecutionRefusal(
+                "OPTION_ADJUSTMENT_NOT_EXECUTABLE",
+                {"plan_id": plan_id, "phase": phase},
+            )
         legs_by_step = {int(step[0]): step for step in step_order}
         orders: List[Dict[str, Any]] = []
         trades: List[Dict[str, Any]] = []

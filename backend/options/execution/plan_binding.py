@@ -253,7 +253,7 @@ def _frozen_option_run_block(plan: Mapping[str, Any]) -> dict[str, Any]:
 def _frozen_phase(plan: Mapping[str, Any], *, default: str) -> str:
     block = _frozen_option_run_block(plan)
     phase = str(block.get("phase") or "").strip().lower()
-    if phase in ("entry", "exit"):
+    if phase in ("entry", "exit", "adjust"):
         return phase
     if phase:
         raise PlanBindingRefusal(
@@ -502,6 +502,10 @@ def _to_execution_leg(leg: Mapping[str, Any], *, plan_id: str, index: int) -> di
     quantity = leg.get("quantity")
     if quantity is None:
         quantity = abs(int(leg.get("signed_quantity") or 0))
+    # Lots follow the frozen quantity (ratio x structure_units), not the ratio
+    # alone, so a multi-unit structure's run legs describe what they hold.
+    lot_size = int(leg.get("lot_size") or 0)
+    lots = abs(int(quantity or 0)) // lot_size if lot_size > 0 else leg.get("ratio")
     return {
         "leg_id": f"{plan_id}:{index}",
         "tradingsymbol": str(leg.get("broker_symbol") or leg.get("tradingsymbol") or ""),
@@ -513,7 +517,7 @@ def _to_execution_leg(leg: Mapping[str, Any], *, plan_id: str, index: int) -> di
         "option_type": leg.get("option_type"),
         "expiry_key": leg.get("expiry"),
         "lot_size": leg.get("lot_size"),
-        "lots": leg.get("ratio"),
+        "lots": lots,
         "metadata": {
             "instrument_id": str(leg.get("instrument_id") or ""),
             "role": "entry",
@@ -643,9 +647,25 @@ def resolve_plan_option_run(
     Exit: the frozen ``option_run`` reference is a LOOKUP KEY; ownership,
     environment and exact leg identity are validated against the durable run and
     its entry binding before anything is submitted.
+    Adjust: frozen in S1 but not yet executable, so it refuses by name here
+    rather than falling into either branch above.
     """
     plan_id = str(plan.get("plan_id") or "")
     phase = _frozen_phase(plan, default=default_phase)
+    if phase == "adjust":
+        # S1 freezes adjust; it does not execute it. Refuse by name BEFORE the
+        # binding short-circuit so an adjust plan can never resolve into the
+        # entry branch (create a run) or the exit branch (validate a close).
+        raise PlanBindingRefusal(
+            "OPTION_ADJUSTMENT_NOT_EXECUTABLE",
+            {
+                "plan_id": plan_id,
+                "message": (
+                    "an adjust plan is frozen but not executable until the adjust "
+                    "engine lands; it is never treated as an entry or an exit"
+                ),
+            },
+        )
     existing = binding_store.get(plan_id)
     if existing is not None:
         # A retry of an entry/exit plan resolves to the SAME run.

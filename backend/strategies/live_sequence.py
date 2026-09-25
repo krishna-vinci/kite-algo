@@ -742,6 +742,17 @@ def build_option_steps(ctx: LaneContext) -> List[StepSpec]:
         )
     target = dict(ctx.option_target(dict(ctx.plan), dict(ctx.binding)))
     phase = str(target.get("phase") or "")
+    if phase == "adjust":
+        # B2.2 is paper-only; the live lane must refuse an adjust plan by name
+        # rather than reuse the entry/exit dependency rules for it.
+        raise LiveRefusal(
+            "LIVE_OPTION_ADJUST_UNSUPPORTED",
+            {
+                "plan_id": ctx.plan_id,
+                "phase": phase,
+                "message": "the live option lane does not support an adjust plan",
+            },
+        )
     run = target.get("run")
     run_id = str(getattr(run, "strategy_run_id", "") or target.get("option_run_id") or "")
     steps = list(ctx.option_run_steps(dict(ctx.plan), target))

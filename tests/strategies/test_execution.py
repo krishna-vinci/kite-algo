@@ -2367,6 +2367,56 @@ class ExecutorOptionRunBindingTests(ExecutorTestCase, unittest.IsolatedAsyncioTe
 
         return ExecutionRefusal
 
+    def test_an_adjust_plan_refuses_at_the_binding_edge_by_name(self):
+        """S1 freezes adjust; it never resolves into the entry or exit branch."""
+        from backend.options.execution.durable_store import DurableOptionRunStore
+        from backend.options.execution.plan_binding import (
+            PlanBindingRefusal,
+            PlanOptionRunBindingStore,
+            is_option_entry_plan,
+            resolve_plan_option_run,
+        )
+
+        short, hedge = self._entry_legs()
+        self.seed_strategy()
+        self.seed_validated_plan(
+            "plan-adjust",
+            plan_kind="option_structure",
+            legs=[short, hedge],
+            resolved_extra={
+                "option_run": {
+                    "phase": "adjust",
+                    "option_run_id": "opt-run-existing",
+                    "based_on_generation": 1,
+                }
+            },
+        )
+        plan = _plan_view_for(self.factory, "plan-adjust")
+        # The entry gate must not claim an adjust plan.
+        self.assertFalse(is_option_entry_plan(plan))
+        with self.assertRaises(PlanBindingRefusal) as ctx:
+            resolve_plan_option_run(
+                plan,
+                strategy_id=STRATEGY,
+                account_id=ACCOUNT,
+                execution_environment="paper",
+                worker_run_id="run-plan-adjust",
+                binding_store=PlanOptionRunBindingStore(session_factory=self.factory),
+                run_store=DurableOptionRunStore(session_factory=self.factory),
+            )
+        self.assertEqual(ctx.exception.reason_code, "OPTION_ADJUSTMENT_NOT_EXECUTABLE")
+        # Neither branch ran: no run was created and no binding was written.
+        self.assertEqual(self._run_count(), 0)
+        self.assertEqual(self._binding_rows("plan-adjust"), [])
+
+    def test_the_option_step_derivation_refuses_an_adjust_target(self):
+        from backend.strategies.execution import ExecutionRefusal
+
+        executor = self.build_executor()
+        with self.assertRaises(ExecutionRefusal) as ctx:
+            executor._option_run_steps({}, {"phase": "adjust", "run": object()})
+        self.assertEqual(ctx.exception.reason_code, "OPTION_ADJUSTMENT_NOT_EXECUTABLE")
+
 
 class ExecutorOptionContinuityTests(ExecutorTestCase, unittest.IsolatedAsyncioTestCase):
     """Phase B1: a held structure is never opened twice, and never closed twice.

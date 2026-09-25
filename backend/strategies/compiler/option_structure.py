@@ -46,6 +46,9 @@ EXPIRY_POLICIES = (
 #: Policies that settle physically, and therefore need capability evidence.
 PHYSICAL_POLICIES = ("allow_physical_settlement",)
 
+#: The frozen per-leg roles (``side`` stays the authority; a role is coverage).
+LEG_ROLES = ("hedge", "short", "naked")
+
 #: The chain resolver shape: keyword selection in, one contract or ``None`` out.
 ChainResolver = Callable[..., Optional[Mapping[str, Any]]]
 
@@ -61,6 +64,48 @@ def _as_ratio(value: Any) -> int:
             {"ratio": value, "message": "A leg ratio must be a positive whole number"},
         )
     return int(numeric)
+
+
+def _as_structure_units(value: Any) -> int:
+    """The size multiplier: a positive whole number, defaulting to one."""
+    try:
+        numeric = float(value if value is not None else 1)
+    except (TypeError, ValueError) as exc:
+        raise ValidationRefusal("PAYLOAD_INVALID", {"reason": str(exc)}) from exc
+    if numeric != int(numeric) or int(numeric) <= 0:
+        raise ValidationRefusal(
+            "PAYLOAD_INVALID",
+            {
+                "structure_units": value,
+                "message": "structure_units must be a positive whole number",
+            },
+        )
+    return int(numeric)
+
+
+def _as_positive_int(value: Any, *, field: str) -> int:
+    """Required positive whole number (the adjust generation basis)."""
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValidationRefusal("PAYLOAD_INVALID", {field: value, "reason": str(exc)}) from exc
+    if numeric != int(numeric) or int(numeric) <= 0:
+        raise ValidationRefusal(
+            "PAYLOAD_INVALID",
+            {field: value, "message": f"{field} must be a positive whole number"},
+        )
+    return int(numeric)
+
+
+def _as_optional_object(value: Any, *, field: str) -> Optional[Dict[str, Any]]:
+    """An optional frozen sub-object (``protection_policy`` / ``max_loss``)."""
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValidationRefusal(
+            "PAYLOAD_INVALID", {field: value, "message": f"{field} must be an object"}
+        )
+    return dict(value)
 
 
 def _as_optional_float(value: Any) -> Optional[float]:
@@ -112,6 +157,22 @@ class OptionStructureCompiler(TargetCompiler):
         underlying = str(payload.get("underlying") or "").upper()
         structure_expiry = _expiry_iso(payload.get("expiry"))
         product = str(payload.get("product") or "NRML").upper()
+        structure_units = _as_structure_units(payload.get("structure_units"))
+        protection_policy = _as_optional_object(
+            payload.get("protection_policy"), field="protection_policy"
+        )
+        if protection_policy is not None and "naked" in protection_policy:
+            # A naked declaration is a boolean; anything else would make the
+            # naked gate read a value the compiler never validated.
+            if not isinstance(protection_policy["naked"], bool):
+                raise ValidationRefusal(
+                    "PAYLOAD_INVALID",
+                    {
+                        "protection_policy": protection_policy,
+                        "message": "protection_policy.naked must be a boolean",
+                    },
+                )
+        max_loss = _as_optional_object(payload.get("max_loss"), field="max_loss")
 
         resolved_legs: List[Dict[str, Any]] = []
         for index, leg_payload in enumerate(legs_payload):
@@ -127,15 +188,29 @@ class OptionStructureCompiler(TargetCompiler):
                     product=product,
                     underlying=underlying,
                     structure_expiry=structure_expiry,
+                    structure_units=structure_units,
                     chain_resolver=chain_resolver,
                 )
             )
 
         expiry_policy = self._expiry_policy(payload, legs=resolved_legs)
-        phase, option_run_id = self._option_run_binding(payload)
+        phase, option_run_id, based_on_generation = self._option_run_binding(payload)
+        if phase == "adjust":
+            # The desired TARGET each leg must converge to. Sign comes from
+            # ``side``: ``desired_quantity`` is the unsigned magnitude, exactly
+            # like the legacy ``quantity`` field it mirrors.
+            for leg in resolved_legs:
+                leg["desired_quantity"] = int(leg["quantity"])
         digest = self._structure_digest(
             underlying=underlying, expiry=structure_expiry, legs=resolved_legs
         )
+
+        option_run: Dict[str, Any] = {"phase": phase, "option_run_id": option_run_id}
+        frozen_option_run = dict(option_run)
+        if phase == "adjust":
+            # The generation the strategy observed. Frozen in the RESOLVED block
+            # so a stale basis refuses instead of being recomputed.
+            frozen_option_run["based_on_generation"] = based_on_generation
 
         logical: Dict[str, Any] = {
             "target_kind": self.target_kind,
@@ -144,16 +219,8 @@ class OptionStructureCompiler(TargetCompiler):
             "product": product,
             "structure_id": str(payload.get("structure_id") or ""),
             "expiry_policy": expiry_policy,
-            "option_run": {"phase": phase, "option_run_id": option_run_id},
-            "legs": [
-                {
-                    "option_type": leg["option_type"],
-                    "strike": leg["strike"],
-                    "side": leg["side"],
-                    "ratio": leg["ratio"],
-                }
-                for leg in resolved_legs
-            ],
+            "option_run": option_run,
+            "legs": [self._logical_leg(leg) for leg in resolved_legs],
         }
         resolved: Dict[str, Any] = {
             "target_kind": self.target_kind,
@@ -167,36 +234,70 @@ class OptionStructureCompiler(TargetCompiler):
             # plan carries the option-run reference it closes; an entry plan
             # creates the run. Re-deciding this at execution would let a caller
             # change which structure a plan closes.
-            "option_run": {"phase": phase, "option_run_id": option_run_id},
+            "option_run": frozen_option_run,
             "legs": resolved_legs,
         }
+        # Legacy entry/exit payloads must freeze byte-identically, so a key with
+        # a default is only written when the payload supplied it (or this is an
+        # adjust, which has no legacy shape to preserve).
+        if "structure_units" in payload or phase == "adjust":
+            resolved["structure_units"] = structure_units
+        if protection_policy is not None:
+            logical["protection_policy"] = protection_policy
+            resolved["protection_policy"] = protection_policy
+        if max_loss is not None:
+            logical["max_loss"] = max_loss
+            resolved["max_loss"] = max_loss
         return ResolvedPlan(target_kind=self.target_kind, logical=logical, resolved=resolved)
 
     # -- run binding --------------------------------------------------------
 
     @staticmethod
-    def _option_run_binding(payload: Mapping[str, Any]) -> tuple[str, Optional[str]]:
-        """The frozen phase and the option-run reference an EXIT closes.
+    def _logical_leg(leg: Mapping[str, Any]) -> Dict[str, Any]:
+        """The logical leg: identity, direction and size ratio (and role)."""
+        logical_leg: Dict[str, Any] = {
+            "option_type": leg["option_type"],
+            "strike": leg["strike"],
+            "side": leg["side"],
+            "ratio": leg["ratio"],
+        }
+        if leg.get("role") is not None:
+            logical_leg["role"] = leg["role"]
+        return logical_leg
+
+    @staticmethod
+    def _option_run_binding(
+        payload: Mapping[str, Any],
+    ) -> tuple[str, Optional[str], Optional[int]]:
+        """The frozen phase, the option-run reference it acts on, and the basis.
 
         The reference is a lookup key, never authority: the executor re-validates
         ownership, environment and leg identity against the durable run. But it
         must be frozen, because choosing it later would let a caller point a plan
         at a structure it never described.
+
+        ``adjust`` names the run it mutates exactly as ``exit`` does, and freezes
+        the generation it observed so a stale basis refuses instead of being
+        recomputed against a newer run.
         """
         declared_phase = payload.get("phase")
         reference = payload.get("option_run_id")
+        basis = payload.get("based_on_generation")
         block = payload.get("option_run")
         if isinstance(block, Mapping):
             declared_phase = block.get("phase", declared_phase)
             reference = block.get("option_run_id", reference)
+            basis = block.get("based_on_generation", basis)
         phase = None if declared_phase in (None, "") else str(declared_phase).strip().lower()
         option_run_id = None if reference in (None, "") else str(reference).strip()
         if phase is None:
+            # A reference implies the close it describes, none implies entry.
+            # ``adjust`` is NEVER inferred: a resize must name its phase.
             phase = "exit" if option_run_id else "entry"
-        if phase not in ("entry", "exit"):
+        if phase not in ("entry", "exit", "adjust"):
             raise ValidationRefusal(
                 "PAYLOAD_INVALID",
-                {"phase": phase, "allowed": ["entry", "exit"]},
+                {"phase": phase, "allowed": ["entry", "exit", "adjust"]},
             )
         if phase == "exit" and not option_run_id:
             raise ValidationRefusal(
@@ -208,7 +309,30 @@ class OptionStructureCompiler(TargetCompiler):
                     )
                 },
             )
-        return phase, option_run_id
+        if phase == "adjust" and not option_run_id:
+            raise ValidationRefusal(
+                "OPTION_ADJUSTMENT_REFERENCE_REQUIRED",
+                {
+                    "message": (
+                        "An adjust plan must reference the option run it changes; the "
+                        "reference is validated at execution, never trusted"
+                    )
+                },
+            )
+        based_on_generation: Optional[int] = None
+        if phase == "adjust":
+            if basis in (None, ""):
+                raise ValidationRefusal(
+                    "OPTION_ADJUSTMENT_BASIS_REQUIRED",
+                    {
+                        "message": (
+                            "An adjust plan must freeze the option-run generation it "
+                            "observed; the basis is what makes a stale adjustment refuse"
+                        )
+                    },
+                )
+            based_on_generation = _as_positive_int(basis, field="based_on_generation")
+        return phase, option_run_id, based_on_generation
 
     # -- legs ---------------------------------------------------------------
 
@@ -221,8 +345,16 @@ class OptionStructureCompiler(TargetCompiler):
         product: str,
         underlying: str,
         structure_expiry: Optional[str],
+        structure_units: int,
         chain_resolver: Optional[ChainResolver],
     ) -> Dict[str, Any]:
+        """Resolve one leg against the pin and size it.
+
+        ``quantity`` is the UNSIGNED magnitude ``lot_size * ratio *
+        structure_units``, and ``signed_quantity`` carries the sign of ``side``.
+        The frozen ``desired_quantity`` of an adjust leg mirrors ``quantity`` for
+        the same reason: ``side`` stays the authority on direction.
+        """
         selection = leg.get("selection")
         if selection is not None:
             mapping = self._resolve_selection(
@@ -273,12 +405,21 @@ class OptionStructureCompiler(TargetCompiler):
         side = str(leg.get("side") or "BUY").upper()
         if side not in ("BUY", "SELL"):
             raise ValidationRefusal("PAYLOAD_INVALID", {"leg_index": index, "side": side})
-        quantity = lot_size * ratio
+        role_raw = leg.get("role")
+        role: Optional[str] = None
+        if role_raw not in (None, ""):
+            role = str(role_raw).strip().lower()
+            if role not in LEG_ROLES:
+                raise ValidationRefusal(
+                    "PAYLOAD_INVALID",
+                    {"leg_index": index, "role": str(role_raw), "allowed": list(LEG_ROLES)},
+                )
+        quantity = lot_size * ratio * structure_units
         reference_price = _as_optional_float(leg.get("reference_price"))
         if reference_price is None:
             reference_price = _as_optional_float(mapping.get("reference_price"))
 
-        return {
+        resolved_leg: Dict[str, Any] = {
             "instrument_id": str(mapping["instrument_id"]),
             "exchange": str(mapping.get("exchange") or ""),
             "tradingsymbol": str(mapping.get("tradingsymbol") or ""),
@@ -298,6 +439,9 @@ class OptionStructureCompiler(TargetCompiler):
             "reference_price": reference_price,
             "selection": dict(selection) if selection else None,
         }
+        if role is not None:
+            resolved_leg["role"] = role
+        return resolved_leg
 
     def _resolve_direct(
         self, *, index: int, leg: Mapping[str, Any], pinned: PinnedCatalogRead
