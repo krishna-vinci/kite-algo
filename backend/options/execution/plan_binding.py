@@ -18,7 +18,7 @@ re-checked against what the platform persisted.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from sqlalchemy import text
 from backend.app.database import SessionLocal
@@ -620,6 +620,149 @@ def _frozen_leg_quantity(leg: Mapping[str, Any]) -> Optional[int]:
     return None
 
 
+#: The plan-execution states the adjust takeover rule understands. Only
+#: ``finished`` lets anything be re-derived on top of a plan's own work.
+PLAN_EXECUTION_FINISHED = "finished"
+PLAN_EXECUTION_IN_FLIGHT = "in_flight"
+PLAN_EXECUTION_UNKNOWN = "unknown"
+
+#: The trail event that means a step was COMMITTED to the runtime and has no
+#: outcome yet. Mirrors ``backend.strategies.execution_snapshot``'s pending
+#: vocabulary and the executor's own ``PLAN_ALREADY_EXECUTED`` proof.
+_PLAN_TRAIL_SUBMITTED = "submitted"
+
+
+def option_plan_execution_state(plan_id: str, *, session: Any) -> Dict[str, Any]:
+    """Whether ONE plan's own execution has FINISHED, from durable records only.
+
+    The signal is the plan's OWN append-only trail
+    (``strategy_plan_execution_events``) - the same trail the executor's
+    ``PLAN_ALREADY_EXECUTED`` guard reads and the owned-work snapshot folds. No
+    clock, no caller assertion and no new storage: a plan is finished exactly
+    when its own committed work has all been answered.
+
+    * ``finished`` - the plan committed at least one submission and every
+      submission it made carries an outcome (``filled`` / ``partially_filled`` /
+      ``rejected`` / ``failed`` / ``no_op``). Its pass has closed, so the run's
+      own confirmed fills are the only authority for what is still missing.
+    * ``in_flight`` - a committed submission has NO outcome yet: the broker may or
+      may not have taken it, so nothing may be re-derived on top of it.
+    * ``unknown`` - no committed submission, or the trail cannot be read. The plan
+      may still be driven, so its work is never taken over.
+    """
+    plan = str(plan_id or "")
+    if not plan:
+        return {"state": PLAN_EXECUTION_UNKNOWN, "evidence": {"reason": "plan_id_missing"}}
+    try:
+        rows = session.execute(
+            text(
+                "SELECT step_no, event FROM strategy_plan_execution_events "
+                "WHERE plan_id = :plan ORDER BY created_at, id"
+            ),
+            {"plan": plan},
+        ).all()
+    except Exception as exc:  # noqa: BLE001 - an unreadable trail is never "finished"
+        return {
+            "state": PLAN_EXECUTION_UNKNOWN,
+            "evidence": {
+                "plan_id": plan,
+                "reason": "plan_trail_unreadable",
+                "error": type(exc).__name__,
+            },
+        }
+    # A step is closed by ANY outcome event, and open while it carries a committed
+    # submission with none: the two sets are what make the fold independent of row
+    # order, because two rows written by one transaction can share ``created_at``.
+    submitted: set[int] = set()
+    closed: set[int] = set()
+    for row in rows:
+        step_no = int(row[0] or 0)
+        event = str(row[1] or "")
+        if event == _PLAN_TRAIL_SUBMITTED:
+            submitted.add(step_no)
+        else:
+            closed.add(step_no)
+    evidence = {
+        "plan_id": plan,
+        "events": len(rows),
+        "submitted_events": len(submitted),
+        "steps": sorted(submitted | closed),
+    }
+    if not rows or not submitted:
+        return {
+            "state": PLAN_EXECUTION_UNKNOWN,
+            "evidence": {**evidence, "reason": "no_committed_submission"},
+        }
+    unresolved = sorted(submitted - closed)
+    if unresolved:
+        return {
+            "state": PLAN_EXECUTION_IN_FLIGHT,
+            "evidence": {**evidence, "unresolved_steps": unresolved},
+        }
+    return {"state": PLAN_EXECUTION_FINISHED, "evidence": evidence}
+
+
+def option_adjust_owner_plan_ids(option_run_id: str, *, session: Any) -> List[str]:
+    """The plans whose binding owns ONE run's adjust phase, oldest first."""
+    rows = session.execute(
+        text(
+            "SELECT plan_id FROM public.strategy_plan_option_runs "
+            "WHERE option_run_id = :run AND phase = 'adjust' "
+            "ORDER BY created_at, plan_id"
+        ),
+        {"run": str(option_run_id)},
+    ).all()
+    return [str(row[0]) for row in rows if str(row[0] or "")]
+
+
+def option_adjust_owner_state(
+    option_run_id: str, *, session: Any, exclude_plan_ids: Any = ()
+) -> Dict[str, Any]:
+    """The combined execution state of the plans that own ONE run's adjust phase.
+
+    ``exclude_plan_ids`` names the plan(s) whose OWN attempt is being re-driven -
+    a plan never supersedes itself, and an unstarted attempt of the caller's own
+    is not a predecessor. ``finished`` then requires EVERY remaining plan bound to
+    the run's adjust phase to have finished executing, so an adjust is never taken
+    over while a predecessor could still be submitting. A run whose adjust phase
+    is reached from NO adjust edge is ``unknown`` (the platform cannot prove who
+    moved it), and an unreadable read is ``unknown`` too - never "no owners".
+    """
+    excluded = {str(value) for value in (exclude_plan_ids or ()) if str(value)}
+    option_run = str(option_run_id or "")
+    try:
+        bound = option_adjust_owner_plan_ids(option_run, session=session)
+    except Exception as exc:  # noqa: BLE001 - unreadable ownership is not "none"
+        return {
+            "state": PLAN_EXECUTION_UNKNOWN,
+            "plan_ids": [],
+            "plans": {},
+            "reason": "adjust_owner_read_failed",
+            "error": type(exc).__name__,
+        }
+    if not bound:
+        return {
+            "state": PLAN_EXECUTION_UNKNOWN,
+            "plan_ids": [],
+            "plans": {},
+            "reason": "no_adjust_binding",
+        }
+    owners = [owner for owner in bound if owner not in excluded]
+    if not owners:
+        # The caller's own edge is the ONLY thing bound to this adjust phase: its
+        # own attempt, with nothing to supersede.
+        return {"state": PLAN_EXECUTION_FINISHED, "plan_ids": list(bound), "plans": {}}
+    plans = {owner: option_plan_execution_state(owner, session=session) for owner in owners}
+    states = [str(entry.get("state") or "") for entry in plans.values()]
+    if PLAN_EXECUTION_IN_FLIGHT in states:
+        state = PLAN_EXECUTION_IN_FLIGHT
+    elif PLAN_EXECUTION_UNKNOWN in states:
+        state = PLAN_EXECUTION_UNKNOWN
+    else:
+        state = PLAN_EXECUTION_FINISHED
+    return {"state": state, "plan_ids": list(bound), "plans": plans}
+
+
 def assess_option_adjust_admissibility(
     plan: Mapping[str, Any],
     *,
@@ -645,9 +788,14 @@ def assess_option_adjust_admissibility(
       mutate;
     * the run is already being adjusted by ANOTHER plan
       (``OPTION_RUN_ADJUST_IN_FLIGHT``) or moved on entirely
-      (``OPTION_RUN_STATE_CHANGED``). The one admissible in-flight state is the
-      run's own ``adjusting`` state reached through THIS plan's edge, which is
-      what makes a retry resolve instead of refusing;
+      (``OPTION_RUN_STATE_CHANGED``). Two in-flight states are admissible: the
+      run's own ``adjusting`` state reached through THIS plan's edge (a retry of
+      the same plan), and an ``adjusting`` state whose owning plan(s) have
+      provably FINISHED executing - a withheld or partially filled adjust is
+      SUPERSEDED, not repaired by hand, because the successor re-derives every
+      delta from the run's own confirmed fills and therefore executes only the
+      remainder. A plan still submitting, or an owner set the platform cannot
+      read, keeps refusing;
     * the run's held generation is not the one the plan froze
       (``OPTION_ADJUSTMENT_STALE_BASIS``). The approved target is never
       re-derived against a newer structure;
@@ -710,18 +858,34 @@ def assess_option_adjust_admissibility(
     }
     if run_status == "adjusting":
         if not owned_by_this_plan:
-            raise PlanBindingRefusal(
-                "OPTION_RUN_ADJUST_IN_FLIGHT",
-                {
-                    "plan_id": plan_id,
-                    "option_run_id": option_run_id,
-                    "option_run_status": run_status,
-                    "message": (
-                        "another plan owns this run's in-flight adjust; its delta is "
-                        "re-derived from the run's own fills, never from a second plan"
-                    ),
-                },
+            # A SECOND plan may SUPERSEDE this in-flight adjust only while the
+            # plan(s) that own it have provably FINISHED executing: a withheld or
+            # partially filled adjust is then the new plan's STARTING POINT, and
+            # because every delta is re-derived from the run's own confirmed fills
+            # only the remainder executes. Anything else - a plan still submitting,
+            # a plan that never committed a submission, or an unreadable owner set -
+            # refuses, because the same work must never be submitted twice.
+            owner_state = option_adjust_owner_state(
+                option_run_id, session=session, exclude_plan_ids=(plan_id,)
             )
+            if str(owner_state.get("state") or "") != PLAN_EXECUTION_FINISHED:
+                raise PlanBindingRefusal(
+                    "OPTION_RUN_ADJUST_IN_FLIGHT",
+                    {
+                        "plan_id": plan_id,
+                        "option_run_id": option_run_id,
+                        "option_run_status": run_status,
+                        "adjust_owner_state": owner_state,
+                        "message": (
+                            "this run's in-flight adjust is not provably finished: "
+                            "another plan still owns its work, its own trail cannot "
+                            "prove the pass closed, or its ownership cannot be read. "
+                            "A successor re-derives every delta from the run's own "
+                            "confirmed fills, so it is admitted only once nothing of "
+                            "the previous adjust can still be submitting."
+                        ),
+                    },
+                )
     elif run_status != "entered":
         raise PlanBindingRefusal(
             "OPTION_RUN_STATE_CHANGED",
@@ -1013,9 +1177,11 @@ def _resolve_adjust_binding(
     an ENTRY binding of this plan's own scope, and the generation basis the plan
     froze is compared against the run's held generation. The mutation rules
     themselves are NOT restated here: they are the shared admissibility rule
-    (``assess_option_adjust_admissibility``), asked through this store's own
-    session, so the execution path and the early callers can never disagree
-    about what may be adjusted. A run that moved on (a completed adjust, a close)
+    (``assess_option_adjust_admissibility``), asked inside the transaction that
+    writes the edge and under the run's own advisory lock, so the execution path
+    and the early callers can never disagree about what may be adjusted - and two
+    plans racing to take over ONE in-flight adjust serialize instead of both
+    sizing the same remainder. A run that moved on (a completed adjust, a close)
     refuses as a stale basis rather than being re-derived against a newer
     structure - the approved artifact stays the approved artifact.
     """
@@ -1062,10 +1228,24 @@ def _resolve_adjust_binding(
         account_id=account_id,
         execution_environment=execution_environment,
     )
-    # The ONE mutation rule, re-read here under the execution path's own session:
-    # ownership, the run's state, the frozen basis, an unresolved protective stage
-    # and the strategy's other unresolved work.
-    with binding_store.session_factory() as session:
+    # The ONE mutation rule is asked INSIDE the transaction that writes the edge,
+    # and on PostgreSQL under the run's OWN advisory lock: two plans racing to take
+    # over one in-flight adjust serialize there, and the one that goes second
+    # reads the FIRST one's edge as an owner that has not finished executing (it
+    # has committed no submission yet), so it refuses instead of both sizing the
+    # same remainder against the same fills. The key order is fixed - this plan,
+    # then this run - so the two locks can never deadlock.
+    session = binding_store.session_factory()
+    try:
+        if _dialect_name(session) == "postgresql":
+            session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+                {"key": f"option-bind:{plan_id}"},
+            )
+            session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+                {"key": f"option-run:{option_run_id}"},
+            )
         assess_option_adjust_admissibility(
             plan,
             strategy_id=str(strategy_id),
@@ -1073,15 +1253,22 @@ def _resolve_adjust_binding(
             execution_environment=str(execution_environment),
             session=session,
         )
-    binding = binding_store.bind(
-        plan_id=plan_id,
-        option_run_id=option_run_id,
-        strategy_id=strategy_id,
-        account_id=account_id,
-        execution_environment=execution_environment,
-        phase="adjust",
-        worker_run_id=worker_run_id,
-    )
+        binding = binding_store.bind(
+            plan_id=plan_id,
+            option_run_id=option_run_id,
+            strategy_id=strategy_id,
+            account_id=account_id,
+            execution_environment=execution_environment,
+            phase="adjust",
+            worker_run_id=worker_run_id,
+            db=session,
+        )
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
     return {"phase": "adjust", "option_run_id": run.strategy_run_id, "run": run, "binding": binding}
 
 

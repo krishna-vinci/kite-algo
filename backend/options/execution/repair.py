@@ -25,16 +25,23 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from .lifecycle import mark_cleanup_required, mark_closed, mark_exit_previewed, mark_exiting
 from .models import OptionRunState, OptionRunStatus
+from .plan_binding import PLAN_EXECUTION_FINISHED, PLAN_EXECUTION_UNKNOWN
 
 #: Only a run the platform knows is unfinished-but-readable is repairable.
+#: ``adjusting`` joins them because a leg generation that stopped mid-flight is
+#: exactly the stranded work this path exists for - but, unlike the others, it is
+#: repairable only while the plan that owns the adjust has provably FINISHED
+#: executing (``adjust_in_flight`` otherwise): the platform never closes a
+#: structure out from under a plan that may still be submitting.
 REPAIRABLE_RUN_STATUSES = (
     OptionRunStatus.PARTIAL_ENTRY.value,
     OptionRunStatus.PARTIAL_EXIT.value,
     OptionRunStatus.CLEANUP_REQUIRED.value,
+    OptionRunStatus.ADJUSTING.value,
 )
 
 STATE_FLAT = "flat"
@@ -48,6 +55,10 @@ REASON_EVIDENCE_CHANGED = "OPTION_RUN_REPAIR_EVIDENCE_CHANGED"
 REASON_ACTION_MISMATCH = "OPTION_RUN_REPAIR_ACTION_MISMATCH"
 REASON_STATE_CHANGED = "OPTION_RUN_REPAIR_STATE_CHANGED"
 REASON_LIVE_UNSUPPORTED = "OPTION_RUN_REPAIR_LIVE_UNSUPPORTED"
+
+#: The assessment reason an ``adjusting`` run carries while the plan that owns
+#: its adjust may still be submitting (or cannot be proven finished).
+REASON_ADJUST_IN_FLIGHT = "adjust_in_flight"
 
 ACTION_CLOSE_FLAT = "close_flat"
 ACTION_CLOSE_RESIDUAL = "close_residual"
@@ -81,7 +92,9 @@ class OptionRunRepairRefusal(RuntimeError):
         return payload
 
 
-def assess_option_run_repair(run: Any, staged_exit: Any) -> Dict[str, Any]:
+def assess_option_run_repair(
+    run: Any, staged_exit: Any, *, adjust_owner: Optional[Mapping[str, Any]] = None
+) -> Dict[str, Any]:
     """Classify one option run from its OWN confirmed evidence. Side-effect free.
 
     Returns exactly one of ``flat`` / ``residual`` / ``ambiguous`` /
@@ -89,6 +102,12 @@ def assess_option_run_repair(run: Any, staged_exit: Any) -> Dict[str, Any]:
     verdict rests on. Nothing is refreshed here: a GET must be able to report the
     state without moving it, and the POST re-derives the same digest before it is
     allowed to act.
+
+    ``adjust_owner`` is the execution state of the plan(s) that own an
+    ``adjusting`` run's adjust phase (``option_adjust_owner_state``). A caller
+    that cannot supply it, or supplies anything but ``finished``, cannot be told
+    that the run is stranded: the verdict is ``ambiguous`` with the reason
+    ``adjust_in_flight`` rather than a close the platform might race.
     """
     option_run_id = str(getattr(run, "strategy_run_id", "") or "")
     status = str(getattr(run, "status", "") or "").strip().lower()
@@ -163,6 +182,16 @@ def assess_option_run_repair(run: Any, staged_exit: Any) -> Dict[str, Any]:
         # escalated, not guessed at.
         reasons.append("unreadable_fills")
 
+    # An ``adjusting`` run is mid-mutation: it is only repairable once the plan
+    # that owns its adjust has provably finished executing. While that plan may
+    # still be submitting - or while the platform cannot prove it is not - the
+    # verdict is ``ambiguous``, never a close that races it.
+    owner_state = dict(adjust_owner or {})
+    if status == OptionRunStatus.ADJUSTING.value and (
+        str(owner_state.get("state") or "") != PLAN_EXECUTION_FINISHED
+    ):
+        reasons.append(REASON_ADJUST_IN_FLIGHT)
+
     if status not in REPAIRABLE_RUN_STATUSES:
         state = STATE_NOT_REPAIRABLE
         reason_code: Optional[str] = REASON_NOT_REPAIRABLE
@@ -181,6 +210,7 @@ def assess_option_run_repair(run: Any, staged_exit: Any) -> Dict[str, Any]:
         "option_run_id": option_run_id,
         "status": status,
         "state": state,
+        "adjust_owner": owner_state or None,
         "open_by_leg": open_by_leg,
         "outstanding_buy": outstanding_buy,
         "outstanding_sell": outstanding_sell,
@@ -215,13 +245,17 @@ def _repair_exiting(run: OptionRunState, *, pending_legs: List[str]) -> OptionRu
     """The durable ``exiting`` state for a repaired run, along existing edges.
 
     The durable vocabulary has no direct edge from ``partial_entry`` /
-    ``cleanup_required`` to ``exiting``; the repair walks the edges the lifecycle
-    already allows (``partial_entry`` -> ``cleanup_required`` -> ``exit_previewed``
-    -> ``exiting``) and only the FINAL state is ever persisted. That keeps one
-    state machine for both the plan path and the repair path.
+    ``adjusting`` / ``cleanup_required`` to ``exiting``; the repair walks the
+    edges the lifecycle already allows (``partial_entry`` | ``adjusting`` ->
+    ``cleanup_required`` -> ``exit_previewed`` -> ``exiting``) and only the FINAL
+    state is ever persisted. That keeps one state machine for both the plan path
+    and the repair path.
     """
     working = run
-    if str(working.status) == OptionRunStatus.PARTIAL_ENTRY.value:
+    if str(working.status) in (
+        OptionRunStatus.PARTIAL_ENTRY.value,
+        OptionRunStatus.ADJUSTING.value,
+    ):
         working = mark_cleanup_required(working)
     if str(working.status) == OptionRunStatus.CLEANUP_REQUIRED.value:
         working = mark_exit_previewed(working)
@@ -231,6 +265,24 @@ def _repair_exiting(run: OptionRunState, *, pending_legs: List[str]) -> OptionRu
 def _repair_closed(run: OptionRunState) -> OptionRunState:
     """The durable ``exited`` state for a proven-flat run (existing edges only)."""
     return mark_closed(_repair_exiting(run, pending_legs=[]))
+
+
+def option_adjust_owner_reader(session_factory: Any) -> Callable[[str], Dict[str, Any]]:
+    """The SHARED takeover rule as a reader the repair service can use.
+
+    One rule, two callers: the adjust gate and the repair assessment must agree
+    about whether the plan that owns an ``adjusting`` run may still be submitting,
+    so the repair path reads exactly what ``assess_option_adjust_admissibility``
+    reads rather than re-deriving it.
+    """
+
+    def _read(option_run_id: str) -> Dict[str, Any]:
+        from .plan_binding import option_adjust_owner_state
+
+        with session_factory() as session:
+            return dict(option_adjust_owner_state(str(option_run_id), session=session))
+
+    return _read
 
 
 def pending_leg_ids(run: OptionRunState, close_plan: List[Dict[str, Any]]) -> List[str]:
@@ -259,11 +311,38 @@ class OptionRunRepairService:
     compare-and-set the execution path uses (``save_run_if_status``) - which is
     what makes the transition the per-run ownership token, so two repairs can
     never both act.
+
+    ``adjust_owner_reader`` is what lets an ``adjusting`` run be classified: the
+    owner of its adjust phase is read through the SHARED takeover rule
+    (:func:`option_adjust_owner_reader`). Without it, an ``adjusting`` verdict is
+    ``ambiguous`` by name rather than assumed stranded.
     """
 
-    def __init__(self, *, run_store: Any, staged_exit: Any) -> None:
+    def __init__(
+        self, *, run_store: Any, staged_exit: Any, adjust_owner_reader: Any = None
+    ) -> None:
         self._run_store = run_store
         self._staged_exit = staged_exit
+        self._adjust_owner_reader = adjust_owner_reader
+
+    def _adjust_owner(self, option_run_id: str) -> Optional[Dict[str, Any]]:
+        """The execution state of the plan(s) that own this run's adjust phase.
+
+        The reader is the SHARED takeover rule
+        (:func:`option_adjust_owner_reader`). A reader that is missing, or that
+        fails, yields no verdict at all: an ``adjusting`` run is then ``ambiguous``
+        by name rather than assumed stranded.
+        """
+        if self._adjust_owner_reader is None:
+            return None
+        try:
+            return dict(self._adjust_owner_reader(str(option_run_id)) or {})
+        except Exception as exc:  # noqa: BLE001 - an unreadable owner is never "finished"
+            return {
+                "state": PLAN_EXECUTION_UNKNOWN,
+                "reason": "adjust_owner_read_failed",
+                "error": type(exc).__name__,
+            }
 
     def _run(self, option_run_id: str) -> OptionRunState:
         try:
@@ -275,7 +354,11 @@ class OptionRunRepairService:
 
     def assessment(self, option_run_id: str) -> Dict[str, Any]:
         """The read-only verdict for one run."""
-        return assess_option_run_repair(self._run(option_run_id), self._staged_exit)
+        return assess_option_run_repair(
+            self._run(option_run_id),
+            self._staged_exit,
+            adjust_owner=self._adjust_owner(option_run_id),
+        )
 
     def plan(
         self, *, option_run_id: str, action: str, evidence_digest: str
@@ -286,7 +369,9 @@ class OptionRunRepairService:
         never acts on evidence an operator saw before a fill moved it.
         """
         run = self._run(option_run_id)
-        assessment = assess_option_run_repair(run, self._staged_exit)
+        assessment = assess_option_run_repair(
+            run, self._staged_exit, adjust_owner=self._adjust_owner(option_run_id)
+        )
         if str(evidence_digest or "") != str(assessment.get("evidence_digest") or ""):
             raise OptionRunRepairRefusal(
                 REASON_EVIDENCE_CHANGED,

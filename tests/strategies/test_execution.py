@@ -1395,6 +1395,78 @@ class _StagedStubService:
         }
 
 
+class _PartialFillStubService:
+    """A paper runtime stub where exactly ONE side of the book fills partially.
+
+    The roll's acquire stage releases the new SHORT only against a CONFIRMED hedge
+    fill, so the partial leg has to be a short reached AFTER its hedge: the hedge
+    fills in full, and the short's remainder is what proves the acquire half did
+    not finish.
+    """
+
+    def __init__(self, *, partial_side="SELL", fill_ratio=0.5):
+        self.partial_side = str(partial_side).upper()
+        self.fill_ratio = fill_ratio
+        self.sent = []
+
+    async def place_order(self, *, account_scope, order_payload, attribution):
+        _ = (account_scope, attribution)
+        self.sent.append(dict(order_payload))
+        quantity = int(order_payload["quantity"])
+        side = str(order_payload["transaction_type"]).upper()
+        if side == self.partial_side:
+            status = "partially_filled"
+            filled = int(quantity * self.fill_ratio)
+        else:
+            status = "filled"
+            filled = quantity
+        return {
+            "status": status,
+            "order": {
+                "order_id": f"STUB-{len(self.sent)}",
+                "tradingsymbol": order_payload["tradingsymbol"],
+                "quantity": quantity,
+                "filled_quantity": filled,
+                "pending_quantity": quantity - filled,
+                "average_price": "100.0",
+            },
+        }
+
+
+class _RejectedLegStubService:
+    """A paper runtime stub that rejects exactly ONE contract's one side.
+
+    Everything else fills, so a roll's acquire half lands and only the named leg
+    of the RELEASE half fails - the shape an old leg that will not close has.
+    """
+
+    def __init__(self, *, symbol, side):
+        self.symbol = str(symbol)
+        self.side = str(side).upper()
+        self.sent = []
+
+    async def place_order(self, *, account_scope, order_payload, attribution):
+        _ = (account_scope, attribution)
+        self.sent.append(dict(order_payload))
+        quantity = int(order_payload["quantity"])
+        if (
+            str(order_payload["tradingsymbol"]) == self.symbol
+            and str(order_payload["transaction_type"]).upper() == self.side
+        ):
+            return {"status": "rejected", "reason": "no liquidity"}
+        return {
+            "status": "filled",
+            "order": {
+                "order_id": f"STUB-{len(self.sent)}",
+                "tradingsymbol": order_payload["tradingsymbol"],
+                "quantity": quantity,
+                "filled_quantity": quantity,
+                "pending_quantity": 0,
+                "average_price": "100.0",
+            },
+        }
+
+
 class ExecutorStagedFinancingTests(ExecutorTestCase, unittest.IsolatedAsyncioTestCase):
     """A dependent buy is released only against a CONFIRMED reduction.
 
@@ -2037,7 +2109,8 @@ class ExecutorOptionRunBindingTests(ExecutorTestCase, unittest.IsolatedAsyncioTe
             return (
                 session.execute(
                     text(
-                        "SELECT strategy_run_id, status, legs, orders, trades, metadata "
+                        "SELECT strategy_run_id, status, legs, orders, trades, metadata, "
+                        "protection "
                         "FROM public.option_run_states WHERE strategy_run_id = :r"
                     ),
                     {"r": option_run_id},
@@ -2390,6 +2463,31 @@ class ExecutorOptionRunBindingTests(ExecutorTestCase, unittest.IsolatedAsyncioTe
             hedge["expiry"] = expiry
         return [short, hedge]
 
+    #: The NEXT expiry's contracts: a roll is a different instrument, not the same
+    #: one re-labelled, so the desired state names its own ids and symbols.
+    ROLL_SHORT_ID = "cccccccc-0000-0000-0000-0000000000c1"
+    ROLL_HEDGE_ID = "cccccccc-0000-0000-0000-0000000000c2"
+
+    def _roll_legs(self, *, units=1, expiry="2026-11-26", hedge_symbol="TCS26NOV3000CE"):
+        """The desired state of an expiry roll: the next expiry, short first."""
+        short = self._option_leg(
+            side="SELL",
+            symbol="TCS26NOV2500CE",
+            instrument_id=self.ROLL_SHORT_ID,
+            quantity=75 * units,
+            signed_quantity=-75 * units,
+            expiry=expiry,
+        )
+        hedge = self._option_leg(
+            side="BUY",
+            symbol=hedge_symbol,
+            instrument_id=self.ROLL_HEDGE_ID,
+            quantity=75 * units,
+            signed_quantity=75 * units,
+            expiry=expiry,
+        )
+        return [short, hedge]
+
     def _seed_adjust_plan(
         self,
         plan_id,
@@ -2399,6 +2497,8 @@ class ExecutorOptionRunBindingTests(ExecutorTestCase, unittest.IsolatedAsyncioTe
         generation=1,
         expiry="2026-10-29",
         protection_policy=None,
+        underlying=None,
+        expiry_policy=None,
     ):
         """A frozen ``adjust`` plan: the target, its basis, and the run it mutates."""
         self.seed_validated_plan(
@@ -2417,6 +2517,10 @@ class ExecutorOptionRunBindingTests(ExecutorTestCase, unittest.IsolatedAsyncioTe
                 "based_on_generation": generation,
             },
         }
+        if underlying is not None:
+            resolved["underlying"] = underlying
+        if expiry_policy is not None:
+            resolved["expiry_policy"] = expiry_policy
         if protection_policy is not None:
             resolved["protection_policy"] = protection_policy
         with self.factory() as session:
@@ -2624,8 +2728,8 @@ class ExecutorOptionRunBindingTests(ExecutorTestCase, unittest.IsolatedAsyncioTe
         self.assertEqual(run["status"], "entered")
         self.assertEqual(json.loads(run["metadata"]).get("structure_generation", 1), 1)
 
-    async def test_an_adjust_that_would_reverse_or_roll_a_contract_is_refused(self):
-        """A re-entry and a roll are NOT adjusts; both refuse by name."""
+    async def test_an_adjust_that_would_reverse_a_contract_is_refused(self):
+        """Closing through flat and re-opening is a re-entry, not an adjust."""
         executor, option_run_id = await self._enter_a_structure()
         self._seed_adjust_plan(
             "plan-adjust",
@@ -2641,20 +2745,356 @@ class ExecutorOptionRunBindingTests(ExecutorTestCase, unittest.IsolatedAsyncioTe
         run = self._run_row(option_run_id)
         self.assertEqual(run["status"], "entered")
 
-        # A desired state on a DIFFERENT expiry is the S4 roll, not an adjust.
+    async def test_an_expiry_roll_acquires_hedge_first_then_releases_the_old_generation(self):
+        """A roll opens and PROVES the new expiry, then closes the old one."""
+        executor, option_run_id = await self._enter_a_structure()
+        # The run carries the generation it protects; the roll re-points it.
+        self._seed_run_protection(
+            option_run_id,
+            {
+                "underlying": "NIFTY",
+                "expiry": "2026-10-29",
+                "expiry_policy": "exit_before_cutoff",
+                "structure_digest": "digest-old",
+            },
+        )
         self._seed_adjust_plan(
-            "plan-adjust-roll",
+            "plan-roll",
             reference=option_run_id,
-            legs=self._adjust_legs(units=1, expiry="2026-11-26"),
+            legs=self._roll_legs(),
+            expiry="2026-11-26",
+            underlying="NIFTY",
+            expiry_policy="exit_before_cutoff",
+        )
+        self.claim_reservation(plan_id="plan-roll")
+
+        result = await executor.execute(_plan_view_for(self.factory, "plan-roll"), actor=OWNER)
+
+        self.assertEqual(result["status"], "filled")
+        # ACQUIRE first - the new hedge (step 2) before the new short (step 1), the
+        # hedge gate's own rule - then RELEASE - the old short (step 3) before the
+        # old hedge (step 4), the exit builder's own rule. Nothing of the old
+        # generation is submitted before the new one is filled.
+        self.assertEqual(
+            [(row["step_no"], row["event"]) for row in self.events("plan-roll")],
+            [
+                (2, "submitted"), (2, "filled"),
+                (1, "submitted"), (1, "filled"),
+                (3, "submitted"), (3, "filled"),
+                (4, "submitted"), (4, "filled"),
+            ],
+        )
+        self.assertEqual(
+            [row["refusal_reason"] for row in self.events("plan-roll") if row["refusal_reason"]],
+            [],
+        )
+        run = self._run_row(option_run_id)
+        self.assertEqual(run["status"], "entered")
+        metadata = json.loads(run["metadata"])
+        self.assertEqual(metadata["structure_generation"], 2)
+        self.assertEqual(metadata["structure_digest"], "digest-iron-condor")
+        # The held legs ARE the new generation, all on the new expiry; the old
+        # generation is gone from the run's own record of what it holds.
+        legs = json.loads(run["legs"])
+        self.assertEqual(
+            {
+                row["leg_id"]: (
+                    row["transaction_type"],
+                    int(row["quantity"]),
+                    row["expiry_key"],
+                )
+                for row in legs
+            },
+            {
+                "plan-roll:1": ("SELL", 75, "2026-11-26"),
+                "plan-roll:2": ("BUY", 75, "2026-11-26"),
+            },
+        )
+        # The run's OWN ledger proves both halves: the new legs held, the old flat.
+        self.assertEqual(
+            {
+                leg_id: quantity
+                for leg_id, quantity in _run_open_by_leg(json.loads(run["trades"])).items()
+                if quantity != 0
+            },
+            {"plan-roll:1": -75, "plan-roll:2": 75},
+        )
+        # The run's protection block is re-pointed at the generation it now holds,
+        # the new expiry included: nothing still describes the released one.
+        self.assertEqual(
+            json.loads(run["protection"]),
+            {
+                "underlying": "NIFTY",
+                "expiry": "2026-11-26",
+                "expiry_policy": "exit_before_cutoff",
+                "structure_digest": "digest-iron-condor",
+            },
+        )
+        self.assertEqual(self._run_count(), 1)
+
+    async def test_a_partial_roll_acquire_never_releases_the_old_legs(self):
+        """A half-acquired rollout withholds the old generation, retryably."""
+        executor, option_run_id = await self._enter_a_structure()
+        self._seed_adjust_plan(
+            "plan-roll",
+            reference=option_run_id,
+            legs=self._roll_legs(),
             expiry="2026-11-26",
         )
-        with self.assertRaises(self._refusal) as roll_ctx:
-            await executor.execute(
-                _plan_view_for(self.factory, "plan-adjust-roll"), actor=OWNER
-            )
-        self.assertEqual(roll_ctx.exception.reason_code, "OPTION_ADJUSTMENT_UNSUPPORTED")
-        (roll_trail,) = self.events("plan-adjust-roll")
-        self.assertEqual(roll_trail["detail"]["reason"], "expiry_change_is_a_roll")
+        self.claim_reservation(plan_id="plan-roll")
+        # The new hedge fills in FULL (so the new short is released) and the new
+        # SHORT only half-fills: the acquire half is not proven, so no old leg may
+        # be touched at all.
+        executor._paper_service = _PartialFillStubService(partial_side="SELL")
+
+        await executor.execute(_plan_view_for(self.factory, "plan-roll"), actor=OWNER)
+
+        withheld = [
+            row
+            for row in self.events("plan-roll")
+            if row["refusal_reason"] == "OPTION_ADJUSTMENT_ROLL_INCOMPLETE"
+        ]
+        self.assertEqual([row["step_no"] for row in withheld], [3, 4])
+        self.assertEqual(withheld[0]["detail"]["reason"], "new_generation_not_proven")
+        self.assertTrue(withheld[0]["detail"]["retryable"])
+        self.assertEqual(withheld[0]["detail"]["new_expiry"], "2026-11-26")
+        self.assertEqual(withheld[0]["detail"]["held_expiry"], "2026-10-29")
+        self.assertEqual(withheld[0]["detail"]["unproven_acquire_steps"], [1])
+        # Only the two ACQUIRE orders reached the runtime: nothing closed an old leg.
+        self.assertEqual(
+            [order["tradingsymbol"] for order in executor._paper_service.sent],
+            ["TCS26NOV3000CE", "TCS26NOV2500CE"],
+        )
+        run = self._run_row(option_run_id)
+        # The SAME generation: a withheld release is retryable, never half-applied.
+        self.assertEqual(run["status"], "adjusting")
+        self.assertEqual(json.loads(run["metadata"]).get("structure_generation", 1), 1)
+        self.assertEqual(
+            {row["leg_id"] for row in json.loads(run["legs"])},
+            {"plan-op:1", "plan-op:2", "plan-roll:1", "plan-roll:2"},
+        )
+        run_open = _run_open_by_leg(json.loads(run["trades"]))
+        # The old generation still holds exactly what the entry opened, and the
+        # new short holds only the part that actually filled.
+        self.assertEqual(run_open.get("plan-op:1"), -75)
+        self.assertEqual(run_open.get("plan-op:2"), 75)
+        self.assertEqual(run_open.get("plan-roll:1"), -37)
+
+    async def test_a_rejected_roll_acquire_leg_releases_nothing_of_the_old_generation(self):
+        """A rejected acquire leg is cleanup work: the old legs are never touched."""
+        executor, option_run_id = await self._enter_a_structure()
+        self._seed_adjust_plan(
+            "plan-roll",
+            reference=option_run_id,
+            legs=self._roll_legs(hedge_symbol="MISSING"),
+            expiry="2026-11-26",
+        )
+        self.claim_reservation(plan_id="plan-roll")
+
+        result = await executor.execute(_plan_view_for(self.factory, "plan-roll"), actor=OWNER)
+
+        self.assertEqual(result["status"], "rejected")
+        # The new hedge never arrived, so the new short is withheld by the hedge
+        # gate AND the release is withheld by the roll: the half-applied roll is
+        # cleanup work, exactly like any other rejected required leg.
+        self.assertEqual(
+            sorted(
+                row["refusal_reason"]
+                for row in self.events("plan-roll")
+                if row["refusal_reason"]
+            ),
+            [
+                "OPTION_ADJUSTMENT_ROLL_INCOMPLETE",
+                "OPTION_ADJUSTMENT_ROLL_INCOMPLETE",
+                "OPTION_HEDGE_NOT_FILLED",
+                "PAPER_ORDER_REJECTED",
+            ],
+        )
+        run = self._run_row(option_run_id)
+        self.assertEqual(run["status"], "cleanup_required")
+        self.assertEqual(json.loads(run["metadata"]).get("structure_generation", 1), 1)
+        # No order against the OLD generation was placed: its two entry fills are
+        # the only orders those contracts ever carry.
+        self.assertEqual(
+            sorted(
+                (order.tradingsymbol, order.transaction_type)
+                for order in executor._paper_service.repository.orders.values()
+                if order.tradingsymbol in {"TCS26OCT2500CE", "TCS26OCT3000CE"}
+            ),
+            [("TCS26OCT2500CE", "sell"), ("TCS26OCT3000CE", "buy")],
+        )
+
+    async def test_an_adjust_whose_desired_state_mixes_expiries_is_refused(self):
+        """Two expiries in ONE desired state is not one structure: refused."""
+        executor, option_run_id = await self._enter_a_structure()
+        legs = self._adjust_legs(units=1)
+        legs[1]["expiry"] = "2026-11-26"  # the hedge alone moves: not one structure
+        self._seed_adjust_plan(
+            "plan-adjust",
+            reference=option_run_id,
+            legs=legs,
+            expiry="2026-10-29",
+        )
+
+        with self.assertRaises(self._refusal) as ctx:
+            await executor.execute(_plan_view_for(self.factory, "plan-adjust"), actor=OWNER)
+
+        self.assertEqual(ctx.exception.reason_code, "OPTION_ADJUSTMENT_UNSUPPORTED")
+        (trail,) = self.events("plan-adjust")
+        self.assertEqual(trail["detail"]["reason"], "mixed_expiries_in_one_desired_state")
+        self.assertEqual(trail["detail"]["mismatched"][0]["leg_expiry"], "2026-11-26")
+        # Nothing was placed and the run did not move off its held generation.
+        self.assertEqual(len(executor._paper_service.repository.orders), 2)  # the entry
+        run = self._run_row(option_run_id)
+        self.assertEqual(run["status"], "entered")
+        self.assertEqual(json.loads(run["metadata"]).get("structure_generation", 1), 1)
+
+    async def test_a_new_adjust_plan_takes_over_a_finished_roll(self):
+        """A withheld roll is SUPERSEDED, never stranded: the successor finishes it."""
+        executor, option_run_id = await self._enter_a_structure()
+        self._seed_adjust_plan(
+            "plan-roll",
+            reference=option_run_id,
+            legs=self._roll_legs(units=2),
+            expiry="2026-11-26",
+        )
+        self.claim_reservation(plan_id="plan-roll")
+        executor._paper_service = _PartialFillStubService(partial_side="SELL")
+        await executor.execute(_plan_view_for(self.factory, "plan-roll"), actor=OWNER)
+        self.assertEqual(self._run_row(option_run_id)["status"], "adjusting")
+
+        # A SECOND plan on the SAME basis takes the run over: the delta is
+        # re-derived from the run's own confirmed fills, so only the remainder of
+        # the acquire half is opened and the old generation is then released.
+        executor._paper_service = self.build_paper_service(starting_balance="1000000")
+        self._seed_adjust_plan(
+            "plan-roll-2",
+            reference=option_run_id,
+            legs=self._roll_legs(units=2),
+            expiry="2026-11-26",
+        )
+        self.claim_reservation(plan_id="plan-roll-2")
+        result = await executor.execute(_plan_view_for(self.factory, "plan-roll-2"), actor=OWNER)
+
+        self.assertEqual(result["status"], "filled")
+        # The 150-qty hedge the run ALREADY holds is a no_op, not a re-send, and the
+        # roll's release half still waits until BOTH acquire legs are answered: the
+        # whole acquire half is closed before any old leg is touched.
+        self.assertEqual(
+            [(row["step_no"], row["event"]) for row in self.events("plan-roll-2")],
+            [
+                (1, "submitted"), (1, "filled"),
+                (2, "no_op"),
+                (3, "submitted"), (3, "filled"),
+                (4, "submitted"), (4, "filled"),
+            ],
+        )
+        self.assertEqual(
+            [
+                int(row["filled_quantity"])
+                for row in self.events("plan-roll-2")
+                if row["event"] == "filled"
+            ],
+            [75, 75, 75],  # the short's REMAINDER, then the old short, then its hedge
+        )
+        run = self._run_row(option_run_id)
+        self.assertEqual(run["status"], "entered")
+        metadata = json.loads(run["metadata"])
+        self.assertEqual(metadata["structure_generation"], 2)
+        self.assertEqual(metadata["adjust_superseded_plan_ids"], ["plan-roll"])
+        self.assertEqual(
+            {
+                row["leg_id"]: (row["transaction_type"], int(row["quantity"]))
+                for row in json.loads(run["legs"])
+            },
+            {"plan-roll:1": ("SELL", 150), "plan-roll:2": ("BUY", 150)},
+        )
+        run_open = _run_open_by_leg(json.loads(run["trades"]))
+        # 75 held before the takeover plus the 75 remainder: the SAME total, never
+        # a re-send of the whole 75.
+        self.assertEqual(run_open.get("plan-roll:1"), -150)
+        self.assertEqual(run_open.get("plan-roll:2"), 150)
+        self.assertEqual(run_open.get("plan-op:1"), 0)
+        self.assertEqual(run_open.get("plan-op:2"), 0)
+
+    async def test_a_superseding_plan_refuses_while_the_roll_is_still_submitting(self):
+        """A predecessor mid-submission is never overrun: refused by name."""
+        executor, option_run_id = await self._enter_a_structure()
+        self._seed_adjust_plan(
+            "plan-roll",
+            reference=option_run_id,
+            legs=self._roll_legs(),
+            expiry="2026-11-26",
+        )
+        self.claim_reservation(plan_id="plan-roll")
+        executor._paper_service = _PartialFillStubService(partial_side="SELL")
+        await executor.execute(_plan_view_for(self.factory, "plan-roll"), actor=OWNER)
+        # A committed submission with no outcome yet: the pass has NOT closed.
+        self._seed_unfinished_submission("plan-roll")
+
+        self._seed_adjust_plan(
+            "plan-roll-2",
+            reference=option_run_id,
+            legs=self._roll_legs(),
+            expiry="2026-11-26",
+        )
+        self.claim_reservation(plan_id="plan-roll-2")
+        with self.assertRaises(self._refusal) as ctx:
+            await executor.execute(_plan_view_for(self.factory, "plan-roll-2"), actor=OWNER)
+
+        self.assertEqual(ctx.exception.reason_code, "OPTION_RUN_ADJUST_IN_FLIGHT")
+        self.assertEqual(ctx.exception.detail["adjust_owner_state"]["state"], "in_flight")
+        (trail,) = self.events("plan-roll-2")
+        self.assertEqual(trail["refusal_reason"], "OPTION_RUN_ADJUST_IN_FLIGHT")
+        self.assertEqual(trail["detail"]["adjust_owner_state"]["state"], "in_flight")
+        # The run did not move and no takeover was recorded.
+        run = self._run_row(option_run_id)
+        self.assertEqual(run["status"], "adjusting")
+        self.assertNotIn("adjust_superseded_plan_ids", json.loads(run["metadata"]))
+
+    async def test_a_failed_roll_release_leg_never_lands_the_new_generation(self):
+        """An old leg that will not close is cleanup work, never a new "entered"."""
+        executor, option_run_id = await self._enter_a_structure()
+        self._seed_adjust_plan(
+            "plan-roll",
+            reference=option_run_id,
+            legs=self._roll_legs(),
+            expiry="2026-11-26",
+        )
+        self.claim_reservation(plan_id="plan-roll")
+        # The ACQUIRE half lands (both new legs fill); the OLD SHORT's close is the
+        # one order that fails, so the old hedge can never be released.
+        executor._paper_service = _RejectedLegStubService(
+            symbol="TCS26OCT2500CE", side="BUY"
+        )
+
+        await executor.execute(_plan_view_for(self.factory, "plan-roll"), actor=OWNER)
+
+        self.assertEqual(
+            sorted(
+                row["refusal_reason"]
+                for row in self.events("plan-roll")
+                if row["refusal_reason"]
+            ),
+            ["OPTION_HEDGE_RELEASE_WITHHELD", "PAPER_ORDER_REJECTED"],
+        )
+        run = self._run_row(option_run_id)
+        self.assertEqual(run["status"], "cleanup_required")
+        # The generation the strategy observes did NOT move: the roll never landed.
+        self.assertEqual(json.loads(run["metadata"]).get("structure_generation", 1), 1)
+        self.assertEqual(
+            {row["leg_id"] for row in json.loads(run["legs"])},
+            {"plan-op:1", "plan-op:2", "plan-roll:1", "plan-roll:2"},
+        )
+        # The old hedge was never traded: its exposure stays exactly as it was.
+        self.assertEqual(
+            [
+                order["tradingsymbol"]
+                for order in executor._paper_service.sent
+                if order["tradingsymbol"] == "TCS26OCT3000CE"
+            ],
+            [],
+        )
 
     async def test_an_adjust_opens_a_new_leg_on_the_runs_own_ledger(self):
         """A desired leg the run does not hold is a NEW run leg, and it fills."""
@@ -2783,6 +3223,35 @@ class ExecutorOptionRunBindingTests(ExecutorTestCase, unittest.IsolatedAsyncioTe
                         }
                     ),
                 },
+            )
+            session.commit()
+
+    def _seed_run_protection(self, option_run_id, protection):
+        """Freeze an arbitrary protection block on one durable option run."""
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "UPDATE public.option_run_states SET protection = :protection "
+                    "WHERE strategy_run_id = :r"
+                ),
+                {"r": option_run_id, "protection": json.dumps(protection)},
+            )
+            session.commit()
+
+    def _seed_unfinished_submission(self, plan_id, *, step_no=90):
+        """A committed submission with NO outcome: the plan is still executing."""
+        from backend.strategies.attribution_models import StrategyPlanExecutionEvent
+
+        with self.factory() as session:
+            session.add(
+                StrategyPlanExecutionEvent(
+                    id=f"evt-in-flight-{plan_id}-{step_no}",
+                    plan_id=str(plan_id),
+                    step_no=int(step_no),
+                    event="submitted",
+                    actor_id=OWNER,
+                    detail={"source": "test", "reason": "still_executing"},
+                )
             )
             session.commit()
 
@@ -3484,6 +3953,17 @@ def _plan_view_for(factory, plan_id):
     from backend.strategies.proposals import ProposalStore
 
     return ProposalStore(session_factory=factory).get_plan(plan_id)
+
+
+def _run_open_by_leg(trades):
+    """The run's OWN open quantity per leg, from its recorded trades alone."""
+    open_by_leg = {}
+    for trade in trades:
+        quantity = int(trade.get("quantity") or 0)
+        sign = 1 if str(trade.get("transaction_type") or "").upper() == "BUY" else -1
+        leg_id = str(trade.get("leg_id") or "")
+        open_by_leg[leg_id] = open_by_leg.get(leg_id, 0) + sign * quantity
+    return open_by_leg
 
 
 if __name__ == "__main__":

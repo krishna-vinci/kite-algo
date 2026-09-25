@@ -85,13 +85,21 @@ def build_option_run_repair_service(request: Any, session_factory: Any) -> Optio
     ``StagedStructureExit``, and a residual close is submitted through it too.
     """
     from backend.options.execution.durable_store import DurableOptionRunStore
+    from backend.options.execution.repair import option_adjust_owner_reader
     from backend.options.protection.staged_exit import StagedStructureExit
 
     run_store = getattr(_app_state(request), "option_run_store", None)
     if run_store is None:
         run_store = DurableOptionRunStore(session_factory=session_factory)
     staged = StagedStructureExit(session_factory=session_factory, run_store=run_store)
-    return OptionRunRepairService(run_store=run_store, staged_exit=staged)
+    # The owner reader is what lets an ``adjusting`` run be classified: it is the
+    # SAME shared rule the adjust gate asks, so the repair path cannot disagree
+    # about whether the owning plan may still be submitting.
+    return OptionRunRepairService(
+        run_store=run_store,
+        staged_exit=staged,
+        adjust_owner_reader=option_adjust_owner_reader(session_factory),
+    )
 
 
 def repair_audit_job(repo: Any, run: Any) -> Any:

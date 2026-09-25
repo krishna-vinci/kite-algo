@@ -322,6 +322,50 @@ class _Env:
         )
         return option_run_id
 
+    def bind_adjust(self, option_run_id: str, *, finished: bool) -> str:
+        """One adjust edge on this run, plus that plan's OWN execution trail.
+
+        ``finished`` closes the trail (its submission carries an outcome);
+        otherwise the submission is left unanswered - exactly what a plan that may
+        still be submitting looks like to the takeover rule.
+        """
+        from sqlalchemy import text
+
+        from backend.options.execution.plan_binding import PlanOptionRunBindingStore
+
+        plan_id = self._seed_plan(
+            legs=[self.short_leg, self.hedge_leg], phase="adjust", reference=option_run_id
+        )
+        PlanOptionRunBindingStore(session_factory=self.factory).bind(
+            plan_id=plan_id,
+            option_run_id=option_run_id,
+            strategy_id=self.strategy_id,
+            account_id=ACCOUNT,
+            execution_environment="paper",
+            phase="adjust",
+            worker_run_id=self.run_id,
+        )
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT INTO public.strategy_plan_execution_events "
+                    "(plan_id, step_no, event, actor_id, detail) "
+                    "VALUES (:plan, 1, 'submitted', :actor, '{}')"
+                ),
+                {"plan": plan_id, "actor": OWNER},
+            )
+            if finished:
+                session.execute(
+                    text(
+                        "INSERT INTO public.strategy_plan_execution_events "
+                        "(plan_id, step_no, event, filled_quantity, actor_id, detail) "
+                        "VALUES (:plan, 1, 'filled', 75, :actor, '{}')"
+                    ),
+                    {"plan": plan_id, "actor": OWNER},
+                )
+            session.commit()
+        return plan_id
+
 
 def _app(factory, monkeypatch):
     from fastapi import FastAPI
@@ -624,3 +668,64 @@ async def test_a_live_residual_close_is_refused_rather_than_invented(pg, monkeyp
         assert repair.json()["detail"]["rejection_reason"] == "OPTION_RUN_REPAIR_LIVE_UNSUPPORTED"
 
     assert _run_row(factory, option_run_id)["status"] == "partial_entry"
+
+
+@pytest.mark.asyncio
+async def test_an_adjusting_run_repairs_once_its_owning_plan_is_finished(pg, monkeypatch):
+    """A leg generation that stopped mid-flight is closeable, never a wedge."""
+    factory = pg["factory"]
+    env = _Env(factory)
+    option_run_id = env.seed_run(
+        status="adjusting",
+        trades=[_open_trade("leg_short", "SELL"), _open_trade("leg_hedge", "BUY")],
+    )
+    env.bind_adjust(option_run_id, finished=True)
+
+    async with _client(factory, monkeypatch) as client:
+        inspection = await client.get(_repair_url(env.strategy_id, option_run_id))
+        assert inspection.status_code == 200, inspection.text
+        body = inspection.json()
+        # The verdict is the run's own evidence, under the plan's own execution
+        # state: finished, so the residual close is the governed way out.
+        assert body["status"] == "adjusting"
+        assert body["evidence"]["adjust_owner"]["state"] == "finished", body
+        assert body["state"] == "residual", body
+
+        repair = await client.post(
+            _repair_url(env.strategy_id, option_run_id),
+            json={"action": "close_residual", "evidence_digest": body["evidence_digest"]},
+        )
+        assert repair.status_code == 200, repair.text
+        assert repair.json()["run_status"] == "exiting"
+
+    assert _run_row(factory, option_run_id)["status"] == "exiting"
+
+
+@pytest.mark.asyncio
+async def test_an_adjusting_run_whose_plan_is_still_submitting_is_refused(pg, monkeypatch):
+    """Nothing is closed out from under a plan that may still be submitting."""
+    factory = pg["factory"]
+    env = _Env(factory)
+    option_run_id = env.seed_run(
+        status="adjusting",
+        trades=[_open_trade("leg_short", "SELL"), _open_trade("leg_hedge", "BUY")],
+    )
+    env.bind_adjust(option_run_id, finished=False)
+
+    async with _client(factory, monkeypatch) as client:
+        inspection = await client.get(_repair_url(env.strategy_id, option_run_id))
+        assert inspection.status_code == 200, inspection.text
+        body = inspection.json()
+        assert body["status"] == "adjusting"
+        assert body["state"] == "ambiguous"
+        assert "adjust_in_flight" in body["reasons"]
+        assert body["evidence"]["adjust_owner"]["state"] == "in_flight"
+
+        repair = await client.post(
+            _repair_url(env.strategy_id, option_run_id),
+            json={"action": "close_residual", "evidence_digest": body["evidence_digest"]},
+        )
+        assert repair.status_code == 409, repair.text
+        assert repair.json()["detail"]["rejection_reason"] == "OPTION_RUN_REPAIR_AMBIGUOUS"
+
+    assert _run_row(factory, option_run_id)["status"] == "adjusting"

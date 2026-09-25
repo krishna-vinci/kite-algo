@@ -13,6 +13,7 @@ from backend.options.execution.models import OptionRunState
 from backend.options.execution.repair import (
     ACTION_CLOSE_FLAT,
     ACTION_CLOSE_RESIDUAL,
+    REASON_ADJUST_IN_FLIGHT,
     REASON_AMBIGUOUS,
     REASON_EVIDENCE_CHANGED,
     REASON_NOT_REPAIRABLE,
@@ -100,9 +101,17 @@ class _FakeRunStore:
         return True
 
 
-def _service(run: OptionRunState) -> tuple[OptionRunRepairService, _FakeRunStore]:
+def _service(
+    run: OptionRunState, *, adjust_owner: dict | None = None
+) -> tuple[OptionRunRepairService, _FakeRunStore]:
     store = _FakeRunStore(run)
-    return OptionRunRepairService(run_store=store, staged_exit=_staged_exit()), store
+    reader = None if adjust_owner is None else (lambda _run_id: dict(adjust_owner))
+    return (
+        OptionRunRepairService(
+            run_store=store, staged_exit=_staged_exit(), adjust_owner_reader=reader
+        ),
+        store,
+    )
 
 
 def test_a_flat_partial_run_is_flat_and_closes_through_the_service():
@@ -262,6 +271,85 @@ def test_a_fill_the_run_cannot_attribute_is_ambiguous():
     assessment = assess_option_run_repair(run, _staged_exit())
     assert assessment["state"] == STATE_AMBIGUOUS
     assert "unattributable_trades" in assessment["reasons"]
+
+
+def test_an_adjusting_run_is_repairable_once_its_owning_plan_finished():
+    """A leg generation that stopped mid-flight is stranded work too."""
+    run = _run(
+        "adjusting",
+        trades=[_trade("leg_short", "SELL", 75), _trade("leg_hedge", "BUY", 75)],
+    )
+    owner = {"state": "finished", "plan_ids": ["plan-roll"], "plans": {}}
+    assessment = assess_option_run_repair(run, _staged_exit(), adjust_owner=owner)
+    assert assessment["state"] == STATE_RESIDUAL
+    assert assessment["reasons"] == []
+    assert assessment["reason_code"] is None
+    assert [order["tradingsymbol"] for order in assessment["close_plan"]] == [SHORT]
+
+    service, store = _service(run, adjust_owner=owner)
+    planned, detail = service.plan(
+        option_run_id=run.strategy_run_id,
+        action=ACTION_CLOSE_RESIDUAL,
+        evidence_digest=assessment["evidence_digest"],
+    )
+    assert detail["state"] == STATE_RESIDUAL
+    service.commit(planned, allowed_from=str(run.status))
+    assert store.run.status == "exiting"
+    assert store.run.pending_legs == ["leg_short"]
+
+
+def test_a_flat_adjusting_run_closes_flat_along_the_existing_edges():
+    """``adjusting`` reaches ``exited`` through ``cleanup_required``, as repair does."""
+    run = _run(
+        "adjusting",
+        trades=[
+            _trade("leg_short", "SELL", 75),
+            _trade("leg_short", "BUY", 75),
+            _trade("leg_hedge", "BUY", 75),
+            _trade("leg_hedge", "SELL", 75),
+        ],
+    )
+    owner = {"state": "finished", "plan_ids": ["plan-roll"], "plans": {}}
+    assessment = assess_option_run_repair(run, _staged_exit(), adjust_owner=owner)
+    assert assessment["state"] == STATE_FLAT
+
+    service, store = _service(run, adjust_owner=owner)
+    planned, _detail = service.plan(
+        option_run_id=run.strategy_run_id,
+        action=ACTION_CLOSE_FLAT,
+        evidence_digest=assessment["evidence_digest"],
+    )
+    service.commit(planned, allowed_from=str(run.status))
+    assert store.run.status == "exited"
+
+
+def test_an_adjusting_run_whose_plan_is_still_submitting_is_ambiguous():
+    """Nothing is closed out from under a plan that may still be submitting."""
+    run = _run("adjusting", trades=[_trade("leg_short", "SELL", 75)])
+    submitting = {"state": "in_flight", "plan_ids": ["plan-roll"], "plans": {}}
+    assessment = assess_option_run_repair(run, _staged_exit(), adjust_owner=submitting)
+    assert assessment["state"] == STATE_AMBIGUOUS
+    assert assessment["reason_code"] == REASON_AMBIGUOUS
+    assert REASON_ADJUST_IN_FLIGHT in assessment["reasons"]
+
+    service, store = _service(run, adjust_owner=submitting)
+    inspection = service.assessment(run.strategy_run_id)
+    assert REASON_ADJUST_IN_FLIGHT in inspection["reasons"]
+    with pytest.raises(OptionRunRepairRefusal) as refusal:
+        service.plan(
+            option_run_id=run.strategy_run_id,
+            action=ACTION_CLOSE_RESIDUAL,
+            evidence_digest=inspection["evidence_digest"],
+        )
+    assert refusal.value.reason_code == REASON_AMBIGUOUS
+    assert refusal.value.status_code == 409
+    assert store.run.status == "adjusting"
+
+    # No reader at all is the same answer, never "stranded": the caller that
+    # cannot read the owner is not told the run may be closed.
+    unread = assess_option_run_repair(run, _staged_exit())
+    assert unread["state"] == STATE_AMBIGUOUS
+    assert REASON_ADJUST_IN_FLIGHT in unread["reasons"]
 
 
 def test_a_non_repairable_status_refuses_and_does_not_change_the_run():

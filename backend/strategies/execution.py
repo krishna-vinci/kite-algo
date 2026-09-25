@@ -322,12 +322,35 @@ class PaperPlanExecutor:
             entry_steps = self._ordered_entry_steps(entry_steps, build_entry_order_plan)
             exit_steps = self._ordered_exit_steps(exit_steps, build_structure_exit_orders)
             if str((option_target or {}).get("phase") or "") == "adjust":
-                # An ADJUST reduces first and increases second: a reduction frees
-                # the run's own hedge only against its PROVEN short closure, while
-                # every increase is released only against a confirmed hedge fill.
-                # The two orderings are the entry and exit builders' own; nothing
-                # is re-derived here.
-                step_order = exit_steps + entry_steps
+                if bool((option_target or {}).get("_adjust_roll")):
+                    # A ROLL is ACQUIRE-first: the new generation is opened and
+                    # proven before the old one is released, so the structure is
+                    # never briefly unheld. Both halves keep their own ordering
+                    # (hedge before its dependent short; short close before the
+                    # hedge release it defends) - the same two builders as entry
+                    # and exit, applied to the two stages.
+                    acquire_numbers = {
+                        int(number)
+                        for number in (
+                            (option_target or {}).get("_adjust_roll_acquire_steps") or []
+                        )
+                    }
+                    acquiring = [
+                        step for step in steps_spec if int(step[0]) in acquire_numbers
+                    ]
+                    releasing = [
+                        step for step in steps_spec if int(step[0]) not in acquire_numbers
+                    ]
+                    step_order = self._ordered_entry_steps(
+                        acquiring, build_entry_order_plan
+                    ) + self._ordered_exit_steps(releasing, build_structure_exit_orders)
+                else:
+                    # An ADJUST reduces first and increases second: a reduction
+                    # frees the run's own hedge only against its PROVEN short
+                    # closure, while every increase is released only against a
+                    # confirmed hedge fill. The two orderings are the entry and exit
+                    # builders' own; nothing is re-derived here.
+                    step_order = exit_steps + entry_steps
             else:
                 step_order = entry_steps + exit_steps
             hedge_required = sum(
@@ -358,6 +381,25 @@ class PaperPlanExecutor:
         # old contract (peak-margin semantics), and the options lane has its own
         # hedge/exit ordering; neither may be reordered by this generic rule.
         staged_by_release: Dict[int, List[int]] = {}
+        # A ROLL's release half is withheld until its acquire half is PROVEN: every
+        # new leg's required quantity must be held by this run's OWN fills - its
+        # confirmed open at sizing plus this pass's confirmed fills - never by a
+        # submission or by the event word alone. A step that only partially filled,
+        # and (because the pinned lot floors the delta) a step that rounds to a
+        # no-op while the run still sits short of its target, both prove nothing.
+        roll_acquire_steps = [
+            int(number)
+            for number in (option_target or {}).get("_adjust_roll_acquire_steps") or []
+        ]
+        roll_release_steps = {
+            int(number)
+            for number in (option_target or {}).get("_adjust_roll_release_steps") or []
+        }
+        roll_acquire_numbers = set(roll_acquire_steps)
+        roll_acquire_legs = {
+            int(step[0]): step for step in step_order if int(step[0]) in roll_acquire_numbers
+        }
+        roll_expiries = dict((option_target or {}).get("_adjust_roll_expiries") or {})
         # The product must be the CNC cash segment on EVERY leg: an
         # ``intent_bundle`` also carries NRML/MIS shapes whose sequencing and
         # margining are the domain's own, so the generic portfolio rule must not
@@ -419,6 +461,52 @@ class PaperPlanExecutor:
             return base + timedelta(microseconds=counter)
 
         for step_no, leg, quantity, side in step_order:
+            if int(step_no) in roll_release_steps:
+                acquire_evidence = {
+                    number: self._roll_acquire_evidence(step, outcomes)
+                    for number, step in sorted(roll_acquire_legs.items())
+                }
+                unproven = [
+                    number
+                    for number, evidence in acquire_evidence.items()
+                    if not evidence["proven"]
+                ]
+                if unproven:
+                    outcomes.append(
+                        self._record_event(
+                            plan_id,
+                            step_no=step_no,
+                            event="rejected",
+                            refusal_reason="OPTION_ADJUSTMENT_ROLL_INCOMPLETE",
+                            actor_id=actor,
+                            detail={
+                                "instrument_id": leg.get("instrument_id"),
+                                "tradingsymbol": leg.get("tradingsymbol"),
+                                "side": side,
+                                "quantity": int(quantity),
+                                "held_expiry": str(roll_expiries.get("held") or ""),
+                                "new_expiry": str(roll_expiries.get("desired") or ""),
+                                "acquire_steps": list(roll_acquire_steps),
+                                "unproven_acquire_steps": unproven,
+                                "acquire_evidence": acquire_evidence,
+                                "acquire_outcomes": {
+                                    str(number): _event_for_step(outcomes, number)
+                                    for number in roll_acquire_steps
+                                },
+                                "retryable": True,
+                                "reason": "new_generation_not_proven",
+                                "message": (
+                                    "the new generation's required quantities are not "
+                                    "held by this run's own fills, so the old "
+                                    "generation is not released; the run stays adjusting "
+                                    "and a retry converges from the fills already held"
+                                ),
+                            },
+                            at=_stamp(),
+                        )
+                    )
+                    rejected = True
+                    continue
             dependent_on = staged_by_release.get(int(step_no))
             if dependent_on:
                 unresolved_sales = [
@@ -1053,6 +1141,42 @@ class PaperPlanExecutor:
         return open_by_leg
 
     @staticmethod
+    def _roll_acquire_evidence(
+        step: Any, outcomes: Sequence[Mapping[str, Any]]
+    ) -> Dict[str, Any]:
+        """Whether a roll's acquire leg is HELD at its target, and the evidence.
+
+        The run's own ledger decides it: the confirmed open this leg had when the
+        plan was SIZED plus every confirmed fill recorded against it in this pass,
+        against the frozen target. A submission proves nothing, a partial fill
+        proves only its part, and the recorded event word is deliberately not the
+        test - with the pinned lot flooring the delta, a step can round to a
+        ``no_op`` while the run still sits short of the target it names.
+        """
+        index, leg, _quantity, side = step
+        target = int(
+            leg.get("signed_quantity")
+            if leg.get("signed_quantity") is not None
+            else leg.get("quantity") or 0
+        )
+        held = int(leg.get("_current_quantity") or 0)
+        bought = str(side).upper() == "BUY"
+        for outcome in outcomes:
+            if int(outcome.get("step_no") or 0) != int(index):
+                continue
+            if str(outcome.get("event") or "") not in ("filled", "partially_filled"):
+                continue
+            amount = abs(int(outcome.get("filled_quantity") or 0))
+            held += amount if bought else -amount
+        return {
+            "step_no": int(index),
+            "run_leg_id": str(leg.get("_run_leg_id") or ""),
+            "target_quantity": target,
+            "held_quantity": held,
+            "proven": abs(held) >= abs(target),
+        }
+
+    @staticmethod
     def _option_run_generation(run: Any) -> int:
         """The run's held leg generation. Absent means the first one."""
         metadata = getattr(run, "metadata", None) or {}
@@ -1100,10 +1224,19 @@ class PaperPlanExecutor:
 
     @staticmethod
     def _adjusted_protection(run: Any, plan: Mapping[str, Any]) -> Dict[str, Any]:
-        """The run's protection block, re-pointed at the generation it now holds."""
+        """The run's protection block, re-pointed at the generation it now holds.
+
+        A roll moves the structure onto a new expiry, so every frozen field the
+        block carries is rewritten - the digest and the policy as ever, and an
+        explicit ``expiry`` when the run's own block declares one (the entry edge
+        writes it beside the policy only when it has it).
+        """
         resolved = plan.get("resolved_plan") or {}
         protection = dict(getattr(run, "protection", None) or {})
-        for key in ("structure_digest", "structure_id", "underlying", "expiry_policy"):
+        keys = ["structure_digest", "structure_id", "underlying", "expiry_policy"]
+        if "expiry" in protection:
+            keys.append("expiry")
+        for key in keys:
             value = resolved.get(key)
             if value not in (None, ""):
                 protection[key] = value
@@ -1277,10 +1410,23 @@ class PaperPlanExecutor:
         ``{plan_id}:{index}`` - appended to the run's legs BEFORE the first
         submission, so a fill lands on the leg the run will hold.
 
-        Two shapes are not an adjust and refuse by name here: a REVERSAL on one
-        contract (both non-zero with opposite signs - a reduce-to-zero and re-open
-        is a re-entry with its own plan), and an expiry change (that is the S4
-        roll, whose acquire-prove-release ordering this slice does not implement).
+        Three shapes are decided here, all from the frozen target and the run's own
+        held legs:
+
+        * a resize, an addition or a removal stays within the run's held expiry:
+          one delta per contract, as above;
+        * an EXPIRY ROLL - every frozen leg on ONE expiry the run does not hold -
+          is a two-stage sequence: the new generation is ACQUIRED first (hedges
+          before their dependent shorts, both released only against confirmed
+          fills) and PROVEN from the run's own trades, and only then is the old
+          generation RELEASED (shorts closed and proven before hedges). The old
+          legs are never touched before the new ones are proven, and the proof is
+          the run's own ledger - mirroring ``backend.strategies.rolls``' ordering
+          without reusing its ``strategy_rolls`` storage;
+        * a REVERSAL on one contract (both non-zero with opposite signs - a
+          reduce-to-zero and re-open is a re-entry with its own plan), or a
+          desired state whose legs disagree about the expiry, is not an adjust:
+          it refuses ``OPTION_ADJUSTMENT_UNSUPPORTED``.
 
         Two safety gates decide whether the target may be reached AT ALL, before
         a single order is sized:
@@ -1310,43 +1456,56 @@ class PaperPlanExecutor:
                     **uncovered,
                 },
             )
-        structure_expiry = str(resolved.get("expiry") or "")
         previous_legs = [dict(leg) for leg in getattr(run, "legs", []) or []]
+        desired_expiry = self._adjust_desired_expiry(
+            plan_id=plan_id, resolved=resolved, frozen=frozen
+        )
+        # A ROLL is an expiry change: the target is on an expiry the run does not
+        # hold. Held legs are therefore matched per (identity, expiry), so a
+        # desired leg is opened as a NEW run leg instead of being traded as a
+        # delta against the leg it replaces. A run holding BOTH generations is a
+        # roll already in flight (a retry), and is still a roll.
+        roll = bool(desired_expiry) and any(
+            str(held.get("expiry_key") or "") not in ("", desired_expiry)
+            for held in previous_legs
+        )
+        if roll:
+            held_underlying = str(
+                (getattr(run, "protection", None) or {}).get("underlying") or ""
+            )
+            plan_underlying = str(resolved.get("underlying") or "")
+            if held_underlying and plan_underlying and held_underlying != plan_underlying:
+                raise ExecutionRefusal(
+                    "OPTION_ADJUSTMENT_UNSUPPORTED",
+                    {
+                        "plan_id": plan_id,
+                        "instrument_id": "",
+                        "reason": "underlying_change_is_not_an_adjust",
+                        "held_underlying": held_underlying,
+                        "plan_underlying": plan_underlying,
+                        "message": (
+                            "a roll moves the expiry of ONE underlying; a different "
+                            "underlying is a different structure, never an adjust"
+                        ),
+                    },
+                )
+        if desired_expiry:
+            # The generations are kept apart by expiry: a leg the run holds on the
+            # OLD expiry is not the leg this delta names, even under one identity.
+            run_legs = {
+                identity: held
+                for identity, held in run_legs.items()
+                if str(held.get("expiry_key") or "") in ("", desired_expiry)
+            }
         named: set[str] = set()
         steps: List[Any] = []
         desired_legs: List[Dict[str, Any]] = []
+        acquire_step_numbers: List[int] = []
         for index, leg in enumerate(frozen, start=1):
             identity = str(leg.get("instrument_id") or leg.get("tradingsymbol") or "")
             named.add(identity)
             lot = self._pinned_lot(plan, leg)
-            leg_expiry = str(leg.get("expiry") or "")
-            if structure_expiry and leg_expiry and leg_expiry != structure_expiry:
-                raise ExecutionRefusal(
-                    "OPTION_ADJUSTMENT_UNSUPPORTED",
-                    {
-                        "plan_id": plan_id,
-                        "instrument_id": identity,
-                        "reason": "expiry_change_is_a_roll",
-                        "plan_expiry": leg_expiry,
-                        "structure_expiry": structure_expiry,
-                    },
-                )
             run_leg = run_legs.get(identity)
-            if (
-                run_leg is not None
-                and structure_expiry
-                and str(run_leg.get("expiry_key") or "") not in ("", structure_expiry)
-            ):
-                raise ExecutionRefusal(
-                    "OPTION_ADJUSTMENT_UNSUPPORTED",
-                    {
-                        "plan_id": plan_id,
-                        "instrument_id": identity,
-                        "reason": "expiry_change_is_a_roll",
-                        "run_expiry": str(run_leg.get("expiry_key") or ""),
-                        "structure_expiry": structure_expiry,
-                    },
-                )
             if run_leg is None:
                 from backend.options.execution.plan_binding import _to_execution_leg
 
@@ -1385,6 +1544,7 @@ class PaperPlanExecutor:
                 target_quantity, current
             )
             steps.append((index, leg, quantity, "BUY" if quantity > 0 else "SELL"))
+            acquire_step_numbers.append(index)
             desired_legs.append(
                 self._desired_adjust_run_leg(leg, run_leg=run_leg, target_quantity=target_quantity)
             )
@@ -1393,8 +1553,16 @@ class PaperPlanExecutor:
         # target is flat, so the step closes exactly the run's own open - never a
         # position another structure holds.
         step_no = len(frozen)
+        release_step_numbers: List[int] = []
+        release_legs: List[Dict[str, Any]] = []
         for run_leg in previous_legs:
-            if self._run_leg_identity(run_leg) in named:
+            if self._run_leg_identity(run_leg) in named and (
+                not desired_expiry
+                or str(run_leg.get("expiry_key") or "") in ("", desired_expiry)
+            ):
+                # Named AND on the generation this target holds: the delta above
+                # answers for it. A same-identity leg on the OTHER expiry is the
+                # roll's old generation, and is released below instead.
                 continue
             current = int(open_by_leg.get(str(run_leg.get("leg_id")), 0))
             if current == 0:
@@ -1408,6 +1576,8 @@ class PaperPlanExecutor:
             removal["_increases_exposure"] = False
             quantity = self._floor_to_lot(-current, lot)
             steps.append((step_no, removal, quantity, "BUY" if quantity > 0 else "SELL"))
+            release_step_numbers.append(step_no)
+            release_legs.append(dict(run_leg))
 
         # The protection split, decided from the run's own frozen protection block
         # (the worker safety gate's own read) and the DELTA this target implies: a
@@ -1450,7 +1620,91 @@ class PaperPlanExecutor:
                 run.legs.append(run_leg)
         target["_adjust_desired_legs"] = desired_legs
         target["_adjust_previous_legs"] = previous_legs
+        # The RELEASE half of a roll is gated on the ACQUIRE half's confirmed
+        # fills. Only a roll owns that gate: a plain resize never releases a leg
+        # the target no longer names before the new generation is proven.
+        target["_adjust_release_legs"] = release_legs
+        if roll:
+            target["_adjust_roll"] = True
+            target["_adjust_roll_acquire_steps"] = list(acquire_step_numbers)
+            target["_adjust_roll_release_steps"] = list(release_step_numbers)
+            target["_adjust_roll_expiries"] = {
+                "held": str(previous_legs[0].get("expiry_key") or ""),
+                "desired": str(desired_expiry),
+            }
         return steps
+
+    @staticmethod
+    def _adjust_desired_expiry(
+        *,
+        plan_id: str,
+        resolved: Mapping[str, Any],
+        frozen: Sequence[Mapping[str, Any]],
+    ) -> str:
+        """The ONE expiry a frozen adjust names, or a refusal by name.
+
+        The compiler freezes the structure's expiry once and every leg must agree
+        with it: a desired state that spreads its legs over more than one expiry is
+        not one structure, and mixing them would leave the engine with no single
+        generation to acquire or release. A leg on a different expiry than the
+        frozen structure refuses ``OPTION_ADJUSTMENT_UNSUPPORTED`` BEFORE anything
+        is sized - an expiry change belongs to a roll of EVERY leg, and a
+        single-leg change is a close and a re-entry.
+        """
+        declared = str(resolved.get("expiry") or "")
+        mismatched: List[Dict[str, Any]] = []
+        for leg in frozen:
+            leg_expiry = str(leg.get("expiry") or "")
+            if declared and leg_expiry and leg_expiry != declared:
+                mismatched.append(
+                    {
+                        "instrument_id": str(
+                            leg.get("instrument_id") or leg.get("tradingsymbol") or ""
+                        ),
+                        "leg_expiry": leg_expiry,
+                        "structure_expiry": declared,
+                    }
+                )
+        if not declared:
+            expiries = {str(leg.get("expiry") or "") for leg in frozen} - {""}
+            if len(expiries) > 1:
+                mismatched.append({"structure_expiry": "", "leg_expiries": sorted(expiries)})
+            else:
+                declared = next(iter(expiries), "")
+        if mismatched:
+            raise ExecutionRefusal(
+                "OPTION_ADJUSTMENT_UNSUPPORTED",
+                {
+                    "plan_id": plan_id,
+                    "reason": "mixed_expiries_in_one_desired_state",
+                    "mismatched": mismatched,
+                    "message": (
+                        "a desired state whose legs disagree about the expiry is not "
+                        "one structure: the engine has no single generation to "
+                        "acquire or release"
+                    ),
+                },
+            )
+        return declared
+
+    def _adjust_release_legs_still_open(
+        self, target: Mapping[str, Any], run: Any
+    ) -> List[str]:
+        """The legs a COMPLETED roll still holds, read from the run's own ledger.
+
+        A roll's completion is a claim about the position the run holds, so it is
+        answered from the run's own recorded fills - never from the plan's intent
+        that the release legs were submitted.
+        """
+        open_after = self._option_run_open_by_leg(run)
+        return [
+            leg_id
+            for leg_id in (
+                str(leg.get("leg_id") or "")
+                for leg in target.get("_adjust_release_legs") or []
+            )
+            if int(open_after.get(leg_id, 0) or 0) != 0
+        ]
 
     @staticmethod
     def _desired_adjust_run_leg(
@@ -1499,6 +1753,64 @@ class PaperPlanExecutor:
 
             self._option_run_store = DurableOptionRunStore(session_factory=self.session_factory)
         return self._option_run_store
+
+    def _option_adjust_superseded_plans(self, run: Any, *, plan_id: str) -> List[str]:
+        """The plans this plan TAKES OVER, or a refusal by name.
+
+        The shared rule (``option_adjust_owner_state``) is asked again at the CAS
+        boundary, on a fresh read: resolution already proved the run's adjust
+        owners finished executing, and this is what keeps a plan that bound in
+        between from being overrun. A read that cannot prove them finished - or a
+        run whose adjust phase is reached from NO adjust edge - refuses, because a
+        takeover re-derives the delta from the run's own confirmed fills and the
+        same work must never be submitted twice.
+        """
+        from backend.options.execution.plan_binding import (
+            PLAN_EXECUTION_FINISHED,
+            option_adjust_owner_state,
+        )
+
+        option_run_id = str(getattr(run, "strategy_run_id", "") or "")
+        try:
+            with self.session_factory() as session:
+                owner_state = option_adjust_owner_state(
+                    option_run_id, session=session, exclude_plan_ids=(plan_id,)
+                )
+        except Exception as exc:  # noqa: BLE001 - an unreadable owner is never "none"
+            raise ExecutionRefusal(
+                "OPTION_RUN_ADJUST_IN_FLIGHT",
+                {
+                    "plan_id": plan_id,
+                    "option_run_id": option_run_id,
+                    "option_run_status": str(getattr(run, "status", "") or ""),
+                    "reason": "adjust_owner_read_failed",
+                    "error": type(exc).__name__,
+                    "message": (
+                        "the plans that own this run's in-flight adjust cannot be read; "
+                        "the transition is never taken on an unreadable owner set"
+                    ),
+                },
+            ) from exc
+        if str(owner_state.get("state") or "") != PLAN_EXECUTION_FINISHED:
+            raise ExecutionRefusal(
+                "OPTION_RUN_ADJUST_IN_FLIGHT",
+                {
+                    "plan_id": plan_id,
+                    "option_run_id": option_run_id,
+                    "option_run_status": str(getattr(run, "status", "") or ""),
+                    "adjust_owner_state": owner_state,
+                    "message": (
+                        "this run's in-flight adjust is not provably finished, so its "
+                        "remainder is not taken over: the delta is re-derived from the "
+                        "run's own fills and the same work is never submitted twice"
+                    ),
+                },
+            )
+        return [
+            str(owner)
+            for owner in owner_state.get("plan_ids") or []
+            if str(owner) and str(owner) != str(plan_id)
+        ]
 
     def _resolve_option_target(
         self, plan: Mapping[str, Any], binding: Mapping[str, Any]
@@ -1564,26 +1876,28 @@ class PaperPlanExecutor:
                 # One CAS-guarded transition is the adjust's ownership token, so
                 # two plans can never mutate one structure concurrently.
                 if observed == "adjusting":
-                    # This plan's OWN binding already owns the in-flight adjust (a
-                    # re-drive): the transition is not re-taken, and the delta is
-                    # re-derived from the run's own confirmed fills.
-                    owner = str((target.get("binding") or {}).get("plan_id") or "")
-                    if owner != plan_id:
-                        raise ExecutionRefusal(
-                            "OPTION_RUN_ADJUST_IN_FLIGHT",
-                            {
-                                "plan_id": plan_id,
-                                "option_run_id": run.strategy_run_id,
-                                "option_run_status": observed,
-                                "owning_plan_id": owner,
-                                "message": (
-                                    "another plan owns this run's in-flight adjust; the "
-                                    "transition is taken exactly once"
-                                ),
-                            },
-                        )
-                    return target
-                if observed != "entered":
+                    # This plan TAKES OVER the run's in-flight adjust: either its
+                    # OWN bound-but-unstarted attempt, or a SUPERSEDE of a plan
+                    # whose execution has provably FINISHED (the shared rule
+                    # admitted it at resolution; it is asked again here, at the
+                    # CAS boundary, so a plan that bound in between cannot be
+                    # overrun). Every delta is re-derived from the run's own
+                    # confirmed fills, so a successor executes only the remainder.
+                    superseded = self._option_adjust_superseded_plans(run, plan_id=plan_id)
+                    if superseded:
+                        # The takeover is durable on the run: which plan(s) this
+                        # one took over, kept oldest-first for audit.
+                        metadata = dict(getattr(run, "metadata", None) or {})
+                        history = list(metadata.get("adjust_superseded_plan_ids") or [])
+                        for previous in superseded:
+                            if previous not in history:
+                                history.append(previous)
+                        metadata["adjust_superseded_plan_ids"] = history
+                        run.metadata = metadata
+                    next_run = mark_adjusting(
+                        run, pending_legs=list(getattr(run, "pending_legs", []) or [])
+                    )
+                elif observed != "entered":
                     raise ExecutionRefusal(
                         "OPTION_RUN_STATE_CHANGED",
                         {
@@ -1593,31 +1907,33 @@ class PaperPlanExecutor:
                             "message": "an adjust may only mutate a run's held structure",
                         },
                     )
-                # A stage the platform committed and has not resolved owns the
-                # run's next transition, so the structure is not mutated beside it.
-                from backend.options.protection.staged_exit import (
-                    unresolved_stage_claim,
-                )
-
-                unresolved = unresolved_stage_claim(getattr(run, "orders", None) or [])
-                if unresolved is not None:
-                    raise ExecutionRefusal(
-                        "OPTION_PROTECTIVE_EXIT_UNRESOLVED",
-                        {
-                            "plan_id": plan_id,
-                            "option_run_id": run.strategy_run_id,
-                            "option_run_status": observed,
-                            "stage_digest": str(unresolved.get("stage_digest") or ""),
-                            "stage_state": str(unresolved.get("state") or ""),
-                            "stage_attempt": int(unresolved.get("attempt") or 1),
-                            "message": (
-                                "a protective exit stage is unresolved for this run; "
-                                "it is reconciled from the platform's own pre-send "
-                                "records before the structure is mutated"
-                            ),
-                        },
+                else:
+                    # A stage the platform committed and has not resolved owns the
+                    # run's next transition, so the structure is not mutated beside
+                    # it.
+                    from backend.options.protection.staged_exit import (
+                        unresolved_stage_claim,
                     )
-                next_run = mark_adjusting(run)
+
+                    unresolved = unresolved_stage_claim(getattr(run, "orders", None) or [])
+                    if unresolved is not None:
+                        raise ExecutionRefusal(
+                            "OPTION_PROTECTIVE_EXIT_UNRESOLVED",
+                            {
+                                "plan_id": plan_id,
+                                "option_run_id": run.strategy_run_id,
+                                "option_run_status": observed,
+                                "stage_digest": str(unresolved.get("stage_digest") or ""),
+                                "stage_state": str(unresolved.get("state") or ""),
+                                "stage_attempt": int(unresolved.get("attempt") or 1),
+                                "message": (
+                                    "a protective exit stage is unresolved for this run; "
+                                    "it is reconciled from the platform's own pre-send "
+                                    "records before the structure is mutated"
+                                ),
+                            },
+                        )
+                    next_run = mark_adjusting(run)
             else:
                 # A protective exit stage the platform committed and has not
                 # resolved owns the run's next exit. A governed exit submitted
@@ -1726,11 +2042,32 @@ class PaperPlanExecutor:
 
         store = self._option_runs()
         phase = str(target.get("phase") or "")
+        roll = bool(target.get("_adjust_roll"))
+        # A ROLL withholds its old generation rather than failing it: a release
+        # refused because the new generation is not yet PROVEN leaves the run in
+        # the same generation on purpose, and a retry converges from the fills the
+        # run already holds. Only a roll owns that reading - a plain adjust's
+        # withheld release stays the failure S3 pinned.
+        roll_withheld_refusals = (
+            frozenset(
+                {
+                    # The release half was never attempted: the new generation is
+                    # not yet proven, so the same generation is simply retried.
+                    "OPTION_ADJUSTMENT_ROLL_INCOMPLETE",
+                    # A dependent short the hedge did not (yet) prove: §4's partial
+                    # hedge fill, withheld for the remainder in the SAME generation.
+                    "OPTION_HEDGE_NOT_FILLED",
+                }
+            )
+            if roll
+            else frozenset()
+        )
         legs_by_step = {int(step[0]): step for step in step_order}
         orders: List[Dict[str, Any]] = []
         trades: List[Dict[str, Any]] = []
         completed: List[str] = []
         pending: List[str] = []
+        withheld: List[str] = []
         failed: List[str] = []
         for outcome in outcomes:
             step_no = int(outcome.get("step_no") or 0)
@@ -1759,7 +2096,10 @@ class PaperPlanExecutor:
             elif event == "partially_filled":
                 pending.append(leg_id)
             elif event in ("rejected", "failed"):
-                failed.append(leg_id)
+                if str(outcome.get("refusal_reason") or "") in roll_withheld_refusals:
+                    withheld.append(leg_id)
+                else:
+                    failed.append(leg_id)
 
         run = target["run"]
         # Record the evidence FIRST: the run's next state is derived from the
@@ -1792,11 +2132,21 @@ class PaperPlanExecutor:
                     # a fabricated "entered".
                     run = mark_cleanup_required(run)
                     run.failed_legs = list(failed)
-                elif pending:
+                elif pending or withheld:
                     # A withheld or partially filled increase leaves the SAME
                     # generation: the target is unchanged, so a retry re-derives
                     # the delta from the run's own fills and can only converge.
-                    run = mark_adjusting(run, pending_legs=list(dict.fromkeys(pending)))
+                    run = mark_adjusting(
+                        run, pending_legs=list(dict.fromkeys(pending + withheld))
+                    )
+                elif roll and self._adjust_release_legs_still_open(target, run):
+                    # A ROLL may only COMPLETE on proof from the run's OWN ledger
+                    # that every leg it releases is flat: the old generation is
+                    # released, never merely declared gone.
+                    run = mark_adjusting(
+                        run,
+                        pending_legs=self._adjust_release_legs_still_open(target, run),
+                    )
                 else:
                     # Every leg landed. The desired state becomes the run's HELD
                     # state, under a new generation, with the previous generation's

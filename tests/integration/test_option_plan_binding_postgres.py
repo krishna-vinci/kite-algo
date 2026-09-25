@@ -918,6 +918,102 @@ class TestAdjustEdge:
         # Never re-derived against the newer run: no edge was written.
         assert _store(factory).get(plan_id) is None
 
+    def test_only_one_plan_takes_over_an_in_flight_adjust(self, pg):
+        """One run, one takeover: the run lock serializes, the loser refuses."""
+        import threading
+
+        from sqlalchemy import text
+
+        from backend.options.execution.plan_binding import PlanBindingRefusal
+
+        factory, strategy_id, entry_legs, option_run_id = self._entered(pg, generation=1)
+        legs = self._resized(entry_legs, quantity=150)
+        # The OWNER's edge exists and its pass has FINISHED: the run is left
+        # mid-mutation with no committed submission outstanding.
+        owner_plan = self._adjust_plan(
+            factory, strategy_id, legs=legs, reference=option_run_id, generation=1
+        )
+        _resolve(factory, owner_plan, strategy_id=strategy_id)
+        with factory() as session:
+            session.execute(
+                text(
+                    "UPDATE public.option_run_states SET status = 'adjusting' "
+                    "WHERE strategy_run_id = :r"
+                ),
+                {"r": option_run_id},
+            )
+            for event in ("submitted", "filled"):
+                session.execute(
+                    text(
+                        "INSERT INTO public.strategy_plan_execution_events "
+                        "(plan_id, step_no, event, filled_quantity, actor_id, detail) "
+                        "VALUES (:plan, 1, :event, 75, 'test', '{}')"
+                    ),
+                    {"plan": owner_plan, "event": event},
+                )
+            session.commit()
+
+        # TWO plans on the SAME basis resolve at once, each with its own bound
+        # worker run - exactly what two dispatches of one run would look like.
+        racers = [
+            self._adjust_plan(
+                factory, strategy_id, legs=legs, reference=option_run_id, generation=1
+            )
+            for _ in range(2)
+        ]
+        barrier = threading.Barrier(2)
+        won: list = []
+        refused: list = []
+        guard = threading.Lock()
+
+        def _take(plan_id: str) -> None:
+            try:
+                barrier.wait(timeout=10)
+                target = _resolve(factory, plan_id, strategy_id=strategy_id)
+                with guard:
+                    won.append((plan_id, target["option_run_id"]))
+            except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+                with guard:
+                    refused.append(exc)
+
+        threads = [threading.Thread(target=_take, args=(plan_id,)) for plan_id in racers]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+
+        # EXACTLY ONE edge was written. The loser refused by name, because the
+        # winner's own edge - a plan with no committed submission yet - is an
+        # owner that has not finished, so the same remainder is never sized twice.
+        assert len(won) == 1, won
+        assert won[0][1] == option_run_id
+        assert len(refused) == 1, refused
+        assert isinstance(refused[0], PlanBindingRefusal), refused
+        assert refused[0].reason_code == "OPTION_RUN_ADJUST_IN_FLIGHT"
+        owner_state = refused[0].detail["adjust_owner_state"]
+        assert owner_state["state"] in {"unknown", "in_flight"}
+        # The winner IS an owner the loser can see, and it reads as a plan that
+        # has committed no submission yet - never as a finished one.
+        winner_state = owner_state["plans"][won[0][0]]
+        assert winner_state["state"] in {"unknown", "in_flight"}
+        assert winner_state["evidence"]["events"] == 0
+        assert winner_state["evidence"]["reason"] == "no_committed_submission"
+        loser = next(plan_id for plan_id in racers if plan_id != won[0][0])
+        assert _store(factory).get(loser) is None
+        with factory() as session:
+            adjust_edges = (
+                session.execute(
+                    text(
+                        "SELECT plan_id FROM public.strategy_plan_option_runs "
+                        "WHERE option_run_id = :r AND phase = 'adjust'"
+                    ),
+                    {"r": option_run_id},
+                )
+                .scalars()
+                .all()
+            )
+        assert sorted(str(value) for value in adjust_edges) == sorted([owner_plan, won[0][0]])
+
 
 def _shape_digest(legs, *, underlying="NIFTY", expiry="2026-10-29") -> str:
     """The digest the compiler itself would freeze for these frozen legs."""
