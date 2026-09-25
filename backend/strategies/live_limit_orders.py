@@ -79,6 +79,7 @@ def is_gated_limit_release_rule(rule: Any) -> bool:
         RULE_HEDGE_RELEASE_WITHHELD,
         RULE_ROLL_CLOSE_RELEASED,
         RULE_STAGED_FUNDING_GATE,
+        RULE_OPTION_ROLL_RELEASE_GATE,
     )
 
     return str(rule or "") in (
@@ -87,7 +88,23 @@ def is_gated_limit_release_rule(rule: Any) -> bool:
         RULE_ROLL_CLOSE_RELEASED,
         RULE_HEDGE_FILL_GATE,
         RULE_HEDGE_RELEASE_WITHHELD,
+        RULE_OPTION_ROLL_RELEASE_GATE,
     )
+
+
+def is_gated_limit_step(*, lane: Any, spec: Any) -> bool:
+    """Classify a step structurally, not only by today's release-rule list.
+
+    An option-lane step is either an immediate leg or a gated dependent leg.
+    Checking the lane means a NEW option gate (including one carrying a future
+    ``option_*`` step class) cannot silently inherit the legacy MARKET path.
+    """
+    from .live_sequence import RULE_IMMEDIATE
+
+    rule = str(getattr(spec, "release_rule", "") or "")
+    if str(lane or getattr(spec, "lane", "") or "") == "option_structure":
+        return rule != RULE_IMMEDIATE
+    return is_gated_limit_release_rule(rule)
 
 
 # -- configuration -----------------------------------------------------------
@@ -154,6 +171,13 @@ def _positive_number(value: Any) -> Optional[float]:
     if not math.isfinite(number) or number <= 0.0:
         return None
     return number
+
+
+def quote_reference_ltp(quote: Optional[Mapping[str, Any]]) -> Optional[float]:
+    """The quote's usable fresh LTP, regardless of its payload key."""
+    if not isinstance(quote, Mapping):
+        return None
+    return _positive_number(quote.get("ltp", quote.get("last_price")))
 
 
 def frozen_reference_price(

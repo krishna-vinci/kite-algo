@@ -228,6 +228,7 @@ class LiveLaneLedger:
         step_no = int(getattr(spec, "step_no", 0) or 0)
         store = self._runs()
         run = store.get_run(run_id)
+        dedupe_key = f"{plan_id}:{step_no}:cumulative:{int(filled_total)}"
         recorded = sum(
             int(trade.get("quantity") or 0)
             for trade in (getattr(run, "trades", []) or [])
@@ -236,7 +237,7 @@ class LiveLaneLedger:
         )
         increment = int(filled_total) - recorded
         if increment > 0:
-            run = store.record_trades(
+            appended, _skipped = store.record_trades_once(
                 run_id,
                 [
                     {
@@ -247,11 +248,16 @@ class LiveLaneLedger:
                         "plan_id": plan_id,
                         "step_no": step_no,
                         "filled_total": int(filled_total),
+                        "dedupe_key": dedupe_key,
                         "source": "hosted_live_ingestion",
                         "recorded_at": self._clock().isoformat(),
                     }
                 ],
+                dedupe_key="dedupe_key",
             )
+            run = store.get_run(run_id)
+            if not appended:
+                increment = 0
         status = self._advance_option_run(run)
         status = self._advance_option_adjust(parent, run, status=status)
         return {

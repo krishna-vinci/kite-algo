@@ -827,6 +827,7 @@ async def test_live_roll_partial_acquisition_holds_old_generation_then_releases_
         assert counts["sequence_released"] == 1, (
             counts,
             _claims(pg["factory"], plan["plan_id"]),
+            _option_run(pg["factory"], plan["plan_id"]),
         )
         assert len(broker_calls) == 5, "old hedge was released beside the old short"
         assert broker_calls[-1].payload["order"]["transaction_type"] == "BUY"
@@ -1196,6 +1197,15 @@ async def test_gated_option_legs_are_bounded_limits_and_a_timeout_cancels_once(
     class _Broker:
         async def handle(self, intent, *, context=None):
             broker_calls.append(intent)
+            if intent.intent_type == "cancel_order":
+                order_id = str(intent.payload.get("order", {}).get("order_id") or "")
+                return {
+                    "result": {
+                        "order_id": order_id,
+                        "status": "CANCELLED",
+                        "filled_quantity": 0,
+                    }
+                }
             return {"result": {"order_id": f"O-{len(broker_calls)}", "status": "success"}}
 
     app, executor = _build_app(pg["factory"], _Broker(), clock)

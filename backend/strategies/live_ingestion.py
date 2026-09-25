@@ -61,7 +61,7 @@ from backend.strategies.settlement import ExecutionBarrier
 LIVE_ENVIRONMENT = "live"
 
 #: Outcomes the consumer may still progress. Everything else is resolved truth.
-SCANNABLE_STATES = ("pending", "partial", "finalizing", "rejecting")
+SCANNABLE_STATES = ("pending", "partial", "finalizing", "rejecting", "uncertain")
 
 #: States that may never be rewritten by a later pass.
 TERMINAL_STATES = ("filled", "rejected", "no_op")

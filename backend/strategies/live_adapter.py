@@ -70,8 +70,9 @@ from .live_limit_orders import (
     derive_bounded_limit,
     frozen_reference_price,
     gated_limit_timeout_seconds,
-    is_gated_limit_release_rule,
+    is_gated_limit_step,
     option_limit_max_drift_pct,
+    quote_reference_ltp,
     staged_buy_max_price_drift_pct,
 )
 from .live_readers import live_catalog_tick_size
@@ -538,6 +539,7 @@ class LivePlanAdapter:
         quote_max_age_seconds: float = QUOTE_MAX_AGE_SECONDS,
         live_option_chain_max_age_seconds: float = LIVE_OPTION_CHAIN_MAX_AGE_SECONDS,
         submissions: Any = None,
+        sweep_lease_seconds: float = 120.0,
         position_reader: Any = None,
         authority_reader: Any = None,
         tick_reader: Any = None,
@@ -573,6 +575,10 @@ class LivePlanAdapter:
         self.live_option_chain_max_age_seconds = float(live_option_chain_max_age_seconds)
         #: Durable per-step claim/outcome: the ONLY submission state.
         self.submissions = submissions or LiveSubmissionStore(session_factory=session_factory)
+        #: The timeout sweep takes the same durable single-writer fence as the
+        #: outcome consumer. A short lease would let a slow broker call lose the
+        #: right to write while still holding a broker-side cancel.
+        self.sweep_lease_seconds = float(sweep_lease_seconds)
         #: The DOMAIN seams (roll state machine, durable option run binding and
         #: the option engine's own step derivation) are reused through the paper
         #: executor's existing methods rather than re-implemented here. Built
@@ -1897,7 +1903,7 @@ class LivePlanAdapter:
         observed quote, the chosen price, the band and the tick source.
         """
         rule = str(getattr(spec, "release_rule", "") or "")
-        if not is_gated_limit_release_rule(rule):
+        if not is_gated_limit_step(lane=str(getattr(spec, "lane", "") or ""), spec=spec):
             return None
         plan_id = str(plan.get("plan_id") or "")
         step_no = int(getattr(spec, "step_no", 0) or 0)
@@ -1909,6 +1915,13 @@ class LivePlanAdapter:
             notional_inr=getattr(spec, "notional_inr", 0.0),
             quantity=ordered,
         )
+        if reference <= 0.0:
+            # A roll release is derived at release time, so its legacy step may
+            # not carry a frozen reference. Fresh LTP is the fallback evidence:
+            # derive_bounded_limit still clamps book evidence into this band.
+            ltp = quote_reference_ltp(quote)
+            if lane == "option_structure" and ltp:
+                reference = ltp
         if reference <= 0.0:
             raise LiveRefusal(
                 "LIVE_REFERENCE_PRICE_UNAVAILABLE",
@@ -2228,6 +2241,7 @@ class LivePlanAdapter:
             "errors": 0,
         }
         declared: List[Dict[str, Any]] = []
+        sweep_token = f"limit-timeout-{uuid.uuid4().hex}"
         lister = getattr(self.submissions, "working_limit_steps", None)
         if not callable(lister) or self.intent_handler is None:
             return {**counters, "declared": declared}
@@ -2243,7 +2257,12 @@ class LivePlanAdapter:
         )
         for row in rows:
             try:
-                outcome = await self._expire_one_limit(row, moment=moment, timeout=timeout)
+                outcome = await self._expire_one_limit(
+                    row,
+                    moment=moment,
+                    timeout=timeout,
+                    sweep_token=sweep_token,
+                )
             except Exception as exc:  # noqa: BLE001 - one bad row never kills the pass
                 counters["errors"] += 1
                 counters["error_detail"] = (
@@ -2260,15 +2279,61 @@ class LivePlanAdapter:
         return {**counters, "declared": declared}
 
     async def _expire_one_limit(
-        self, row: Mapping[str, Any], *, moment: datetime, timeout: float
+        self,
+        row: Mapping[str, Any],
+        *,
+        moment: datetime,
+        timeout: float,
+        sweep_token: str,
     ) -> Optional[Dict[str, Any]]:
-        """One claim's timeout decision. ``None`` means "not mine to touch"."""
+        """Lease one claim, then hand its current row to the timeout decision."""
         plan_id = str(row.get("plan_id") or "")
         step_no = int(row.get("step_no") or 0)
-        state = str(row.get("state") or "pending")
+        # Acquire BEFORE re-reading the row: the scan is only a work hint. The
+        # consumer's live lease is never stolen, and a finalizing write belongs
+        # to its holder even if that lease later expires.
+        leased = self.submissions.acquire_lease(
+            plan_id=plan_id,
+            step_no=step_no,
+            token=sweep_token,
+            lease_seconds=self.sweep_lease_seconds,
+        )
+        if leased is None:
+            return None
+        try:
+            return await self._expire_leased_limit(
+                dict(leased),
+                moment=moment,
+                timeout=timeout,
+                sweep_token=sweep_token,
+            )
+        finally:
+            try:
+                self.submissions.release_lease(
+                    plan_id=plan_id, step_no=step_no, token=sweep_token
+                )
+            except Exception:  # noqa: BLE001 - an abandoned lease expires
+                pass
+
+    async def _expire_leased_limit(
+        self,
+        row: Mapping[str, Any],
+        *,
+        moment: datetime,
+        timeout: float,
+        sweep_token: str,
+    ) -> Optional[Dict[str, Any]]:
+        """One claim's timeout decision after the sweep owns its lease."""
+        plan_id = str(row.get("plan_id") or "")
+        step_no = int(row.get("step_no") or 0)
+        state = str(row.get("state") or "")
         detail = dict(row.get("detail") or {})
         execution_order = dict(detail.get("execution_order") or {})
         if str(execution_order.get("order_type") or "") != ORDER_TYPE_LIMIT:
+            return None
+        # The consumer stages outcomes before its effects finish. The sweep has
+        # no business regressing those writes, leased or not.
+        if state in ("finalizing", "rejecting"):
             return None
         submitted_at = _as_datetime(execution_order.get("submitted_at"))
         if submitted_at is None:
@@ -2308,6 +2373,7 @@ class LivePlanAdapter:
             step_no=step_no,
             state=state,
             detail={"execution_order": execution_order, "limit_timeout": attempt},
+            consumer_token=sweep_token,
         )
         try:
             acknowledged, refused, results = await self._send_limit_cancel(
@@ -2334,16 +2400,18 @@ class LivePlanAdapter:
                         ),
                     },
                 },
+                consumer_token=sweep_token,
             )
             return {"tag": "uncertain"}
 
-        fills = self._confirmed_fill_total(plan_id=plan_id, orders=orders)
+        ingested_fills = self._confirmed_fill_total(plan_id=plan_id, orders=orders)
+        broker_states = self._authoritative_order_states(results, orders=orders)
         resolved = {
             **attempt,
             "cancel_state": "accepted" if acknowledged else ("refused" if refused else "uncertain"),
             "cancel_results": list(results),
         }
-        if fills is None:
+        if ingested_fills is None or broker_states is None:
             self.submissions.record_outcome(
                 plan_id=plan_id,
                 step_no=step_no,
@@ -2353,9 +2421,13 @@ class LivePlanAdapter:
                     "limit_timeout": {
                         **resolved,
                         "cancel_state": "uncertain",
-                        "note": "the confirmed-fill read failed, so no terminal outcome is claimed",
+                        "note": (
+                            "broker boundary or confirmed-fill evidence was incomplete; "
+                            "no terminal outcome is claimed"
+                        ),
                     },
                 },
+                consumer_token=sweep_token,
             )
             return {"tag": "uncertain"}
         if not acknowledged:
@@ -2375,8 +2447,19 @@ class LivePlanAdapter:
                         ),
                     },
                 },
+                consumer_token=sweep_token,
             )
             return {"tag": "uncertain"}
+        broker_fills = sum(
+            int(state.get("filled_quantity") or 0) for state in broker_states.values()
+        )
+        all_broker_terminal = all(state.get("terminal") for state in broker_states.values())
+        all_broker_refused = all(
+            state.get("status") in ("CANCELLED", "REJECTED", "LAPSED")
+            for state in broker_states.values()
+        )
+        fills = max(ingested_fills, broker_fills if all_broker_terminal else 0)
+        resolved["broker_order_states"] = dict(broker_states)
         if ordered and fills >= ordered:
             # The cancel raced a COMPLETE fill: ingestion owns the finalisation.
             self.submissions.record_outcome(
@@ -2391,8 +2474,26 @@ class LivePlanAdapter:
                         "note": "the order filled completely before the cancel landed; ingestion finalises it",
                     },
                 },
+                consumer_token=sweep_token,
             )
             return {"tag": "filled"}
+        if fills > 0 and not (all_broker_terminal and all_broker_refused):
+            self.submissions.record_outcome(
+                plan_id=plan_id,
+                step_no=step_no,
+                state=state,
+                detail={
+                    "execution_order": execution_order,
+                    "limit_timeout": {
+                        **resolved,
+                        "cancel_state": "uncertain",
+                        "filled_quantity": fills,
+                        "note": "broker state is terminal but ambiguous for a partial outcome",
+                    },
+                },
+                consumer_token=sweep_token,
+            )
+            return {"tag": "uncertain"}
         if fills > 0:
             self.submissions.record_outcome(
                 plan_id=plan_id,
@@ -2408,8 +2509,27 @@ class LivePlanAdapter:
                         "blocking": "limit_timeout_partial_residual_retained",
                     },
                 },
+                consumer_token=sweep_token,
             )
             return {"tag": "partial"}
+
+        if not (all_broker_terminal and all_broker_refused):
+            self.submissions.record_outcome(
+                plan_id=plan_id,
+                step_no=step_no,
+                state=state,
+                detail={
+                    "execution_order": execution_order,
+                    "limit_timeout": {
+                        **resolved,
+                        "cancel_state": "uncertain",
+                        "filled_quantity": fills,
+                        "note": "the broker order is not proven terminal refused; no zero-fill is claimed",
+                    },
+                },
+                consumer_token=sweep_token,
+            )
+            return {"tag": "uncertain"}
 
         terminal_state = "repair_required" if risk_reducing else "rejected"
         self.submissions.record_outcome(
@@ -2442,6 +2562,56 @@ class LivePlanAdapter:
                 "ordered": ordered,
             },
         }
+
+    @staticmethod
+    def _authoritative_order_states(
+        results: Sequence[Any], *, orders: Sequence[str]
+    ) -> Optional[Dict[str, Dict[str, Any]]]:
+        """Read terminal state/filled qty from the cancel boundary, or ``None``.
+
+        A bare cancel acknowledgement is not proof: it carries no authoritative
+        status or traded quantity. Evidence must cover EVERY known order id.
+        """
+        wanted = [str(value) for value in orders if str(value)]
+        by_order: Dict[str, Dict[str, Any]] = {}
+        terminal_statuses = {"COMPLETE", "CANCELLED", "CANCELED", "REJECTED", "LAPSED"}
+        refused_statuses = {"CANCELLED", "CANCELED", "REJECTED", "LAPSED"}
+        for result in results or []:
+            payload = dict(result or {}) if isinstance(result, Mapping) else {}
+            body = (
+                payload.get("result")
+                if isinstance(payload.get("result"), Mapping)
+                else payload
+            )
+            if not isinstance(body, Mapping):
+                continue
+            order_id = str(
+                body.get("order_id")
+                or body.get("broker_order_id")
+                or payload.get("order_id")
+                or ""
+            )
+            if order_id not in wanted:
+                continue
+            status = str(body.get("status") or body.get("state") or "").upper()
+            filled = body.get(
+                "filled_quantity", body.get("filled_qty", body.get("traded_quantity"))
+            )
+            try:
+                filled_quantity = max(0, int(filled)) if filled not in (None, "") else None
+            except (TypeError, ValueError):
+                return None
+            if filled_quantity is None:
+                return None
+            by_order[order_id] = {
+                "status": status,
+                "terminal": status in terminal_statuses,
+                "refused": status in refused_statuses,
+                "filled_quantity": filled_quantity,
+            }
+        if not wanted or set(by_order) != set(wanted):
+            return None
+        return by_order
 
     async def _send_limit_cancel(
         self,

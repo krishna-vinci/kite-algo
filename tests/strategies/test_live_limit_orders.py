@@ -30,14 +30,20 @@ from backend.strategies.live_limit_orders import (
     derive_bounded_limit,
     gated_limit_timeout_seconds,
     is_gated_limit_release_rule,
+    is_gated_limit_step,
     option_limit_max_drift_pct,
     round_toward_passive,
     staged_buy_max_price_drift_pct,
 )
 from backend.strategies.live_sequence import (
+    RELEASE_RULES,
     RULE_HEDGE_FILL_GATE,
+    RULE_HEDGE_RELEASE_WITHHELD,
     RULE_IMMEDIATE,
     RULE_MIS_SQUAREOFF,
+    RULE_OPTION_ROLL_RELEASE_GATE,
+    RULE_ALL_PREREQUISITES_FILLED,
+    RULE_ROLL_CLOSE_RELEASED,
     RULE_STAGED_FUNDING_GATE,
     StepSpec,
     prerequisites_met,
@@ -124,12 +130,35 @@ class _FakeSubmissions:
         )
         if str(row.get("state") or "") not in TERMINAL:
             row["state"] = str(state)
+        if consumer_token is not None:
+            held = str(row.get("consumer_token") or "")
+            until = row.get("consumer_until")
+            if held != str(consumer_token) or until is None or until <= NOW:
+                return {}
         if broker_order_ids:
             row["broker_order_ids"] = [str(value) for value in broker_order_ids]
         merged = dict(row.get("detail") or {}) if merge_detail else {}
         merged.update(dict(detail or {}))
         row["detail"] = merged
         return dict(row)
+
+    def acquire_lease(self, *, plan_id, step_no, token, lease_seconds):
+        row = self.rows.get((str(plan_id), int(step_no)))
+        if row is None or str(row.get("state") or "") in TERMINAL:
+            return None
+        held = str(row.get("consumer_token") or "")
+        until = row.get("consumer_until")
+        if held and held != str(token) and until is not None and until > NOW:
+            return None
+        row["consumer_token"] = str(token)
+        row["consumer_until"] = NOW + timedelta(seconds=float(lease_seconds))
+        return dict(row)
+
+    def release_lease(self, *, plan_id, step_no, token):
+        row = self.rows.get((str(plan_id), int(step_no)))
+        if row and str(row.get("consumer_token") or "") == str(token):
+            row["consumer_token"] = None
+            row["consumer_until"] = None
 
     def working_limit_steps(self, *, limit: int = 100):
         return [
@@ -144,15 +173,32 @@ class _FakeSubmissions:
 class _FakeBroker:
     """The intent boundary. Records every intent, and can fail a cancel."""
 
-    def __init__(self, *, fail_cancel: bool = False):
+    def __init__(
+        self,
+        *,
+        fail_cancel: bool = False,
+        cancel_status: str = "success",
+        cancel_filled_quantity: int | None = None,
+    ):
         self.intents: list = []
         self.fail_cancel = fail_cancel
+        self.cancel_status = cancel_status
+        self.cancel_filled_quantity = cancel_filled_quantity
 
     async def handle(self, intent, *, context=None):
         self.intents.append((intent, dict(context or {})))
         if intent.intent_type == "cancel_order" and self.fail_cancel:
             raise RuntimeError("transport lost during cancel")
-        return {"result": {"order_id": f"O-{len(self.intents)}", "status": "success"}}
+        if intent.intent_type == "cancel_order":
+            payload = dict(intent.payload.get("order") or {})
+            result = {
+                "order_id": str(payload.get("order_id") or ""),
+                "status": self.cancel_status,
+            }
+            if self.cancel_filled_quantity is not None:
+                result["filled_quantity"] = int(self.cancel_filled_quantity)
+            return {"result": result}
+        return {"result": {"order_id": f"O-{len(self.intents)}"}}
 
     def intents_of(self, kind: str):
         return [intent for intent, _ctx in self.intents if intent.intent_type == kind]
@@ -240,8 +286,22 @@ class DerivationTests(unittest.TestCase):
     def test_only_dependent_release_rules_take_the_bounded_limit_path(self):
         self.assertTrue(is_gated_limit_release_rule(RULE_STAGED_FUNDING_GATE))
         self.assertTrue(is_gated_limit_release_rule(RULE_HEDGE_FILL_GATE))
+        self.assertTrue(is_gated_limit_release_rule(RULE_OPTION_ROLL_RELEASE_GATE))
         self.assertFalse(is_gated_limit_release_rule(RULE_IMMEDIATE))
         self.assertFalse(is_gated_limit_release_rule(RULE_MIS_SQUAREOFF))
+
+    def test_every_registered_dependent_rule_and_every_option_gate_is_limit_classified(self):
+        for rule in RELEASE_RULES:
+            with self.subTest(rule=rule):
+                self.assertEqual(
+                    is_gated_limit_release_rule(rule),
+                    rule not in (RULE_IMMEDIATE, RULE_MIS_SQUAREOFF),
+                )
+                spec = _spec(lane="option_structure", release_rule=rule)
+                self.assertEqual(
+                    is_gated_limit_step(lane="option_structure", spec=spec),
+                    rule != RULE_IMMEDIATE,
+                )
 
     def test_configuration_defaults_and_names_are_shared(self):
         saved = {
@@ -340,6 +400,29 @@ class GatedDispatchTests(unittest.TestCase):
             "LIVE_OPTION_LIMIT_MAX_DRIFT_PCT",
         )
 
+    def test_a_future_option_release_gate_cannot_fall_back_to_market(self):
+        broker = _FakeBroker()
+        adapter = _adapter(broker=broker)
+        outcome = asyncio.run(
+            adapter.dispatch_step(
+                {"plan_id": "plan-1", "account_id": "kite:A", "plan_kind": "option_structure"},
+                _spec(
+                    side="SELL",
+                    lane="option_structure",
+                    release_rule="option_new_generation_release",
+                    detail={"option": {"step_class": "option_future_release"}},
+                ),
+                binding={"strategy_run_id": "run-1"},
+                account_id="kite:A",
+                strategy_id="stg-A",
+                quote=_quote(ltp=100.0),
+            )
+        )
+        order = broker.intents_of("place_order")[0].payload["order"]
+        self.assertEqual(order["order_type"], "LIMIT")
+        self.assertEqual(order["price"], 99.5)
+        self.assertEqual(outcome["detail"]["execution_order"]["release_rule"], "option_new_generation_release")
+
     def test_a_non_gated_leg_keeps_its_market_dispatch(self):
         broker = _FakeBroker()
         adapter = _adapter(broker=broker)
@@ -424,7 +507,7 @@ class LimitTimeoutTests(unittest.TestCase):
 
     def test_a_zero_filled_cancel_is_terminal_and_releases_no_dependent(self):
         submissions = _FakeSubmissions([self._row()])
-        broker = _FakeBroker()
+        broker = _FakeBroker(cancel_status="CANCELLED", cancel_filled_quantity=0)
         adapter = _adapter(broker=broker, submissions=submissions, fill_reader=lambda **_: [])
 
         counts = asyncio.run(adapter.expire_timed_out_limits())
@@ -448,7 +531,7 @@ class LimitTimeoutTests(unittest.TestCase):
 
     def test_a_partial_fill_retains_the_remainder_and_releases_nothing(self):
         submissions = _FakeSubmissions([self._row(quantity=100)])
-        broker = _FakeBroker()
+        broker = _FakeBroker(cancel_status="CANCELLED", cancel_filled_quantity=40)
         adapter = _adapter(
             broker=broker,
             submissions=submissions,
@@ -469,7 +552,7 @@ class LimitTimeoutTests(unittest.TestCase):
 
     def test_an_unfilled_risk_reduction_becomes_named_action_required(self):
         submissions = _FakeSubmissions([self._row(increases_exposure=False)])
-        broker = _FakeBroker()
+        broker = _FakeBroker(cancel_status="CANCELLED", cancel_filled_quantity=0)
         adapter = _adapter(broker=broker, submissions=submissions, fill_reader=lambda **_: [])
         counts = asyncio.run(adapter.expire_timed_out_limits())
         self.assertEqual(counts["expired"], 1)
@@ -509,7 +592,7 @@ class LimitTimeoutTests(unittest.TestCase):
 
     def test_a_cancel_that_raced_a_complete_fill_leaves_ingestion_the_outcome(self):
         submissions = _FakeSubmissions([self._row(quantity=100)])
-        broker = _FakeBroker()
+        broker = _FakeBroker(cancel_status="COMPLETE", cancel_filled_quantity=100)
         adapter = _adapter(
             broker=broker,
             submissions=submissions,
@@ -528,6 +611,47 @@ class LimitTimeoutTests(unittest.TestCase):
         counts = asyncio.run(adapter.expire_timed_out_limits())
         self.assertEqual(counts["uncertain"], 1)
         self.assertEqual(submissions.rows[("plan-1", 2)]["state"], "pending")
+
+    def test_a_cancel_without_broker_order_state_is_never_a_zero_fill(self):
+        submissions = _FakeSubmissions([self._row()])
+        broker = _FakeBroker(cancel_status="success", cancel_filled_quantity=0)
+        adapter = _adapter(broker=broker, submissions=submissions, fill_reader=lambda **_: [])
+        counts = asyncio.run(adapter.expire_timed_out_limits())
+        stored = submissions.rows[("plan-1", 2)]
+        self.assertEqual(counts["uncertain"], 1)
+        self.assertEqual(stored["state"], "pending")
+        self.assertIn(
+            "not proven terminal refused",
+            stored["detail"]["limit_timeout"]["note"],
+        )
+
+    def test_a_late_broker_partial_fill_is_not_recorded_as_a_zero_fill(self):
+        """A fill fact can lag the cancel; the boundary still reports the trade."""
+        submissions = _FakeSubmissions([self._row(quantity=75)])
+        broker = _FakeBroker(cancel_status="CANCELLED", cancel_filled_quantity=25)
+        adapter = _adapter(broker=broker, submissions=submissions, fill_reader=lambda **_: [])
+        counts = asyncio.run(adapter.expire_timed_out_limits())
+        stored = submissions.rows[("plan-1", 2)]
+        self.assertEqual(counts["partial"], 1)
+        self.assertEqual(stored["state"], "partial")
+        self.assertEqual(stored["detail"]["limit_timeout"]["filled_quantity"], 25)
+        self.assertEqual(stored["detail"]["limit_timeout"]["residual_quantity"], 50)
+
+    def test_a_consumer_leased_claim_is_not_read_or_cancelled_by_the_sweep(self):
+        row = self._row()
+        row["consumer_token"] = "outcome-consumer"
+        row["consumer_until"] = NOW + timedelta(seconds=60)
+        submissions = _FakeSubmissions([row])
+        broker = _FakeBroker(cancel_status="CANCELLED", cancel_filled_quantity=0)
+        counts = asyncio.run(
+            _adapter(broker=broker, submissions=submissions).expire_timed_out_limits()
+        )
+        stored = submissions.rows[("plan-1", 2)]
+        self.assertEqual(counts["skipped"], 1)
+        self.assertEqual(broker.intents, [])
+        self.assertEqual(stored["state"], "pending")
+        self.assertNotIn("limit_timeout", stored["detail"])
+        self.assertEqual(stored["consumer_token"], "outcome-consumer")
 
 
 if __name__ == "__main__":
