@@ -1915,6 +1915,22 @@ class LivePlanAdapter:
             notional_inr=getattr(spec, "notional_inr", 0.0),
             quantity=ordered,
         )
+        reference_source = "frozen_plan" if reference > 0.0 else ""
+        if reference <= 0.0:
+            # A RELEASE step is built from the run's OWN legs (``_removal_leg``),
+            # and those carry no frozen plan price: the structure they close was
+            # opened by a different plan. The fresh quote's LTP then stands in as
+            # the reference - the same anchor the bounded derivation already applies when
+            # the required side of the book is absent - so the leg is STILL a
+            # bounded LIMIT and never an unbounded market order.
+            raw_ltp = (quote or {}).get("ltp")
+            try:
+                candidate = abs(float(raw_ltp)) if raw_ltp is not None else 0.0
+            except (TypeError, ValueError):
+                candidate = 0.0
+            if candidate > 0.0:
+                reference = candidate
+                reference_source = "live_quote"
         if reference <= 0.0:
             # A roll release is derived at release time, so its legacy step may
             # not carry a frozen reference. Fresh LTP is the fallback evidence:
@@ -1925,7 +1941,13 @@ class LivePlanAdapter:
         if reference <= 0.0:
             raise LiveRefusal(
                 "LIVE_REFERENCE_PRICE_UNAVAILABLE",
-                {"plan_id": plan_id, "step_no": step_no, "release_rule": rule, "lane": lane},
+                {
+                    "plan_id": plan_id,
+                    "step_no": step_no,
+                    "release_rule": rule,
+                    "lane": lane,
+                    "quote_ltp": None if not quote else quote.get("ltp"),
+                },
             )
         max_drift_env = (
             "LIVE_OPTION_LIMIT_MAX_DRIFT_PCT"
@@ -1956,6 +1978,7 @@ class LivePlanAdapter:
             **derived,
             "lane": lane,
             "release_rule": rule,
+            "reference_price_source": reference_source,
             "quantity": int(ordered),
             "variety": str(getattr(spec, "variety", "") or "regular"),
             "max_drift_env": max_drift_env,

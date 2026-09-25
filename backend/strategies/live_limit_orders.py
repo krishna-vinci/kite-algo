@@ -77,9 +77,9 @@ def is_gated_limit_release_rule(rule: Any) -> bool:
         RULE_ALL_PREREQUISITES_FILLED,
         RULE_HEDGE_FILL_GATE,
         RULE_HEDGE_RELEASE_WITHHELD,
+        RULE_OPTION_ROLL_RELEASE_GATE,
         RULE_ROLL_CLOSE_RELEASED,
         RULE_STAGED_FUNDING_GATE,
-        RULE_OPTION_ROLL_RELEASE_GATE,
     )
 
     return str(rule or "") in (
@@ -88,6 +88,10 @@ def is_gated_limit_release_rule(rule: Any) -> bool:
         RULE_ROLL_CLOSE_RELEASED,
         RULE_HEDGE_FILL_GATE,
         RULE_HEDGE_RELEASE_WITHHELD,
+        # An option roll's OLD generation is released only after every
+        # acquisition is proven filled (``RULE_OPTION_ROLL_RELEASE_GATE``), so it
+        # is a gated dependent leg like the structure-exit hedge: it is a LIMIT,
+        # never an unbounded market order.
         RULE_OPTION_ROLL_RELEASE_GATE,
     )
 
