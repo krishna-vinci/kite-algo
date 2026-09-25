@@ -2367,55 +2367,341 @@ class ExecutorOptionRunBindingTests(ExecutorTestCase, unittest.IsolatedAsyncioTe
 
         return ExecutionRefusal
 
-    def test_an_adjust_plan_refuses_at_the_binding_edge_by_name(self):
-        """S1 freezes adjust; it never resolves into the entry or exit branch."""
+    # ------------------------------------------------------------- adjust edge
+
+    def _adjust_legs(self, *, units, short_side="SELL", hedge_symbol="TCS26OCT3000CE", expiry=None):
+        """The desired state for ``units`` of the entry structure, short first."""
+        short = self._option_leg(
+            side=short_side,
+            symbol="TCS26OCT2500CE",
+            instrument_id=self.SHORT_ID,
+            quantity=75 * units,
+            signed_quantity=(75 if short_side == "BUY" else -75) * units,
+        )
+        hedge = self._option_leg(
+            side="BUY",
+            symbol=hedge_symbol,
+            instrument_id=self.HEDGE_ID,
+            quantity=75 * units,
+            signed_quantity=75 * units,
+        )
+        if expiry is not None:
+            short["expiry"] = expiry
+            hedge["expiry"] = expiry
+        return [short, hedge]
+
+    def _seed_adjust_plan(self, plan_id, *, reference, legs, generation=1, expiry="2026-10-29"):
+        """A frozen ``adjust`` plan: the target, its basis, and the run it mutates."""
+        self.seed_validated_plan(
+            plan_id, plan_kind="option_structure", legs=legs, run_id=f"run-{plan_id}"
+        )
+        self.seed_binding(run_id=f"run-{plan_id}")
+        with self.factory() as session:
+            session.execute(
+                text("UPDATE strategy_plans SET resolved_plan = :resolved WHERE plan_id = :p"),
+                {
+                    "p": plan_id,
+                    "resolved": json.dumps(
+                        {
+                            "target_kind": "option_structure",
+                            "product": "NRML",
+                            "expiry": expiry,
+                            "structure_digest": "digest-iron-condor",
+                            "legs": legs,
+                            "option_run": {
+                                "phase": "adjust",
+                                "option_run_id": reference,
+                                "based_on_generation": generation,
+                            },
+                        }
+                    ),
+                },
+            )
+            session.commit()
+
+    async def _enter_and_resize(self, *, units=2, plan_id="plan-adjust"):
+        """Enter one unit, then adjust it to ``units`` through the real engine."""
+        executor, option_run_id = await self._enter_a_structure()
+        self._seed_adjust_plan(
+            plan_id, reference=option_run_id, legs=self._adjust_legs(units=units)
+        )
+        self.claim_reservation(plan_id=plan_id)
+        result = await executor.execute(_plan_view_for(self.factory, plan_id), actor=OWNER)
+        return executor, option_run_id, result
+
+    async def test_an_adjust_binds_an_adjust_edge_to_the_entrys_own_run(self):
+        """The reference is a LOOKUP KEY: the entry edge stays the authority."""
         from backend.options.execution.durable_store import DurableOptionRunStore
         from backend.options.execution.plan_binding import (
-            PlanBindingRefusal,
             PlanOptionRunBindingStore,
             is_option_entry_plan,
             resolve_plan_option_run,
         )
 
-        short, hedge = self._entry_legs()
-        self.seed_strategy()
-        self.seed_validated_plan(
-            "plan-adjust",
-            plan_kind="option_structure",
-            legs=[short, hedge],
-            resolved_extra={
-                "option_run": {
-                    "phase": "adjust",
-                    "option_run_id": "opt-run-existing",
-                    "based_on_generation": 1,
-                }
-            },
+        _executor, option_run_id = await self._enter_a_structure()
+        self._seed_adjust_plan(
+            "plan-adjust", reference=option_run_id, legs=self._adjust_legs(units=2)
         )
-        plan = _plan_view_for(self.factory, "plan-adjust")
-        # The entry gate must not claim an adjust plan.
-        self.assertFalse(is_option_entry_plan(plan))
-        with self.assertRaises(PlanBindingRefusal) as ctx:
-            resolve_plan_option_run(
-                plan,
-                strategy_id=STRATEGY,
-                account_id=ACCOUNT,
-                execution_environment="paper",
-                worker_run_id="run-plan-adjust",
-                binding_store=PlanOptionRunBindingStore(session_factory=self.factory),
-                run_store=DurableOptionRunStore(session_factory=self.factory),
+        # Resolve WITHOUT executing: the edge validates, binds, and creates nothing.
+        binding_store = PlanOptionRunBindingStore(session_factory=self.factory)
+        target = resolve_plan_option_run(
+            _plan_view_for(self.factory, "plan-adjust"),
+            strategy_id=STRATEGY,
+            account_id=ACCOUNT,
+            execution_environment="paper",
+            worker_run_id="run-plan-adjust",
+            binding_store=binding_store,
+            run_store=DurableOptionRunStore(session_factory=self.factory),
+        )
+
+        self.assertEqual(target["phase"], "adjust")
+        self.assertEqual(target["option_run_id"], option_run_id)
+        # The entry gate is for ENTRIES: an adjust never claims it.
+        self.assertFalse(is_option_entry_plan(_plan_view_for(self.factory, "plan-adjust")))
+        (binding,) = self._binding_rows("plan-adjust")
+        self.assertEqual(binding["phase"], "adjust")
+        self.assertEqual(binding["option_run_id"], option_run_id)
+        # The entry created one run; the adjust edge reused it rather than
+        # manufacturing a second structure.
+        self.assertEqual(self._run_count(), 1)
+        # The delta was NOT placed by the resolve: only the binding exists.
+        self.assertEqual(self.events("plan-adjust"), [])
+
+    async def test_an_adjust_resizes_up_by_delta_and_hedges_before_the_short(self):
+        """1 -> 2 units: the increase is the DELTA from the run's own fills."""
+        executor, option_run_id, result = await self._enter_and_resize(units=2)
+
+        self.assertEqual(result["status"], "filled")
+        # Leg 2 is the hedge; leg 1 is the short. The entry ordering releases the
+        # short only after the hedge BUY is CONFIRMED, not merely submitted.
+        self.assertEqual(
+            [(row["step_no"], row["event"]) for row in self.events("plan-adjust")],
+            [(2, "submitted"), (2, "filled"), (1, "submitted"), (1, "filled")],
+        )
+        run = self._run_row(option_run_id)
+        self.assertEqual(run["status"], "entered")
+        metadata = json.loads(run["metadata"])
+        self.assertEqual(metadata["structure_generation"], 2)
+        # The run's held legs are the DESIRED generation, not the entry's.
+        legs = json.loads(run["legs"])
+        self.assertEqual(
+            {row["leg_id"]: int(row["quantity"]) for row in legs},
+            {"plan-op:1": 150, "plan-op:2": 150},
+        )
+        # Hedge and short moved by exactly ONE unit each: 75 + 75, never 150 each.
+        delta_fills = [
+            int(row["filled_quantity"]) for row in self.events("plan-adjust") if row["event"] == "filled"
+        ]
+        self.assertEqual(sorted(delta_fills), [75, 75])
+        self.assertEqual(self._run_count(), 1)
+
+    async def test_an_adjust_resize_down_closes_the_short_before_releasing_the_hedge(self):
+        """2 -> 1 units: the hedge release is proven by the short's closure."""
+        executor = self.build_executor(
+            paper_service=self.build_paper_service(starting_balance="1000000")
+        )
+        entry_legs = self._adjust_legs(units=2)
+        self._seed_lane("plan-op", plan_kind="option_structure", legs=entry_legs)
+        entry = await executor.execute(_plan_view_for(self.factory, "plan-op"), actor=OWNER)
+        self.assertEqual(entry["status"], "filled")
+        (binding,) = self._binding_rows("plan-op")
+        option_run_id = str(binding["option_run_id"])
+
+        # The desired state names the hedge FIRST: the engine's own exit rule
+        # (short liability before hedge release) is what reorders the reductions.
+        reduction = list(reversed(self._adjust_legs(units=1)))
+        self._seed_adjust_plan("plan-adjust", reference=option_run_id, legs=reduction)
+        result = await executor.execute(_plan_view_for(self.factory, "plan-adjust"), actor=OWNER)
+
+        self.assertEqual(result["status"], "filled")
+        # step 2 (the short's BUY) is submitted before step 1 (the hedge's SELL),
+        # and the hedge is released only because that closure FILLED.
+        self.assertEqual(
+            [(row["step_no"], row["event"]) for row in self.events("plan-adjust")],
+            [(2, "submitted"), (2, "filled"), (1, "submitted"), (1, "filled")],
+        )
+        self.assertEqual(
+            [row["refusal_reason"] for row in self.events("plan-adjust") if row["refusal_reason"]],
+            [],
+        )
+        run = self._run_row(option_run_id)
+        self.assertEqual(run["status"], "entered")
+        self.assertEqual(json.loads(run["metadata"])["structure_generation"], 2)
+        legs = json.loads(run["legs"])
+        self.assertEqual(
+            {row["leg_id"]: int(row["quantity"]) for row in legs},
+            {"plan-op:1": 75, "plan-op:2": 75},
+        )
+
+    async def test_an_adjust_with_a_stale_basis_refuses_and_places_nothing(self):
+        """The mutation twin of the resize: the run moved on, so the basis is dead."""
+        executor, option_run_id, resized = await self._enter_and_resize(units=2)
+        self.assertEqual(resized["status"], "filled")
+        self.assertEqual(json.loads(self._run_row(option_run_id)["metadata"])["structure_generation"], 2)
+        orders_after_resize = dict(executor._paper_service.repository.orders)
+
+        # A second plan, still frozen against the generation the strategy saw
+        # BEFORE the resize, must never be re-derived against the newer run.
+        self._seed_adjust_plan(
+            "plan-adjust-stale",
+            reference=option_run_id,
+            legs=self._adjust_legs(units=3),
+            generation=1,
+        )
+        self.claim_reservation(plan_id="plan-adjust-stale")
+        with self.assertRaises(self._refusal) as ctx:
+            await executor.execute(
+                _plan_view_for(self.factory, "plan-adjust-stale"), actor=OWNER
             )
-        self.assertEqual(ctx.exception.reason_code, "OPTION_ADJUSTMENT_NOT_EXECUTABLE")
-        # Neither branch ran: no run was created and no binding was written.
-        self.assertEqual(self._run_count(), 0)
-        self.assertEqual(self._binding_rows("plan-adjust"), [])
 
-    def test_the_option_step_derivation_refuses_an_adjust_target(self):
-        from backend.strategies.execution import ExecutionRefusal
+        self.assertEqual(ctx.exception.reason_code, "OPTION_ADJUSTMENT_STALE_BASIS")
+        (trail,) = self.events("plan-adjust-stale")
+        self.assertEqual(trail["refusal_reason"], "OPTION_ADJUSTMENT_STALE_BASIS")
+        detail = trail["detail"]
+        self.assertEqual(detail["based_on_generation"], 1)
+        self.assertEqual(detail["structure_generation"], 2)
+        # Nothing was placed and no edge was written for the stale plan.
+        self.assertEqual(executor._paper_service.repository.orders, orders_after_resize)
+        self.assertEqual(self._binding_rows("plan-adjust-stale"), [])
+        self.assertEqual(json.loads(self._run_row(option_run_id)["metadata"])["structure_generation"], 2)
 
-        executor = self.build_executor()
-        with self.assertRaises(ExecutionRefusal) as ctx:
-            executor._option_run_steps({}, {"phase": "adjust", "run": object()})
-        self.assertEqual(ctx.exception.reason_code, "OPTION_ADJUSTMENT_NOT_EXECUTABLE")
+    async def test_a_rejected_adjust_leg_leaves_the_run_in_cleanup_required(self):
+        """A required increase that never arrives is cleanup work, never entered."""
+        executor, option_run_id = await self._enter_a_structure()
+        # The same resize as the happy path, but the hedge's contract cannot be
+        # priced, so the hedge BUY is rejected and the short is never released.
+        self._seed_adjust_plan(
+            "plan-adjust",
+            reference=option_run_id,
+            legs=self._adjust_legs(units=2, hedge_symbol="MISSING"),
+        )
+        self.claim_reservation(plan_id="plan-adjust")
+        result = await executor.execute(_plan_view_for(self.factory, "plan-adjust"), actor=OWNER)
+
+        self.assertEqual(result["status"], "rejected")
+        refusal = next(
+            row
+            for row in self.events("plan-adjust")
+            if row["refusal_reason"] == "OPTION_HEDGE_NOT_FILLED"
+        )
+        self.assertTrue(refusal["detail"]["action_required"])
+        run = self._run_row(option_run_id)
+        self.assertEqual(run["status"], "cleanup_required")
+        # The failed adjust did NOT advance the generation the strategy observes.
+        # An absent counter IS the first generation, so assert the effective one.
+        self.assertEqual(json.loads(run["metadata"]).get("structure_generation", 1), 1)
+
+    async def test_an_adjust_whose_target_is_already_held_is_a_no_op(self):
+        """A zero delta on every leg changes nothing, including the generation."""
+        executor, option_run_id = await self._enter_a_structure()
+        self._seed_adjust_plan(
+            "plan-adjust", reference=option_run_id, legs=self._adjust_legs(units=1)
+        )
+        result = await executor.execute(_plan_view_for(self.factory, "plan-adjust"), actor=OWNER)
+
+        self.assertEqual(result["status"], "no_op")
+        self.assertEqual(
+            [row["event"] for row in self.events("plan-adjust")], ["no_op", "no_op"]
+        )
+        self.assertEqual(
+            sorted(
+                order.transaction_type
+                for order in executor._paper_service.repository.orders.values()
+            ),
+            ["buy", "sell"],  # only the ENTRY's two legs, nothing from the adjust
+        )
+        run = self._run_row(option_run_id)
+        self.assertEqual(run["status"], "entered")
+        self.assertEqual(json.loads(run["metadata"]).get("structure_generation", 1), 1)
+
+    async def test_an_adjust_that_would_reverse_or_roll_a_contract_is_refused(self):
+        """A re-entry and a roll are NOT adjusts; both refuse by name."""
+        executor, option_run_id = await self._enter_a_structure()
+        self._seed_adjust_plan(
+            "plan-adjust",
+            reference=option_run_id,
+            legs=self._adjust_legs(units=1, short_side="BUY"),
+        )
+        with self.assertRaises(self._refusal) as ctx:
+            await executor.execute(_plan_view_for(self.factory, "plan-adjust"), actor=OWNER)
+
+        self.assertEqual(ctx.exception.reason_code, "OPTION_ADJUSTMENT_UNSUPPORTED")
+        (trail,) = self.events("plan-adjust")
+        self.assertEqual(trail["detail"]["reason"], "reversal_on_one_contract")
+        run = self._run_row(option_run_id)
+        self.assertEqual(run["status"], "entered")
+
+        # A desired state on a DIFFERENT expiry is the S4 roll, not an adjust.
+        self._seed_adjust_plan(
+            "plan-adjust-roll",
+            reference=option_run_id,
+            legs=self._adjust_legs(units=1, expiry="2026-11-26"),
+            expiry="2026-11-26",
+        )
+        with self.assertRaises(self._refusal) as roll_ctx:
+            await executor.execute(
+                _plan_view_for(self.factory, "plan-adjust-roll"), actor=OWNER
+            )
+        self.assertEqual(roll_ctx.exception.reason_code, "OPTION_ADJUSTMENT_UNSUPPORTED")
+        (roll_trail,) = self.events("plan-adjust-roll")
+        self.assertEqual(roll_trail["detail"]["reason"], "expiry_change_is_a_roll")
+
+    async def test_an_adjust_opens_a_new_leg_on_the_runs_own_ledger(self):
+        """A desired leg the run does not hold is a NEW run leg, and it fills."""
+        executor, option_run_id = await self._enter_a_structure()
+        extra = self._option_leg(
+            side="BUY",
+            symbol="TCS26OCT3500CE",
+            instrument_id="cccccccc-0000-0000-0000-0000000000a3",
+            lot=75,
+        )
+        self._seed_adjust_plan(
+            "plan-adjust", reference=option_run_id, legs=self._adjust_legs(units=1) + [extra]
+        )
+        self.claim_reservation(plan_id="plan-adjust")
+        result = await executor.execute(_plan_view_for(self.factory, "plan-adjust"), actor=OWNER)
+
+        self.assertEqual(result["status"], "filled")
+        run = self._run_row(option_run_id)
+        self.assertEqual(run["status"], "entered")
+        metadata = json.loads(run["metadata"])
+        self.assertEqual(metadata["structure_generation"], 2)
+        # The shape the run HOLDS now. It is what the owned-work snapshot reports
+        # ahead of the origin plan's digest, so the duplicate gate compares against
+        # the 3-leg structure rather than the 2-leg one the run opened with.
+        self.assertEqual(metadata["structure_digest"], "digest-iron-condor")
+        # The new leg is keyed to the ADJUST plan that opened it, and the run's
+        # held legs are exactly the desired generation.
+        legs = json.loads(run["legs"])
+        self.assertEqual(
+            {row["leg_id"]: int(row["quantity"]) for row in legs},
+            {"plan-op:1": 75, "plan-op:2": 75, "plan-adjust:3": 75},
+        )
+        trades = json.loads(run["trades"])
+        self.assertEqual(
+            [int(row["quantity"]) for row in trades if row["leg_id"] == "plan-adjust:3"], [75]
+        )
+
+    async def test_an_adjust_removing_a_hedge_withholds_it_until_proven(self):
+        """A desired state that drops a hedge may not release it unproven."""
+        executor, option_run_id = await self._enter_a_structure()
+        self._seed_adjust_plan(
+            "plan-adjust",
+            reference=option_run_id,
+            legs=[self._adjust_legs(units=1)[0]],  # the short only: the hedge is REMOVED
+        )
+        result = await executor.execute(_plan_view_for(self.factory, "plan-adjust"), actor=OWNER)
+
+        self.assertEqual(result["status"], "rejected")
+        detail = next(
+            row["detail"]
+            for row in self.events("plan-adjust")
+            if row["refusal_reason"] == "OPTION_HEDGE_RELEASE_WITHHELD"
+        )
+        self.assertEqual(detail["reason"], "short_not_proven_closed")
+        run = self._run_row(option_run_id)
+        self.assertEqual(run["status"], "cleanup_required")
+        self.assertEqual(json.loads(run["metadata"]).get("structure_generation", 1), 1)
 
 
 class ExecutorOptionContinuityTests(ExecutorTestCase, unittest.IsolatedAsyncioTestCase):

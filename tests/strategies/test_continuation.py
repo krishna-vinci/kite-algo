@@ -350,6 +350,15 @@ def test_the_option_run_classification_fails_closed():
     assert classify({"status": "entered", "failed_legs": [{"leg_id": "l1"}]}) == "outstanding"
 
 
+def test_an_in_flight_adjust_is_outstanding_not_held():
+    """A run whose leg generation is moving holds nothing to continue into."""
+    from backend.strategies.continuation import ContinuationCollector
+
+    assert ContinuationCollector._option_run_state({"status": "adjusting"}) == "outstanding"
+    # Landing the adjust restores the ONLY held status.
+    assert ContinuationCollector._option_run_state({"status": "entered"}) == "held"
+
+
 def test_the_digest_moves_with_the_axes():
     base = continuation_digest(_ev())
     assert continuation_digest(_ev()) == base

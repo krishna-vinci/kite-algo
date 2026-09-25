@@ -786,3 +786,278 @@ def test_concurrent_resolution_of_one_plan_yields_exactly_one_run(pg):
         run_store=DurableOptionRunStore(session_factory=factory),
     )
     assert retry["option_run_id"] == results[0]
+
+
+class TestAdjustEdge:
+    """B2.2 S2: an adjust plan mutates the run its own ENTRY launched.
+
+    The database proves what the SQLite fixture cannot: ``ck_plan_option_run_phase``
+    admits ``adjust``, and the edge is the same insert-only shape an exit uses.
+    """
+
+    def _entered(self, pg, *, generation: int):
+        """One bound ENTRY structure, HELD at ``generation``."""
+        import json
+
+        from sqlalchemy import text
+
+        factory = pg["factory"]
+        entry_legs = _structure_legs()
+        run_id = _new_run_id()
+        strategy_id, entry_plan = _strategy_and_plan(
+            factory, legs=entry_legs, run_id=run_id
+        )
+        _bind_run(factory, run_id=run_id, strategy_id=strategy_id)
+        option_run_id = _resolve(factory, entry_plan, strategy_id=strategy_id)["option_run_id"]
+        # The binding edge fills nothing; the run is HELD here so the adjust
+        # edge's own preconditions (status, generation) are what this proves.
+        with factory() as session:
+            session.execute(
+                text(
+                    "UPDATE public.option_run_states SET status = 'entered', "
+                    "metadata = :metadata WHERE strategy_run_id = :r"
+                ),
+                {
+                    "r": option_run_id,
+                    "metadata": json.dumps({"structure_generation": int(generation)}),
+                },
+            )
+            session.commit()
+        return factory, strategy_id, entry_legs, option_run_id
+
+    @staticmethod
+    def _resized(entry_legs, *, quantity: int):
+        """The same structure at a different size: the frozen desired target."""
+        legs = [dict(leg) for leg in entry_legs]
+        for leg in legs:
+            leg["quantity"] = int(quantity)
+            leg["signed_quantity"] = (
+                int(quantity) if str(leg["side"]).upper() == "BUY" else -int(quantity)
+            )
+        return legs
+
+    def _adjust_plan(self, factory, strategy_id: str, *, legs, reference, generation):
+        """A frozen ``adjust`` plan of the SAME strategy, on its own worker run."""
+        run_id = _new_run_id()
+        _bind_run(factory, run_id=run_id, strategy_id=strategy_id)
+        _, plan_id = _strategy_and_plan(
+            factory,
+            legs=legs,
+            phase="adjust",
+            run_id=run_id,
+            strategy_id=strategy_id,
+            reference=reference,
+            resolved_extra={
+                "option_run": {
+                    "phase": "adjust",
+                    "option_run_id": str(reference),
+                    "based_on_generation": int(generation),
+                }
+            },
+        )
+        return plan_id
+
+    def test_an_adjust_edge_binds_to_the_entrys_run_under_the_widened_check(self, pg):
+        from sqlalchemy import text
+
+        factory, strategy_id, entry_legs, option_run_id = self._entered(pg, generation=1)
+        plan_id = self._adjust_plan(
+            factory,
+            strategy_id,
+            legs=self._resized(entry_legs, quantity=150),
+            reference=option_run_id,
+            generation=1,
+        )
+
+        resolved = _resolve(factory, plan_id, strategy_id=strategy_id)
+
+        assert resolved["phase"] == "adjust"
+        assert resolved["option_run_id"] == option_run_id
+        # The row EXISTS: the widened CHECK admitted the phase, and the edge
+        # carries the same identity columns an exit edge does.
+        stored = _store(factory).get(plan_id)
+        assert stored["phase"] == "adjust"
+        assert stored["option_run_id"] == option_run_id
+        assert stored["strategy_id"] == strategy_id
+        assert stored["execution_environment"] == "paper"
+        with factory() as session:
+            phases = (
+                session.execute(
+                    text(
+                        "SELECT phase FROM public.strategy_plan_option_runs "
+                        "WHERE option_run_id = :r ORDER BY phase"
+                    ),
+                    {"r": option_run_id},
+                )
+                .scalars()
+                .all()
+            )
+        # One entry edge and one adjust edge on ONE run: an adjust never opens a
+        # second structure.
+        assert list(phases) == ["adjust", "entry"]
+
+    def test_an_adjust_frozen_against_an_older_generation_refuses(self, pg):
+        from backend.options.execution.plan_binding import PlanBindingRefusal
+
+        factory, strategy_id, entry_legs, option_run_id = self._entered(pg, generation=2)
+        plan_id = self._adjust_plan(
+            factory,
+            strategy_id,
+            legs=self._resized(entry_legs, quantity=150),
+            reference=option_run_id,
+            generation=1,
+        )
+
+        with pytest.raises(PlanBindingRefusal) as ctx:
+            _resolve(factory, plan_id, strategy_id=strategy_id)
+
+        assert ctx.value.reason_code == "OPTION_ADJUSTMENT_STALE_BASIS"
+        assert ctx.value.detail["based_on_generation"] == 1
+        assert ctx.value.detail["structure_generation"] == 2
+        assert ctx.value.detail["option_run_id"] == option_run_id
+        # Never re-derived against the newer run: no edge was written.
+        assert _store(factory).get(plan_id) is None
+
+
+def _shape_digest(legs, *, underlying="NIFTY", expiry="2026-10-29") -> str:
+    """The digest the compiler itself would freeze for these frozen legs."""
+    from backend.strategies.compiler.option_structure import OptionStructureCompiler
+
+    return OptionStructureCompiler._structure_digest(
+        underlying=underlying, expiry=expiry, legs=legs
+    )
+
+
+def _extra_hedge_leg():
+    """The third leg an additive adjust opens: a further BUY, same expiry."""
+    leg = dict(_structure_legs()[1])
+    leg.update(
+        {
+            "instrument_id": str(uuid.uuid4()),
+            "tradingsymbol": "NIFTY26OCT35000CE",
+            "broker_symbol": "NIFTY26OCT35000CE",
+            "broker_token": 7003,
+            "strike": 35000.0,
+        }
+    )
+    return leg
+
+
+def _shape_entry_plan(factory, strategy_id: str, *, legs, digest: str) -> str:
+    """A frozen ENTRY plan for one shape, carrying that shape's digest."""
+    run_id = _new_run_id()
+    _bind_run(factory, run_id=run_id, strategy_id=strategy_id)
+    _, plan_id = _strategy_and_plan(
+        factory,
+        legs=legs,
+        run_id=run_id,
+        strategy_id=strategy_id,
+        resolved_extra={"structure_digest": digest, "underlying": "NIFTY", "expiry": "2026-10-29"},
+    )
+    return plan_id
+
+
+def _settled_shape_change(factory, *, option_run_id: str, legs, digest: str) -> None:
+    """A settled additive adjust: the run HOLDS a new shape at generation 2.
+
+    This is the state the engine writes at settle (``run.legs`` rewritten, the
+    held digest recorded beside the generation); the binding edge reads it back
+    through the owned-work snapshot, which is what this proves.
+    """
+    import json
+
+    from sqlalchemy import text
+
+    with factory() as session:
+        session.execute(
+            text(
+                "UPDATE public.option_run_states SET status = 'entered', legs = :legs, "
+                "metadata = :metadata WHERE strategy_run_id = :r"
+            ),
+            {
+                "r": option_run_id,
+                "legs": json.dumps(legs),
+                "metadata": json.dumps(
+                    {"structure_generation": 2, "structure_digest": digest}
+                ),
+            },
+        )
+        session.commit()
+
+
+class TestShapeChangeAfterAnAdjust:
+    """A shape-changing adjust moves the identity the duplicate gate compares."""
+
+    def _settled(self, pg):
+        """(factory, strategy_id, new_legs, new_digest) after an additive adjust."""
+        factory = pg["factory"]
+        entry_legs = _structure_legs()
+        run_id = _new_run_id()
+        strategy_id, entry_plan = _strategy_and_plan(
+            factory, legs=entry_legs, run_id=run_id
+        )
+        _bind_run(factory, run_id=run_id, strategy_id=strategy_id)
+        option_run_id = _resolve(factory, entry_plan, strategy_id=strategy_id)["option_run_id"]
+        new_legs = entry_legs + [_extra_hedge_leg()]
+        new_digest = _shape_digest(new_legs)
+        assert new_digest != _shape_digest(entry_legs)
+        _settled_shape_change(
+            factory, option_run_id=option_run_id, legs=new_legs, digest=new_digest
+        )
+        return factory, strategy_id, new_legs, new_digest
+
+    def test_the_snapshot_reports_the_shape_the_run_holds_now(self, pg):
+        from backend.strategies.execution_snapshot import OwnedWorkSnapshotService
+
+        factory, strategy_id, new_legs, new_digest = self._settled(pg)
+
+        rows, coverage = OwnedWorkSnapshotService(session_factory=factory).option_runs_for_scope(
+            account_id=ACCOUNT, strategy_id=strategy_id, environment="paper"
+        )
+
+        assert coverage["coverage"] == "known"
+        (row,) = rows
+        assert row["structure_digest"] == new_digest
+        assert row["structure_generation"] == 2
+        assert len(row["legs"]) == len(new_legs)
+
+    def test_an_entry_for_the_shape_the_run_now_holds_is_refused(self, pg):
+        from sqlalchemy import text
+
+        from backend.options.execution.plan_binding import PlanBindingRefusal
+
+        factory, strategy_id, new_legs, new_digest = self._settled(pg)
+        # The shape the run holds NOW: same digest, same legs.
+        held_shape_plan = _shape_entry_plan(
+            factory, strategy_id, legs=new_legs, digest=new_digest
+        )
+
+        with pytest.raises(PlanBindingRefusal) as ctx:
+            _resolve(factory, held_shape_plan, strategy_id=strategy_id)
+
+        assert ctx.value.reason_code == "OPTION_STRUCTURE_ALREADY_OPEN"
+        assert ctx.value.detail["structure_digest"] == new_digest
+        assert _store(factory).get(held_shape_plan) is None
+
+        # Twin: a genuinely different third shape is still a new structure and is
+        # admitted (a run that holds a DIFFERENT shape never blocks a new entry).
+        third_legs = _structure_legs()
+        third_digest = _shape_digest(third_legs)
+        third_plan = _shape_entry_plan(
+            factory, strategy_id, legs=third_legs, digest=third_digest
+        )
+
+        resolved = _resolve(factory, third_plan, strategy_id=strategy_id)
+
+        assert resolved["phase"] == "entry"
+        assert _store(factory).get(third_plan)["phase"] == "entry"
+        # Two structures now: the held shape and the genuinely different one.
+        with factory() as session:
+            entry_edges = session.execute(
+                text(
+                    "SELECT COUNT(*) FROM public.strategy_plan_option_runs "
+                    "WHERE strategy_id = :sid AND phase = 'entry'"
+                ),
+                {"sid": strategy_id},
+            ).scalar()
+        assert int(entry_edges) == 2

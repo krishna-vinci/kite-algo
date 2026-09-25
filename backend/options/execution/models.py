@@ -14,6 +14,9 @@ class OptionRunStatus(str, Enum):
     ENTRY_PREVIEWED = "entry_previewed"
     ENTERING = "entering"
     ENTERED = "entered"
+    #: A desired-state mutation of an ``entered`` run is in flight. The run is
+    #: still the owner of the structure; only its held leg generation changes.
+    ADJUSTING = "adjusting"
     PARTIAL_ENTRY = "partial_entry"
     CLEANUP_REQUIRED = "cleanup_required"
     EXIT_PREVIEWED = "exit_previewed"

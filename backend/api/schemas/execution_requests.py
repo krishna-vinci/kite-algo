@@ -158,6 +158,10 @@ class OwnedOptionRunRow(BaseModel):
     #: compares it (or, absent it, the leg identities) to tell "the structure I
     #: already hold" from "a different structure".
     structure_digest: str = ""
+    #: The leg generation this run HOLDS now. It starts at 1 and increments only
+    #: when an adjust lands, so a strategy can freeze the generation it observed
+    #: as the basis of its next desired-state plan.
+    structure_generation: int = 1
     expiry_policy: str = ""
     product: str = ""
     status: str = "unknown"

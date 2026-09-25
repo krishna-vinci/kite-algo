@@ -150,6 +150,9 @@ _OPTION_RUN_FINISHED = frozenset({"exited", "settled"})
 #: The only option-run status that holds a structure cleanly.
 _OPTION_RUN_HELD = "entered"
 
+#: An adjust that has not landed: the run's leg generation is moving.
+_OPTION_RUN_ADJUSTING = "adjusting"
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -712,14 +715,19 @@ class ContinuationCollector:
 
         Only ``entered`` counts as a cleanly held structure, and only when nothing
         about that run is still in flight: a partially filled leg, a failed leg,
-        or an unresolved protective exit stage all keep it outstanding. A status
-        outside the durable vocabulary is outstanding, never finished.
+        an in-flight ``adjusting`` leg generation, or an unresolved protective
+        exit stage all keep it outstanding. A status outside the durable
+        vocabulary is outstanding, never finished.
         """
         status = str(row.get("status") or "").strip().lower()
         if bool(row.get("protective_exit_unresolved")):
             return "outstanding"
         if status in _OPTION_RUN_FINISHED:
             return "finished"
+        if status == _OPTION_RUN_ADJUSTING:
+            # An adjust mutates the structure's own leg generation: the run is
+            # still owned, and the next evaluation must wait for it to land.
+            return "outstanding"
         outstanding_legs = len(list(row.get("pending_legs") or [])) + len(
             list(row.get("failed_legs") or [])
         )

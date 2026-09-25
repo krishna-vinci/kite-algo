@@ -2861,7 +2861,7 @@ CREATE TABLE IF NOT EXISTS public.strategy_plan_option_runs (
     execution_environment TEXT NOT NULL,
     phase TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT ck_plan_option_run_phase CHECK (phase IN ('entry', 'exit')),
+    CONSTRAINT ck_plan_option_run_phase CHECK (phase IN ('entry', 'exit', 'adjust')),
     CONSTRAINT fk_plan_option_run_plan FOREIGN KEY (plan_id)
         REFERENCES public.strategy_plans (plan_id) ON DELETE RESTRICT,
     CONSTRAINT fk_plan_option_run_run FOREIGN KEY (option_run_id)

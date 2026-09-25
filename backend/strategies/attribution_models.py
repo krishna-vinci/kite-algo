@@ -600,7 +600,7 @@ class StrategyPlanOptionRun(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "phase IN ('entry', 'exit')",
+            "phase IN ('entry', 'exit', 'adjust')",
             name="ck_plan_option_run_phase",
         ),
         ForeignKeyConstraint(

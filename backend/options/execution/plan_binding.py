@@ -65,7 +65,11 @@ _TERMINAL_RUN_STATUSES = frozenset({"exited", "settled"})
 #: absent: a cleanly held DIFFERENT structure never blocks a new entry.
 _UNRESOLVED_RUN_STATUSES = frozenset(
     {"created", "entry_previewed", "entering", "partial_entry",
-     "cleanup_required", "exit_previewed", "exiting", "partial_exit"}
+     "cleanup_required", "exit_previewed", "exiting", "partial_exit",
+     # An adjust that has not landed is in-flight work like any other: the run's
+     # leg generation is moving, so a new ENTRY on top of it would stack exposure
+     # the operator never approved (B2.1a's rule, unchanged).
+     "adjusting"}
 )
 
 #: The durable vocabulary of ``backend.options.execution.models.OptionRunStatus``.
@@ -168,7 +172,7 @@ class PlanOptionRunBindingStore:
                 "OPTION_PLAN_BINDING_INVALID",
                 {"plan_id": plan_id, "option_run_id": option_run_id},
             )
-        if phase not in ("entry", "exit"):
+        if phase not in ("entry", "exit", "adjust"):
             raise PlanBindingRefusal(
                 "OPTION_PLAN_BINDING_INVALID",
                 {"plan_id": plan_id, "phase": phase},
@@ -630,6 +634,229 @@ def _validate_exit_reference(
         )
 
 
+def _structure_generation(run: OptionRunState) -> int:
+    """The run's held leg generation. Absent means the first one (D-9).
+
+    The counter lives in ``option_run_states.metadata`` JSONB, so a run created
+    before adjustments existed (or by a path that never adjusted) reads as
+    generation 1 rather than as "unknown": the only thing an adjust needs to
+    know is whether the basis it froze is still the generation the run holds.
+    """
+    metadata = getattr(run, "metadata", None) or {}
+    try:
+        generation = int(metadata.get("structure_generation") or 1)
+    except (TypeError, ValueError):
+        return 1
+    return generation if generation >= 1 else 1
+
+
+def _validate_adjust_reference(
+    plan: Mapping[str, Any],
+    *,
+    run: OptionRunState,
+    binding: Mapping[str, Any],
+    strategy_id: str,
+    account_id: str,
+    execution_environment: str,
+) -> None:
+    """An adjust plan may only mutate the structure the platform bound it to.
+
+    The scope checks are the exit edge's own - strategy, account and environment
+    of the ENTRY binding, never of the caller's claim. The leg check differs in
+    exactly the way the semantics differ: an exit must move OPPOSITE to the
+    position it holds, while an adjust may ADD to, reduce, or re-open a leg it
+    names. What an adjust may never do is touch a leg under a different product,
+    or silently adopt a contract the run does not hold under the same identity.
+    """
+    plan_id = str(plan.get("plan_id") or "")
+    if (
+        str(binding.get("strategy_id")) != str(strategy_id)
+        or str(binding.get("account_id")) != str(account_id)
+        or str(binding.get("execution_environment")) != str(execution_environment)
+    ):
+        raise PlanBindingRefusal(
+            "OPTION_ADJUSTMENT_SCOPE_MISMATCH",
+            {
+                "plan_id": plan_id,
+                "option_run_id": run.strategy_run_id,
+                "binding_strategy_id": str(binding.get("strategy_id")),
+                "binding_account_id": str(binding.get("account_id")),
+                "binding_environment": str(binding.get("execution_environment")),
+                "plan_strategy_id": str(strategy_id),
+                "plan_account_id": str(account_id),
+                "plan_environment": str(execution_environment),
+            },
+        )
+    held = {_run_leg_identity(leg): leg for leg in run.legs}
+    mismatched: list[dict[str, Any]] = []
+    for leg in _entry_legs(plan):
+        held_leg = held.get(_leg_identity(leg))
+        if held_leg is None:
+            # A leg the run does not hold is a leg this adjust OPENS: the delta is
+            # the whole target, and the hedge gate governs it like any increase.
+            continue
+        run_product = str(held_leg.get("product") or "").upper()
+        plan_product = str(leg.get("product") or "").upper()
+        if run_product and plan_product and run_product != plan_product:
+            mismatched.append(
+                {
+                    "instrument_id": _leg_identity(leg),
+                    "reason": "product_mismatch",
+                    "run_product": run_product,
+                    "plan_product": plan_product,
+                }
+            )
+    if mismatched:
+        raise PlanBindingRefusal(
+            "OPTION_ADJUSTMENT_LEG_MISMATCH",
+            {"plan_id": plan_id, "option_run_id": run.strategy_run_id, "mismatched": mismatched},
+        )
+
+
+def _resolve_adjust_binding(
+    plan: Mapping[str, Any],
+    *,
+    plan_id: str,
+    strategy_id: str,
+    account_id: str,
+    execution_environment: str,
+    worker_run_id: Optional[str],
+    binding_store: PlanOptionRunBindingStore,
+    run_store: DurableOptionRunStore,
+) -> dict[str, Any]:
+    """Bind an ``adjust`` plan to the run it MUTATES (one generation of it).
+
+    Nothing here trusts the caller: the run is read back, its ownership edge is
+    an ENTRY binding of this plan's own scope, and the generation basis the plan
+    froze is compared against the run's held generation. A run that moved on (a
+    completed adjust, a close) refuses as a stale basis rather than being
+    re-derived against a newer structure - the approved artifact stays the
+    approved artifact.
+    """
+    from backend.options.protection.staged_exit import unresolved_stage_claim
+
+    block = _frozen_option_run_block(plan)
+    option_run_id = str(block.get("option_run_id") or "").strip()
+    if not option_run_id:
+        raise PlanBindingRefusal(
+            "OPTION_ADJUSTMENT_REFERENCE_REQUIRED",
+            {"plan_id": plan_id, "message": "an adjust plan must reference the option run it changes"},
+        )
+    if worker_run_id and option_run_id == str(worker_run_id):
+        raise PlanBindingRefusal(
+            "OPTION_ADJUSTMENT_REFERENCE_IS_WORKER_RUN",
+            {
+                "plan_id": plan_id,
+                "option_run_id": option_run_id,
+                "message": "an option run id is not the hosted worker-run id",
+            },
+        )
+    entry_bindings = [
+        row for row in binding_store.list_for_run(option_run_id) if row.get("phase") == "entry"
+    ]
+    if not entry_bindings:
+        raise PlanBindingRefusal(
+            "OPTION_ADJUSTMENT_RUN_NOT_LAUNCHED",
+            {
+                "plan_id": plan_id,
+                "option_run_id": option_run_id,
+                "message": "no entry plan of this platform launched that option run",
+            },
+        )
+    try:
+        run = run_store.get_run(option_run_id)
+    except KeyError as exc:
+        raise PlanBindingRefusal(
+            "OPTION_RUN_MISSING",
+            {"plan_id": plan_id, "option_run_id": option_run_id},
+        ) from exc
+    _validate_adjust_reference(
+        plan,
+        run=run,
+        binding=entry_bindings[0],
+        strategy_id=strategy_id,
+        account_id=account_id,
+        execution_environment=execution_environment,
+    )
+    status = str(getattr(run, "status", "") or "").strip().lower()
+    if status == "adjusting":
+        # This plan has no binding yet (an existing one returned earlier), so the
+        # in-flight adjust belongs to ANOTHER plan: one transition, one owner.
+        raise PlanBindingRefusal(
+            "OPTION_RUN_ADJUST_IN_FLIGHT",
+            {
+                "plan_id": plan_id,
+                "option_run_id": run.strategy_run_id,
+                "option_run_status": status,
+                "message": (
+                    "another plan owns this run's in-flight adjust; its delta is "
+                    "re-derived from the run's own fills, never from a second plan"
+                ),
+            },
+        )
+    if status != "entered":
+        raise PlanBindingRefusal(
+            "OPTION_RUN_STATE_CHANGED",
+            {
+                "plan_id": plan_id,
+                "option_run_id": run.strategy_run_id,
+                "option_run_status": status or "unknown",
+                "message": "an adjust mutates the run's HELD structure; this run is not entered",
+            },
+        )
+    basis = block.get("based_on_generation")
+    try:
+        based_on_generation = int(basis)
+    except (TypeError, ValueError):
+        raise PlanBindingRefusal(
+            "OPTION_ADJUSTMENT_BASIS_REQUIRED",
+            {"plan_id": plan_id, "based_on_generation": basis},
+        ) from None
+    held_generation = _structure_generation(run)
+    if based_on_generation != held_generation:
+        raise PlanBindingRefusal(
+            "OPTION_ADJUSTMENT_STALE_BASIS",
+            {
+                "plan_id": plan_id,
+                "option_run_id": run.strategy_run_id,
+                "based_on_generation": based_on_generation,
+                "structure_generation": held_generation,
+                "message": (
+                    "the run has moved to a different leg generation than the one this "
+                    "adjust was approved against; it is never re-derived against a newer one"
+                ),
+            },
+        )
+    unresolved = unresolved_stage_claim(getattr(run, "orders", None) or [])
+    if unresolved is not None:
+        raise PlanBindingRefusal(
+            "OPTION_PROTECTIVE_EXIT_UNRESOLVED",
+            {
+                "plan_id": plan_id,
+                "option_run_id": run.strategy_run_id,
+                "option_run_status": status,
+                "stage_digest": str(unresolved.get("stage_digest") or ""),
+                "stage_state": str(unresolved.get("state") or ""),
+                "stage_attempt": int(unresolved.get("attempt") or 1),
+                "message": (
+                    "a protective exit stage is unresolved for this run; it is "
+                    "reconciled from the platform's own pre-send records before the "
+                    "structure is mutated"
+                ),
+            },
+        )
+    binding = binding_store.bind(
+        plan_id=plan_id,
+        option_run_id=option_run_id,
+        strategy_id=strategy_id,
+        account_id=account_id,
+        execution_environment=execution_environment,
+        phase="adjust",
+        worker_run_id=worker_run_id,
+    )
+    return {"phase": "adjust", "option_run_id": run.strategy_run_id, "run": run, "binding": binding}
+
+
 def resolve_plan_option_run(
     plan: Mapping[str, Any],
     *,
@@ -647,25 +874,14 @@ def resolve_plan_option_run(
     Exit: the frozen ``option_run`` reference is a LOOKUP KEY; ownership,
     environment and exact leg identity are validated against the durable run and
     its entry binding before anything is submitted.
-    Adjust: frozen in S1 but not yet executable, so it refuses by name here
-    rather than falling into either branch above.
+    Adjust: the same discipline, applied to a MUTATION. The run reference is
+    again only a lookup key; the run must be this strategy's own ``entered``
+    structure, its generation must be the one the plan froze as its basis, and
+    it must not be holding an unresolved protective stage. The plan binds with
+    ``phase="adjust"`` (insert-only, exactly as an exit edge does).
     """
     plan_id = str(plan.get("plan_id") or "")
     phase = _frozen_phase(plan, default=default_phase)
-    if phase == "adjust":
-        # S1 freezes adjust; it does not execute it. Refuse by name BEFORE the
-        # binding short-circuit so an adjust plan can never resolve into the
-        # entry branch (create a run) or the exit branch (validate a close).
-        raise PlanBindingRefusal(
-            "OPTION_ADJUSTMENT_NOT_EXECUTABLE",
-            {
-                "plan_id": plan_id,
-                "message": (
-                    "an adjust plan is frozen but not executable until the adjust "
-                    "engine lands; it is never treated as an entry or an exit"
-                ),
-            },
-        )
     existing = binding_store.get(plan_id)
     if existing is not None:
         # A retry of an entry/exit plan resolves to the SAME run.
@@ -689,6 +905,18 @@ def resolve_plan_option_run(
 
     if phase == "entry":
         return _create_entry_run_atomically(
+            plan,
+            plan_id=plan_id,
+            strategy_id=strategy_id,
+            account_id=account_id,
+            execution_environment=execution_environment,
+            worker_run_id=worker_run_id,
+            binding_store=binding_store,
+            run_store=run_store,
+        )
+
+    if phase == "adjust":
+        return _resolve_adjust_binding(
             plan,
             plan_id=plan_id,
             strategy_id=strategy_id,

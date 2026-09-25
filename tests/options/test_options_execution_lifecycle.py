@@ -1,12 +1,15 @@
 import pytest
 
 from backend.options.execution.lifecycle import (
+    mark_adjusted,
+    mark_adjusting,
     mark_closed,
     mark_entered,
     mark_entering,
     mark_entry_previewed,
     mark_exit_previewed,
     mark_exiting,
+    mark_cleanup_required,
     mark_partial_entry,
     mark_partial_exit,
     transition_to,
@@ -94,3 +97,25 @@ def test_exit_preview_and_exit_paths_cover_partial_and_full_exit():
 def test_invalid_transition_raises_value_error():
     with pytest.raises(ValueError, match="Invalid option run status transition"):
         transition_to(OptionRunState(status="created"), "exiting")
+
+
+def test_an_adjust_mutates_a_held_run_and_lands_back_on_it():
+    """``entered -> adjusting -> entered``: the run owns the structure throughout."""
+    state = mark_adjusting(OptionRunState(status="entered", completed_legs=["A"]))
+    assert state.status == "adjusting"
+    # A leg withheld for its hedge stays the SAME generation, retryably.
+    assert mark_adjusting(state, pending_legs=["B"]).status == "adjusting"
+    # A completed adjust lands back on the held structure with the new legs done.
+    landed = mark_adjusted(state, completed_legs=["A", "B"])
+    assert landed.status == "entered"
+    assert landed.completed_legs == ["A", "B"]
+    assert landed.pending_legs == []
+
+
+def test_an_adjust_may_only_start_from_a_held_run():
+    """No other status may enter ``adjusting``, and it never reaches terminal."""
+    for status in ("created", "entry_previewed", "entering", "partial_entry", "exited"):
+        with pytest.raises(ValueError, match="Invalid option run status transition"):
+            mark_adjusting(OptionRunState(status=status))
+    # A rejected required leg is cleanup work, never a fabricated "entered".
+    assert mark_cleanup_required(OptionRunState(status="adjusting")).status == "cleanup_required"

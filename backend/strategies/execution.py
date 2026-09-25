@@ -321,7 +321,15 @@ class PaperPlanExecutor:
             exit_steps = [step for step in steps_spec if not step[1].get("_increases_exposure")]
             entry_steps = self._ordered_entry_steps(entry_steps, build_entry_order_plan)
             exit_steps = self._ordered_exit_steps(exit_steps, build_structure_exit_orders)
-            step_order = entry_steps + exit_steps
+            if str((option_target or {}).get("phase") or "") == "adjust":
+                # An ADJUST reduces first and increases second: a reduction frees
+                # the run's own hedge only against its PROVEN short closure, while
+                # every increase is released only against a confirmed hedge fill.
+                # The two orderings are the entry and exit builders' own; nothing
+                # is re-derived here.
+                step_order = exit_steps + entry_steps
+            else:
+                step_order = entry_steps + exit_steps
             hedge_required = sum(
                 abs(int(quantity)) for _, _, quantity, side in entry_steps if side == "BUY"
             )
@@ -705,6 +713,7 @@ class PaperPlanExecutor:
         if option_target is not None and option_touches_run:
             self._settle_option_run(
                 option_target,
+                plan=plan,
                 step_order=step_order,
                 outcomes=outcomes,
                 plan_id=plan_id,
@@ -1043,6 +1052,40 @@ class PaperPlanExecutor:
             )
         return open_by_leg
 
+    @staticmethod
+    def _option_run_generation(run: Any) -> int:
+        """The run's held leg generation. Absent means the first one."""
+        metadata = getattr(run, "metadata", None) or {}
+        try:
+            generation = int(metadata.get("structure_generation") or 1)
+        except (TypeError, ValueError):
+            return 1
+        return generation if generation >= 1 else 1
+
+    @staticmethod
+    def _option_run_shape_digest(run: Any) -> str:
+        """The shape the run HOLDS now: its own record first, its entry block next.
+
+        A shape-changing adjust rewrites the record, so an adjustment NEVER has to
+        re-derive the previous generation's identity from the plan that opened it.
+        """
+        metadata = getattr(run, "metadata", None) or {}
+        recorded = str(metadata.get("structure_digest") or "")
+        if recorded:
+            return recorded
+        return str((getattr(run, "protection", None) or {}).get("structure_digest") or "")
+
+    @staticmethod
+    def _adjusted_protection(run: Any, plan: Mapping[str, Any]) -> Dict[str, Any]:
+        """The run's protection block, re-pointed at the generation it now holds."""
+        resolved = plan.get("resolved_plan") or {}
+        protection = dict(getattr(run, "protection", None) or {})
+        for key in ("structure_digest", "structure_id", "underlying", "expiry_policy"):
+            value = resolved.get(key)
+            if value not in (None, ""):
+                protection[key] = value
+        return protection
+
     def _option_run_steps(
         self, plan: Mapping[str, Any], target: Mapping[str, Any]
     ) -> List[Any]:
@@ -1057,16 +1100,16 @@ class PaperPlanExecutor:
         of the run leg's open side, and a leg whose direction would OPEN (or
         extend) exposure is refused. A repeated or partial exit therefore closes
         only what remains, and can never overclose or touch another structure.
+
+        Adjust: the frozen plan freezes the DESIRED TARGET, so each leg's order is
+        ``signed(desired) - the run's own confirmed open``. A run leg the desired
+        state omits is removed, and a desired leg the run does not hold is a new
+        run leg. The delta is re-derived at every attempt and is never replayed
+        from the approved plan, so a fill that landed between approval and
+        submission only moves the run toward the target.
         """
         plan_id = str(plan.get("plan_id") or "")
         phase = str(target.get("phase") or "")
-        if phase == "adjust":
-            # Frozen in S1, executed in S2. Until then an adjust plan must never
-            # fall through to the entry or exit derivation.
-            raise ExecutionRefusal(
-                "OPTION_ADJUSTMENT_NOT_EXECUTABLE",
-                {"plan_id": plan_id, "phase": phase},
-            )
         run = target["run"]
         frozen = [dict(leg) for leg in (plan.get("resolved_plan") or {}).get("legs") or []]
         if not frozen:
@@ -1074,6 +1117,16 @@ class PaperPlanExecutor:
 
         open_by_leg = self._option_run_open_by_leg(run)
         run_legs = {self._run_leg_identity(leg): leg for leg in getattr(run, "legs", []) or []}
+        if phase == "adjust":
+            return self._adjust_option_run_steps(
+                plan,
+                target,
+                plan_id=plan_id,
+                frozen=frozen,
+                run=run,
+                run_legs=run_legs,
+                open_by_leg=open_by_leg,
+            )
 
         steps: List[Any] = []
         for index, leg in enumerate(frozen, start=1):
@@ -1180,6 +1233,174 @@ class PaperPlanExecutor:
                 },
             )
 
+    def _adjust_option_run_steps(
+        self,
+        plan: Mapping[str, Any],
+        target: Dict[str, Any],
+        *,
+        plan_id: str,
+        frozen: Sequence[Mapping[str, Any]],
+        run: Any,
+        run_legs: Dict[str, Dict[str, Any]],
+        open_by_leg: Mapping[str, int],
+    ) -> List[Any]:
+        """``signed(desired target) - this RUN's own confirmed open``, per leg.
+
+        The frozen plan carries the target; the run's own trades are what it
+        converges FROM. A resize is therefore one delta per contract, and a retry
+        after a partial fill can only move the run TOWARD the approved target. A
+        run leg the desired state no longer names is removed (target flat), and a
+        desired leg the run does not hold becomes a new run leg named
+        ``{plan_id}:{index}`` - appended to the run's legs BEFORE the first
+        submission, so a fill lands on the leg the run will hold.
+
+        Two shapes are not an adjust and refuse by name here: a REVERSAL on one
+        contract (both non-zero with opposite signs - a reduce-to-zero and re-open
+        is a re-entry with its own plan), and an expiry change (that is the S4
+        roll, whose acquire-prove-release ordering this slice does not implement).
+        """
+        resolved = plan.get("resolved_plan") or {}
+        structure_expiry = str(resolved.get("expiry") or "")
+        previous_legs = [dict(leg) for leg in getattr(run, "legs", []) or []]
+        named: set[str] = set()
+        steps: List[Any] = []
+        desired_legs: List[Dict[str, Any]] = []
+        for index, leg in enumerate(frozen, start=1):
+            identity = str(leg.get("instrument_id") or leg.get("tradingsymbol") or "")
+            named.add(identity)
+            lot = self._pinned_lot(plan, leg)
+            leg_expiry = str(leg.get("expiry") or "")
+            if structure_expiry and leg_expiry and leg_expiry != structure_expiry:
+                raise ExecutionRefusal(
+                    "OPTION_ADJUSTMENT_UNSUPPORTED",
+                    {
+                        "plan_id": plan_id,
+                        "instrument_id": identity,
+                        "reason": "expiry_change_is_a_roll",
+                        "plan_expiry": leg_expiry,
+                        "structure_expiry": structure_expiry,
+                    },
+                )
+            run_leg = run_legs.get(identity)
+            if (
+                run_leg is not None
+                and structure_expiry
+                and str(run_leg.get("expiry_key") or "") not in ("", structure_expiry)
+            ):
+                raise ExecutionRefusal(
+                    "OPTION_ADJUSTMENT_UNSUPPORTED",
+                    {
+                        "plan_id": plan_id,
+                        "instrument_id": identity,
+                        "reason": "expiry_change_is_a_roll",
+                        "run_expiry": str(run_leg.get("expiry_key") or ""),
+                        "structure_expiry": structure_expiry,
+                    },
+                )
+            if run_leg is None:
+                from backend.options.execution.plan_binding import _to_execution_leg
+
+                # The shape the entry edge writes for a leg: same ids, same
+                # identity metadata, keyed by the ADJUST plan that opened it.
+                run_leg = _to_execution_leg(leg, plan_id=plan_id, index=index)
+                run_legs[identity] = run_leg
+            current = int(open_by_leg.get(str(run_leg.get("leg_id")), 0))
+            target_quantity = int(
+                leg.get("signed_quantity")
+                if leg.get("signed_quantity") is not None
+                else leg.get("quantity") or 0
+            )
+            if target_quantity != 0 and current != 0 and (target_quantity > 0) != (current > 0):
+                raise ExecutionRefusal(
+                    "OPTION_ADJUSTMENT_UNSUPPORTED",
+                    {
+                        "plan_id": plan_id,
+                        "instrument_id": identity,
+                        "reason": "reversal_on_one_contract",
+                        "target_quantity": target_quantity,
+                        "run_open_quantity": current,
+                        "message": (
+                            "closing through flat and re-opening is a re-entry: it needs "
+                            "its own plan, never one adjust"
+                        ),
+                    },
+                )
+            quantity = self._floor_to_lot(target_quantity - current, lot)
+            leg["_current_quantity"] = current
+            leg["_pinned_lot"] = lot
+            # The RUN's leg identity: its own open quantity and this step's fills
+            # are keyed by it, exactly as the entry and exit lanes key them.
+            leg["_run_leg_id"] = str(run_leg.get("leg_id") or f"{plan_id}:{index}")
+            leg["_increases_exposure"] = self._opens_or_grows_exposure(
+                target_quantity, current
+            )
+            steps.append((index, leg, quantity, "BUY" if quantity > 0 else "SELL"))
+            desired_legs.append(
+                self._desired_adjust_run_leg(leg, run_leg=run_leg, target_quantity=target_quantity)
+            )
+
+        # A leg the run holds that the desired state does not name is REMOVED: the
+        # target is flat, so the step closes exactly the run's own open - never a
+        # position another structure holds.
+        step_no = len(frozen)
+        for run_leg in previous_legs:
+            if self._run_leg_identity(run_leg) in named:
+                continue
+            current = int(open_by_leg.get(str(run_leg.get("leg_id")), 0))
+            if current == 0:
+                continue
+            step_no += 1
+            removal = self._removal_leg(run_leg, current=current)
+            lot = self._pinned_lot(plan, removal)
+            removal["_current_quantity"] = current
+            removal["_pinned_lot"] = lot
+            removal["_run_leg_id"] = str(run_leg.get("leg_id") or f"{plan_id}:{step_no}")
+            removal["_increases_exposure"] = False
+            quantity = self._floor_to_lot(-current, lot)
+            steps.append((step_no, removal, quantity, "BUY" if quantity > 0 else "SELL"))
+
+        previous_ids = {str(leg.get("leg_id") or "") for leg in previous_legs}
+        for run_leg in desired_legs:
+            if str(run_leg.get("leg_id") or "") not in previous_ids:
+                # Durable before submission: a fill must land on a leg the run
+                # already records, and a retry must re-read (not re-create) it.
+                run.legs.append(run_leg)
+        target["_adjust_desired_legs"] = desired_legs
+        target["_adjust_previous_legs"] = previous_legs
+        return steps
+
+    @staticmethod
+    def _desired_adjust_run_leg(
+        leg: Mapping[str, Any], *, run_leg: Mapping[str, Any], target_quantity: int
+    ) -> Dict[str, Any]:
+        """The run leg the DESIRED state names, carrying its frozen size."""
+        lot_size = int(leg.get("lot_size") or run_leg.get("lot_size") or 0)
+        quantity = abs(int(target_quantity))
+        return {
+            **dict(run_leg),
+            "transaction_type": "BUY" if int(target_quantity) > 0 else "SELL",
+            "quantity": quantity,
+            "lots": quantity // lot_size if lot_size > 0 else run_leg.get("lots"),
+        }
+
+    @staticmethod
+    def _removal_leg(run_leg: Mapping[str, Any], *, current: int) -> Dict[str, Any]:
+        """A frozen-shaped leg that closes the run's own open on a removed leg."""
+        metadata = run_leg.get("metadata") or {}
+        instrument_id = metadata.get("instrument_id") if isinstance(metadata, Mapping) else None
+        return {
+            "instrument_id": str(instrument_id or ""),
+            "tradingsymbol": str(run_leg.get("tradingsymbol") or ""),
+            "broker_symbol": str(run_leg.get("tradingsymbol") or ""),
+            "broker_exchange": str(run_leg.get("exchange") or ""),
+            "exchange": str(run_leg.get("exchange") or ""),
+            "product": run_leg.get("product"),
+            "lot_size": run_leg.get("lot_size"),
+            "expiry": str(run_leg.get("expiry_key") or ""),
+            "side": "BUY" if int(current) < 0 else "SELL",
+            "quantity": abs(int(current)),
+        }
+
     def _option_bindings(self) -> Any:
         if self._plan_binding_store is None:
             from backend.options.execution.plan_binding import PlanOptionRunBindingStore
@@ -1230,6 +1451,7 @@ class PaperPlanExecutor:
         not repeat an exit whose outcome is unknown.
         """
         from backend.options.execution.lifecycle import (
+            mark_adjusting,
             mark_entering,
             mark_exit_previewed,
             mark_exiting,
@@ -1238,11 +1460,6 @@ class PaperPlanExecutor:
         _ = actor
         run = target["run"]
         phase = str(target.get("phase") or "")
-        if phase == "adjust":
-            raise ExecutionRefusal(
-                "OPTION_ADJUSTMENT_NOT_EXECUTABLE",
-                {"plan_id": plan_id, "phase": phase},
-            )
         store = self._option_runs()
         observed = str(run.status)
         try:
@@ -1260,6 +1477,64 @@ class PaperPlanExecutor:
                         },
                     )
                 next_run = mark_entering(run)
+            elif phase == "adjust":
+                # One CAS-guarded transition is the adjust's ownership token, so
+                # two plans can never mutate one structure concurrently.
+                if observed == "adjusting":
+                    # This plan's OWN binding already owns the in-flight adjust (a
+                    # re-drive): the transition is not re-taken, and the delta is
+                    # re-derived from the run's own confirmed fills.
+                    owner = str((target.get("binding") or {}).get("plan_id") or "")
+                    if owner != plan_id:
+                        raise ExecutionRefusal(
+                            "OPTION_RUN_ADJUST_IN_FLIGHT",
+                            {
+                                "plan_id": plan_id,
+                                "option_run_id": run.strategy_run_id,
+                                "option_run_status": observed,
+                                "owning_plan_id": owner,
+                                "message": (
+                                    "another plan owns this run's in-flight adjust; the "
+                                    "transition is taken exactly once"
+                                ),
+                            },
+                        )
+                    return target
+                if observed != "entered":
+                    raise ExecutionRefusal(
+                        "OPTION_RUN_STATE_CHANGED",
+                        {
+                            "plan_id": plan_id,
+                            "option_run_id": run.strategy_run_id,
+                            "option_run_status": observed,
+                            "message": "an adjust may only mutate a run's held structure",
+                        },
+                    )
+                # A stage the platform committed and has not resolved owns the
+                # run's next transition, so the structure is not mutated beside it.
+                from backend.options.protection.staged_exit import (
+                    unresolved_stage_claim,
+                )
+
+                unresolved = unresolved_stage_claim(getattr(run, "orders", None) or [])
+                if unresolved is not None:
+                    raise ExecutionRefusal(
+                        "OPTION_PROTECTIVE_EXIT_UNRESOLVED",
+                        {
+                            "plan_id": plan_id,
+                            "option_run_id": run.strategy_run_id,
+                            "option_run_status": observed,
+                            "stage_digest": str(unresolved.get("stage_digest") or ""),
+                            "stage_state": str(unresolved.get("state") or ""),
+                            "stage_attempt": int(unresolved.get("attempt") or 1),
+                            "message": (
+                                "a protective exit stage is unresolved for this run; "
+                                "it is reconciled from the platform's own pre-send "
+                                "records before the structure is mutated"
+                            ),
+                        },
+                    )
+                next_run = mark_adjusting(run)
             else:
                 # A protective exit stage the platform committed and has not
                 # resolved owns the run's next exit. A governed exit submitted
@@ -1344,6 +1619,7 @@ class PaperPlanExecutor:
         self,
         target: Dict[str, Any],
         *,
+        plan: Mapping[str, Any],
         step_order: Sequence[Any],
         outcomes: List[Dict[str, Any]],
         plan_id: str,
@@ -1357,6 +1633,8 @@ class PaperPlanExecutor:
         cleanup-required state rather than a fabricated "entered".
         """
         from backend.options.execution.lifecycle import (
+            mark_adjusted,
+            mark_adjusting,
             mark_cleanup_required,
             mark_closed,
             mark_partial_entry,
@@ -1365,11 +1643,6 @@ class PaperPlanExecutor:
 
         store = self._option_runs()
         phase = str(target.get("phase") or "")
-        if phase == "adjust":
-            raise ExecutionRefusal(
-                "OPTION_ADJUSTMENT_NOT_EXECUTABLE",
-                {"plan_id": plan_id, "phase": phase},
-            )
         legs_by_step = {int(step[0]): step for step in step_order}
         orders: List[Dict[str, Any]] = []
         trades: List[Dict[str, Any]] = []
@@ -1429,6 +1702,54 @@ class PaperPlanExecutor:
                         failed_legs=[],
                         pending_legs=pending,
                     )
+            elif phase == "adjust":
+                if failed:
+                    # A required leg of the new generation was rejected: the run
+                    # holds a HALF-APPLIED structure, which is cleanup work, never
+                    # a fabricated "entered".
+                    run = mark_cleanup_required(run)
+                    run.failed_legs = list(failed)
+                elif pending:
+                    # A withheld or partially filled increase leaves the SAME
+                    # generation: the target is unchanged, so a retry re-derives
+                    # the delta from the run's own fills and can only converge.
+                    run = mark_adjusting(run, pending_legs=list(dict.fromkeys(pending)))
+                else:
+                    # Every leg landed. The desired state becomes the run's HELD
+                    # state, under a new generation, with the previous generation's
+                    # legs kept (bounded) so the basis a strategy observed stays
+                    # answerable after the fact.
+                    previous_legs = [
+                        dict(leg) for leg in target.get("_adjust_previous_legs") or []
+                    ]
+                    desired_legs = [dict(leg) for leg in target.get("_adjust_desired_legs") or []]
+                    previous_digest = self._option_run_shape_digest(run)
+                    frozen_digest = str(
+                        (plan.get("resolved_plan") or {}).get("structure_digest") or ""
+                    )
+                    metadata = dict(getattr(run, "metadata", None) or {})
+                    generation = self._option_run_generation(run)
+                    history = list(metadata.get("structure_generation_history") or [])
+                    history.append(
+                        {
+                            "generation": generation,
+                            "structure_digest": previous_digest,
+                            "legs": previous_legs,
+                        }
+                    )
+                    metadata["structure_generation"] = generation + 1
+                    if frozen_digest:
+                        # The shape the run HOLDS now. The owned-work snapshot reads
+                        # this ahead of the ORIGINATING plan's digest, because an
+                        # additive/removal adjust makes the two differ - and the
+                        # duplicate gate must compare against what is held.
+                        metadata["structure_digest"] = frozen_digest
+                    metadata["structure_generation_history"] = history[-10:]
+                    run.metadata = metadata
+                    run.protection = self._adjusted_protection(run, plan)
+                    if desired_legs:
+                        run.legs = desired_legs
+                    run = mark_adjusted(run, completed_legs=list(dict.fromkeys(completed)))
             else:
                 if failed:
                     # The existing exit route's sequence: the run goes to

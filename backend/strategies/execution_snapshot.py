@@ -155,6 +155,56 @@ def _protective_exit_unresolved(orders: Any) -> bool:
         return True
 
 
+def _run_metadata(state: Any) -> Mapping[str, Any]:
+    """A run's own metadata as a mapping, whichever shape the driver handed back.
+
+    ``jsonb`` arrives decoded on PostgreSQL and may arrive as the JSON document
+    itself elsewhere. An unreadable value is EMPTY rather than guessed: every
+    caller here treats a missing key as "the first generation / no recorded
+    shape", which is what a run the adjust engine has never touched holds.
+    """
+    metadata = (state or {}).get("metadata") if isinstance(state, Mapping) else None
+    if isinstance(metadata, (str, bytes, bytearray)):
+        try:
+            metadata = json.loads(metadata)
+        except (TypeError, ValueError):
+            return {}
+    if not isinstance(metadata, Mapping):
+        return {}
+    return metadata
+
+
+def _structure_generation(state: Any) -> int:
+    """The leg generation a run HOLDS, from its own metadata (1 when absent).
+
+    Anything unreadable reads as generation 1 - the generation a run that never
+    adjusted holds - because a fabricated high generation would refuse the next
+    legitimate adjust, while a fabricated low one refuses it as a stale basis.
+    Both refuse; neither guesses a structure this run does not hold.
+    """
+    metadata = _run_metadata(state)
+    try:
+        generation = int(metadata.get("structure_generation") or 1)
+    except (TypeError, ValueError):
+        return 1
+    return generation if generation >= 1 else 1
+
+
+def _structure_digest(state: Any, resolved: Mapping[str, Any]) -> str:
+    """The SHAPE the run holds now: its own record first, its entry plan's second.
+
+    A run that has been adjusted records the digest of the generation it holds,
+    because an adjust that adds or removes a leg changes the shape while the plan
+    that OPENED the run still names the old one. The duplicate gate compares this
+    value against a new plan's frozen digest, so reading the originating plan's
+    stale digest here would let an entry re-open the structure the run holds.
+    """
+    recorded = str(_run_metadata(state).get("structure_digest") or "")
+    if recorded:
+        return recorded
+    return str((resolved or {}).get("structure_digest") or "")
+
+
 def _json_list(value: Any) -> List[Any]:
     """A JSON list from a driver that may hand it back as text.
 
@@ -631,7 +681,7 @@ class OwnedWorkSnapshotService:
                         f"""
                         SELECT strategy_run_id, strategy_name, product, status,
                                legs, completed_legs, failed_legs, pending_legs,
-                               orders, trades, updated_at
+                               orders, trades, metadata, updated_at
                         FROM public.option_run_states
                         WHERE strategy_run_id IN ({placeholders})
                         """
@@ -691,10 +741,16 @@ class OwnedWorkSnapshotService:
                     "underlying": str(resolved.get("underlying") or ""),
                     "expiry": str(resolved.get("expiry") or ""),
                     "structure_id": str(resolved.get("structure_id") or ""),
-                    # The FROZEN structure identity of the edge that opened this
-                    # run. It is what makes "is this the same structure?" a
-                    # comparison of identities rather than of list positions.
-                    "structure_digest": str(resolved.get("structure_digest") or ""),
+                    # The structure identity the run HOLDS NOW: the shape this run
+                    # records once an adjust has rewritten its legs, and otherwise
+                    # the frozen identity of the edge that opened it. It is what
+                    # makes "is this the same structure?" a comparison of
+                    # identities rather than of list positions.
+                    "structure_digest": _structure_digest(state, resolved),
+                    # The leg generation the run HOLDS now (1 until an adjust
+                    # lands). An adjust freezes the generation it observed as its
+                    # basis, so this is what makes a stale basis detectable.
+                    "structure_generation": _structure_generation(state),
                     "expiry_policy": str(resolved.get("expiry_policy") or ""),
                     "product": str(
                         (state or {}).get("product") or resolved.get("product") or ""

@@ -141,3 +141,67 @@ def test_unreadable_leg_list_is_unknown_coverage_not_no_outstanding_legs():
     assert rows == []
     assert coverage["coverage"] == "unknown"
     assert coverage["reason"] == "option_run_state_unreadable"
+
+
+def _state_row(*, metadata=None):
+    return {
+        "strategy_run_id": "opt-1",
+        "status": "entered",
+        "legs": "[]",
+        "completed_legs": "[]",
+        "pending_legs": "[]",
+        "failed_legs": "[]",
+        "orders": "[]",
+        "metadata": metadata,
+    }
+
+
+def _session_returning(state_row):
+    class _Session:
+        def execute(self, statement, params=None):  # noqa: ANN001
+            if isinstance(statement, TextClause):
+                return _FakeResult([state_row])
+            return _FakeResult([_edge("plan-1")])
+
+    return _Session()
+
+
+def _service_with_digest(digest: str):
+    service = OwnedWorkSnapshotService(session_factory=lambda: None)
+    service._bound_runs = lambda *args, **kwargs: ["run-1"]  # type: ignore[assignment]
+    service._plans = lambda *args, **kwargs: [  # type: ignore[assignment]
+        SimpleNamespace(plan_id="plan-1", resolved_plan={"structure_digest": digest})
+    ]
+    return service
+
+
+def test_the_runs_own_digest_wins_over_the_originating_plans():
+    """After a shape-changing adjust the OPENING plan's digest is stale.
+
+    The duplicate gate compares this row against a new plan's frozen digest, so
+    reporting the originating plan's digest here would let an entry re-open the
+    very structure the run holds.
+    """
+    rows, coverage = _service_with_digest("digest-opened")._option_runs(
+        _session_returning(
+            _state_row(metadata='{"structure_generation": 2, "structure_digest": "digest-held"}')
+        ),
+        account_id=ACCOUNT,
+        strategy_id=STRATEGY,
+        environment=ENVIRONMENT,
+    )
+
+    assert coverage["coverage"] == "known"
+    (row,) = rows
+    assert row["structure_digest"] == "digest-held"
+    assert row["structure_generation"] == 2
+
+    # A run that has never been adjusted still reports the plan that opened it.
+    rows, _coverage = _service_with_digest("digest-opened")._option_runs(
+        _session_returning(_state_row(metadata="{}")),
+        account_id=ACCOUNT,
+        strategy_id=STRATEGY,
+        environment=ENVIRONMENT,
+    )
+    assert rows[0]["structure_digest"] == "digest-opened"
+    assert rows[0]["structure_generation"] == 1

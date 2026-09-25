@@ -25,6 +25,17 @@ _ALLOWED_TRANSITIONS: dict[str, set[str]] = {
         OptionRunStatus.EXIT_PREVIEWED.value,
         # Compatibility for direct partial-exit helpers.
         OptionRunStatus.PARTIAL_EXIT.value,
+        # A desired-state mutation of the held structure.
+        OptionRunStatus.ADJUSTING.value,
+    },
+    #: An adjust is a transient ownership of the run: it lands back in ``entered``
+    #: with a new generation, stays ``adjusting`` while a leg is withheld or only
+    #: partially filled (the delta is re-derived on a retry), or hands the run to
+    #: the existing cleanup route when a required leg was rejected.
+    OptionRunStatus.ADJUSTING.value: {
+        OptionRunStatus.ENTERED.value,
+        OptionRunStatus.ADJUSTING.value,
+        OptionRunStatus.CLEANUP_REQUIRED.value,
     },
     OptionRunStatus.EXIT_PREVIEWED.value: {OptionRunStatus.EXITING.value},
     OptionRunStatus.EXITING.value: {
@@ -80,6 +91,28 @@ def mark_entered(state: OptionRunState, *, completed_legs: Iterable[str] | None 
 
 def mark_cleanup_required(state: OptionRunState) -> OptionRunState:
     return transition_to(state, OptionRunStatus.CLEANUP_REQUIRED)
+
+
+def mark_adjusting(
+    state: OptionRunState, *, pending_legs: Iterable[str] = ()
+) -> OptionRunState:
+    """Take the run's ownership for an in-flight desired-state mutation."""
+    next_state = transition_to(state, OptionRunStatus.ADJUSTING)
+    next_state.pending_legs = list(pending_legs)
+    return next_state
+
+
+def mark_adjusted(
+    state: OptionRunState, *, completed_legs: Iterable[str] | None = None
+) -> OptionRunState:
+    """Land a COMPLETED adjust back on the held structure, new generation."""
+    next_state = transition_to(state, OptionRunStatus.ENTERED)
+    if completed_legs is None:
+        return next_state
+    next_state.completed_legs = list(completed_legs)
+    next_state.pending_legs = []
+    next_state.failed_legs = []
+    return next_state
 
 
 def mark_exit_previewed(state: OptionRunState) -> OptionRunState:
