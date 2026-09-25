@@ -41,9 +41,11 @@ from backend.strategies.live_settings import hosted_live_disabled_detail, hosted
 from backend.strategies.live_sequence import (
     BLOCKER_HEDGE_NOT_FILLED,
     BLOCKER_HEDGE_SHORT_NOT_CLOSED,
+    BLOCKER_OPTION_ROLL_NOT_PROVEN,
     RULE_MIS_SQUAREOFF,
     RULE_HEDGE_FILL_GATE,
     RULE_HEDGE_RELEASE_WITHHELD,
+    RULE_OPTION_ROLL_RELEASE_GATE,
     RULE_ROLL_CLOSE_RELEASED,
     RULE_STAGED_FUNDING_GATE,
     LivePlanSequence,
@@ -826,6 +828,8 @@ class LivePlanExecutor:
             return self._hedge_fill_release_rule(spec=spec, parent=parent)
         if rule == RULE_HEDGE_RELEASE_WITHHELD:
             return self._hedge_release_withheld_rule(spec=spec, parent=parent)
+        if rule == RULE_OPTION_ROLL_RELEASE_GATE:
+            return self._option_roll_release_rule(spec=spec, parent=parent)
         if rule != RULE_MIS_SQUAREOFF:
             return True, "", {}
         from backend.strategies.mis_squareoff import scheduled_time_for, squareoff_schedule
@@ -1052,6 +1056,130 @@ class LivePlanExecutor:
         if not released:
             return False, BLOCKER_HEDGE_SHORT_NOT_CLOSED, detail
         return True, "", detail
+
+    def _option_roll_release_rule(
+        self, *, spec: Any, parent: Optional[Mapping[str, Any]]
+    ) -> tuple[bool, str, Dict[str, Any]]:
+        """Prove a roll's replacement generation before touching its old one.
+
+        The graph has already bound every old leg to every acquisition. This gate
+        re-checks those parent outcomes and asks the durable option ledger the
+        stronger question: does the run itself now hold the exact desired
+        generation? A submitted or partially filled acquisition is not proof, and
+        an exact-fill check cannot be satisfied by unrelated work on the same
+        contract.
+        """
+        from backend.options.execution.durable_store import DurableOptionRunStore
+        from backend.strategies.live_sequence import _as_dict
+
+        # The parent's recorded leg outcomes round-trip through JSON keyed by
+        # STRING step number; read them with the shared normaliser so the acquire
+        # proof is never silently skipped as "pending".
+        specs, legs = self._parent_leg_outcomes(parent)
+        acquire_nos = [
+            int(step_no)
+            for step_no, item in specs.items()
+            if _as_dict(getattr(item, "detail", {})).get("option", {}).get("step_class")
+            == "option_roll_acquire"
+        ]
+        unfilled = [
+            int(step_no)
+            for step_no in acquire_nos
+            if str(legs.get(int(step_no), {}).get("outcome") or "pending") != "filled"
+        ]
+        step_no = int(getattr(spec, "step_no", 0) or 0)
+        common = {
+            "rule": RULE_OPTION_ROLL_RELEASE_GATE,
+            "step_no": step_no,
+            "acquire_steps": acquire_nos,
+            "unfilled_acquire_steps": unfilled,
+        }
+        if unfilled:
+            return False, BLOCKER_OPTION_ROLL_NOT_PROVEN, common
+
+        run_ids = {
+            str(_as_dict(getattr(item, "detail", {})).get("option", {}).get("option_run_id") or "")
+            for item in specs.values()
+        }
+        run_ids.discard("")
+        if len(run_ids) != 1:
+            return False, "LIVE_OPTION_RUN_LEDGER_INCONSISTENT", {
+                **common,
+                "option_run_ids": sorted(run_ids),
+                "message": "roll steps do not name exactly one option run",
+            }
+        store = DurableOptionRunStore(session_factory=self.session_factory)
+        try:
+            run = store.get_run(next(iter(run_ids)))
+        except Exception as exc:  # noqa: BLE001 - an unreadable ledger is never clear
+            return False, "LIVE_OPTION_RUN_LEDGER_INCONSISTENT", {
+                **common,
+                "error": type(exc).__name__,
+                "message": "the option run ledger could not be read",
+            }
+        open_by_leg: Dict[str, int] = {}
+        for trade in getattr(run, "trades", []) or []:
+            leg_id = str((trade or {}).get("leg_id") or "")
+            side = str((trade or {}).get("transaction_type") or "").upper()
+            open_by_leg[leg_id] = open_by_leg.get(leg_id, 0) + (
+                int((trade or {}).get("quantity") or 0)
+                if side == "BUY"
+                else -int((trade or {}).get("quantity") or 0)
+            )
+        expected_by_leg: Dict[str, int] = {}
+        for item in specs.values():
+            detail = _as_dict(getattr(item, "detail", {}))
+            option = _as_dict(detail.get("option"))
+            if str(option.get("step_class") or "") != "option_roll_acquire":
+                continue
+            expected_by_leg[str(option.get("run_leg_id") or "")] = int(
+                detail.get("sizing", {}).get("target") or 0
+            )
+        mismatches = [
+            {
+                "run_leg_id": leg_id,
+                "expected_quantity": expected,
+                "ledger_quantity": open_by_leg.get(leg_id, 0),
+            }
+            for leg_id, expected in expected_by_leg.items()
+            if open_by_leg.get(leg_id, 0) != expected
+        ]
+        if mismatches:
+            return False, "LIVE_OPTION_RUN_LEDGER_INCONSISTENT", {
+                **common,
+                "expected_quantities": expected_by_leg,
+                "ledger_quantities": open_by_leg,
+                "mismatches": mismatches,
+                "message": "the run ledger does not hold the exact replacement generation",
+            }
+        # The old generation is now inside the ordinary structure-exit rule:
+        # shorts may close, but each hedge remains behind its proven short closure.
+        # The release steps carry no ``depends_on`` (the gate IS the proof), so the
+        # closure is asked of the parent's own OLD-generation short steps directly.
+        option = _as_dict(getattr(spec, "detail", {})).get("option", {})
+        if str(option.get("step_class") or "") == "option_roll_release":
+            current = int(getattr(spec, "current_quantity", 0) or 0)
+            if current > 0:
+                release_shorts = tuple(
+                    int(item.step_no)
+                    for item in specs.values()
+                    if str(
+                        _as_dict(getattr(item, "detail", {})).get("option", {}).get(
+                            "step_class"
+                        )
+                        or ""
+                    )
+                    == "option_roll_release"
+                    and int(getattr(item, "current_quantity", 0) or 0) < 0
+                )
+                if release_shorts:
+                    import dataclasses
+
+                    delegated = dataclasses.replace(spec, depends_on=release_shorts)
+                    return self._hedge_release_withheld_rule(
+                        spec=delegated, parent=parent
+                    )
+        return True, "", {**common, "ledger_quantities": expected_by_leg}
 
     def _mis_context(
         self, *, plan: Mapping[str, Any], binding: Mapping[str, Any]

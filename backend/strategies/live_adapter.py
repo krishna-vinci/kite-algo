@@ -711,7 +711,12 @@ class LivePlanAdapter:
         from .execution import ExecutionRefusal
 
         try:
-            return list(self._domain()._option_run_steps(dict(plan), dict(target)))
+            # ``target`` is passed THROUGH, never copied: the engine's derivation
+            # records the roll context (``_adjust_roll*``) and the desired run legs
+            # on the target it is given, and the lane builder reads them back. A
+            # copy would silently drop the roll boundary and release the old
+            # generation beside the new one.
+            return list(self._domain()._option_run_steps(dict(plan), target))
         except ExecutionRefusal as exc:
             raise LiveRefusal(exc.reason_code, exc.detail) from exc
 

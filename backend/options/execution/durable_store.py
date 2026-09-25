@@ -413,6 +413,9 @@ class DurableOptionRunStore:
         allowed_from: "list[str] | tuple[str, ...]",
         expected_generation: int | None = None,
         db: Any = None,
+        owner_policy: Any = None,
+        owner_run_id: Optional[str] = None,
+        owner_observed_epoch: Optional[int] = None,
     ) -> bool:
         """Compare-and-set the run's status: the per-RUN execution ownership.
 
@@ -423,6 +426,11 @@ class DurableOptionRunStore:
         status it observed, and the loser refuses instead of trading. An adjust
         also pins the frozen leg generation, so a plan cannot win a status race
         and then trade against a newer structure.
+
+        ``owner_policy`` mirrors :meth:`save_run`: when supplied, the adjust's new
+        protection policy is CASed onto the ACTIVE owner row in the SAME
+        transaction as the winning run write, so a completion can never read
+        under a policy the owner row never saw.
         """
         self._require_id(run.strategy_run_id)
         allowed = [str(status) for status in allowed_from]
@@ -503,6 +511,19 @@ class DurableOptionRunStore:
             won = int(getattr(result, "rowcount", 0) or 0) > 0
             if won:
                 self._release_protection_owner_if_terminal(session, run)
+                if owner_policy is not None:
+                    # A moved owner row (or a superseded owner id) refuses here,
+                    # which rolls the run write back with it: the two commit
+                    # together or not at all.
+                    OptionProtectionOwnerStore(
+                        session_factory=self._session_factory
+                    ).update_policy(
+                        run.strategy_run_id,
+                        owner_policy,
+                        int(owner_observed_epoch or 0),
+                        owner_run_id=owner_run_id,
+                        db=session,
+                    )
             if owns_session:
                 session.commit()
             return won

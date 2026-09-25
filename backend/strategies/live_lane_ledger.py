@@ -253,6 +253,7 @@ class LiveLaneLedger:
                 ],
             )
         status = self._advance_option_run(run)
+        status = self._advance_option_adjust(parent, run, status=status)
         return {
             "lane": "option_structure",
             "option_run_id": run_id,
@@ -262,6 +263,145 @@ class LiveLaneLedger:
             "option_run_status": status,
             "idempotent": increment <= 0,
         }
+
+    def _advance_option_adjust(
+        self, parent: Mapping[str, Any], run: Any, *, status: str
+    ) -> str:
+        """Complete an adjust only from the run's own ledger proof.
+
+        The generic helper leaves ``adjusting`` alone because it has no phase
+        vocabulary. This is the option-specific completion: every frozen target
+        quantity must equal the signed run trade, old removed legs must be flat,
+        and only then does the generation bump and the desired protection freeze.
+        The check is idempotent; replayed ingestion sees the newer status and
+        returns without another bump.
+        """
+        if status != "adjusting":
+            return status
+        expected_by_leg: Dict[str, int] = {}
+        desired_specs = []
+        for spec in parent.get("step_spec") or []:
+            detail = dict(getattr(spec, "detail", {}) or {})
+            option = dict(detail.get("option") or {})
+            if str(option.get("phase") or "") != "adjust":
+                continue
+            leg_id = str(option.get("run_leg_id") or "")
+            target = int(detail.get("sizing", {}).get("target") or 0)
+            expected_by_leg[leg_id] = target
+            desired_specs.append(spec)
+        if not desired_specs:
+            return status
+
+        open_by_leg: Dict[str, int] = {}
+        for trade in getattr(run, "trades", []) or []:
+            leg_id = str((trade or {}).get("leg_id") or "")
+            side = str((trade or {}).get("transaction_type") or "").upper()
+            open_by_leg[leg_id] = open_by_leg.get(leg_id, 0) + (
+                int((trade or {}).get("quantity") or 0)
+                if side == "BUY"
+                else -int((trade or {}).get("quantity") or 0)
+            )
+        if any(open_by_leg.get(leg_id, 0) != target for leg_id, target in expected_by_leg.items()):
+            return status
+
+        old_legs = [dict(leg) for leg in getattr(run, "legs", []) or []]
+        metadata = dict(getattr(run, "metadata", None) or {})
+        generation = int(metadata.get("structure_generation") or 1)
+        history = list(metadata.get("structure_generation_history") or [])
+        history.append(
+            {
+                "generation": generation,
+                "structure_digest": metadata.get("structure_digest") or "",
+                "legs": old_legs,
+            }
+        )
+        metadata["structure_generation"] = generation + 1
+        metadata["structure_generation_history"] = history[-10:]
+        desired_legs = []
+        for spec in desired_specs:
+            detail = dict(getattr(spec, "detail", {}) or {})
+            option = dict(detail.get("option") or {})
+            leg_id = str(option.get("run_leg_id") or "")
+            target = int(detail.get("sizing", {}).get("target") or 0)
+            if target == 0:
+                continue
+            existing = next(
+                (dict(leg) for leg in old_legs if str(leg.get("leg_id") or "") == leg_id),
+                None,
+            )
+            leg = existing or {
+                "leg_id": leg_id,
+                "tradingsymbol": str(getattr(spec, "tradingsymbol") or ""),
+                "exchange": str(getattr(spec, "exchange") or ""),
+                "product": str(getattr(spec, "product") or ""),
+                "lot_size": int(getattr(spec, "lot_size") or 1),
+                "metadata": {
+                    "instrument_id": str(getattr(spec, "instrument_id") or ""),
+                    "expiry": str(option.get("expiry") or ""),
+                    "expiry_key": str(option.get("expiry") or ""),
+                    "structure_id": str(option.get("structure_id") or ""),
+                },
+            }
+            leg.update(
+                {
+                    "quantity": abs(target),
+                    "lots": abs(target) // int(leg.get("lot_size") or 1),
+                    "transaction_type": "BUY" if target > 0 else "SELL",
+                }
+            )
+            desired_legs.append(leg)
+        run.metadata = metadata
+        if desired_legs:
+            run.legs = desired_legs
+        protection = next(
+            (
+                dict(option.get("desired_protection") or {})
+                for spec in desired_specs
+                for option in [dict((getattr(spec, "detail", {}) or {}).get("option") or {})]
+                if option.get("desired_protection")
+            ),
+            None,
+        )
+        if protection is not None:
+            run.protection = protection
+        from backend.options.execution.lifecycle import mark_adjusted
+        from backend.options.execution.plan_binding import read_option_protection_owner
+        from backend.options.protection.ownership import (
+            option_protection_policy_snapshot,
+        )
+
+        # B2.4 S4: a NEW generation freezes the adjust's protection policy on the
+        # owner row, in the SAME transaction as the run's completion write and
+        # CASed on the epoch observed here. A row that moved under us, a
+        # superseded owner, or an unreadable row simply leaves the run write
+        # unperformed - the owner row is never invented by a completion.
+        owner_policy = None
+        owner_run_id = None
+        owner_observed_epoch = 0
+        with self.session_factory() as session:
+            owner_row, _owner_read_error = read_option_protection_owner(
+                str(getattr(run, "strategy_run_id", "") or ""), session=session
+            )
+        if owner_row is not None and str(owner_row.get("state") or "") == "active":
+            owner_policy = option_protection_policy_snapshot(protection or {})
+            owner_run_id = str(owner_row.get("owner_run_id") or "") or None
+            owner_observed_epoch = int(owner_row.get("owner_epoch") or 0)
+
+        try:
+            next_run = mark_adjusted(
+                run, completed_legs=[leg_id for leg_id, target in expected_by_leg.items() if target]
+            )
+        except ValueError:
+            return status
+        if self._runs().save_run_if_status(
+            next_run,
+            allowed_from=("adjusting",),
+            owner_policy=owner_policy,
+            owner_run_id=owner_run_id,
+            owner_observed_epoch=owner_observed_epoch,
+        ):
+            return str(next_run.status)
+        return status
 
     def _advance_option_run(self, run: Any) -> str:
         """Derive the run's next status from its OWN recorded trades.

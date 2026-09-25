@@ -126,6 +126,10 @@ RULE_HEDGE_FILL_GATE = "hedge_fill_gate"
 #: An option structure's HEDGE half of an EXIT: released only against the short
 #: it defends being PROVEN closed (the existing exit builder's rule).
 RULE_HEDGE_RELEASE_WITHHELD = "hedge_release_withheld"
+#: A roll's old generation: released only after EVERY replacement leg is
+#: terminal-filled and the run ledger holds the exact desired quantities. The
+#: gate then applies the structure-exit rule inside the release generation.
+RULE_OPTION_ROLL_RELEASE_GATE = "option_roll_release_gate"
 
 RELEASE_RULES = (
     RULE_IMMEDIATE,
@@ -135,6 +139,7 @@ RELEASE_RULES = (
     RULE_ROLL_CLOSE_RELEASED,
     RULE_HEDGE_FILL_GATE,
     RULE_HEDGE_RELEASE_WITHHELD,
+    RULE_OPTION_ROLL_RELEASE_GATE,
 )
 
 #: Named blockers a refused release records. They are EVIDENCE: the step stays
@@ -144,6 +149,17 @@ BLOCKER_DEADLINE_NOT_DUE = "MIS_SQUAREOFF_NOT_DUE"
 BLOCKER_ROLL_CLOSE_NOT_RELEASED = "roll_close_not_released"
 BLOCKER_HEDGE_NOT_FILLED = "hedge_not_confirmed"
 BLOCKER_HEDGE_SHORT_NOT_CLOSED = "hedge_short_not_proven_closed"
+BLOCKER_OPTION_ROLL_NOT_PROVEN = "option_roll_not_proven"
+
+OPTION_STEP_CLASSES = (
+    "option_reduce_short",
+    "option_remove_short",
+    "option_reduce_hedge",
+    "option_increase_hedge",
+    "option_increase_short",
+    "option_roll_acquire",
+    "option_roll_release",
+)
 
 
 def _utcnow() -> datetime:
@@ -761,6 +777,13 @@ def build_option_steps(ctx: LaneContext) -> List[StepSpec]:
       under :data:`RULE_HEDGE_RELEASE_WITHHELD` behind the short-closing step(s),
       because releasing a hedge before its short is provably closed opens the
       naked window the structure exists to avoid.
+    * ADJUST reuses the paper target-minus-run-open delta and names each live
+      action explicitly. Reductions precede increases: short reductions are
+      immediate, hedge reductions wait for those proven closures, hedge increases
+      wait for reductions when reductions and increases coexist, and short
+      increases wait for every hedge increase. An expiry roll adds a durable
+      generation boundary: old-generation legs wait for every acquisition and the
+      service proves the run ledger before releasing them.
     """
     if ctx.option_target is None or ctx.option_run_steps is None:
         raise LiveRefusal(
@@ -775,17 +798,6 @@ def build_option_steps(ctx: LaneContext) -> List[StepSpec]:
         )
     target = dict(ctx.option_target(dict(ctx.plan), dict(ctx.binding)))
     phase = str(target.get("phase") or "")
-    if phase == "adjust":
-        # B2.2 is paper-only; the live lane must refuse an adjust plan by name
-        # rather than reuse the entry/exit dependency rules for it.
-        raise LiveRefusal(
-            "LIVE_OPTION_ADJUST_UNSUPPORTED",
-            {
-                "plan_id": ctx.plan_id,
-                "phase": phase,
-                "message": "the live option lane does not support an adjust plan",
-            },
-        )
     run = target.get("run")
     run_id = str(getattr(run, "strategy_run_id", "") or target.get("option_run_id") or "")
     steps = list(ctx.option_run_steps(dict(ctx.plan), target))
@@ -794,15 +806,57 @@ def build_option_steps(ctx: LaneContext) -> List[StepSpec]:
 
     hedge_entries = [
         int(index)
-        for index, leg, _quantity, _side in steps
-        if bool(leg.get("_increases_exposure")) and str(_side).upper() == "BUY"
+        for index, leg, quantity, side in steps
+        if bool(leg.get("_increases_exposure")) and str(side).upper() == "BUY"
     ]
     short_exits = [
         int(index)
-        for index, leg, _quantity, _side in steps
+        for index, leg, quantity, side in steps
         if not bool(leg.get("_increases_exposure"))
         and int(leg.get("_current_quantity") or 0) < 0
+        and int(quantity) != 0
     ]
+    reductions = [
+        int(index)
+        for index, leg, quantity, _side in steps
+        if phase in ("adjust", "exit") and int(quantity) != 0
+        and not bool(leg.get("_increases_exposure"))
+    ]
+    #: Reductions split by the position they close: a short closure is immediate,
+    #: while the HEDGE that defended it is released only against that proven
+    #: closure (the existing structure-exit rule).
+    short_reductions = [
+        int(index)
+        for index, leg, quantity, _side in steps
+        if int(index) in reductions and int(leg.get("_current_quantity") or 0) < 0
+    ]
+    increases = [
+        int(index)
+        for index, leg, quantity, _side in steps
+        if phase == "adjust" and int(quantity) != 0
+        and bool(leg.get("_increases_exposure"))
+    ]
+    hedge_increases = [
+        int(index)
+        for index, leg, quantity, side in steps
+        if int(index) in increases and str(side).upper() == "BUY"
+    ]
+    roll = bool(target.get("_adjust_roll"))
+    acquire_steps = {
+        int(value) for value in target.get("_adjust_roll_acquire_steps") or []
+    }
+    release_steps = {
+        int(value) for value in target.get("_adjust_roll_release_steps") or []
+    }
+    resolved = dict(ctx.plan.get("resolved_plan") or {})
+    desired_protection = {
+        key: resolved[key]
+        for key in (
+            "expiry", "expiry_policy", "max_loss", "protection_policy",
+            "structure_digest", "structure_id", "structure_units", "underlying",
+        )
+        if key in resolved
+    }
 
     specs: List[StepSpec] = []
     for index, leg, quantity, side in steps:
@@ -811,23 +865,87 @@ def build_option_steps(ctx: LaneContext) -> List[StepSpec]:
         signed = int(quantity)
         side = str(side).upper()
         increases = bool(leg.get("_increases_exposure"))
+        current = int(leg.get("_current_quantity") or 0)
         quantity = abs(signed)
         depends_on: Tuple[int, ...] = ()
         rule = RULE_IMMEDIATE
-        rule_detail: Dict[str, Any] = {"phase": phase, "run_leg_id": str(leg.get("_run_leg_id") or "")}
+        rule_detail: Dict[str, Any] = {
+            "phase": phase,
+            "run_leg_id": str(leg.get("_run_leg_id") or ""),
+        }
+        roll_detail: Dict[str, Any] = {}
+        step_class = ""
         if phase == "entry" and increases and side == "SELL" and hedge_entries:
             depends_on = tuple(sorted(hedge_entries))
             rule = RULE_HEDGE_FILL_GATE
             rule_detail["gated_by"] = "hedge_fill_gate"
             rule_detail["dependent_short_quantity"] = int(quantity)
+            step_class = "option_increase_short"
         elif phase == "exit" and (not increases) and side == "SELL" and short_exits:
             # A SELL that closes a LONG leg releases the hedge the short defends.
             depends_on = tuple(sorted(short_exits))
             rule = RULE_HEDGE_RELEASE_WITHHELD
             rule_detail["gated_by"] = "structure_exit_builder"
             rule_detail["releases_hedge_for"] = [
-                str(step[1].get("tradingsymbol") or "") for step in steps if int(step[0]) in short_exits
+                str(step[1].get("tradingsymbol") or "")
+                for step in steps
+                if int(step[0]) in short_exits
             ]
+            step_class = "option_reduce_hedge"
+        elif phase == "exit":
+            step_class = "option_reduce_short" if current < 0 else "option_reduce_hedge"
+        elif roll and int(index) in acquire_steps:
+            roll_detail = {"stage": "acquire"}
+            if side == "SELL" and hedge_increases:
+                depends_on = tuple(sorted(hedge_increases))
+                rule = RULE_HEDGE_FILL_GATE
+                rule_detail["gated_by"] = "hedge_fill_gate"
+                rule_detail["dependent_short_quantity"] = int(quantity)
+                step_class = "option_roll_acquire"
+            elif side == "BUY":
+                step_class = "option_roll_acquire"
+            else:
+                # A SELL acquisition with no hedge to gate it (an admitted naked
+                # shape) is still an acquisition, never a release.
+                step_class = "option_roll_acquire"
+        elif roll and int(index) in release_steps:
+            roll_detail = {"stage": "release"}
+            rule = RULE_OPTION_ROLL_RELEASE_GATE
+            rule_detail["gated_by"] = RULE_OPTION_ROLL_RELEASE_GATE
+            rule_detail["proves_acquire_steps"] = sorted(acquire_steps)
+            step_class = "option_roll_release"
+            # The gate is the ONLY guard on an old-generation step: it is NOT put
+            # behind the acquire claims in ``depends_on``, so a partial
+            # acquisition records ``option_roll_not_proven`` as evidence instead
+            # of waiting silently. The gate proves every acquisition and the run's
+            # own ledger, then orders the release itself - the old short first,
+            # the hedge it defends only behind that proven closure.
+        elif phase == "adjust" and increases and side == "SELL":
+            if hedge_increases:
+                depends_on = tuple(sorted(hedge_increases))
+                rule = RULE_HEDGE_FILL_GATE
+                rule_detail["gated_by"] = "hedge_fill_gate"
+                rule_detail["dependent_short_quantity"] = int(quantity)
+            step_class = "option_increase_short"
+        elif phase == "adjust" and increases and side == "BUY":
+            if reductions:
+                depends_on = tuple(sorted(reductions))
+                rule = RULE_ALL_PREREQUISITES_FILLED
+                rule_detail["gated_by"] = RULE_ALL_PREREQUISITES_FILLED
+            step_class = "option_increase_hedge"
+        elif phase == "adjust" and side == "BUY":
+            step_class = "option_reduce_short"
+        elif phase == "adjust" and side == "SELL":
+            if short_reductions:
+                depends_on = tuple(sorted(short_reductions))
+                rule = RULE_HEDGE_RELEASE_WITHHELD
+                rule_detail["gated_by"] = "structure_exit_builder"
+                rule_detail["releases_hedge_for"] = [
+                    str(step[1].get("tradingsymbol") or "")
+                    for step in steps
+                    if int(step[0]) in short_reductions
+                ]
+            step_class = "option_reduce_hedge"
         price_raw = leg.get("reference_price")
         try:
             price = abs(float(price_raw)) if price_raw is not None else 0.0
@@ -838,11 +956,15 @@ def build_option_steps(ctx: LaneContext) -> List[StepSpec]:
                 step_no=index,
                 step_ref=_step_ref(ctx.plan_id, index),
                 lane=LANE_OPTION_STRUCTURE,
-                domain=str(leg.get("option_type") or leg.get("instrument_type") or "OPT").upper(),
+                domain=str(
+                    leg.get("option_type") or leg.get("instrument_type") or "OPT"
+                ).upper(),
                 quantity=int(quantity),
                 side=side,
                 target_quantity=(
-                    int(leg.get("signed_quantity") or 0) if phase == "entry" else 0
+                    int(leg.get("signed_quantity") or 0)
+                    if phase in ("entry", "adjust")
+                    else 0
                 ),
                 current_quantity=int(leg.get("_current_quantity") or 0),
                 delta=int(signed),
@@ -854,13 +976,17 @@ def build_option_steps(ctx: LaneContext) -> List[StepSpec]:
                 detail={
                     "sizing": {
                         "target": (
-                            int(leg.get("signed_quantity") or 0) if phase == "entry" else 0
+                            int(leg.get("signed_quantity") or 0)
+                            if phase in ("entry", "adjust")
+                            else 0
                         ),
                         "current": int(leg.get("_current_quantity") or 0),
                         "delta": int(signed),
                         "side": side,
                         "quantity": int(quantity),
-                        "lot_size": _as_int(leg.get("_pinned_lot") or leg.get("lot_size"), 1),
+                        "lot_size": _as_int(
+                            leg.get("_pinned_lot") or leg.get("lot_size"), 1
+                        ),
                         "increases_exposure": increases,
                     },
                     "option": {
@@ -871,7 +997,14 @@ def build_option_steps(ctx: LaneContext) -> List[StepSpec]:
                         "structure_digest": str(leg.get("structure_digest") or ""),
                         "expiry": str(leg.get("expiry") or ""),
                         "expiry_policy": str(leg.get("expiry_policy") or ""),
+                        "step_class": step_class,
+                        **(
+                            {"desired_protection": dict(desired_protection)}
+                            if phase == "adjust"
+                            else {}
+                        ),
                     },
+                    **({"roll": roll_detail} if roll_detail else {}),
                     "release": rule_detail,
                 },
                 **_instrument_fields(leg),

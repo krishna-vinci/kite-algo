@@ -248,6 +248,149 @@ class LiveSubmissionStoreTests(unittest.TestCase):
         self.assertEqual(_blocked("filled"), [])
         self.assertEqual(_blocked("no_op"), [])
 
+
+class OptionStepGraphTests(unittest.TestCase):
+    """The live option lane names adjust actions and preserves B2.2 ordering."""
+
+    @staticmethod
+    def _leg(symbol, *, side, delta, target, current, token, instrument_id):
+        return {
+            "instrument_id": instrument_id,
+            "tradingsymbol": symbol,
+            "exchange": "NFO",
+            "broker_symbol": symbol,
+            "product": "NRML",
+            "option_type": "CE",
+            "reference_price": 100.0,
+            "signed_quantity": target,
+            "_run_leg_id": f"leg-{instrument_id}",
+            "_current_quantity": current,
+            "_pinned_lot": 1,
+            "_increases_exposure": (
+                current == 0 or ((target > 0) == (current > 0) and abs(target) > abs(current))
+            ),
+        }
+
+    @staticmethod
+    def _ctx(plan_id, target, steps):
+        from backend.strategies.live_sequence import LaneContext
+
+        plan = {
+            "plan_id": plan_id,
+            "plan_kind": "option_structure",
+            "resolved_plan": {
+                "target_kind": "option_structure",
+                "underlying": "NIFTY",
+                "expiry": "2026-10-29",
+                "expiry_policy": "exit_before_cutoff",
+                "structure_digest": "digest",
+                "max_loss": 1000,
+            },
+        }
+        return LaneContext(
+            plan=plan,
+            binding={},
+            authority={},
+            execution_id=f"ex-{plan_id}",
+            size_leg=lambda leg: {},
+            option_target=lambda _plan, _binding: target,
+            option_run_steps=lambda _plan, _target: steps,
+        )
+
+    def test_a_resize_reduces_the_short_before_increasing_the_hedge(self):
+        from backend.strategies.live_sequence import (
+            RULE_ALL_PREREQUISITES_FILLED,
+            build_option_steps,
+        )
+
+        short = self._leg("SHORT", side="BUY", delta=75, target=-75, current=-150,
+                          token=1, instrument_id="short")
+        hedge = self._leg("HEDGE", side="BUY", delta=75, target=150, current=75,
+                          token=2, instrument_id="hedge")
+        target = {
+            "phase": "adjust",
+            "option_run_id": "run-opt",
+            "_adjust_roll": False,
+        }
+        specs = build_option_steps(self._ctx("plan-resize", target, [(1, short, 75, "BUY"), (2, hedge, 75, "BUY")]))
+
+        self.assertEqual(specs[0].detail["option"]["step_class"], "option_reduce_short")
+        self.assertEqual(specs[0].release_rule, "immediate")
+        self.assertEqual(specs[1].detail["option"]["step_class"], "option_increase_hedge")
+        self.assertEqual(specs[1].release_rule, RULE_ALL_PREREQUISITES_FILLED)
+        self.assertEqual(specs[1].depends_on, (1,))
+        self.assertEqual(specs[1].target_quantity, 150)
+
+    def test_a_resize_down_closes_the_short_before_releasing_the_hedge(self):
+        """A reduce-only resize: the short closes immediately, the hedge behind it."""
+        from backend.strategies.live_sequence import (
+            RULE_HEDGE_RELEASE_WITHHELD,
+            build_option_steps,
+        )
+
+        short = self._leg("SHORT", side="BUY", delta=75, target=-75, current=-150,
+                          token=1, instrument_id="short")
+        hedge = self._leg("HEDGE", side="SELL", delta=-75, target=75, current=150,
+                          token=2, instrument_id="hedge")
+        target = {"phase": "adjust", "option_run_id": "run-opt", "_adjust_roll": False}
+        specs = build_option_steps(
+            self._ctx("plan-down", target, [(1, short, 75, "BUY"), (2, hedge, -75, "SELL")])
+        )
+
+        self.assertEqual(specs[0].detail["option"]["step_class"], "option_reduce_short")
+        self.assertEqual(specs[0].release_rule, "immediate")
+        self.assertEqual(specs[0].depends_on, ())
+        self.assertEqual(specs[1].detail["option"]["step_class"], "option_reduce_hedge")
+        self.assertEqual(specs[1].release_rule, RULE_HEDGE_RELEASE_WITHHELD)
+        # The hedge waits for the short it defends, never for itself.
+        self.assertEqual(specs[1].depends_on, (1,))
+
+    def test_a_roll_binds_every_old_leg_to_every_acquisition(self):
+        from backend.strategies.live_sequence import (
+            RULE_HEDGE_FILL_GATE,
+            RULE_OPTION_ROLL_RELEASE_GATE,
+            build_option_steps,
+        )
+
+        new_hedge = self._leg("NEW-HEDGE", side="BUY", delta=75, target=75, current=0,
+                              token=3, instrument_id="new-hedge")
+        new_short = self._leg("NEW-SHORT", side="SELL", delta=-75, target=-75, current=0,
+                              token=4, instrument_id="new-short")
+        old_short = self._leg("OLD-SHORT", side="BUY", delta=-75, target=0, current=-75,
+                              token=1, instrument_id="old-short")
+        old_hedge = self._leg("OLD-HEDGE", side="SELL", delta=-75, target=0, current=75,
+                              token=2, instrument_id="old-hedge")
+        target = {
+            "phase": "adjust",
+            "option_run_id": "run-opt",
+            "_adjust_roll": True,
+            "_adjust_roll_acquire_steps": [1, 2],
+            "_adjust_roll_release_steps": [3, 4],
+        }
+        specs = build_option_steps(self._ctx(
+            "plan-roll",
+            target,
+            [(1, new_hedge, 75, "BUY"), (2, new_short, -75, "SELL"),
+             (3, old_short, -75, "BUY"), (4, old_hedge, -75, "SELL")],
+        ))
+
+        self.assertEqual(specs[0].detail["option"]["step_class"], "option_roll_acquire")
+        self.assertEqual(specs[0].detail["roll"], {"stage": "acquire"})
+        self.assertEqual(specs[1].release_rule, RULE_HEDGE_FILL_GATE)
+        self.assertEqual(specs[1].depends_on, (1,))
+        # Every old-generation step is gated by the roll's own proof rule (not by
+        # the acquire claims in ``depends_on``), so a partial acquisition is
+        # reported as ``option_roll_not_proven`` rather than waiting silently.
+        for spec in specs[2:]:
+            self.assertEqual(spec.detail["option"]["step_class"], "option_roll_release")
+            self.assertEqual(spec.detail["roll"], {"stage": "release"})
+            self.assertEqual(spec.release_rule, RULE_OPTION_ROLL_RELEASE_GATE)
+            self.assertEqual(spec.depends_on, ())
+
+    def test_only_a_dead_funding_leg_names_the_blocked_steps(self):
+        """C1.1 §5: the blocked funding steps are named only once they are DEAD."""
+        from backend.strategies.live_sequence import staged_funding_blocked_steps
+
         # EVERY funding leg has to be dead: one dead reduction behind a live one
         # still leaves the buy waiting rather than permanently unfunded.
         class _TwoSpec:
