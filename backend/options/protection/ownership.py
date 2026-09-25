@@ -231,6 +231,60 @@ class OptionProtectionOwnerStore:
                 session.close()
         return None if row is None else self._view(dict(row))
 
+    def list_protection_owners(
+        self, db: Any = None, *, owner_run_id: Optional[str] = None
+    ) -> list[dict[str, Any]]:
+        """Every ACTIVE owner row, with its option run's live evidence.
+
+        This is the protection loop's enumeration (design section 2 step 3): the
+        row - not the owning worker run's status - is what keeps a structure
+        protected, so the option run's own live evidence is joined in and NO
+        predicate is placed on the worker run being ``open``. A structure whose
+        worker run has closed stays protected until the option run itself reaches
+        a terminal status and releases the row.
+
+        ``owner_run_id`` narrows the read to the rows ONE worker run is
+        authoritative for, which is how the safety gate resolves a hosted,
+        plan-created run (``opt_run_<uuid>``) whose option-run id shares nothing
+        with the worker run id.
+        """
+
+        conditions = ["o.state = 'active'"]
+        params: dict[str, Any] = {}
+        if owner_run_id is not None:
+            conditions.append("o.owner_run_id = :owner_run_id")
+            params["owner_run_id"] = str(owner_run_id)
+        owns_session = db is None
+        session = db or self._session_factory()
+        try:
+            rows = (
+                session.execute(
+                    text(
+                        f"""
+                        SELECT
+                            o.option_run_id, o.strategy_id, o.account_id,
+                            o.execution_environment, o.owner_run_id, o.owner_epoch,
+                            o.policy_version, o.policy, o.action_state, o.stage_digest,
+                            o.state, o.released_at,
+                            s.status AS option_run_status,
+                            s.orders AS option_run_orders
+                        FROM public.option_protection_owners o
+                        LEFT JOIN public.option_run_states s
+                          ON s.strategy_run_id = o.option_run_id
+                        WHERE {' AND '.join(conditions)}
+                        ORDER BY o.option_run_id
+                        """
+                    ),
+                    params,
+                )
+                .mappings()
+                .all()
+            )
+        finally:
+            if owns_session:
+                session.close()
+        return [self._view(dict(row)) for row in rows]
+
     # -- mutations -----------------------------------------------------------
 
     def claim(
@@ -652,6 +706,13 @@ class OptionProtectionOwnerStore:
             except json.JSONDecodeError:
                 policy = {}
         view["policy"] = policy if isinstance(policy, dict) else {}
+        # The option run's own stage records ride along on
+        # :meth:`list_protection_owners`; SQLite hands JSON back as text.
+        if isinstance(view.get("option_run_orders"), str):
+            try:
+                view["option_run_orders"] = json.loads(view["option_run_orders"] or "[]")
+            except json.JSONDecodeError:
+                view["option_run_orders"] = []
         if view.get("owner_epoch") is not None:
             view["owner_epoch"] = int(view["owner_epoch"])
         return view

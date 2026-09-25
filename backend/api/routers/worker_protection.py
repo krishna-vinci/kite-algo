@@ -15,6 +15,9 @@ from backend.api.services.safety import build_safety_fingerprint, build_signed_s
 from backend.broker_api.core.redis_events import get_redis, publish_event
 from backend.broker_api.timeline.worker_timeline import worker_timeline_store
 from backend.app.database import SessionLocal
+from backend.options.protection.ownership import (
+    OWNER_UNKNOWN as _OPTION_PROTECTION_OWNER_UNKNOWN,
+)
 from backend.api.schemas.worker import WorkerDecisionEventRequest, WorkerProtectionPatchRequest, WorkerRiskPatchRequest, WorkerRunPnlLeg, WorkerRunPnlSnapshot, WorkerRunPnlTotals, WorkerFundsSegment, WorkerFundsSnapshot, WorkerExitRequest
 from backend.api.routers.worker_shared import *
 from backend.api.services.hosted_attempt import (
@@ -632,6 +635,7 @@ def _safety_blocking_reasons(
     generic_status: str,
     generic_exit_submitted: bool,
     option_status: str | None,
+    option_owner_unknown: bool = False,
 ) -> list[str]:
     blocking_reasons: list[str] = []
     if run_status != "open":
@@ -640,11 +644,29 @@ def _safety_blocking_reasons(
         blocking_reasons.append("GENERIC_PROTECTION_TRIGGERED")
     if generic_exit_submitted:
         blocking_reasons.append("GENERIC_EXIT_IN_PROGRESS")
-    if option_status == _OPTION_PROTECTION_STATE_UNAVAILABLE:
+    if option_owner_unknown:
+        # The worker run HAS an option structure but its protection owner could
+        # not be read: new exposure is refused by name rather than shown a clean
+        # state the platform cannot actually vouch for (B2.4 decision 7).
+        blocking_reasons.append(_OPTION_PROTECTION_OWNER_UNKNOWN)
+    elif option_status == _OPTION_PROTECTION_STATE_UNAVAILABLE:
         blocking_reasons.append("OPTIONS_PROTECTION_STATE_UNAVAILABLE")
     elif option_status and option_run_status_blocks_trading(option_status):
         blocking_reasons.append("OPTIONS_RUN_NOT_ACTIVE")
     return blocking_reasons
+
+def _option_gate_status(snapshot: Dict[str, Any]) -> str | None:
+    """The option status the safety check and its fingerprint are keyed by.
+
+    Both "the option run could not be read" and "its protection owner could not
+    be read" collapse to the unavailable sentinel: the fingerprint only has to
+    CHANGE when the state does, and a clean run must never share one with either.
+    """
+
+    reason = snapshot.get("blocking_reason")
+    if reason in ("OPTIONS_PROTECTION_STATE_UNAVAILABLE", _OPTION_PROTECTION_OWNER_UNKNOWN):
+        return _OPTION_PROTECTION_STATE_UNAVAILABLE
+    return snapshot.get("run_status")
 
 def _compute_option_observation_fingerprint(snapshot: Dict[str, Any]) -> str:
     canonical = {
@@ -685,6 +707,155 @@ def _build_option_observation_snapshot(run: Any) -> Dict[str, Any]:
         "recommended_exit_orders_count": len(recommended_exit_orders),
     }
 
+def _option_observation_snapshot(
+    *,
+    applicable: bool,
+    blocking_reason: Optional[str],
+    run_status: Optional[str] = None,
+    triggered: bool = False,
+) -> Dict[str, Any]:
+    return {
+        "applicable": bool(applicable),
+        "run_status": run_status,
+        "evaluation_mode": "run_state",
+        "triggered": bool(triggered),
+        "blocking": bool(blocking_reason),
+        "blocking_reason": blocking_reason,
+        "matched_rule": None,
+        "metrics": {},
+        "recommended_exit_orders_count": 0,
+    }
+
+def _option_run_ids_owned_by_worker(session: Any, strategy_run_id: str) -> List[str]:
+    """The option runs whose ACTIVE protection owner row names this worker run.
+
+    A hosted, plan-created option run is ``opt_run_<uuid>``: it shares NOTHING
+    with the worker run id, so the primary-key lookup that works for the direct
+    options API cannot find it. The owner row is the relation between the two
+    identities, and reading it is what makes the ``OPTIONS_*`` reasons reachable
+    for a hosted strategy at all (B2.4 decision 7).
+    """
+
+    from backend.options.protection.ownership import OptionProtectionOwnerStore
+
+    rows = OptionProtectionOwnerStore().list_protection_owners(
+        db=session, owner_run_id=strategy_run_id
+    )
+    return [
+        str(row.get("option_run_id") or "")
+        for row in rows
+        if str(row.get("option_run_id") or "")
+    ]
+
+def _worker_run_has_option_runs(session: Any, strategy_run_id: str) -> bool:
+    """Whether ANY option run names this worker run, by either identity.
+
+    Only asked when the owner row could not be read: the run that is protected
+    must not be shown as "nothing to protect" merely because the owner reader
+    failed. Both shapes count - the primary key the direct options API chooses
+    and the ``metadata.worker_run_id`` binding the plan path writes.
+    """
+
+    row = session.execute(
+        text(
+            """
+            SELECT strategy_run_id
+            FROM public.option_run_states
+            WHERE strategy_run_id = :run
+               OR metadata ->> 'worker_run_id' = :run
+            LIMIT 1
+            """
+        ),
+        {"run": str(strategy_run_id)},
+    ).fetchone()
+    return row is not None
+
+def _resolve_option_observation_snapshot(
+    store: Any, session: Any, strategy_run_id: str
+) -> Dict[str, Any]:
+    """The option observation the safety gate blocks on, resolved OWNER ROW first.
+
+    1. the ACTIVE protection owner rows whose ``owner_run_id`` is this worker run
+       (the hosted, plan-created shape);
+    2. the legacy primary-key lookup, for runs created through the direct options
+       API, where the caller chose the worker run id as the option run id.
+
+    An unreadable owner row is NOT "no owner": when the worker run has option runs
+    the caller must not be handed an ``applicable: False`` it cannot trust, so new
+    exposure fails closed by name instead.
+    """
+
+    owner_read_failed = False
+    option_run_ids: List[str] = []
+    try:
+        option_run_ids = _option_run_ids_owned_by_worker(session, strategy_run_id)
+    except Exception:
+        owner_read_failed = True
+        try:
+            session.rollback()
+        except Exception:
+            pass
+
+    if owner_read_failed:
+        try:
+            has_option_runs = _worker_run_has_option_runs(session, strategy_run_id)
+        except Exception:
+            has_option_runs = False
+        if has_option_runs:
+            return _option_observation_snapshot(
+                applicable=True,
+                blocking_reason=_OPTION_PROTECTION_OWNER_UNKNOWN,
+            )
+
+    if not option_run_ids:
+        try:
+            # Preserves the direct-options-API semantics exactly: a worker run
+            # with no option run under that id is not applicable, while an
+            # unreadable run state stays an unavailable block.
+            option_run_ids = [
+                str(store.get_run_in_session(session, strategy_run_id).strategy_run_id)
+            ]
+        except KeyError:
+            return _option_observation_snapshot(applicable=False, blocking_reason=None)
+        except Exception:
+            return _option_observation_snapshot(
+                applicable=True,
+                blocking_reason="OPTIONS_PROTECTION_STATE_UNAVAILABLE",
+            )
+
+    snapshots: List[Dict[str, Any]] = []
+    for option_run_id in option_run_ids:
+        try:
+            option_run = store.get_run_in_session(session, option_run_id)
+        except KeyError:
+            continue
+        except Exception:
+            snapshots.append(
+                _option_observation_snapshot(
+                    applicable=True,
+                    blocking_reason="OPTIONS_PROTECTION_STATE_UNAVAILABLE",
+                )
+            )
+            continue
+        try:
+            snapshots.append(_build_option_observation_snapshot(option_run))
+        except Exception:
+            snapshots.append(
+                _option_observation_snapshot(
+                    applicable=True,
+                    blocking_reason="OPTIONS_PROTECTION_STATE_UNAVAILABLE",
+                )
+            )
+
+    if not snapshots:
+        return _option_observation_snapshot(applicable=False, blocking_reason=None)
+    # ONE worker run can own more than one structure; the gate reports the first
+    # one that BLOCKS, so a clean structure can never mask a blocked one.
+    for snapshot in snapshots:
+        if snapshot.get("blocking"):
+            return snapshot
+    return snapshots[0]
+
 def _observe_worker_option_protection_timeline_state_sync(
     *,
     strategy_run_id: str,
@@ -695,67 +866,24 @@ def _observe_worker_option_protection_timeline_state_sync(
     store = get_option_run_store()
     session_factory = getattr(store, "_session_factory", SessionLocal)
 
+    timeline_events: List[Dict[str, Any]] = []
     session = session_factory()
     try:
-        option_run = store.get_run_in_session(session, strategy_run_id)
-    except KeyError:
         try:
-            session.rollback()
+            snapshot = _resolve_option_observation_snapshot(store, session, strategy_run_id)
         except Exception:
-            pass
-        session.close()
-        return (
-            {
-                "applicable": False,
-                "run_status": None,
-                "evaluation_mode": "run_state",
-                "triggered": False,
-                "blocking": False,
-                "blocking_reason": None,
-                "matched_rule": None,
-                "metrics": {},
-                "recommended_exit_orders_count": 0,
-            },
-            [],
-        )
-    except Exception:
-        try:
+            snapshot = _option_observation_snapshot(
+                applicable=True,
+                blocking_reason="OPTIONS_PROTECTION_STATE_UNAVAILABLE",
+            )
+        if not snapshot.get("applicable"):
+            # No option run is reachable for this worker run: the same answer this
+            # gate has always given, and nothing to record on the timeline.
             session.rollback()
-        except Exception:
-            pass
-        session.close()
-        unavailable = {
-            "applicable": True,
-            "run_status": None,
-            "evaluation_mode": "run_state",
-            "triggered": False,
-            "blocking": True,
-            "blocking_reason": "OPTIONS_PROTECTION_STATE_UNAVAILABLE",
-            "matched_rule": None,
-            "metrics": {},
-            "recommended_exit_orders_count": 0,
-        }
-        return unavailable, []
+            return snapshot, []
 
-    try:
-        snapshot = _build_option_observation_snapshot(option_run)
-    except Exception:
-        snapshot = {
-            "applicable": True,
-            "run_status": None,
-            "evaluation_mode": "run_state",
-            "triggered": False,
-            "blocking": True,
-            "blocking_reason": "OPTIONS_PROTECTION_STATE_UNAVAILABLE",
-            "matched_rule": None,
-            "metrics": {},
-            "recommended_exit_orders_count": 0,
-        }
+        fingerprint = _compute_option_observation_fingerprint(snapshot)
 
-    fingerprint = _compute_option_observation_fingerprint(snapshot)
-
-    timeline_events: List[Dict[str, Any]] = []
-    try:
         account_id = str((worker_run or {}).get("account_scope") or "")
         if worker_run is not None:
             session.execute(
@@ -841,11 +969,7 @@ async def validate_worker_run_safety_token(
     runtime_state = dict(current_run.get("runtime_state") or {})
     generic = dict(runtime_state.get("backend_protection_state") or {})
     option_snapshot = await _option_run_protection_snapshot_for_worker(request, strategy_run_id)
-    option_status = (
-        _OPTION_PROTECTION_STATE_UNAVAILABLE
-        if option_snapshot.get("blocking_reason") == "OPTIONS_PROTECTION_STATE_UNAVAILABLE"
-        else option_snapshot.get("run_status")
-    )
+    option_status = _option_gate_status(option_snapshot)
     run_status = str(current_run.get("status") or "open")
     generic_status = str(generic.get("status") or "active")
     generic_exit_submitted = bool(generic.get("exit_submitted"))
@@ -868,6 +992,8 @@ async def validate_worker_run_safety_token(
             generic_status=generic_status,
             generic_exit_submitted=generic_exit_submitted,
             option_status=option_status,
+            option_owner_unknown=option_snapshot.get("blocking_reason")
+            == _OPTION_PROTECTION_OWNER_UNKNOWN,
         )
         if option_snapshot.get("triggered"):
             blocking_reasons.append("OPTIONS_PROTECTION_TRIGGERED")
@@ -958,11 +1084,7 @@ async def get_worker_run_safety_check(request: Request, strategy_run_id: str):
         strategy_run_id,
         worker_run=run,
     )
-    option_status = (
-        _OPTION_PROTECTION_STATE_UNAVAILABLE
-        if option_snapshot.get("blocking_reason") == "OPTIONS_PROTECTION_STATE_UNAVAILABLE"
-        else option_snapshot.get("run_status")
-    )
+    option_status = _option_gate_status(option_snapshot)
     generic_status = str(generic.get("status") or "active")
     generic_exit_submitted = bool(generic.get("exit_submitted"))
     run_status = str(run.get("status") or "open")
@@ -972,6 +1094,8 @@ async def get_worker_run_safety_check(request: Request, strategy_run_id: str):
         generic_status=generic_status,
         generic_exit_submitted=generic_exit_submitted,
         option_status=option_status,
+        option_owner_unknown=option_snapshot.get("blocking_reason")
+        == _OPTION_PROTECTION_OWNER_UNKNOWN,
     )
     if option_snapshot.get("triggered"):
         blocking_reasons.append("OPTIONS_PROTECTION_TRIGGERED")

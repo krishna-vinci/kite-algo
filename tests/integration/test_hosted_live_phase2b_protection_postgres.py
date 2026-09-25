@@ -1575,3 +1575,149 @@ def test_a_paused_first_sender_cannot_be_declared_unsent(pg):
     first_thread.join(timeout=60)
     assert outcomes["first"]["errors"] == 0, outcomes
     assert len(broker.placed) == 1, broker.placed
+
+
+def _owner_row(factory, option_run_id: str) -> dict:
+    from sqlalchemy import text
+
+    with factory() as session:
+        return dict(
+            session.execute(
+                text(
+                    "SELECT option_run_id, owner_run_id, owner_epoch, action_state, "
+                    " stage_digest, state FROM public.option_protection_owners "
+                    "WHERE option_run_id = :run"
+                ),
+                {"run": option_run_id},
+            )
+            .mappings()
+            .one()
+        )
+
+
+def _claim_owner(factory, option_run, worker_run_id: str) -> None:
+    """The S1 entry hook's write, made directly: one ACTIVE owner row at epoch 1."""
+    from backend.options.protection.ownership import (
+        OptionProtectionOwnerStore,
+        option_protection_policy_snapshot,
+        option_protection_policy_version,
+    )
+
+    policy = option_protection_policy_snapshot({})
+    OptionProtectionOwnerStore(session_factory=factory).claim(
+        option_run, worker_run_id, policy, option_protection_policy_version(policy)
+    )
+
+
+def _set_worker_run_status(factory, run_id: str, status: str) -> None:
+    from sqlalchemy import text
+
+    with factory() as session:
+        session.execute(
+            text(
+                "UPDATE public.algo_worker_runs SET status = :status "
+                "WHERE strategy_run_id = :run"
+            ),
+            {"status": status, "run": run_id},
+        )
+        session.commit()
+
+
+def _owned_structure_seed(pg):
+    """A live structure whose worker run is CLOSED but whose owner row is not."""
+    broker = _FakeBrokerBoundary()
+    seeded = _seed_live_run(
+        pg["factory"],
+        legs=[
+            {
+                "symbol": "NIFTY26OCT25000CE",
+                "token": 900001,
+                "product": "NRML",
+                "net_quantity": -75,
+            },
+            {
+                "symbol": "NIFTY26OCT30000CE",
+                "token": 900002,
+                "product": "NRML",
+                "net_quantity": 75,
+            },
+        ],
+        protection={"exit_on_worker_stale": True, "worker_stale_sec": 60},
+        structure={
+            "structure_digest": "phase2b-owned-structure",
+            "legs": [
+                {"tradingsymbol": "NIFTY26OCT25000CE", "side": "SELL", "quantity": -75},
+                {"tradingsymbol": "NIFTY26OCT30000CE", "side": "BUY", "quantity": 75},
+            ],
+            "closed_short_quantities": {},
+        },
+    )
+    option_run = _seed_option_run(
+        pg["factory"],
+        worker_run_id=seeded["run_id"],
+        strategy_id=seeded["strategy_id"],
+        short_symbol="NIFTY26OCT25000CE",
+        hedge_symbol="NIFTY26OCT30000CE",
+    )
+    _claim_owner(pg["factory"], option_run, seeded["run_id"])
+    _set_worker_run_status(pg["factory"], seeded["run_id"], "closed")
+    return broker, seeded, option_run
+
+
+def _placed_orders(broker) -> list[tuple[str, str, int]]:
+    return [
+        (
+            str(order["tradingsymbol"]),
+            str(order["transaction_type"]).rsplit(".", 1)[-1],
+            int(order["quantity"]),
+        )
+        for order in broker.placed
+    ]
+
+
+def test_a_closed_worker_run_still_protects_the_structure_it_owns(pg):
+    """B2.4 S2a: the OWNER ROW - not the worker run's status - keeps protection on.
+
+    The worker run here is CLOSED, so ``list_protection_enabled_runs`` cannot see
+    it at all: before this slice a structure left protection by status change
+    alone. The loop reads the owner row instead, and the staged exit still goes
+    out over the platform's own risk-reducing authority.
+    """
+    broker, seeded, option_run = _owned_structure_seed(pg)
+    clock = _MoveableClock(datetime.now(timezone.utc))
+    runtime, _request = _runtime(pg["factory"], broker, pnl_legs=[], now_fn=clock)
+
+    result = asyncio.run(runtime.evaluate_once())
+
+    assert result == {"evaluated": 1, "triggered": 1, "errors": 0}, result
+    assert _placed_orders(broker) == [("NIFTY26OCT25000CE", "BUY", 75)], _placed_orders(broker)
+    owner = _owner_row(pg["factory"], option_run.strategy_run_id)
+    assert owner["state"] == "active"
+    assert owner["owner_run_id"] == seeded["run_id"]
+    # The stage is still OWED (the hedge waits for the short's proven closure), so
+    # the row a gate reads says exactly that rather than "none".
+    assert owner["action_state"] == "staging", owner
+    assert owner["stage_digest"], owner
+
+
+def test_a_released_owner_row_leaves_the_closed_run_unprotected(pg):
+    """Twin: the same closed run, once the OPTION run reaches a terminal status."""
+    from backend.options.execution.durable_store import DurableOptionRunStore
+
+    broker, _seeded, option_run = _owned_structure_seed(pg)
+    runs = DurableOptionRunStore(session_factory=pg["factory"])
+    current = runs.get_run(option_run.strategy_run_id)
+    current.status = "exited"
+    runs.save_run(current)
+    assert _owner_row(pg["factory"], option_run.strategy_run_id)["state"] == "released"
+
+    clock = _MoveableClock(datetime.now(timezone.utc))
+    runtime, _request = _runtime(pg["factory"], broker, pnl_legs=[], now_fn=clock)
+
+    result = asyncio.run(runtime.evaluate_once())
+
+    assert result == {"evaluated": 0, "triggered": 0, "errors": 0}, result
+    assert broker.placed == [], broker.placed
+    # No stage was ever taken for this structure: the released row really did
+    # stop the loop rather than only the counter.
+    assert _stage_states(pg, option_run.strategy_run_id) == []

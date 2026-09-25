@@ -1,5 +1,5 @@
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -62,6 +62,77 @@ class _StructureRepo(_Repo):
         if structure is not None:
             protection["structure"] = structure
         self.runs[0]["runtime_state"]["backend_protection"] = protection
+
+
+_OWNED_STRUCTURE = {
+    "structure_digest": "digest-owned",
+    "legs": [
+        {"tradingsymbol": "SHORT-CE", "side": "SELL", "quantity": -75,
+         "exchange": "NFO", "product": "NRML"},
+    ],
+    "closed_short_quantities": {},
+}
+
+
+class _OwnerRowRepo(_StructureRepo):
+    """A CLOSED worker run that still has an ACTIVE protection owner row (B2.4 S2a).
+
+    The generic per-run list cannot reach this run at all - its status is not
+    ``open`` - so anything the loop does here, it does because it read the owner
+    row.
+    """
+
+    def __init__(self, *, owner_state="active", also_in_run_list=True):
+        super().__init__(structure=dict(_OWNED_STRUCTURE))
+        self.runs[0]["status"] = "closed"
+        self.owner_state = owner_state
+        self.also_in_run_list = also_in_run_list
+
+    async def list_protection_enabled_runs(self):
+        if not self.also_in_run_list:
+            return []
+        # Deliberately overlapping: if the loop did not give the owner row
+        # precedence this run would be evaluated twice.
+        return [dict(self.runs[0])]
+
+    async def list_protection_owners(self):
+        if self.owner_state != "active":
+            return []
+        return [
+            {
+                **dict(self.runs[0]),
+                "protection_owner": {
+                    "option_run_id": "opt_run_abc123",
+                    "owner_run_id": "run-1",
+                    "owner_epoch": 1,
+                    "action_state": "none",
+                    "policy_version": "v" * 64,
+                    "policy": {"structure_digest": "digest-owned"},
+                    "option_run_status": "entered",
+                },
+            }
+        ]
+
+
+class _OwnerMirrorStore:
+    """Records what the loop mirrored onto the owner row."""
+
+    def __init__(self):
+        self.calls = []
+
+    def record_action(self, option_run_id, action_state, stage_digest, observed_epoch):
+        self.calls.append((option_run_id, action_state, stage_digest, observed_epoch))
+
+
+class _Clock:
+    def __init__(self, now: datetime):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds: int) -> None:
+        self.now = self.now + timedelta(seconds=int(seconds))
 
 
 class WorkerProtectionRuntimeTests(unittest.IsolatedAsyncioTestCase):
@@ -366,6 +437,172 @@ class WorkerProtectionRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(exit_mock.await_args)
         kwargs = getattr(exit_mock.await_args, "kwargs", {})
         self.assertEqual(kwargs["idempotency_key"], "backend-protection:run-1:g1:basket_stoploss:abc")
+
+    async def test_an_active_owner_row_keeps_a_closed_structure_protected(self):
+        """B2.4 S2a: protection follows the OWNER ROW, not the worker run's status.
+
+        The worker run here is ``closed``, so it is not in the generic
+        per-run list. The structure is still owed its protective exit, and the
+        owner row is the only reason the loop evaluates it at all.
+        """
+        repo = _OwnerRowRepo()
+        owner_store = _OwnerMirrorStore()
+        structure_exit = AsyncMock(
+            return_value={
+                "submitted": True,
+                "complete": True,
+                "reason": "submitted",
+                "option_run_id": "opt_run_abc123",
+                "stage_digest": "stage-1",
+            }
+        )
+        runtime = WorkerProtectionRuntime(
+            repo=repo,
+            pnl_loader=AsyncMock(return_value={"legs": [
+                {"symbol": "NSE:INFY", "product": "CNC", "side": "BUY", "quantity": 1,
+                 "net_quantity": 1, "average_price": 100, "last_price": 94}
+            ]}),
+            exit_submitter=AsyncMock(return_value={"status": "closed"}),
+            structure_exit_submitter=structure_exit,
+            owner_store=owner_store,
+            now_fn=lambda: datetime(2026, 4, 25, 12, 1, tzinfo=timezone.utc),
+            squareoff_schedule={},
+        )
+
+        result = await runtime.evaluate_once()
+
+        self.assertEqual(result, {"evaluated": 1, "triggered": 1, "errors": 0})
+        structure_exit.assert_awaited_once()
+        state = repo.saved[-1][1]["backend_protection_state"]
+        self.assertTrue(state["exit_submitted"])
+        # The claim is mirrored BEFORE the stage, and the stage verdict after it,
+        # onto the option run's own owner row at its observed epoch.
+        self.assertEqual(
+            [(call[0], call[1]) for call in owner_store.calls],
+            [("opt_run_abc123", "claimed"), ("opt_run_abc123", "none")],
+        )
+        self.assertEqual(owner_store.calls[0][3], 1)
+        self.assertEqual(owner_store.calls[1][2], "stage-1")
+
+    async def test_a_released_owner_row_is_not_evaluated(self):
+        """Twin: no owner row, no evaluation - even for a structure we know about."""
+        repo = _OwnerRowRepo(owner_state="released", also_in_run_list=False)
+        owner_store = _OwnerMirrorStore()
+        structure_exit = AsyncMock()
+        runtime = WorkerProtectionRuntime(
+            repo=repo,
+            pnl_loader=AsyncMock(return_value={"legs": []}),
+            exit_submitter=AsyncMock(),
+            structure_exit_submitter=structure_exit,
+            owner_store=owner_store,
+            now_fn=lambda: datetime(2026, 4, 25, 12, 1, tzinfo=timezone.utc),
+            squareoff_schedule={},
+        )
+
+        result = await runtime.evaluate_once()
+
+        self.assertEqual(result, {"evaluated": 0, "triggered": 0, "errors": 0})
+        structure_exit.assert_not_awaited()
+        self.assertEqual(owner_store.calls, [])
+
+    async def test_an_owner_row_whose_run_has_protection_off_is_not_evaluated(self):
+        """Twin: the owner row carries ownership, not the on/off switch.
+
+        A structure whose run declares no protection rule has nothing to fire and
+        no structure identity to exit, so it stays on the path it had before the
+        owner row existed - otherwise every plan-created structure would be
+        re-written every pass for no decision at all.
+        """
+        repo = _OwnerRowRepo(also_in_run_list=False)
+        repo.runs[0]["runtime_state"]["backend_protection"] = {"enabled": False}
+        structure_exit = AsyncMock()
+        runtime = WorkerProtectionRuntime(
+            repo=repo,
+            pnl_loader=AsyncMock(return_value={"legs": []}),
+            exit_submitter=AsyncMock(),
+            structure_exit_submitter=structure_exit,
+            owner_store=_OwnerMirrorStore(),
+            now_fn=lambda: datetime(2026, 4, 25, 12, 1, tzinfo=timezone.utc),
+            squareoff_schedule={},
+        )
+
+        result = await runtime.evaluate_once()
+
+        self.assertEqual(result, {"evaluated": 0, "triggered": 0, "errors": 0})
+        structure_exit.assert_not_awaited()
+
+    async def test_a_structure_with_an_owner_row_is_evaluated_exactly_once(self):
+        """One structure, one evaluation: the owner row wins over the run list.
+
+        A worker run that appears in BOTH enumerations must not be claimed - and
+        could not be submitted - twice by the same pass.
+        """
+        repo = _OwnerRowRepo(also_in_run_list=True)
+        structure_exit = AsyncMock(
+            return_value={"submitted": True, "complete": True, "reason": "submitted"}
+        )
+        runtime = WorkerProtectionRuntime(
+            repo=repo,
+            pnl_loader=AsyncMock(return_value={"legs": [
+                {"symbol": "NSE:INFY", "product": "CNC", "side": "BUY", "quantity": 1,
+                 "net_quantity": 1, "average_price": 100, "last_price": 94}
+            ]}),
+            exit_submitter=AsyncMock(return_value={"status": "closed"}),
+            structure_exit_submitter=structure_exit,
+            owner_store=_OwnerMirrorStore(),
+            now_fn=lambda: datetime(2026, 4, 25, 12, 1, tzinfo=timezone.utc),
+            squareoff_schedule={},
+        )
+
+        result = await runtime.evaluate_once()
+
+        self.assertEqual(result, {"evaluated": 1, "triggered": 1, "errors": 0})
+        structure_exit.assert_awaited_once()
+
+    async def test_a_still_owed_stage_is_staging_and_an_unknown_send_is_unresolved(self):
+        """The mirror carries the run's own stage verdict onto the owner row."""
+        repo = _OwnerRowRepo()
+        owner_store = _OwnerMirrorStore()
+        structure_exit = AsyncMock(side_effect=[
+            {
+                "submitted": True,
+                "complete": False,
+                "reason": "submitted",
+                "option_run_id": "opt_run_abc123",
+                "stage_digest": "stage-2",
+            },
+            {
+                "submitted": False,
+                "complete": False,
+                "reason": "stage_send_unknown",
+                "option_run_id": "opt_run_abc123",
+                "stage_digest": "stage-3",
+            },
+        ])
+        clock = _Clock(datetime(2026, 4, 25, 12, 1, tzinfo=timezone.utc))
+        runtime = WorkerProtectionRuntime(
+            repo=repo,
+            pnl_loader=AsyncMock(return_value={"legs": [
+                {"symbol": "NSE:INFY", "product": "CNC", "side": "BUY", "quantity": 1,
+                 "net_quantity": 1, "average_price": 100, "last_price": 94}
+            ]}),
+            exit_submitter=AsyncMock(return_value={"status": "closed"}),
+            structure_exit_submitter=structure_exit,
+            owner_store=owner_store,
+            now_fn=clock,
+            squareoff_schedule={},
+        )
+
+        await runtime.evaluate_once()
+        self.assertEqual(owner_store.calls[-1][1], "staging")
+        self.assertEqual(owner_store.calls[-1][2], "stage-2")
+
+        # Past the claim's own throttle window, so the next pass re-derives the
+        # stage instead of inheriting it, and this time cannot resolve it.
+        clock.advance(180)
+        await runtime.evaluate_once()
+        self.assertEqual(owner_store.calls[-1][1], "unresolved")
+        self.assertEqual(owner_store.calls[-1][2], "stage-3")
 
 
 if __name__ == "__main__":

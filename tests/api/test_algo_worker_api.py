@@ -1771,6 +1771,52 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["options_protection"]["evaluation_mode"], "run_state")
         self.assertTrue(response["options_protection"]["triggered"])
 
+    async def test_safety_check_refuses_new_exposure_when_the_protection_owner_is_unknown(self):
+        """B2.4 decision 7: an unreadable owner is NOT a clean state.
+
+        A worker run whose option structure exists but whose protection owner
+        cannot be read must not be shown "no options protection": the reason
+        travels by its OWN name, so a caller can tell it apart from an
+        unreadable option run.
+        """
+        repo = _FakeWorkerRepository()
+        repo.runs["run-opt-owned"] = {
+            "strategy_run_id": "run-opt-owned",
+            "token_id": "worker-1",
+            "template_id": "iron_condor",
+            "account_scope": "kite:paper-a",
+            "execution_mode": "paper",
+            "status": "open",
+            "runtime_state": {"backend_protection_state": {"status": "active", "exit_submitted": False}},
+            "metadata": {},
+        }
+        request = self._request(repo)
+
+        with patch(
+            "backend.api.routers.worker_protection._option_run_protection_snapshot_for_worker",
+            AsyncMock(
+                return_value={
+                    "applicable": True,
+                    "run_status": None,
+                    "evaluation_mode": "run_state",
+                    "triggered": False,
+                    "blocking": True,
+                    "blocking_reason": "OPTION_PROTECTION_OWNER_UNKNOWN",
+                    "matched_rule": None,
+                    "metrics": {},
+                    "recommended_exit_orders_count": 0,
+                }
+            ),
+        ):
+            response = await get_worker_run_safety_check(request, "run-opt-owned")
+
+        self.assertFalse(response["can_trade"])
+        self.assertIsNone(response["safety_token"])
+        self.assertEqual(response["blocking_reasons"], ["OPTION_PROTECTION_OWNER_UNKNOWN"])
+        self.assertEqual(
+            response["options_protection"]["blocking_reason"], "OPTION_PROTECTION_OWNER_UNKNOWN"
+        )
+
     async def test_live_bound_token_can_create_paper_run_but_not_other_live_scope(self):
         token = WorkerToken(
             token_id="worker-live",

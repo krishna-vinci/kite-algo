@@ -235,6 +235,11 @@ class SqlAlchemyAlgoWorkerRepository:
     async def list_protection_enabled_runs(self) -> List[Dict[str, Any]]:
         return await asyncio.to_thread(self._list_protection_enabled_runs_sync)
 
+    async def list_protection_owners(self) -> List[Dict[str, Any]]:
+        """The worker runs an ACTIVE option-protection owner row names."""
+
+        return await asyncio.to_thread(self._list_protection_owners_sync)
+
     async def update_run_risk(self, strategy_run_id: str, patch: Dict[str, Any]) -> Dict[str, Any]:
         return await asyncio.to_thread(self._update_run_risk_sync, strategy_run_id, patch)
 
@@ -759,6 +764,45 @@ class SqlAlchemyAlgoWorkerRepository:
             return [self._run_view_with_worker(row) for row in rows]
         finally:
             db.close()
+
+    def _list_protection_owners_sync(self) -> List[Dict[str, Any]]:
+        """Active protection owners as run views, for the protection loop (B2.4 S2a).
+
+        The owner row - not ``algo_worker_runs.status`` - is what keeps an option
+        structure protected, so this read carries NO status predicate: a
+        structure whose worker run has closed is still evaluated until the option
+        run itself reaches a terminal status and releases the row. The owner
+        identity is attached as ``protection_owner`` so the loop can attribute
+        the action it takes (and mirror it back) onto the structure that owns it.
+        """
+
+        from backend.options.protection.ownership import OptionProtectionOwnerStore
+
+        rows = OptionProtectionOwnerStore(
+            session_factory=self.session_factory
+        ).list_protection_owners()
+        views: List[Dict[str, Any]] = []
+        for row in rows:
+            owner_run_id = str(row.get("owner_run_id") or "")
+            if not owner_run_id:
+                # ``ck_opo_owner_present`` makes this unreachable for an active
+                # row: a row that disagrees with it is not attributable.
+                continue
+            run = self._get_run_sync(owner_run_id)
+            if run is None:
+                continue
+            view = dict(run)
+            view["protection_owner"] = {
+                "option_run_id": str(row.get("option_run_id") or ""),
+                "owner_run_id": owner_run_id,
+                "owner_epoch": int(row.get("owner_epoch") or 0),
+                "action_state": str(row.get("action_state") or "none"),
+                "policy_version": row.get("policy_version"),
+                "policy": dict(row.get("policy") or {}),
+                "option_run_status": row.get("option_run_status"),
+            }
+            views.append(view)
+        return views
 
     def _update_run_risk_sync(self, strategy_run_id: str, patch: Dict[str, Any]) -> Dict[str, Any]:
         run = self._get_run_sync(strategy_run_id)

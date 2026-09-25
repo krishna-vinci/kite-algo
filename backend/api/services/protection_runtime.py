@@ -37,6 +37,7 @@ class WorkerProtectionRuntime:
         structure_exit_submitter: Optional[
             Callable[[Dict[str, Any], Dict[str, Any]], Awaitable[Dict[str, Any]]]
         ] = None,
+        owner_store: Any = None,
     ) -> None:
         self.repo = repo
         self.pnl_loader = pnl_loader
@@ -49,13 +50,43 @@ class WorkerProtectionRuntime:
         #: (shorts first, hedges only against PROVEN short closure). ``None`` keeps
         #: the generic path, which is what every non-structure run uses.
         self.structure_exit_submitter = structure_exit_submitter
+        #: Where a protective action is MIRRORED, so the owner row and this loop
+        #: cannot disagree about an exit that is in flight (B2.4 S2a). Injected in
+        #: tests; the production default is the durable owner store.
+        self.owner_store = owner_store
 
     async def evaluate_once(self) -> Dict[str, int]:
+        # OPTION STRUCTURES are enumerated by OWNER ROW, not by the worker run's
+        # status: a structure whose worker run has closed is still protected until
+        # the option run itself reaches a terminal status and releases the row.
+        owner_runs = await self._protection_owner_runs()
+        owned_worker_run_ids = {
+            str(run.get("strategy_run_id") or "")
+            for run in owner_runs
+            if str(run.get("strategy_run_id") or "")
+        }
         runs = await self.repo.list_protection_enabled_runs()
+        pending: list[Dict[str, Any]] = []
+        for run in owner_runs:
+            # The owner row survives the worker run's STATUS; it does not turn
+            # protection on. A run whose own protection config is off has no rule
+            # to fire and no structure identity to exit, so evaluating it would
+            # only write state every pass. Those runs stay on exactly the path
+            # they had before this slice.
+            if not self._protection_enabled(run):
+                continue
+            pending.append(dict(run))
+        for run in list(runs or []):
+            # ONE evaluation per structure: the OWNER ROW WINS for a worker run
+            # that has one, so the generic per-run list cannot add a second pass
+            # that would claim - and could submit - the same exit twice.
+            if str(run.get("strategy_run_id") or "") in owned_worker_run_ids:
+                continue
+            pending.append(dict(run))
         evaluated = 0
         triggered = 0
         errors = 0
-        for run in list(runs or []):
+        for run in pending:
             evaluated += 1
             try:
                 if await self._evaluate_run(dict(run)):
@@ -64,6 +95,116 @@ class WorkerProtectionRuntime:
                 errors += 1
                 await self._persist_run_error(run, exc)
         return {"evaluated": evaluated, "triggered": triggered, "errors": errors}
+
+    async def _protection_owner_runs(self) -> list[Dict[str, Any]]:
+        """The runs an ACTIVE protection owner row names (B2.4 S2a).
+
+        A repository that cannot enumerate owners - an older test double, or a
+        deployment with no option structures - contributes nothing, which is what
+        keeps the generic per-run loop byte-for-byte the behaviour it had.
+        """
+
+        lister = getattr(self.repo, "list_protection_owners", None)
+        if lister is None:
+            return []
+        rows = await lister()
+        return [dict(row) for row in (rows or [])]
+
+    @staticmethod
+    def _protection_enabled(run: Dict[str, Any]) -> bool:
+        """Whether the run's own protection config is ON.
+
+        An unreadable config is evaluated rather than skipped, so its failure is
+        recorded like any other instead of disappearing.
+        """
+
+        try:
+            config = validate_backend_protection_payload(
+                (run.get("runtime_state") or {}).get("backend_protection")
+            )
+        except Exception:  # noqa: BLE001 - let the evaluation report the error
+            return True
+        return bool(config.enabled)
+
+    def _protection_owner_store(self) -> Any:
+        if self.owner_store is None:
+            from backend.options.protection.ownership import (
+                OptionProtectionOwnerStore,
+                get_option_protection_owner_store,
+            )
+
+            # The mirror travels the SAME database as the loop's own reads: the
+            # owner row and the worker run's protection state are two records of
+            # one decision, so they must not be written through two connections
+            # that only happen to agree in production.
+            session_factory = getattr(self.repo, "session_factory", None)
+            self.owner_store = (
+                OptionProtectionOwnerStore(session_factory=session_factory)
+                if session_factory is not None
+                else get_option_protection_owner_store()
+            )
+        return self.owner_store
+
+    @staticmethod
+    def _protection_owner_context(run: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """The owner row this evaluation is acting for, when there is one.
+
+        Only owner-row-driven evaluations carry it. A structure reached through a
+        worker run with no owner row has no row to mirror onto, and the run's own
+        ``orders`` remain its only evidence.
+        """
+
+        owner = run.get("protection_owner")
+        if not isinstance(owner, dict):
+            return None
+        if not str(owner.get("option_run_id") or ""):
+            return None
+        if owner.get("owner_epoch") is None:
+            return None
+        return owner
+
+    @staticmethod
+    def _owner_action_state(structure_exit: Any) -> str:
+        """The owner row's action state for one stage verdict (design section 3)."""
+
+        exit_result = structure_exit if isinstance(structure_exit, dict) else {}
+        if str(exit_result.get("reason") or "") == "stage_send_unknown":
+            # The platform committed to a stage and cannot say whether the broker
+            # took it: UNRESOLVED work, never a settled outcome.
+            return "unresolved"
+        if bool(exit_result.get("submitted")):
+            return "none" if bool(exit_result.get("complete", True)) else "staging"
+        # Not submitted: the exit claim this pass took is still held, so the row
+        # stays claimed and the next pass continues the SAME staged exit.
+        return "claimed"
+
+    def _mirror_protection_owner_action(
+        self,
+        owner: Optional[Dict[str, Any]],
+        action_state: str,
+        *,
+        stage_digest: Any = None,
+    ) -> None:
+        """Mirror a protective action onto the owner row.
+
+        The run's own ``orders`` stay the EVIDENCE; the row is where the action
+        state lives, so the gates and this loop read one answer. Bookkeeping never
+        stops a risk-reducing exit: a refusal - this caller is no longer the owner
+        at that epoch - leaves the existing row untouched rather than turning a
+        submitted exit into a failed evaluation.
+        """
+
+        if owner is None:
+            return
+        try:
+            self._protection_owner_store().record_action(
+                str(owner.get("option_run_id") or ""),
+                str(action_state),
+                None if stage_digest is None else str(stage_digest),
+                int(owner.get("owner_epoch") or 0),
+            )
+        except Exception:  # noqa: BLE001 - mirroring is bookkeeping, never the exit
+            return
 
     async def _evaluate_run(self, run: Dict[str, Any]) -> bool:
         runtime_state = dict(run.get("runtime_state") or {})
@@ -110,8 +251,18 @@ class WorkerProtectionRuntime:
                 # short-first, and submitted through the platform's own
                 # risk-reducing authority. An evaluator's recommended orders are
                 # never trusted, and a whole-book liquidation is never used here.
+                owner = self._protection_owner_context(run)
+                # The CLAIM is mirrored before the stage: the owner row is where
+                # the action state lives, so a gate that reads it while the stage
+                # is in flight must already see the claim, not "none".
+                self._mirror_protection_owner_action(owner, "claimed")
                 structure_exit = await self._submit_structure_exit(
                     run, claimed_state, structure, claim_id=claim_id
+                )
+                self._mirror_protection_owner_action(
+                    owner,
+                    self._owner_action_state(structure_exit),
+                    stage_digest=(structure_exit or {}).get("stage_digest"),
                 )
                 structure_state = {
                     **claimed_state,

@@ -488,6 +488,181 @@ class TestRelease:
         assert ctx.value.reason_code == CONFLICT
 
 
+def _trigger_policy(factory, option_run_id: str) -> None:
+    """Freeze a policy the run's own evidence makes TRIGGERED.
+
+    The metric comes from the run's own metadata snapshot, which is exactly how
+    a real structure's numbers reach the evaluator - so nothing here fakes the
+    verdict, it only supplies the inputs the rule reads.
+    """
+    from backend.options.execution.durable_store import DurableOptionRunStore
+    from backend.options.execution.models import OptionRunState
+
+    runs = DurableOptionRunStore(session_factory=factory)
+    run = runs.get_run(option_run_id)
+    runs.save_run(
+        OptionRunState(
+            strategy_run_id=run.strategy_run_id,
+            strategy_name=run.strategy_name,
+            product=run.product,
+            legs=list(run.legs),
+            protection={
+                "rules": [
+                    {
+                        "key": "max_loss",
+                        "metric": "strategy_mtm",
+                        "operator": "lte",
+                        "threshold": -1000.0,
+                        "role": "hard_stop",
+                        "action": "exit",
+                    }
+                ],
+                "precedence": ["hard_stop"],
+            },
+            metadata={
+                **dict(run.metadata or {}),
+                "protection_metrics": {"strategy_mtm": -5000.0},
+            },
+            status=run.status,
+            completed_legs=list(run.completed_legs),
+            failed_legs=list(run.failed_legs),
+            pending_legs=list(run.pending_legs),
+            orders=list(run.orders),
+            trades=list(run.trades),
+        )
+    )
+
+
+def _option_snapshot_for_worker(pg, monkeypatch, *, worker_run_id="run-hosted-1"):
+    """The option observation the safety gate resolves, from the REAL code path."""
+    import backend.options.execution.store as option_store_module
+    from backend.api.routers import worker_protection as gate
+    from backend.options.execution.durable_store import DurableOptionRunStore
+
+    store = DurableOptionRunStore(session_factory=pg["factory"])
+    monkeypatch.setattr(option_store_module, "get_option_run_store", lambda: store)
+    snapshot, _events = gate._observe_worker_option_protection_timeline_state_sync(
+        strategy_run_id=worker_run_id,
+        worker_run=None,
+    )
+    return snapshot
+
+
+def _scope_owner_read_to(monkeypatch, option_run_id: str) -> None:
+    """Narrow the owner read to ONE structure.
+
+    This module shares ONE disposable database and ``_entry`` hardcodes the
+    hosted worker run id, so several tests' structures are owned by
+    ``run-hosted-1`` at once - a shape production never holds (one worker run
+    owns the structure it was launched for). The read itself, the resolution and
+    the gate are the production ones; only the enumeration is scoped.
+    """
+    from backend.options.protection.ownership import OptionProtectionOwnerStore
+
+    real = OptionProtectionOwnerStore.list_protection_owners
+
+    def _scoped(self, db=None, *, owner_run_id=None):
+        return [
+            row
+            for row in real(self, db=db, owner_run_id=owner_run_id)
+            if str(row.get("option_run_id") or "") == option_run_id
+        ]
+
+    monkeypatch.setattr(OptionProtectionOwnerStore, "list_protection_owners", _scoped)
+
+
+def _gate_reasons(snapshot: dict) -> list[str]:
+    """The blocking reasons the safety endpoint composes for this observation."""
+    from backend.api.routers import worker_protection as gate
+
+    reasons = gate._safety_blocking_reasons(
+        run_status="open",
+        generic_status="active",
+        generic_exit_submitted=False,
+        option_status=gate._option_gate_status(snapshot),
+        option_owner_unknown=(
+            snapshot.get("blocking_reason") == gate._OPTION_PROTECTION_OWNER_UNKNOWN
+        ),
+    )
+    if snapshot.get("triggered"):
+        reasons.append("OPTIONS_PROTECTION_TRIGGERED")
+    return list(dict.fromkeys(reasons))
+
+
+class TestSafetyGateResolvesThroughTheOwnerRow:
+    """Decision 7: a HOSTED option run must be reachable by the safety gate.
+
+    A plan-created run is ``opt_run_<uuid>``, so the primary key the direct
+    options API chooses - the worker run id - never finds it. Before B2.4 S2a the
+    gate therefore answered ``applicable: False`` for every hosted structure and
+    the ``OPTIONS_*`` blocking reasons could never fire.
+    """
+
+    def test_a_hosted_run_reaches_its_option_run_through_the_owner_row(self, pg, monkeypatch):
+        factory, option_run_id, owner_run_id, _strategy_id = _entry(pg)
+        _trigger_policy(factory, option_run_id)
+        _scope_owner_read_to(monkeypatch, option_run_id)
+
+        snapshot = _option_snapshot_for_worker(pg, monkeypatch)
+
+        # The two identities really are different, which is the whole problem the
+        # owner row solves.
+        assert option_run_id.startswith("opt_run_")
+        assert option_run_id != owner_run_id
+        assert snapshot["applicable"] is True, snapshot
+        assert snapshot["triggered"] is True, snapshot
+        assert snapshot["blocking_reason"] == "OPTIONS_PROTECTION_TRIGGERED"
+        assert _gate_reasons(snapshot) == ["OPTIONS_PROTECTION_TRIGGERED"], snapshot
+
+    def test_an_untriggered_hosted_run_blocks_for_nothing(self, pg, monkeypatch):
+        """Twin: resolving the run is not the same as blocking on it."""
+        factory, option_run_id, _owner_run_id, _strategy_id = _entry(pg)
+        run = _owner_rows(factory, option_run_id)
+        assert run[0]["state"] == "active"
+        _scope_owner_read_to(monkeypatch, option_run_id)
+
+        snapshot = _option_snapshot_for_worker(pg, monkeypatch)
+
+        assert snapshot["applicable"] is True, snapshot
+        assert snapshot["triggered"] is False, snapshot
+        assert snapshot["blocking"] is False, snapshot
+        assert _gate_reasons(snapshot) == [], snapshot
+
+    def test_an_unreadable_owner_row_fails_closed_for_new_exposure(self, pg, monkeypatch):
+        """The run HAS a structure; not being able to read its owner is not "clean"."""
+        from backend.api.routers import worker_protection as gate
+        from backend.options.protection.ownership import OptionProtectionOwnerStore
+
+        factory, option_run_id, _owner_run_id, _strategy_id = _entry(pg)
+
+        def _unreadable(self, *args, **kwargs):
+            raise RuntimeError("owner table unreadable")
+
+        monkeypatch.setattr(OptionProtectionOwnerStore, "list_protection_owners", _unreadable)
+
+        snapshot = _option_snapshot_for_worker(pg, monkeypatch)
+
+        assert snapshot["applicable"] is True, snapshot
+        assert snapshot["blocking"] is True, snapshot
+        assert snapshot["blocking_reason"] == gate._OPTION_PROTECTION_OWNER_UNKNOWN, snapshot
+        assert _gate_reasons(snapshot) == ["OPTION_PROTECTION_OWNER_UNKNOWN"], snapshot
+
+    def test_an_unreadable_owner_row_leaves_a_non_option_run_alone(self, pg, monkeypatch):
+        """Twin: a worker run with NO option runs keeps the old, clean answer."""
+        from backend.options.protection.ownership import OptionProtectionOwnerStore
+
+        def _unreadable(self, *args, **kwargs):
+            raise RuntimeError("owner table unreadable")
+
+        monkeypatch.setattr(OptionProtectionOwnerStore, "list_protection_owners", _unreadable)
+
+        snapshot = _option_snapshot_for_worker(pg, monkeypatch, worker_run_id="run-no-options")
+
+        assert snapshot["applicable"] is False, snapshot
+        assert snapshot["blocking"] is False, snapshot
+        assert _gate_reasons(snapshot) == [], snapshot
+
+
 def test_migration_round_trip_on_a_scratch_database():
     """000047 applies, reverses, and re-applies on a disposable database."""
 
