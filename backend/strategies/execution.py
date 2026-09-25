@@ -1076,6 +1076,29 @@ class PaperPlanExecutor:
         return str((getattr(run, "protection", None) or {}).get("structure_digest") or "")
 
     @staticmethod
+    def _option_protection_block(run: Any) -> Optional[Dict[str, Any]]:
+        """The run's protection state when it is ACTIVE, else ``None``.
+
+        The read is the worker safety gate's own: ``evaluate_option_protection_state``
+        over the run's frozen protection block. Protection counts as ACTIVE when
+        it has TRIGGERED, or when it is UNREADABLE - not knowing is never treated
+        as "clear" for a step that would increase exposure.
+        """
+        from backend.options.protection.runtime import evaluate_option_protection_state
+
+        try:
+            verdict = evaluate_option_protection_state(run=run)
+        except Exception as exc:  # noqa: BLE001 - an unreadable state is never "clear"
+            return {"triggered": None, "unreadable": True, "error": type(exc).__name__}
+        if not bool(verdict.get("triggered")):
+            return None
+        return {
+            "triggered": True,
+            "unreadable": False,
+            "matched_rule": verdict.get("matched_rule"),
+        }
+
+    @staticmethod
     def _adjusted_protection(run: Any, plan: Mapping[str, Any]) -> Dict[str, Any]:
         """The run's protection block, re-pointed at the generation it now holds."""
         resolved = plan.get("resolved_plan") or {}
@@ -1258,8 +1281,35 @@ class PaperPlanExecutor:
         contract (both non-zero with opposite signs - a reduce-to-zero and re-open
         is a re-entry with its own plan), and an expiry change (that is the S4
         roll, whose acquire-prove-release ordering this slice does not implement).
+
+        Two safety gates decide whether the target may be reached AT ALL, before
+        a single order is sized:
+
+        * the NAKED gate - a desired state that leaves a short leg with less
+          protective long coverage of the same option type than it covers refuses
+          ``OPTION_ADJUSTMENT_WOULD_UNHEDGE``, unless the frozen protection
+          policy declares the structure naked. The rule is the binding edge's own
+          (``option_adjust_would_unhedge``), applied to the TARGET state rather
+          than to intermediate steps;
+        * the PROTECTION gate - while the strategy's protection for this
+          structure is TRIGGERED or UNREADABLE, an adjust that contains ANY
+          increase refuses ``OPTION_ADJUSTMENT_PROTECTION_ACTIVE``. A reduce-only
+          adjust stays admissible: risk reduction is never blocked.
         """
         resolved = plan.get("resolved_plan") or {}
+        from backend.options.execution.plan_binding import option_adjust_would_unhedge
+
+        uncovered = option_adjust_would_unhedge(plan)
+        if uncovered is not None:
+            raise ExecutionRefusal(
+                "OPTION_ADJUSTMENT_WOULD_UNHEDGE",
+                {
+                    "plan_id": plan_id,
+                    "option_run_id": str(getattr(run, "strategy_run_id", "") or ""),
+                    "phase": "adjust",
+                    **uncovered,
+                },
+            )
         structure_expiry = str(resolved.get("expiry") or "")
         previous_legs = [dict(leg) for leg in getattr(run, "legs", []) or []]
         named: set[str] = set()
@@ -1358,6 +1408,39 @@ class PaperPlanExecutor:
             removal["_increases_exposure"] = False
             quantity = self._floor_to_lot(-current, lot)
             steps.append((step_no, removal, quantity, "BUY" if quantity > 0 else "SELL"))
+
+        # The protection split, decided from the run's own frozen protection block
+        # (the worker safety gate's own read) and the DELTA this target implies: a
+        # plan that only reduces may always proceed, while any increase is refused
+        # while protection is triggered or unreadable.
+        protection = self._option_protection_block(run)
+        increasing_steps = [
+            step for step in steps if bool(step[1].get("_increases_exposure"))
+        ]
+        if protection is not None and increasing_steps:
+            raise ExecutionRefusal(
+                "OPTION_ADJUSTMENT_PROTECTION_ACTIVE",
+                {
+                    "plan_id": plan_id,
+                    "option_run_id": str(getattr(run, "strategy_run_id", "") or ""),
+                    "option_run_status": str(getattr(run, "status", "") or ""),
+                    **protection,
+                    "increasing_legs": [
+                        {
+                            "instrument_id": str(leg.get("instrument_id") or ""),
+                            "tradingsymbol": str(leg.get("tradingsymbol") or ""),
+                            "side": str(leg.get("side") or ""),
+                        }
+                        for _index, leg, _quantity, _side in increasing_steps
+                    ],
+                    "message": (
+                        "the strategy's protection for this structure is active; an "
+                        "adjust that increases exposure is not taken while protection "
+                        "is triggered or unreadable. Split the plan: reductions stay "
+                        "admissible."
+                    ),
+                },
+            )
 
         previous_ids = {str(leg.get("leg_id") or "") for leg in previous_legs}
         for run_leg in desired_legs:

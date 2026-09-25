@@ -952,7 +952,7 @@ class LivePlanAdapter:
         margin_evidence: Optional[Mapping[str, Any]],
         catalog_state: Optional[Mapping[str, Any]],
     ) -> Dict[str, Any]:
-        self._check_option_entry_admissibility(plan)
+        self._check_option_structure_admissibility(plan)
         verdict = self.admission.evaluate(
             plan,
             execution_environment="live",
@@ -971,29 +971,38 @@ class LivePlanAdapter:
             )
         return {"admitted": True, "detail": dict(verdict.detail or {})}
 
-    def _check_option_entry_admissibility(self, plan: Mapping[str, Any]) -> None:
-        """Refuse a live option ENTRY the strategy's own durable work blocks.
+    def _check_option_structure_admissibility(self, plan: Mapping[str, Any]) -> None:
+        """Refuse a live option plan the strategy's own durable work blocks.
 
-        The rule is the plan/run binding edge's own
-        (``assess_option_entry_admissibility``) - the SAME one the paper
-        admission and the execution-time gate apply - asked here because the live
-        lane admits through its own service rather than ``pipeline.admit``. A run
-        this plan itself is bound to does not block it, so the entry's own
-        withheld steps can still be released.
+        The rules are the plan/run binding edge's own, one per frozen phase
+        (``assess_option_entry_admissibility`` for an ENTRY,
+        ``assess_option_adjust_admissibility`` for an ADJUST) - the SAME ones the
+        paper admission and the execution-time gates apply - asked here because
+        the live lane admits through its own service rather than
+        ``pipeline.admit``. A run this plan itself is bound to does not block it,
+        so the entry's own withheld steps can still be released. An ADJUST is
+        still refused later by name (``LIVE_OPTION_ADJUST_UNSUPPORTED``): B2.2 is
+        paper-only, and asking the mutation gate here does not enable it.
         """
         from backend.options.execution.plan_binding import (
             PlanBindingRefusal,
+            assess_option_adjust_admissibility,
             assess_option_entry_admissibility,
+            is_option_adjust_plan,
             is_option_entry_plan,
         )
 
-        if not is_option_entry_plan(plan):
+        if is_option_entry_plan(plan):
+            assess = assess_option_entry_admissibility
+        elif is_option_adjust_plan(plan):
+            assess = assess_option_adjust_admissibility
+        else:
             # Every other lane and every option EXIT is untouched - answered here
             # so a per-step release never opens a session for this.
             return
         try:
             with self.session_factory() as session:
-                assess_option_entry_admissibility(
+                assess(
                     plan,
                     strategy_id=str(plan.get("strategy_id") or ""),
                     account_id=str(plan.get("account_id") or ""),

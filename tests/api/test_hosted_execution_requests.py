@@ -18,6 +18,7 @@ What is pinned:
 
 from __future__ import annotations
 
+import json
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -420,6 +421,107 @@ def _option_plan(
         )
         session.commit()
     return plan_id
+
+
+def _option_adjust_plan(
+    factory,
+    *,
+    strategy,
+    reference,
+    generation=1,
+    digest=OTHER_DIGEST,
+    run_id=RUN_ID,
+    account=ACCOUNT,
+    plan_id=None,
+    protection_policy=None,
+):
+    """A validated frozen ``option_structure`` ADJUST plan of this strategy.
+
+    The desired target is the same covered structure ``_option_legs`` describes;
+    what varies per test is the generation basis the plan froze.
+    """
+    plan_id = plan_id or str(uuid.uuid4())
+    proposal_id = str(uuid.uuid4())
+    legs = _option_legs()
+    resolved = {
+        "target_kind": "option_structure",
+        "product": "NRML",
+        "structure_digest": digest,
+        "legs": legs,
+        "option_run": {
+            "phase": "adjust",
+            "option_run_id": str(reference),
+            "based_on_generation": int(generation),
+        },
+    }
+    if protection_policy is not None:
+        resolved["protection_policy"] = protection_policy
+    with factory() as session:
+        session.add(
+            StrategyProposal(
+                proposal_id=proposal_id,
+                strategy_id=str(strategy.id),
+                account_id=str(account),
+                evaluation_id=f"eval-{proposal_id}",
+                evaluation_kind="run_now",
+                job_id=None,
+                strategy_run_id=str(run_id),
+                target_kind="option_structure",
+                payload={"legs": legs, "phase": "adjust"},
+                payload_sha256="a" * 64,
+                status="validated",
+            )
+        )
+        session.flush()
+        session.add(
+            StrategyPlan(
+                plan_id=plan_id,
+                proposal_id=proposal_id,
+                strategy_id=str(strategy.id),
+                account_id=str(account),
+                plan_kind="option_structure",
+                plan_hash="h" * 64,
+                logical_plan={"legs": legs},
+                resolved_plan=resolved,
+                pinned_universe_revision_id=None,
+                pinned_member_hash=None,
+                pinned_catalog_generation=GENERATION_ID,
+            )
+        )
+        session.commit()
+    return plan_id
+
+
+def _bind_adjust_edge(world, *, plan_id, run_id):
+    """The adjust edge a FIRST attempt of ``plan_id`` writes, before it submits."""
+    with world["factory"]() as session:
+        session.add(
+            StrategyPlanOptionRun(
+                plan_id=str(plan_id),
+                option_run_id=str(run_id),
+                strategy_id=str(world["strategy"].id),
+                account_id=ACCOUNT,
+                execution_environment="paper",
+                phase="adjust",
+            )
+        )
+        session.commit()
+
+
+def _move_structure_generation(world, option_run_id, *, generation):
+    """The run's held leg generation moved (an adjust landed)."""
+    with world["factory"]() as session:
+        session.execute(
+            text(
+                "UPDATE public.option_run_states SET metadata = :metadata "
+                "WHERE strategy_run_id = :run"
+            ),
+            {
+                "metadata": json.dumps({"structure_generation": int(generation)}),
+                "run": option_run_id,
+            },
+        )
+        session.commit()
 
 
 def _own_option_run(world, *, plan_id, status=None):
@@ -850,7 +952,10 @@ async def test_the_admission_preview_refuses_a_duplicate_structure_by_name(world
 
 def test_the_option_gate_covers_entry_plans_only():
     """Exit plans close work that exists; another lane has no option run at all."""
-    from backend.options.execution.plan_binding import is_option_entry_plan
+    from backend.options.execution.plan_binding import (
+        is_option_adjust_plan,
+        is_option_entry_plan,
+    )
 
     def frozen(resolved):
         return {"resolved_plan": resolved}
@@ -863,10 +968,149 @@ def test_the_option_gate_covers_entry_plans_only():
         }
     )
     other = frozen({"target_kind": "single_instrument", "legs": []})
+    adjusting = frozen(
+        {
+            "target_kind": "option_structure",
+            "option_run": {
+                "phase": "adjust",
+                "option_run_id": "run-1",
+                "based_on_generation": 1,
+            },
+        }
+    )
 
     assert is_option_entry_plan(entry) is True
     assert is_option_entry_plan(closing) is False
     assert is_option_entry_plan(other) is False
+    # The mutation gate is the same predicate over the other frozen phase: an
+    # entry or exit plan never claims it, and an adjust plan never claims entry's.
+    assert is_option_adjust_plan(adjusting) is True
+    assert is_option_adjust_plan(entry) is False
+    assert is_option_adjust_plan(closing) is False
+    assert is_option_adjust_plan(other) is False
+
+
+# ---------------------------------------------------------------------------
+# option adjustments: the mutation gate runs BEFORE the owner is asked
+# ---------------------------------------------------------------------------
+
+
+def test_an_option_adjust_request_refuses_a_stale_basis_before_approval(world):
+    held_plan = _option_plan(world["factory"], strategy=world["strategy"], digest=HELD_DIGEST)
+    run_id = _own_option_run(world, plan_id=held_plan, status="entered")
+    # The run HOLDS generation 1; the plan froze a basis of 5.
+    candidate = _option_adjust_plan(
+        world["factory"], strategy=world["strategy"], reference=run_id, generation=5
+    )
+
+    created = world["service"].create_for_job(
+        job=world["job"], plan_id=candidate, idempotency_key="opt-adj-stale-0001", now=NOW
+    )
+
+    request = created["request"]
+    # The owner is NEVER asked to approve it: it is refused at creation, not left
+    # waiting for a decision the platform would refuse at execution anyway.
+    assert request["status"] == "refused"
+    assert request["status"] != "awaiting_approval"
+    assert request["refusal_code"] == "OPTION_ADJUSTMENT_STALE_BASIS"
+    assert request["refusal_detail"]["stage"] == "request"
+    assert request["refusal_detail"]["option_run_id"] == run_id
+    assert request["refusal_detail"]["based_on_generation"] == 5
+    assert request["refusal_detail"]["structure_generation"] == 1
+    assert world["service"].claim_next(limit=10, now=NOW) == []
+
+    # Admission asks the SAME rule and refuses the SAME plan by the SAME name.
+    with pytest.raises(PipelineRefusal) as ctx:
+        world["pipeline"].admit(world["pipeline"].plan(candidate), environment="paper")
+    assert ctx.value.reason_code == "OPTION_ADJUSTMENT_STALE_BASIS"
+
+
+def test_an_option_adjust_request_with_a_matching_basis_is_admitted(world):
+    _record_policy(world)
+    held_plan = _option_plan(world["factory"], strategy=world["strategy"], digest=HELD_DIGEST)
+    run_id = _own_option_run(world, plan_id=held_plan, status="entered")
+    candidate = _option_adjust_plan(
+        world["factory"], strategy=world["strategy"], reference=run_id, generation=1
+    )
+
+    created = world["service"].create_for_job(
+        job=world["job"], plan_id=candidate, idempotency_key="opt-adj-ok-0001", now=NOW
+    )
+
+    assert created["request"]["status"] == "awaiting_approval"
+    assert created["request"]["refusal_code"] is None
+
+    verdict = world["pipeline"].admit(world["pipeline"].plan(candidate), environment="paper")
+    assert verdict["admitted"] is True
+
+
+def test_an_option_adjust_approval_refuses_when_the_generation_moved(world):
+    held_plan = _option_plan(world["factory"], strategy=world["strategy"], digest=HELD_DIGEST)
+    run_id = _own_option_run(world, plan_id=held_plan, status="entered")
+    candidate = _option_adjust_plan(
+        world["factory"], strategy=world["strategy"], reference=run_id, generation=1
+    )
+    created = world["service"].create_for_job(
+        job=world["job"], plan_id=candidate, idempotency_key="opt-adj-moved-0001", now=NOW
+    )
+    assert created["request"]["status"] == "awaiting_approval"
+
+    # The world moved while the owner was deciding: the run's leg generation
+    # advanced, so the basis the plan froze is dead and it must not become
+    # dispatchable work.
+    _move_structure_generation(world, run_id, generation=2)
+    approved = world["service"].approve(
+        created["request"]["request_id"],
+        owner_id=OWNER,
+        strategy_id=world["strategy"].id,
+        actor=OWNER,
+        now=NOW,
+    )
+
+    assert approved["approved"] is False
+    assert approved["request"]["status"] == "refused"
+    assert approved["request"]["refusal_code"] == "OPTION_ADJUSTMENT_STALE_BASIS"
+    assert approved["request"]["refusal_detail"]["stage"] == "approval"
+    assert approved["request"]["refusal_detail"]["based_on_generation"] == 1
+    assert approved["request"]["refusal_detail"]["structure_generation"] == 2
+    assert world["service"].claim_next(limit=10, now=NOW) == []
+
+
+def test_an_option_adjust_request_refuses_while_another_plan_owns_the_transition(world):
+    """One transition, one owner: a second plan never shares an in-flight adjust."""
+    held_plan = _option_plan(world["factory"], strategy=world["strategy"], digest=HELD_DIGEST)
+    run_id = _own_option_run(world, plan_id=held_plan, status="adjusting")
+    candidate = _option_adjust_plan(
+        world["factory"], strategy=world["strategy"], reference=run_id, generation=1
+    )
+
+    created = world["service"].create_for_job(
+        job=world["job"], plan_id=candidate, idempotency_key="opt-adj-inflight-0001", now=NOW
+    )
+
+    request = created["request"]
+    assert request["status"] == "refused"
+    assert request["refusal_code"] == "OPTION_RUN_ADJUST_IN_FLIGHT"
+    assert request["refusal_detail"]["option_run_id"] == run_id
+    assert request["refusal_detail"]["option_run_status"] == "adjusting"
+
+
+def test_an_option_adjust_retry_through_its_own_edge_is_admitted(world):
+    """``adjusting`` reached through THIS plan's own edge is a retry, not a race."""
+    _record_policy(world)
+    held_plan = _option_plan(world["factory"], strategy=world["strategy"], digest=HELD_DIGEST)
+    run_id = _own_option_run(world, plan_id=held_plan, status="adjusting")
+    candidate = _option_adjust_plan(
+        world["factory"], strategy=world["strategy"], reference=run_id, generation=1
+    )
+    _bind_adjust_edge(world, plan_id=candidate, run_id=run_id)
+
+    created = world["service"].create_for_job(
+        job=world["job"], plan_id=candidate, idempotency_key="opt-adj-retry-0001", now=NOW
+    )
+
+    assert created["request"]["status"] == "awaiting_approval"
+    assert created["request"]["refusal_code"] is None
 
 
 def test_manual_request_is_idempotent_and_conflicts_on_changed_content(world):

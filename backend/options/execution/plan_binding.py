@@ -341,6 +341,83 @@ def is_option_entry_plan(plan: Mapping[str, Any]) -> bool:
     return str(declared or "entry").strip().lower() == "entry"
 
 
+def is_option_adjust_plan(plan: Mapping[str, Any]) -> bool:
+    """Whether the option-ADJUST gate applies to this frozen plan.
+
+    Exactly an ``option_structure`` plan whose frozen phase is ``adjust`` - the
+    mutation counterpart of :func:`is_option_entry_plan`, read from the FROZEN
+    block for the same reason: re-deciding the phase here would be a second copy
+    of the compiler's contract. An entry plan opens work (its own gate) and an
+    exit plan closes it, so neither is gated by the mutation rules.
+    """
+    resolved = plan.get("resolved_plan") or {}
+    if str(resolved.get("target_kind") or "") != "option_structure":
+        return False
+    block = resolved.get("option_run")
+    declared = block.get("phase") if isinstance(block, Mapping) else None
+    return str(declared or "").strip().lower() == "adjust"
+
+
+def _scoped_option_runs(
+    *,
+    plan_id: str,
+    strategy_id: str,
+    account_id: str,
+    execution_environment: str,
+    session: Any,
+) -> list[Any]:
+    """This strategy's OWN option runs for the scope, or a fail-closed refusal.
+
+    The read is the platform's scope-derived discovery
+    (``OwnedWorkSnapshotService.option_runs_for_scope``), which derives the run
+    set from the strategy's own bound attempts - a caller cannot widen it. It is
+    the ONE read both the entry gate and the adjust gate ask, so the two can
+    never disagree about what this strategy owns.
+
+    The coverage rules are the fail-closed ones the snapshot itself states:
+    unknown or truncated discovery, a run whose identity cannot be compared or a
+    run whose state row is unreadable all refuse rather than behave as "no runs".
+    """
+    from backend.strategies.execution_snapshot import OwnedWorkSnapshotService
+
+    try:
+        runs, coverage = OwnedWorkSnapshotService(
+            session_factory=lambda: session
+        ).option_runs_for_scope(
+            account_id=str(account_id),
+            strategy_id=str(strategy_id),
+            environment=str(execution_environment),
+            session=session,
+        )
+    except Exception as exc:  # noqa: BLE001 - an unreadable read is never "no runs"
+        raise PlanBindingRefusal(
+            "OPTION_STRUCTURE_DISCOVERY_UNKNOWN",
+            {
+                "plan_id": str(plan_id),
+                "strategy_id": str(strategy_id),
+                "account_id": str(account_id),
+                "execution_environment": str(execution_environment),
+                "reason": "option_run_discovery_failed",
+                "error": type(exc).__name__,
+            },
+        ) from exc
+
+    if str(coverage.get("coverage") or "unknown") != "known":
+        raise PlanBindingRefusal(
+            "OPTION_STRUCTURE_DISCOVERY_UNKNOWN",
+            {
+                "plan_id": str(plan_id),
+                "strategy_id": str(strategy_id),
+                "account_id": str(account_id),
+                "execution_environment": str(execution_environment),
+                "reason": str(coverage.get("reason") or "option_run_discovery_unknown"),
+                "truncated": bool(coverage.get("truncated")),
+                "count": int(coverage.get("count") or 0),
+            },
+        )
+    return list(runs or [])
+
+
 def assess_option_entry_admissibility(
     plan: Mapping[str, Any],
     *,
@@ -386,45 +463,14 @@ def assess_option_entry_admissibility(
     if not is_option_entry_plan(plan):
         return
     plan_id = str(plan.get("plan_id") or "")
-    from backend.strategies.execution_snapshot import OwnedWorkSnapshotService
-
-    try:
-        runs, coverage = OwnedWorkSnapshotService(
-            session_factory=lambda: session
-        ).option_runs_for_scope(
-            account_id=str(account_id),
-            strategy_id=str(strategy_id),
-            environment=str(execution_environment),
-            session=session,
-        )
-    except Exception as exc:  # noqa: BLE001 - an unreadable read is never "no runs"
-        raise PlanBindingRefusal(
-            "OPTION_STRUCTURE_DISCOVERY_UNKNOWN",
-            {
-                "plan_id": str(plan_id),
-                "strategy_id": str(strategy_id),
-                "account_id": str(account_id),
-                "execution_environment": str(execution_environment),
-                "reason": "option_run_discovery_failed",
-                "error": type(exc).__name__,
-            },
-        ) from exc
-
-    if str(coverage.get("coverage") or "unknown") != "known":
-        raise PlanBindingRefusal(
-            "OPTION_STRUCTURE_DISCOVERY_UNKNOWN",
-            {
-                "plan_id": str(plan_id),
-                "strategy_id": str(strategy_id),
-                "account_id": str(account_id),
-                "execution_environment": str(execution_environment),
-                "reason": str(coverage.get("reason") or "option_run_discovery_unknown"),
-                "truncated": bool(coverage.get("truncated")),
-                "count": int(coverage.get("count") or 0),
-            },
-        )
-
-    for row in list(runs or []):
+    runs = _scoped_option_runs(
+        plan_id=plan_id,
+        strategy_id=str(strategy_id),
+        account_id=str(account_id),
+        execution_environment=str(execution_environment),
+        session=session,
+    )
+    for row in runs:
         run_status = str(row.get("status") or "").strip().lower()
         option_run_id = str(row.get("option_run_id") or "")
         protective_unresolved = bool(row.get("protective_exit_unresolved"))
@@ -491,6 +537,259 @@ def assess_option_entry_admissibility(
                     "message": (
                         "an option run of this strategy carries a status outside the "
                         "durable vocabulary; the discovery is not complete"
+                    ),
+                },
+            )
+
+
+def option_adjust_would_unhedge(plan: Mapping[str, Any]) -> Optional[dict[str, Any]]:
+    """The naked-coverage violation of an adjust's FROZEN target, or ``None``.
+
+    Coverage rule (index options): the frozen structure carries ONE underlying
+    and ONE expiry, so the only dimension a short can be covered across is the
+    option type. Within each option type, the target's total BUY quantity (the
+    protective long) must be at least its total SELL quantity (the short). A type
+    whose SELL total exceeds its BUY total leaves that short leg with less
+    protection than it covers, so it is a violation - and the legs whose
+    magnitude cannot be read are a violation too, because an unreadable size is
+    never proof of coverage.
+
+    A frozen ``protection_policy.naked: true`` is the sanctioned declaration of
+    an intentional naked structure, and it disables the rule for the whole
+    target.
+
+    The rule applies to the TARGET state, never to the intermediate steps: the
+    engine's own ordering (reductions first, hedges before shorts) already keeps
+    the transient exposure inside one adjust bounded, so only the state the
+    structure is left in decides whether it is covered.
+    """
+    resolved = plan.get("resolved_plan") or {}
+    policy = resolved.get("protection_policy")
+    if isinstance(policy, Mapping) and bool(policy.get("naked")):
+        return None
+    bought: dict[str, int] = {}
+    sold: dict[str, int] = {}
+    unreadable: list[dict[str, Any]] = []
+    for leg in _entry_legs(plan):
+        option_type = str(leg.get("option_type") or "").strip().upper()
+        quantity = _frozen_leg_quantity(leg)
+        if quantity is None:
+            unreadable.append(
+                {
+                    "option_type": option_type,
+                    "instrument_id": _leg_identity(leg),
+                    "reason": "leg_quantity_unreadable",
+                }
+            )
+            continue
+        side = str(leg.get("side") or "").strip().upper()
+        if side == "BUY":
+            bought[option_type] = bought.get(option_type, 0) + quantity
+        elif side == "SELL":
+            sold[option_type] = sold.get(option_type, 0) + quantity
+    violations = [
+        {
+            "option_type": option_type,
+            "buy_quantity": int(bought.get(option_type, 0)),
+            "sell_quantity": int(sell_quantity),
+        }
+        for option_type, sell_quantity in sorted(sold.items())
+        if int(sell_quantity) > int(bought.get(option_type, 0))
+    ]
+    if not violations and not unreadable:
+        return None
+    return {
+        "uncovered": violations,
+        "unreadable_legs": unreadable,
+        "message": (
+            "the desired state leaves a short leg with less protective long coverage "
+            "of the same option type; a structure is never left naked unless its "
+            "frozen protection policy declares it"
+        ),
+    }
+
+
+def _frozen_leg_quantity(leg: Mapping[str, Any]) -> Optional[int]:
+    """One frozen leg's unsigned magnitude, or ``None`` when it cannot be read."""
+    for key in ("quantity", "signed_quantity"):
+        try:
+            value = int(leg.get(key))
+        except (TypeError, ValueError):
+            continue
+        return abs(value)
+    return None
+
+
+def assess_option_adjust_admissibility(
+    plan: Mapping[str, Any],
+    *,
+    strategy_id: str,
+    account_id: str,
+    execution_environment: str,
+    session: Any,
+) -> None:
+    """Refuse an option ADJUST that must not run against the run it names.
+
+    The mirror of :func:`assess_option_entry_admissibility`, asked from the same
+    early callers (before the owner is asked to approve, at admission, at
+    execution) and answered from the SAME scope-derived discovery. It is
+    side-effect free: it reads this strategy's own option runs and either returns
+    or raises.
+
+    What it refuses, each BY NAME:
+
+    * the referenced run is not one of THIS strategy's runs in this account and
+      environment (``OPTION_ADJUSTMENT_RUN_NOT_OWNED``) - a reference is a
+      lookup key, never authority, so a run that the platform cannot reach
+      through this strategy's own binding edges is not a run this plan may
+      mutate;
+    * the run is already being adjusted by ANOTHER plan
+      (``OPTION_RUN_ADJUST_IN_FLIGHT``) or moved on entirely
+      (``OPTION_RUN_STATE_CHANGED``). The one admissible in-flight state is the
+      run's own ``adjusting`` state reached through THIS plan's edge, which is
+      what makes a retry resolve instead of refusing;
+    * the run's held generation is not the one the plan froze
+      (``OPTION_ADJUSTMENT_STALE_BASIS``). The approved target is never
+      re-derived against a newer structure;
+    * the run's own records still own an unresolved protective stage
+      (``OPTION_PROTECTIVE_EXIT_UNRESOLVED``);
+    * ANY OTHER run of this strategy is unresolved
+      (``OPTION_STRUCTURE_UNRESOLVED``);
+    * the frozen desired state would leave a short leg short of protective long
+      coverage (``OPTION_ADJUSTMENT_WOULD_UNHEDGE``), unless the frozen
+      protection policy declares the structure naked.
+
+    Unknown discovery refuses (``OPTION_STRUCTURE_DISCOVERY_UNKNOWN``), exactly
+    as the entry gate does. Non-adjust plans are not gated at all.
+    """
+    if not is_option_adjust_plan(plan):
+        return
+    plan_id = str(plan.get("plan_id") or "")
+    uncovered = option_adjust_would_unhedge(plan)
+    if uncovered is not None:
+        raise PlanBindingRefusal(
+            "OPTION_ADJUSTMENT_WOULD_UNHEDGE",
+            {
+                "plan_id": plan_id,
+                "structure_id": str((plan.get("resolved_plan") or {}).get("structure_id") or ""),
+                **uncovered,
+            },
+        )
+    runs = _scoped_option_runs(
+        plan_id=plan_id,
+        strategy_id=str(strategy_id),
+        account_id=str(account_id),
+        execution_environment=str(execution_environment),
+        session=session,
+    )
+    block = _frozen_option_run_block(plan)
+    option_run_id = str(block.get("option_run_id") or "").strip()
+    referenced = None
+    for row in runs:
+        if str(row.get("option_run_id") or "") == option_run_id:
+            referenced = row
+            break
+    if referenced is None:
+        raise PlanBindingRefusal(
+            "OPTION_ADJUSTMENT_RUN_NOT_OWNED",
+            {
+                "plan_id": plan_id,
+                "option_run_id": option_run_id,
+                "strategy_id": str(strategy_id),
+                "account_id": str(account_id),
+                "execution_environment": str(execution_environment),
+                "message": (
+                    "an adjust may only mutate a structure this strategy owns in this "
+                    "account and environment; this run is reached from no such binding"
+                ),
+            },
+        )
+    run_status = str(referenced.get("status") or "").strip().lower()
+    owned_by_this_plan = bool(plan_id) and plan_id in {
+        str(value) for value in (referenced.get("plan_ids") or [])
+    }
+    if run_status == "adjusting":
+        if not owned_by_this_plan:
+            raise PlanBindingRefusal(
+                "OPTION_RUN_ADJUST_IN_FLIGHT",
+                {
+                    "plan_id": plan_id,
+                    "option_run_id": option_run_id,
+                    "option_run_status": run_status,
+                    "message": (
+                        "another plan owns this run's in-flight adjust; its delta is "
+                        "re-derived from the run's own fills, never from a second plan"
+                    ),
+                },
+            )
+    elif run_status != "entered":
+        raise PlanBindingRefusal(
+            "OPTION_RUN_STATE_CHANGED",
+            {
+                "plan_id": plan_id,
+                "option_run_id": option_run_id,
+                "option_run_status": run_status or "unknown",
+                "message": "an adjust mutates the run's HELD structure; this run is not entered",
+            },
+        )
+    basis = block.get("based_on_generation")
+    try:
+        based_on_generation = int(basis)
+    except (TypeError, ValueError):
+        raise PlanBindingRefusal(
+            "OPTION_ADJUSTMENT_BASIS_REQUIRED",
+            {"plan_id": plan_id, "option_run_id": option_run_id, "based_on_generation": basis},
+        ) from None
+    held_generation = int(referenced.get("structure_generation") or 1)
+    if based_on_generation != held_generation:
+        raise PlanBindingRefusal(
+            "OPTION_ADJUSTMENT_STALE_BASIS",
+            {
+                "plan_id": plan_id,
+                "option_run_id": option_run_id,
+                "based_on_generation": based_on_generation,
+                "structure_generation": held_generation,
+                "message": (
+                    "the run has moved to a different leg generation than the one this "
+                    "adjust was approved against; it is never re-derived against a newer one"
+                ),
+            },
+        )
+    if bool(referenced.get("protective_exit_unresolved")):
+        raise PlanBindingRefusal(
+            "OPTION_PROTECTIVE_EXIT_UNRESOLVED",
+            {
+                "plan_id": plan_id,
+                "option_run_id": option_run_id,
+                "option_run_status": run_status,
+                "message": (
+                    "a protective exit stage is unresolved for this run; it is "
+                    "reconciled from the platform's own pre-send records before the "
+                    "structure is mutated"
+                ),
+            },
+        )
+    # The run being adjusted is EXCLUDED here: it is the work this plan owns, and
+    # an in-flight adjust on it is the one state a retry resolves through. Every
+    # other run of this strategy that is not provably finished blocks the
+    # mutation, because the platform cannot know which structure the strategy
+    # means to hold while another one is still moving.
+    for row in runs:
+        if str(row.get("option_run_id") or "") == option_run_id:
+            continue
+        other_status = str(row.get("status") or "").strip().lower()
+        if bool(row.get("protective_exit_unresolved")) or other_status in _UNRESOLVED_RUN_STATUSES:
+            raise PlanBindingRefusal(
+                "OPTION_STRUCTURE_UNRESOLVED",
+                {
+                    "plan_id": plan_id,
+                    "option_run_id": str(row.get("option_run_id") or ""),
+                    "status": other_status or "unknown",
+                    "originating_plan_id": row.get("originating_plan_id"),
+                    "message": (
+                        "this strategy already owns another option run that is not "
+                        "finished; an adjust mutates the structure it names only while "
+                        "that is the only unresolved structure"
                     ),
                 },
             )
@@ -634,22 +933,6 @@ def _validate_exit_reference(
         )
 
 
-def _structure_generation(run: OptionRunState) -> int:
-    """The run's held leg generation. Absent means the first one (D-9).
-
-    The counter lives in ``option_run_states.metadata`` JSONB, so a run created
-    before adjustments existed (or by a path that never adjusted) reads as
-    generation 1 rather than as "unknown": the only thing an adjust needs to
-    know is whether the basis it froze is still the generation the run holds.
-    """
-    metadata = getattr(run, "metadata", None) or {}
-    try:
-        generation = int(metadata.get("structure_generation") or 1)
-    except (TypeError, ValueError):
-        return 1
-    return generation if generation >= 1 else 1
-
-
 def _validate_adjust_reference(
     plan: Mapping[str, Any],
     *,
@@ -728,13 +1011,14 @@ def _resolve_adjust_binding(
 
     Nothing here trusts the caller: the run is read back, its ownership edge is
     an ENTRY binding of this plan's own scope, and the generation basis the plan
-    froze is compared against the run's held generation. A run that moved on (a
-    completed adjust, a close) refuses as a stale basis rather than being
-    re-derived against a newer structure - the approved artifact stays the
-    approved artifact.
+    froze is compared against the run's held generation. The mutation rules
+    themselves are NOT restated here: they are the shared admissibility rule
+    (``assess_option_adjust_admissibility``), asked through this store's own
+    session, so the execution path and the early callers can never disagree
+    about what may be adjusted. A run that moved on (a completed adjust, a close)
+    refuses as a stale basis rather than being re-derived against a newer
+    structure - the approved artifact stays the approved artifact.
     """
-    from backend.options.protection.staged_exit import unresolved_stage_claim
-
     block = _frozen_option_run_block(plan)
     option_run_id = str(block.get("option_run_id") or "").strip()
     if not option_run_id:
@@ -778,72 +1062,16 @@ def _resolve_adjust_binding(
         account_id=account_id,
         execution_environment=execution_environment,
     )
-    status = str(getattr(run, "status", "") or "").strip().lower()
-    if status == "adjusting":
-        # This plan has no binding yet (an existing one returned earlier), so the
-        # in-flight adjust belongs to ANOTHER plan: one transition, one owner.
-        raise PlanBindingRefusal(
-            "OPTION_RUN_ADJUST_IN_FLIGHT",
-            {
-                "plan_id": plan_id,
-                "option_run_id": run.strategy_run_id,
-                "option_run_status": status,
-                "message": (
-                    "another plan owns this run's in-flight adjust; its delta is "
-                    "re-derived from the run's own fills, never from a second plan"
-                ),
-            },
-        )
-    if status != "entered":
-        raise PlanBindingRefusal(
-            "OPTION_RUN_STATE_CHANGED",
-            {
-                "plan_id": plan_id,
-                "option_run_id": run.strategy_run_id,
-                "option_run_status": status or "unknown",
-                "message": "an adjust mutates the run's HELD structure; this run is not entered",
-            },
-        )
-    basis = block.get("based_on_generation")
-    try:
-        based_on_generation = int(basis)
-    except (TypeError, ValueError):
-        raise PlanBindingRefusal(
-            "OPTION_ADJUSTMENT_BASIS_REQUIRED",
-            {"plan_id": plan_id, "based_on_generation": basis},
-        ) from None
-    held_generation = _structure_generation(run)
-    if based_on_generation != held_generation:
-        raise PlanBindingRefusal(
-            "OPTION_ADJUSTMENT_STALE_BASIS",
-            {
-                "plan_id": plan_id,
-                "option_run_id": run.strategy_run_id,
-                "based_on_generation": based_on_generation,
-                "structure_generation": held_generation,
-                "message": (
-                    "the run has moved to a different leg generation than the one this "
-                    "adjust was approved against; it is never re-derived against a newer one"
-                ),
-            },
-        )
-    unresolved = unresolved_stage_claim(getattr(run, "orders", None) or [])
-    if unresolved is not None:
-        raise PlanBindingRefusal(
-            "OPTION_PROTECTIVE_EXIT_UNRESOLVED",
-            {
-                "plan_id": plan_id,
-                "option_run_id": run.strategy_run_id,
-                "option_run_status": status,
-                "stage_digest": str(unresolved.get("stage_digest") or ""),
-                "stage_state": str(unresolved.get("state") or ""),
-                "stage_attempt": int(unresolved.get("attempt") or 1),
-                "message": (
-                    "a protective exit stage is unresolved for this run; it is "
-                    "reconciled from the platform's own pre-send records before the "
-                    "structure is mutated"
-                ),
-            },
+    # The ONE mutation rule, re-read here under the execution path's own session:
+    # ownership, the run's state, the frozen basis, an unresolved protective stage
+    # and the strategy's other unresolved work.
+    with binding_store.session_factory() as session:
+        assess_option_adjust_admissibility(
+            plan,
+            strategy_id=str(strategy_id),
+            account_id=str(account_id),
+            execution_environment=str(execution_environment),
+            session=session,
         )
     binding = binding_store.bind(
         plan_id=plan_id,

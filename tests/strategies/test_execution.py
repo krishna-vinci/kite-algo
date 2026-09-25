@@ -2390,31 +2390,41 @@ class ExecutorOptionRunBindingTests(ExecutorTestCase, unittest.IsolatedAsyncioTe
             hedge["expiry"] = expiry
         return [short, hedge]
 
-    def _seed_adjust_plan(self, plan_id, *, reference, legs, generation=1, expiry="2026-10-29"):
+    def _seed_adjust_plan(
+        self,
+        plan_id,
+        *,
+        reference,
+        legs,
+        generation=1,
+        expiry="2026-10-29",
+        protection_policy=None,
+    ):
         """A frozen ``adjust`` plan: the target, its basis, and the run it mutates."""
         self.seed_validated_plan(
             plan_id, plan_kind="option_structure", legs=legs, run_id=f"run-{plan_id}"
         )
         self.seed_binding(run_id=f"run-{plan_id}")
+        resolved = {
+            "target_kind": "option_structure",
+            "product": "NRML",
+            "expiry": expiry,
+            "structure_digest": "digest-iron-condor",
+            "legs": legs,
+            "option_run": {
+                "phase": "adjust",
+                "option_run_id": reference,
+                "based_on_generation": generation,
+            },
+        }
+        if protection_policy is not None:
+            resolved["protection_policy"] = protection_policy
         with self.factory() as session:
             session.execute(
                 text("UPDATE strategy_plans SET resolved_plan = :resolved WHERE plan_id = :p"),
                 {
                     "p": plan_id,
-                    "resolved": json.dumps(
-                        {
-                            "target_kind": "option_structure",
-                            "product": "NRML",
-                            "expiry": expiry,
-                            "structure_digest": "digest-iron-condor",
-                            "legs": legs,
-                            "option_run": {
-                                "phase": "adjust",
-                                "option_run_id": reference,
-                                "based_on_generation": generation,
-                            },
-                        }
-                    ),
+                    "resolved": json.dumps(resolved),
                 },
             )
             session.commit()
@@ -2682,17 +2692,55 @@ class ExecutorOptionRunBindingTests(ExecutorTestCase, unittest.IsolatedAsyncioTe
             [int(row["quantity"]) for row in trades if row["leg_id"] == "plan-adjust:3"], [75]
         )
 
-    async def test_an_adjust_removing_a_hedge_withholds_it_until_proven(self):
-        """A desired state that drops a hedge may not release it unproven."""
+    async def test_an_adjust_that_would_leave_a_naked_short_is_refused(self):
+        """Dropping a hedge while the short stays is a naked target: refused."""
         executor, option_run_id = await self._enter_a_structure()
         self._seed_adjust_plan(
             "plan-adjust",
             reference=option_run_id,
             legs=[self._adjust_legs(units=1)[0]],  # the short only: the hedge is REMOVED
         )
+
+        with self.assertRaises(self._refusal) as ctx:
+            await executor.execute(_plan_view_for(self.factory, "plan-adjust"), actor=OWNER)
+
+        self.assertEqual(ctx.exception.reason_code, "OPTION_ADJUSTMENT_WOULD_UNHEDGE")
+        (trail,) = self.events("plan-adjust")
+        self.assertEqual(trail["refusal_reason"], "OPTION_ADJUSTMENT_WOULD_UNHEDGE")
+        # The named evidence: SELL 75 against BUY 0 of the same option type.
+        self.assertEqual(
+            trail["detail"]["uncovered"],
+            [{"option_type": "CE", "buy_quantity": 0, "sell_quantity": 75}],
+        )
+        # Nothing was placed, nothing bound, and the run did not move.
+        self.assertEqual(self._binding_rows("plan-adjust"), [])
+        run = self._run_row(option_run_id)
+        self.assertEqual(run["status"], "entered")
+        self.assertEqual(json.loads(run["metadata"]).get("structure_generation", 1), 1)
+
+    async def test_a_declared_naked_adjust_still_withholds_the_unproven_release(self):
+        """The sanctioned ``naked`` declaration admits the plan - the exit rule
+        (a hedge is released only against its short's PROVEN closure) still owns
+        the sequencing, so an unproven release is withheld rather than taken."""
+        executor, option_run_id = await self._enter_a_structure()
+        self._seed_adjust_plan(
+            "plan-adjust",
+            reference=option_run_id,
+            legs=[self._adjust_legs(units=1)[0]],  # the short only: the hedge is REMOVED
+            protection_policy={"kind": "combined_premium_stop", "naked": True},
+        )
         result = await executor.execute(_plan_view_for(self.factory, "plan-adjust"), actor=OWNER)
 
         self.assertEqual(result["status"], "rejected")
+        # Admitted PAST the naked gate: the refusal is the exit builder's own.
+        self.assertEqual(
+            [
+                row["refusal_reason"]
+                for row in self.events("plan-adjust")
+                if row["refusal_reason"]
+            ],
+            ["OPTION_HEDGE_RELEASE_WITHHELD"],
+        )
         detail = next(
             row["detail"]
             for row in self.events("plan-adjust")
@@ -2702,6 +2750,103 @@ class ExecutorOptionRunBindingTests(ExecutorTestCase, unittest.IsolatedAsyncioTe
         run = self._run_row(option_run_id)
         self.assertEqual(run["status"], "cleanup_required")
         self.assertEqual(json.loads(run["metadata"]).get("structure_generation", 1), 1)
+
+    def _trigger_protection(self, option_run_id):
+        """Freeze a protection rule on the run that its OWN book is over.
+
+        The rule is the worker safety gate's own shape (a metric, an operator, a
+        threshold and a role), and ``open_quantity`` is derived from the run's own
+        trades - so an entered structure is over any positive threshold and the
+        protection state is TRIGGERED, not merely configured.
+        """
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "UPDATE public.option_run_states SET protection = :protection "
+                    "WHERE strategy_run_id = :r"
+                ),
+                {
+                    "r": option_run_id,
+                    "protection": json.dumps(
+                        {
+                            "rules": [
+                                {
+                                    "key": "combined-stop",
+                                    "metric": "open_quantity",
+                                    "operator": "gte",
+                                    "threshold": 1,
+                                    "role": "exit",
+                                    "action": "exit",
+                                }
+                            ],
+                            "precedence": ["exit"],
+                        }
+                    ),
+                },
+            )
+            session.commit()
+
+    async def _enter_two_units(self):
+        """One entered structure of TWO units, and its run id."""
+        executor = self.build_executor(
+            paper_service=self.build_paper_service(starting_balance="1000000")
+        )
+        self._seed_lane("plan-op", plan_kind="option_structure", legs=self._adjust_legs(units=2))
+        entry = await executor.execute(_plan_view_for(self.factory, "plan-op"), actor=OWNER)
+        self.assertEqual(entry["status"], "filled")
+        (binding,) = self._binding_rows("plan-op")
+        return executor, str(binding["option_run_id"])
+
+    async def test_an_increase_is_refused_while_protection_is_triggered(self):
+        """A risk-increasing adjust is never taken on triggered protection."""
+        executor, option_run_id = await self._enter_two_units()
+        self._trigger_protection(option_run_id)
+        self._seed_adjust_plan(
+            "plan-adjust", reference=option_run_id, legs=self._adjust_legs(units=3)
+        )
+        self.claim_reservation(plan_id="plan-adjust")
+
+        with self.assertRaises(self._refusal) as ctx:
+            await executor.execute(_plan_view_for(self.factory, "plan-adjust"), actor=OWNER)
+
+        self.assertEqual(ctx.exception.reason_code, "OPTION_ADJUSTMENT_PROTECTION_ACTIVE")
+        (trail,) = self.events("plan-adjust")
+        self.assertEqual(trail["refusal_reason"], "OPTION_ADJUSTMENT_PROTECTION_ACTIVE")
+        self.assertTrue(trail["detail"]["triggered"])
+        self.assertFalse(trail["detail"]["unreadable"])
+        self.assertEqual(
+            sorted(leg["instrument_id"] for leg in trail["detail"]["increasing_legs"]),
+            sorted([self.SHORT_ID, self.HEDGE_ID]),
+        )
+        # Nothing was placed and the run did not move off its held generation.
+        run = self._run_row(option_run_id)
+        self.assertEqual(run["status"], "entered")
+        self.assertEqual(json.loads(run["metadata"]).get("structure_generation", 1), 1)
+        self.assertEqual(len(executor._paper_service.repository.orders), 2)  # the entry only
+
+    async def test_a_reduce_only_adjust_is_admitted_while_protection_is_triggered(self):
+        """Risk reduction is never blocked: the reduction converges."""
+        executor, option_run_id = await self._enter_two_units()
+        self._trigger_protection(option_run_id)
+        self._seed_adjust_plan(
+            "plan-adjust", reference=option_run_id, legs=self._adjust_legs(units=1)
+        )
+
+        result = await executor.execute(_plan_view_for(self.factory, "plan-adjust"), actor=OWNER)
+
+        self.assertEqual(result["status"], "filled")
+        self.assertEqual(
+            [row["refusal_reason"] for row in self.events("plan-adjust") if row["refusal_reason"]],
+            [],
+        )
+        run = self._run_row(option_run_id)
+        self.assertEqual(run["status"], "entered")
+        self.assertEqual(json.loads(run["metadata"])["structure_generation"], 2)
+        legs = json.loads(run["legs"])
+        self.assertEqual(
+            {row["leg_id"]: int(row["quantity"]) for row in legs},
+            {"plan-op:1": 75, "plan-op:2": 75},
+        )
 
 
 class ExecutorOptionContinuityTests(ExecutorTestCase, unittest.IsolatedAsyncioTestCase):

@@ -420,25 +420,26 @@ class ExecutionRequestService:
                 "refusal_code": None,
                 "refusal_detail": {},
             }
-            # An option ENTRY this strategy's own durable work already blocks is
+            # An option plan this strategy's own durable work already blocks (an
+            # ENTRY it owns, or an ADJUST whose basis or state has moved) is
             # refused HERE, by name: the owner must never be asked to approve a
             # plan the platform would refuse at execution anyway.
-            entry_refusal = self._option_entry_refusal(
+            structure_refusal = self._option_structure_refusal(
                 plan=plan,
                 strategy_id=strategy_id,
                 account_id=account_id,
                 execution_environment=environment,
                 session=session,
             )
-            if entry_refusal is not None:
+            if structure_refusal is not None:
                 decision.update(
                     {
                         "status": "refused",
-                        "refusal_code": entry_refusal["reason_code"],
+                        "refusal_code": structure_refusal["reason_code"],
                         "refusal_detail": {
                             "checked_at": moment.isoformat(),
                             "stage": "request",
-                            **entry_refusal["detail"],
+                            **structure_refusal["detail"],
                         },
                     }
                 )
@@ -632,21 +633,22 @@ class ExecutionRequestService:
                     }
                 )
             # The state may have moved while the request waited: re-ask the
-            # structural rule before this becomes dispatchable work.
-            entry_refusal = self._option_entry_refusal(
+            # structural rule (the frozen phase selects it) before this becomes
+            # dispatchable work.
+            structure_refusal = self._option_structure_refusal(
                 plan=plan,
                 strategy_id=str(row.strategy_id),
                 account_id=str(row.account_id),
                 execution_environment=str(row.execution_environment),
                 session=session,
             )
-            if entry_refusal is not None:
+            if structure_refusal is not None:
                 row.status = "refused"
-                row.refusal_code = entry_refusal["reason_code"]
+                row.refusal_code = structure_refusal["reason_code"]
                 row.refusal_detail = {
                     "checked_at": moment.isoformat(),
                     "stage": "approval",
-                    **entry_refusal["detail"],
+                    **structure_refusal["detail"],
                 }
                 row.updated_at = moment
                 session.add(self._audit(row, "refused", actor, "owner", moment))
@@ -1597,7 +1599,7 @@ class ExecutionRequestService:
     # -- structural admission -----------------------------------------------
 
     @staticmethod
-    def _option_entry_refusal(
+    def _option_structure_refusal(
         *,
         plan: Mapping[str, Any],
         strategy_id: str,
@@ -1605,22 +1607,35 @@ class ExecutionRequestService:
         execution_environment: str,
         session: Any,
     ) -> Optional[Dict[str, Any]]:
-        """The named option-entry structural refusal for this plan, or ``None``.
+        """The named option structural refusal for this plan, or ``None``.
 
-        The rule itself lives with the plan/run binding edge
-        (``assess_option_entry_admissibility``): this only asks it through the
-        service's own session, so an option ENTRY the platform would refuse at
-        execution is refused BY NAME before the owner is ever asked to approve
-        it. An unreadable discovery refuses (``OPTION_STRUCTURE_DISCOVERY_UNKNOWN``)
-        exactly as it does at execution - never "no runs".
+        The rules themselves live with the plan/run binding edge, one per frozen
+        phase: ``assess_option_entry_admissibility`` for an ENTRY and
+        ``assess_option_adjust_admissibility`` for an ADJUST. This only asks the
+        one the plan's frozen phase selects, through the service's own session,
+        so an option plan the platform would refuse at execution is refused BY
+        NAME before the owner is ever asked to approve it. An unreadable
+        discovery refuses (``OPTION_STRUCTURE_DISCOVERY_UNKNOWN``) exactly as it
+        does at execution - never "no runs".
         """
         from backend.options.execution.plan_binding import (
             PlanBindingRefusal,
+            assess_option_adjust_admissibility,
             assess_option_entry_admissibility,
+            is_option_adjust_plan,
+            is_option_entry_plan,
         )
 
+        if is_option_entry_plan(plan):
+            assess = assess_option_entry_admissibility
+        elif is_option_adjust_plan(plan):
+            assess = assess_option_adjust_admissibility
+        else:
+            # Every other plan kind, and every option EXIT, is untouched: an exit
+            # closes work that exists rather than opening or mutating a structure.
+            return None
         try:
-            assess_option_entry_admissibility(
+            assess(
                 plan,
                 strategy_id=str(strategy_id),
                 account_id=str(account_id),
