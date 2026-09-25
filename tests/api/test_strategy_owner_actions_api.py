@@ -47,6 +47,7 @@ from backend.options.execution.models import OptionRunState  # noqa: E402
 from backend.strategies import models  # noqa: F401,E402  (table registration)
 from backend.strategies.attribution_models import (  # noqa: E402
     PaperOrderFillProgress,
+    StrategyApproval,
     StrategyPlan,
     StrategyPlanExecutionEvent,
     StrategyPlanOptionRun,
@@ -144,6 +145,108 @@ def session_factory():
             )
             """
         )
+        # Flatten (S3) reads the platform's own catalog to classify a book as an
+        # option structure or not, and freezes its reduction plans against a
+        # PUBLISHED generation, so these are the production shapes.
+        cursor.execute(
+            """
+            CREATE TABLE public.instrument_catalog_generations (
+                id TEXT PRIMARY KEY, status TEXT, published_at TEXT
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE public.instrument_catalog_records (
+                instrument_id TEXT PRIMARY KEY, exchange TEXT, tradingsymbol TEXT,
+                lifecycle_status TEXT NOT NULL DEFAULT 'active',
+                instrument_type TEXT, lot_size INTEGER, current_generation_id TEXT,
+                expiry TEXT, tick_size REAL, underlying TEXT, strike REAL,
+                option_type TEXT
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE public.instrument_broker_mappings (
+                mapping_id TEXT PRIMARY KEY, instrument_id TEXT, broker TEXT,
+                broker_exchange TEXT, broker_symbol TEXT, broker_token INTEGER,
+                valid_from_generation TEXT, valid_to_generation TEXT,
+                is_current INTEGER
+            )
+            """
+        )
+        # The durable option-run rows and the binding edges flatten's option-exit
+        # pass reads/writes are ``public.``-qualified in production code.
+        cursor.execute(
+            """
+            CREATE TABLE public.option_run_states (
+                strategy_run_id TEXT PRIMARY KEY,
+                strategy_name TEXT,
+                product TEXT,
+                status TEXT NOT NULL,
+                legs TEXT,
+                protection TEXT,
+                metadata TEXT,
+                orders TEXT,
+                trades TEXT,
+                completed_legs TEXT,
+                failed_legs TEXT,
+                pending_legs TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE public.strategy_plan_option_runs (
+                plan_id TEXT PRIMARY KEY,
+                option_run_id TEXT NOT NULL,
+                worker_run_id TEXT,
+                strategy_id TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                execution_environment TEXT NOT NULL,
+                phase TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE public.option_protection_owners (
+                option_run_id TEXT PRIMARY KEY,
+                strategy_id TEXT,
+                account_id TEXT,
+                execution_environment TEXT,
+                owner_run_id TEXT,
+                owner_epoch INTEGER,
+                policy_version TEXT,
+                policy TEXT,
+                action_state TEXT,
+                stage_digest TEXT,
+                state TEXT,
+                released_at TEXT
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE public.order_trade_fills (
+                account_id TEXT NOT NULL,
+                order_id TEXT NOT NULL,
+                trade_id TEXT NOT NULL,
+                quantity INTEGER,
+                price REAL,
+                transaction_type TEXT,
+                tradingsymbol TEXT,
+                instrument_token INTEGER,
+                product TEXT,
+                fill_timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (account_id, order_id, trade_id)
+            )
+            """
+        )
 
     Base.metadata.create_all(engine)
     yield sessionmaker(bind=engine, expire_on_commit=False)
@@ -216,7 +319,7 @@ class _FakePaperRuntime:
         return {"mode": "paper", "status": "cancelled"}
 
 
-def _app(session_factory, monkeypatch, user, *, run_store=None, paper=None):
+def _app(session_factory, monkeypatch, user, **state):
     from backend.app import auth as auth_module
 
     monkeypatch.setattr(auth_module, "get_optional_app_user", lambda _request: user)
@@ -227,10 +330,15 @@ def _app(session_factory, monkeypatch, user, *, run_store=None, paper=None):
     app.dependency_overrides[owner_actions_router._owner_actions_db] = lambda: (
         session_factory
     )
+    run_store = state.pop("run_store", None)
     if run_store is not None:
         app.state.option_run_store = run_store
+    paper = state.pop("paper", None)
     if paper is not None:
         app.state.paper_runtime_service = paper
+    for name, value in state.items():
+        if value is not None:
+            setattr(app.state, name, value)
     return app
 
 
@@ -508,6 +616,10 @@ def _dead_url(strategy_id, plan_id, step_no=1):
     return f"{BASE}/{strategy_id}/plans/{plan_id}/steps/{step_no}/dead-submission"
 
 
+def _flatten_url(strategy_id):
+    return f"{BASE}/{strategy_id}/owner-actions/flatten"
+
+
 # ---------------------------------------------------------------------------
 # authentication / authorization
 # ---------------------------------------------------------------------------
@@ -527,6 +639,13 @@ async def test_every_route_requires_a_session(session_factory, monkeypatch):
             await client.post(
                 _dead_url("stg_1", "p1"),
                 json={"evidence_digest": "x", "disposition": "cancelled", "reason": "r"},
+            )
+        ).status_code == 401
+        assert (await client.get(_flatten_url("stg_1"))).status_code == 401
+        assert (
+            await client.post(
+                _flatten_url("stg_1"),
+                json={"reason": "owner_flatten", "stop_evaluator": True},
             )
         ).status_code == 401
 
@@ -1051,3 +1170,1004 @@ async def test_an_open_remainder_is_not_a_dead_submission(session_factory, monke
         {"plan": ADJUST_PLAN},
     )
     assert [row["event"] for row in trail] == ["submitted", "partially_filled"]
+
+
+# ---------------------------------------------------------------------------
+# flatten (B2.6b S3, section 3)
+# ---------------------------------------------------------------------------
+
+EQ_ID = "NSE:INFY"
+EQ = "INFY"
+EQ_ORDER = "PAPER-EQ-1"
+REDUCE_PLAN = "plan-reduce"
+REDUCE_ORDER = "PAPER-REDUCE-1"
+GEN = "gen-flatten-1"
+GENERATION_AT = "2026-09-01T00:00:00+00:00"
+
+
+def _seed_job(
+    session_factory,
+    *,
+    strategy_id,
+    status="queued",
+    owner_id="app:admin",
+    handoff_at=None,
+    attempt=1,
+):
+    """A hosted job through the REAL repository, then its live status."""
+    from backend.strategies import service as strategy_service
+    from backend.strategies.repository import SqlAlchemyStrategyRepository
+
+    repo = SqlAlchemyStrategyRepository(session_factory)
+    version = repo.create_version(
+        strategy_id=str(strategy_id),
+        source="x",
+        source_sha256="a" * 64,
+        parameters_schema={"type": "object"},
+        capabilities_snapshot=strategy_service.build_capabilities_snapshot(trade=False),
+        created_by=owner_id,
+    )
+    job = repo.create_job(
+        strategy_id=str(strategy_id),
+        version_id=version.id,
+        owner_id=owner_id,
+        job_kind="finite",
+        execution_mode="paper",
+        params={},
+        attempt=int(attempt),
+    )
+    with session_factory() as session:
+        session.execute(
+            text(
+                "UPDATE strategy_jobs SET status = :status, handoff_at = :handoff, "
+                "run_id = 'run-1' WHERE id = :id"
+            ),
+            {
+                "status": str(status),
+                "handoff": handoff_at,
+                "id": str(job.id),
+            },
+        )
+        session.commit()
+    return str(job.id)
+
+
+def _seed_approval(session_factory, *, strategy_id, approval_id="approval-1"):
+    session = session_factory()
+    try:
+        session.add(
+            StrategyApproval(
+                approval_id=approval_id,
+                plan_id="plan-approved",
+                strategy_id=str(strategy_id),
+                account_id=ACCOUNT,
+                actor_id="app:admin",
+                actor_kind="manual",
+                reservation_id="reservation-1",
+                execution_environment="live",
+                status="active",
+                plan_hash="hash-approved",
+                snapshot={},
+                evidence={},
+                validity_seconds=900,
+            )
+        )
+        session.commit()
+    finally:
+        session.close()
+
+
+def _seed_projection(
+    session_factory,
+    *,
+    strategy_id,
+    instrument_id,
+    product,
+    net_quantity,
+    environment="paper",
+    account=ACCOUNT,
+    tradingsymbol="INFY",
+    instrument_token=408065,
+    identity_kind="canonical",
+    identity_key=None,
+):
+    """ONE attributed book row for this strategy (canonical or raw)."""
+    from backend.strategies.attribution_models import StrategyPositionProjection
+
+    with session_factory() as session:
+        session.add(
+            StrategyPositionProjection(
+                account_id=str(account),
+                strategy_id=str(strategy_id),
+                execution_environment=environment,
+                identity_kind=identity_kind,
+                identity_key=str(identity_key or instrument_id or "raw-key"),
+                product=str(product),
+                canonical_instrument_id=(
+                    None if identity_kind != "canonical" else str(instrument_id)
+                ),
+                instrument_token=int(instrument_token),
+                exchange="NSE",
+                tradingsymbol=str(tradingsymbol),
+                net_quantity=int(net_quantity),
+                projection_version=1,
+            )
+        )
+        session.commit()
+
+
+def _seed_catalog(
+    session_factory,
+    *,
+    instrument_id=EQ_ID,
+    symbol=EQ,
+    instrument_type="EQ",
+    broker_token=408065,
+    generation=GEN,
+):
+    """A published generation plus the record AND broker mapping resolution needs."""
+    with session_factory() as session:
+        session.execute(
+            text(
+                "INSERT OR IGNORE INTO public.instrument_catalog_generations "
+                "(id, status, published_at) VALUES (:gen, 'published', :at)"
+            ),
+            {"gen": generation, "at": GENERATION_AT},
+        )
+        session.execute(
+            text(
+                "INSERT OR REPLACE INTO public.instrument_catalog_records "
+                "(instrument_id, exchange, tradingsymbol, lifecycle_status, "
+                " instrument_type, current_generation_id) "
+                "VALUES (:iid, 'NSE', :symbol, 'active', :kind, :gen)"
+            ),
+            {
+                "iid": instrument_id,
+                "symbol": symbol,
+                "kind": instrument_type,
+                "gen": generation,
+            },
+        )
+        session.execute(
+            text(
+                "INSERT OR REPLACE INTO public.instrument_broker_mappings "
+                "(mapping_id, instrument_id, broker, broker_exchange, broker_symbol, "
+                " broker_token, valid_from_generation, is_current) "
+                "VALUES (:mid, :iid, 'kite', 'NSE', :symbol, :token, :gen, 1)"
+            ),
+            {
+                "mid": f"map-{instrument_id}",
+                "iid": instrument_id,
+                "symbol": symbol,
+                "token": broker_token,
+                "gen": generation,
+            },
+        )
+        session.commit()
+
+
+def _seed_bound_run(
+    session_factory,
+    *,
+    strategy_id,
+    run_id="run-bound-1",
+    owner_id="app:admin",
+    environment="paper",
+):
+    """The immutable run binding a flatten reduction plan is attributed to."""
+    from backend.strategies.attribution_models import StrategyRunBinding
+
+    with session_factory() as session:
+        session.add(
+            StrategyRunBinding(
+                strategy_run_id=str(run_id),
+                strategy_id=str(strategy_id),
+                owner_id=owner_id,
+                account_id=ACCOUNT,
+                execution_environment=str(environment),
+                bound_by=owner_id,
+                binding_source="hosted_job",
+            )
+        )
+        session.commit()
+
+
+def _seed_public_edge(
+    session_factory,
+    *,
+    strategy_id,
+    plan_id,
+    option_run_id=RUN_ID,
+    worker_run_id="worker-1",
+    phase="entry",
+    environment="paper",
+):
+    """The binding edge the PRODUCTION stores read (``public.``-qualified)."""
+    with session_factory() as session:
+        session.execute(
+            text(
+                "INSERT OR REPLACE INTO public.strategy_plan_option_runs "
+                "(plan_id, option_run_id, worker_run_id, strategy_id, account_id, "
+                " execution_environment, phase) VALUES (:plan, :run, :worker, "
+                " :strategy, :account, :environment, :phase)"
+            ),
+            {
+                "plan": str(plan_id),
+                "run": str(option_run_id),
+                "worker": str(worker_run_id),
+                "strategy": str(strategy_id),
+                "account": ACCOUNT,
+                "environment": str(environment),
+                "phase": str(phase),
+            },
+        )
+        session.commit()
+
+
+def _flat_run(*, status="exited"):
+    """A run whose OWN fills prove it holds nothing."""
+    return _entry_run(
+        status=status,
+        trades=[
+            _trade("plan-entry:1", "SELL", 150),
+            _trade("plan-entry:1", "BUY", 150),
+            _trade("plan-entry:2", "BUY", 150),
+            _trade("plan-entry:2", "SELL", 150),
+        ],
+    )
+
+
+def _flatten_item(body, kind, key=None):
+    for row in body["items"]:
+        if row["kind"] != kind:
+            continue
+        if key is None or row["key"] == key:
+            return row
+    return None
+
+
+class _FakeReductionPipeline:
+    """The governed execute route's paper pipeline, as flatten calls it.
+
+    ``execute`` writes the SAME attributed projection a real fill would, so the
+    book genuinely closes; ``real_admission`` swaps the stand-in verdict for the
+    production ``AdmissionService`` so "it admits" means what it means in
+    production.
+    """
+
+    def __init__(self, session_factory, *, zero_book=True, real_admission=False):
+        self.session_factory = session_factory
+        self.zero_book = zero_book
+        self.real_admission = real_admission
+        self.admit_calls = 0
+        self.admitted = []
+        self.executed = []
+
+    def admit(self, plan, *, environment):
+        self.admit_calls += 1
+        if not self.real_admission:
+            verdict = {"admitted": True, "detail": {"source": "test_pipeline"}}
+        else:
+            from backend.strategies.admission import AdmissionService
+
+            verdict = AdmissionService(
+                session_factory=self.session_factory
+            ).evaluate(plan, execution_environment=environment).as_dict()
+        self.admitted.append(verdict)
+        return verdict
+
+    async def execute(self, plan, *, actor):
+        self.executed.append({"plan_id": plan.get("plan_id"), "actor": str(actor)})
+        if self.zero_book:
+            with self.session_factory() as session:
+                session.execute(
+                    text("UPDATE strategy_position_projection SET net_quantity = 0")
+                )
+                session.commit()
+        return {"status": "filled", "steps": [{"step_no": 1, "filled_quantity": 150}]}
+
+
+def _canned_reduction_builder(plan_id="plan-flatten-eq", target=0):
+    """A planner that returns ONE frozen plan without touching the catalog."""
+
+    def build(scope, book, *, operation_id, actor):
+        _ = (scope, operation_id, actor)
+        return {
+            "plan_id": plan_id,
+            "plan": {
+                "plan_id": plan_id,
+                "strategy_id": str(scope["strategy_id"]),
+                "account_id": str(scope["account_id"]),
+                "plan_kind": "single_instrument",
+                "resolved_plan": {
+                    "target_kind": "single_instrument",
+                    "legs": [
+                        {
+                            "instrument_id": book.get("instrument_id"),
+                            "product": book.get("product"),
+                            "quantity": abs(int(target)),
+                            "signed_quantity": int(target),
+                        }
+                    ],
+                },
+            },
+        }
+
+    return build
+
+
+class _ScriptedExitRunner:
+    """The S2 owner exit for one run, with a caller-scripted sequence of results."""
+
+    def __init__(self, results):
+        self._results = list(results)
+        self.calls = []
+
+    async def __call__(self, scope, option_run_id, *, reason):
+        self.calls.append((str(option_run_id), str(reason)))
+        result = self._results[min(len(self.calls) - 1, len(self._results) - 1)]
+        if isinstance(result, Exception):
+            raise result
+        return dict(result)
+
+
+class _OneRunSnapshot:
+    """A scope-derived run discovery returning exactly one run row."""
+
+    def __init__(self, row):
+        self.row = dict(row)
+
+    def option_runs_for_scope(self, **kwargs):
+        _ = kwargs
+        return [dict(self.row)], {"coverage": "known", "reason": ""}
+
+
+class _FakeExitBoundary:
+    """The paper staged-exit boundary the S2 owner exit submits through."""
+
+    def __init__(self):
+        self.calls = []
+
+    async def place_order(self, *, account_scope, order_payload, attribution):
+        self.calls.append(
+            {
+                "account_id": str(account_scope),
+                "order": dict(order_payload or {}),
+                "attribution": dict(attribution or {}),
+            }
+        )
+        return {"order": {"order_id": f"PAPER-EXIT-{len(self.calls)}"}}
+
+
+def _run_legs():
+    """The durable legs of the run the option-exit pass is asked to close."""
+    return [
+        {
+            "leg_id": "plan-entry:1",
+            "tradingsymbol": SHORT,
+            "transaction_type": "SELL",
+            "quantity": 150,
+            "exchange": "NFO",
+            "product": "NRML",
+        },
+        {
+            "leg_id": "plan-entry:2",
+            "tradingsymbol": HEDGE,
+            "transaction_type": "BUY",
+            "quantity": 150,
+            "exchange": "NFO",
+            "product": "NRML",
+        },
+    ]
+
+
+def _one_run_row(*, status="entered"):
+    return {
+        "option_run_id": RUN_ID,
+        "plan_ids": [ENTRY_PLAN],
+        "originating_plan_id": ENTRY_PLAN,
+        "originating_phase": "entry",
+        "phase": "entry",
+        "worker_run_id": "run-1",
+        "underlying": "NIFTY",
+        "expiry": "2026-11-26",
+        "structure_digest": "sha-entry-digest",
+        "structure_generation": 1,
+        "product": "NRML",
+        "status": str(status),
+        "legs": _run_legs(),
+        "completed_legs": [],
+        "pending_legs": [],
+        "failed_legs": [],
+        "protective_exit_unresolved": False,
+        "coverage": "known",
+    }
+
+
+async def _post_flatten(client, strategy_id, *, reason="owner_flatten", stop_evaluator=True):
+    return await client.post(
+        _flatten_url(strategy_id),
+        json={"reason": reason, "stop_evaluator": stop_evaluator},
+    )
+
+
+@pytest.mark.asyncio
+async def test_flatten_refuses_while_a_running_evaluation_cannot_be_proven_stopped(
+    session_factory, monkeypatch
+):
+    """Section 3 step 1: stop, prove it, or refuse by name."""
+    async with _client(session_factory, monkeypatch) as client:
+        strategy_id = await _create(client)
+    _seed_job(
+        session_factory,
+        strategy_id=strategy_id,
+        status="running",
+        handoff_at=datetime.now(timezone.utc),
+    )
+
+    async with _client(session_factory, monkeypatch) as client:
+        refused = await _post_flatten(client, strategy_id)
+        assert refused.status_code == 409, refused.text
+        detail = refused.json()["detail"]
+        assert detail["rejection_reason"] == "FLATTEN_EVALUATION_ACTIVE"
+        (job,) = detail["stop"]["jobs"]
+        # The stop was REQUESTED (durably) and is not proven: the child may still
+        # place work, so flatten refuses rather than racing it.
+        assert job["state"] == "stopping"
+        assert job["proven_stopped"] is False
+        assert job["requested"] is True
+
+        # The caller declining the stop is the same refusal, reported as requested.
+        declined = await _post_flatten(client, strategy_id, stop_evaluator=False)
+        assert declined.status_code == 409, declined.text
+        assert (
+            declined.json()["detail"]["rejection_reason"]
+            == "FLATTEN_EVALUATION_ACTIVE"
+        )
+        assert declined.json()["detail"]["stop"]["jobs"][0]["state"] == "stopping"
+
+    # The durable stop request and its audit exist; no flatten operation was started.
+    job_row = _rows(
+        session_factory, "SELECT desired_state, stop_requested_at FROM strategy_jobs"
+    )[0]
+    assert job_row["desired_state"] == "stopped"
+    assert job_row["stop_requested_at"]
+    assert _rows(session_factory, "SELECT operation_id FROM strategy_flatten_operations") == []
+    journal = _rows(
+        session_factory,
+        "SELECT reason_code FROM strategy_proposal_journal "
+        "WHERE strategy_id = :strategy",
+        {"strategy": strategy_id},
+    )
+    assert "flatten_stop_evaluator" in [row["reason_code"] for row in journal]
+
+
+@pytest.mark.asyncio
+async def test_flatten_stops_a_queued_evaluator_and_records_the_stop(
+    session_factory, monkeypatch
+):
+    """A provable stop lets the flatten proceed, and the stop is on the record."""
+    async with _client(session_factory, monkeypatch) as client:
+        strategy_id = await _create(client)
+    _seed_job(session_factory, strategy_id=strategy_id, status="queued")
+
+    async with _client(session_factory, monkeypatch) as client:
+        accepted = await _post_flatten(client, strategy_id)
+        assert accepted.status_code == 200, accepted.text
+        body = accepted.json()
+        assert body["stop"]["state"] == "confirmed"
+        (job,) = body["stop"]["jobs"]
+        assert job["status"] == "stopped"
+        assert job["proven_stopped"] is True
+        # Nothing was left to do: an empty strategy IS flat.
+        assert body["status"] == "complete", body
+        assert body["missing"] == []
+        assert body["operation_id"]
+        assert body["audit_id"]
+
+    assert _rows(session_factory, "SELECT status FROM strategy_jobs")[0]["status"] == (
+        "stopped"
+    )
+    assert len(_rows(session_factory, "SELECT operation_id FROM strategy_flatten_operations")) == 1
+
+
+@pytest.mark.asyncio
+async def test_reducing_pending_work_survives_the_flatten_cancel_step(
+    session_factory, monkeypatch
+):
+    """Section 3 step 3: cancel qualifying entries, leave reducing work alone."""
+    from backend.strategies.attribution_models import StrategyPositionProjection
+
+    run_store = _FakeRunStore({RUN_ID: _entry_run()})
+    async with _client(session_factory, monkeypatch, run_store=run_store) as client:
+        strategy_id = await _create(client)
+    # An exposure-increasing entry (a naked short) that flatten MAY cancel.
+    _seed_plan(
+        session_factory,
+        strategy_id=strategy_id,
+        plan_id=ENTRY_PLAN,
+        resolved=_resolved_plan(naked=True),
+        phase="entry",
+    )
+    _seed_trail(
+        session_factory,
+        plan_id=ENTRY_PLAN,
+        step_no=1,
+        rows=[("submitted", None, None), ("partially_filled", ENTRY_ORDER, 75)],
+    )
+    _seed_paper_order(
+        session_factory,
+        order_id=ENTRY_ORDER,
+        status="partially_filled",
+        quantity=150,
+        filled=75,
+        pending=75,
+    )
+    _seed_progress(
+        session_factory,
+        order_id=ENTRY_ORDER,
+        filled=75,
+        remaining=75,
+        status="partially_filled",
+    )
+    # And a REDUCING working order (150 -> 0, a close-to-flat instruction the
+    # compiler treats as a real target) that flatten must never cancel.
+    _seed_plan(
+        session_factory,
+        strategy_id=strategy_id,
+        plan_id=REDUCE_PLAN,
+        resolved={
+            "target_kind": "single_instrument",
+            "legs": [
+                {
+                    "instrument_id": EQ_ID,
+                    "tradingsymbol": EQ,
+                    "broker_symbol": EQ,
+                    "side": "BUY",
+                    "product": "CNC",
+                    "quantity": 0,
+                    "signed_quantity": 0,
+                }
+            ],
+        },
+        plan_kind="single_instrument",
+        phase="entry",
+        option_run_id="opt_run_reduce",
+    )
+    _seed_trail(
+        session_factory,
+        plan_id=REDUCE_PLAN,
+        step_no=1,
+        rows=[("submitted", REDUCE_ORDER, None)],
+    )
+    _seed_paper_order(
+        session_factory,
+        order_id=REDUCE_ORDER,
+        status="pending",
+        quantity=50,
+        filled=0,
+        pending=50,
+    )
+    _seed_projection(
+        session_factory,
+        strategy_id=strategy_id,
+        instrument_id=EQ_ID,
+        product="CNC",
+        net_quantity=150,
+    )
+    # The catalog decides that INFY is NOT an option, so flatten may reduce it
+    # with a single-instrument plan rather than routing it to a run's exit.
+    _seed_catalog(session_factory)
+
+    paper = _FakePaperRuntime(session_factory)
+    pipeline = _FakeReductionPipeline(session_factory)
+    async with _client(
+        session_factory,
+        monkeypatch,
+        run_store=run_store,
+        paper=paper,
+        owner_action_reduction_plan_builder=_canned_reduction_builder(),
+        owner_action_reduction_pipeline=pipeline,
+    ) as client:
+        first = await _post_flatten(client, strategy_id)
+        assert first.status_code == 200, first.text
+        body = first.json()
+        # The qualifying entry is cancelled; the reducing order is left running.
+        cancelled = _flatten_item(body, "cancel_pending", f"cancel:{ENTRY_PLAN}:1")
+        assert cancelled["state"] == "done", cancelled
+        assert cancelled["detail"]["outcome"] == "cancelled"
+        assert cancelled["detail"]["filled_quantity"] == 75
+        reducing = _flatten_item(body, "cancel_pending", f"cancel:{REDUCE_PLAN}:1")
+        assert reducing["state"] == "in_progress", reducing
+        assert reducing["reason_code"] == "CANCEL_REDUCTION_FORBIDDEN"
+        assert body["status"] == "in_progress", body["items"]
+        assert "no_in_flight_governed_work" in body["missing"]
+        # The EQ book WAS closed by the reduction plan, so books_zero holds.
+        assert "books_zero" not in body["missing"]
+        assert _flatten_item(body, "nonoption_reduction")["state"] == "done"
+        assert paper.calls == [(ACCOUNT, ENTRY_ORDER)]
+        assert len(pipeline.executed) == 1
+
+        # A resume preserves the finished cancel and re-reports the reducing work.
+        second = await _post_flatten(client, strategy_id)
+        assert second.status_code == 200, second.text
+        again = second.json()
+        assert _flatten_item(again, "cancel_pending", f"cancel:{ENTRY_PLAN}:1")["state"] == (
+            "done"
+        )
+        assert _flatten_item(again, "cancel_pending", f"cancel:{REDUCE_PLAN}:1")["state"] == (
+            "in_progress"
+        )
+        assert paper.calls == [(ACCOUNT, ENTRY_ORDER)]
+        assert len(pipeline.executed) == 1
+
+    # The reducing order is untouched: no party cancelled it and the fill stands.
+    order = _rows(
+        session_factory,
+        "SELECT status, pending_quantity FROM public.paper_orders "
+        "WHERE order_id = :order",
+        {"order": REDUCE_ORDER},
+    )[0]
+    assert order["status"] == "pending"
+    assert int(order["pending_quantity"]) == 50
+    reducing_trail = _rows(
+        session_factory,
+        "SELECT event FROM strategy_plan_execution_events WHERE plan_id = :plan",
+        {"plan": REDUCE_PLAN},
+    )
+    assert [row["event"] for row in reducing_trail] == ["submitted"]
+
+
+@pytest.mark.asyncio
+async def test_flatten_exits_an_option_run_short_first_and_keeps_the_hedge(
+    session_factory, monkeypatch
+):
+    """Section 3 step 4: through the REAL S2 exit, shorts first, hedges proven."""
+    from backend.options.execution.durable_store import DurableOptionRunStore
+    from backend.options.execution.models import OptionRunCreateRequest
+
+    store = DurableOptionRunStore(session_factory=session_factory)
+    async with _client(session_factory, monkeypatch, run_store=store) as client:
+        strategy_id = await _create(client)
+    _seed_plan(
+        session_factory,
+        strategy_id=strategy_id,
+        plan_id=ENTRY_PLAN,
+        resolved=_resolved_plan(naked=True),
+        phase="entry",
+    )
+    # The production stores read the binding edge and the run ``public.``-qualified.
+    _seed_public_edge(session_factory, strategy_id=strategy_id, plan_id=ENTRY_PLAN)
+    _seed_bound_run(session_factory, strategy_id=strategy_id, run_id="run-1")
+    store.create_run(
+        OptionRunCreateRequest(
+            strategy_run_id=RUN_ID,
+            strategy_name="iron_condor",
+            product="NRML",
+            legs=_run_legs(),
+            protection={"structure_digest": "sha-entry-digest"},
+            metadata={
+                "strategy_id": str(strategy_id),
+                "account_id": ACCOUNT,
+                "execution_environment": "paper",
+                "worker_run_id": "run-1",
+                "plan_id": ENTRY_PLAN,
+                "source": "hosted_plan_execution",
+            },
+        )
+    )
+    run = store.get_run(RUN_ID)
+    run.status = "entered"
+    run.trades = [
+        _trade("plan-entry:1", "SELL", 150),
+        _trade("plan-entry:2", "BUY", 150),
+    ]
+    store.save_run(run)
+
+    boundary = _FakeExitBoundary()
+    async with _client(
+        session_factory, monkeypatch, run_store=store, paper=boundary
+    ) as client:
+        response = await _post_flatten(client, strategy_id)
+        assert response.status_code == 200, response.text
+        body = response.json()
+
+    item = _flatten_item(body, "option_exit", f"option_exit:{RUN_ID}")
+    assert item["state"] == "in_progress", item
+    assert item["reason_code"] == "option_exit_stage_submitted"
+    assert item["detail"]["shorts_proven_closed"] is False
+    assert [row["reason"] for row in item["detail"]["withheld_hedges"]] == [
+        "short_not_proven_closed"
+    ]
+    # ONE stage, and it is the SHORT cover: the hedge is never released early.
+    stages = [
+        (row["tradingsymbol"], row["transaction_type"], row["quantity"])
+        for row in item["detail"]["stage_items"]
+    ]
+    assert stages == [(SHORT, "BUY", 150)]
+    assert len(boundary.calls) == 1
+    assert boundary.calls[0]["order"]["tradingsymbol"] == SHORT
+    assert (
+        boundary.calls[0]["attribution"]["entry_surface"]
+        == "hosted_option_owner_exit"
+    )
+    assert boundary.calls[0]["attribution"]["source"] == "owner_discretionary_exit"
+    # The run moved to ``exiting`` - never ``exited`` on acceptance - so flatten is
+    # not complete while the structure is still held.
+    assert store.get_run(RUN_ID).status == "exiting"
+    assert body["status"] == "in_progress", body["missing"]
+    assert "option_runs_flat" in body["missing"]
+    assert "no_in_flight_governed_work" in body["missing"]
+
+
+@pytest.mark.asyncio
+async def test_a_partial_option_failure_preserves_completed_reductions_and_resumes(
+    session_factory, monkeypatch
+):
+    """Section 3 step 6: one item's failure blocks only that item."""
+    from backend.options.execution.repair import OptionRunRepairRefusal
+
+    runner = _ScriptedExitRunner(
+        [
+            OptionRunRepairRefusal(
+                "OPTION_PROTECTIVE_EXIT_UNRESOLVED",
+                {"option_run_id": RUN_ID, "message": "a stage still owns the run"},
+            ),
+            {
+                "status": "complete",
+                "state": "flat",
+                "run_status": "exited",
+                "evidence_digest": "digest-flat",
+                "items": [],
+                "shorts_proven_closed": True,
+                "withheld_hedges": [],
+            },
+        ]
+    )
+    snapshot = _OneRunSnapshot(_one_run_row(status="entered"))
+    run_store = _FakeRunStore({RUN_ID: _entry_run(status="entered")})
+    pipeline = _FakeReductionPipeline(session_factory)
+
+    async with _client(session_factory, monkeypatch, run_store=run_store) as client:
+        strategy_id = await _create(client)
+    _seed_projection(
+        session_factory,
+        strategy_id=strategy_id,
+        instrument_id=EQ_ID,
+        product="CNC",
+        net_quantity=150,
+    )
+    _seed_catalog(session_factory)
+
+    async with _client(
+        session_factory,
+        monkeypatch,
+        run_store=run_store,
+        owned_work_snapshot_service=snapshot,
+        owner_action_option_exit_runner=runner,
+        owner_action_reduction_plan_builder=_canned_reduction_builder(),
+        owner_action_reduction_pipeline=pipeline,
+    ) as client:
+        first = await _post_flatten(client, strategy_id)
+        assert first.status_code == 200, first.text
+        body = first.json()
+        # The option run failed; the reduction it does not depend on still ran.
+        option = _flatten_item(body, "option_exit", f"option_exit:{RUN_ID}")
+        assert option["state"] == "blocked", option
+        assert option["reason_code"] == "OPTION_PROTECTIVE_EXIT_UNRESOLVED"
+        reduction = _flatten_item(body, "nonoption_reduction")
+        assert reduction["state"] == "done", reduction
+        assert body["status"] == "blocked", body
+        assert body["refusal"] == "OPTION_PROTECTIVE_EXIT_UNRESOLVED"
+        assert len(pipeline.executed) == 1
+
+        # The staged exit settles and the run's own fills prove it flat: a resume
+        # finishes the operation, and the completed reduction is NOT redone.
+        snapshot.row["status"] = "exited"
+        run_store._runs[RUN_ID] = _flat_run()
+        second = await _post_flatten(client, strategy_id)
+        assert second.status_code == 200, second.text
+        again = second.json()
+        assert again["status"] == "complete", again
+        assert (
+            _flatten_item(again, "option_exit", f"option_exit:{RUN_ID}")["state"]
+            == "done"
+        )
+        assert _flatten_item(again, "nonoption_reduction")["state"] == "done"
+        assert len(pipeline.executed) == 1
+        assert len(runner.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_completion_requires_flat_evidence_and_no_in_flight_work(
+    session_factory, monkeypatch
+):
+    """An execution that reported ``filled`` is not proof the BOOK is flat."""
+    snapshot = _OneRunSnapshot(_one_run_row(status="exited"))
+    run_store = _FakeRunStore({RUN_ID: _flat_run()})
+    pipeline = _FakeReductionPipeline(session_factory, zero_book=False)
+    runner = _ScriptedExitRunner(
+        [
+            {
+                "status": "complete",
+                "state": "flat",
+                "run_status": "exited",
+                "evidence_digest": "digest-flat",
+                "items": [],
+                "shorts_proven_closed": True,
+                "withheld_hedges": [],
+            }
+        ]
+    )
+
+    async with _client(session_factory, monkeypatch, run_store=run_store) as client:
+        strategy_id = await _create(client)
+    _seed_projection(
+        session_factory,
+        strategy_id=strategy_id,
+        instrument_id=EQ_ID,
+        product="CNC",
+        net_quantity=150,
+    )
+    _seed_catalog(session_factory)
+
+    async with _client(
+        session_factory,
+        monkeypatch,
+        run_store=run_store,
+        owned_work_snapshot_service=snapshot,
+        owner_action_option_exit_runner=runner,
+        owner_action_reduction_plan_builder=_canned_reduction_builder(),
+        owner_action_reduction_pipeline=pipeline,
+    ) as client:
+        first = await _post_flatten(client, strategy_id)
+        body = first.json()
+        assert body["status"] != "complete", body
+        assert "books_zero" in body["missing"]
+        assert body["done_conditions"]["books_zero"] is False
+        # The executor reported ``filled`` but the BOOK did not move: the item is
+        # not "done" on the command's word alone.
+        unfinished = _flatten_item(body, "nonoption_reduction")
+        assert unfinished["state"] == "blocked", unfinished
+        assert unfinished["reason_code"] == "FLATTEN_REDUCTION_INCOMPLETE"
+        assert unfinished["detail"]["remaining_quantity"] == 150
+
+        # The fills land: the attributed book is flat, and only THEN is the
+        # operation complete.
+        with session_factory() as session:
+            session.execute(
+                text("UPDATE strategy_position_projection SET net_quantity = 0")
+            )
+            session.commit()
+        second = await _post_flatten(client, strategy_id)
+        again = second.json()
+        assert again["status"] == "complete", again
+        assert again["missing"] == []
+        assert all(again["done_conditions"].values())
+        assert len(pipeline.executed) == 1
+
+
+@pytest.mark.parametrize(
+    "target, expected_state, expected_reason",
+    [(0, "done", None), (300, "blocked", "FLATTEN_PLAN_INCREASES_EXPOSURE")],
+)
+@pytest.mark.asyncio
+async def test_a_target_zero_plan_admits_while_an_increasing_plan_refuses_before_admission(
+    session_factory, monkeypatch, target, expected_state, expected_reason
+):
+    """Section 3 step 5: a flatten plan may only reduce, and it is gated first."""
+    async with _client(session_factory, monkeypatch) as client:
+        strategy_id = await _create(client)
+    _seed_projection(
+        session_factory,
+        strategy_id=strategy_id,
+        instrument_id=EQ_ID,
+        product="CNC",
+        net_quantity=150,
+    )
+    _seed_catalog(session_factory)
+    _seed_bound_run(session_factory, strategy_id=strategy_id)
+    pipeline = _FakeReductionPipeline(session_factory, real_admission=True)
+
+    async with _client(
+        session_factory,
+        monkeypatch,
+        # The default planner freezes the plan through the proposal/compile path.
+        owner_action_reduction_plan_builder=(
+            None if target == 0 else _canned_reduction_builder(target=target)
+        ),
+        owner_action_reduction_pipeline=pipeline,
+    ) as client:
+        response = await _post_flatten(client, strategy_id)
+        assert response.status_code == 200, response.text
+        body = response.json()
+
+    item = _flatten_item(body, "nonoption_reduction")
+    assert item["state"] == expected_state, item
+    assert item["reason_code"] == expected_reason
+    assert item["detail"]["attributed_open_quantity"] == 150
+    if target == 0:
+        # The REAL admission rule admitted the frozen target-zero plan, and the
+        # execution closed the book.
+        assert pipeline.admit_calls == 1
+        assert item["detail"]["admission"]["admitted"] is True
+        assert len(pipeline.executed) == 1
+    else:
+        # The exposure-increasing plan never reached admission at all.
+        assert pipeline.admit_calls == 0
+        assert pipeline.executed == []
+
+
+@pytest.mark.asyncio
+async def test_live_nonoption_flatten_refuses_by_name_while_reporting_option_work(
+    session_factory, monkeypatch
+):
+    """Section 3 step 5 (decisions): live non-option fails closed, options report."""
+    # A LIVE hosted strategy is scoped to a real broker account, so the policy has
+    # to authorize that scope as well as the paper one.
+    live_account = "kite:liveuser"
+    monkeypatch.setenv(
+        "HOSTED_STRATEGY_ACCOUNT_SCOPES", f"{ACCOUNT},{live_account}"
+    )
+    snapshot = _OneRunSnapshot(_one_run_row(status="exited"))
+    run_store = _FakeRunStore({RUN_ID: _flat_run()})
+    runner = _ScriptedExitRunner(
+        [
+            {
+                "status": "complete",
+                "state": "flat",
+                "run_status": "exited",
+                "evidence_digest": "digest-flat",
+                "items": [],
+                "shorts_proven_closed": True,
+                "withheld_hedges": [],
+            }
+        ]
+    )
+    async with _client(session_factory, monkeypatch) as client:
+        created = await client.post(
+            BASE,
+            json={
+                "name": "live-flatten",
+                "execution_mode": "live",
+                "job_kind": "finite",
+                "account_scope": live_account,
+                "max_duration_s": 21600,
+                "progress_deadline_s": 600,
+                "stale_exit_policy": "exit_on_worker_stale",
+            },
+        )
+        assert created.status_code == 200, created.text
+        strategy_id = created.json()["strategy_id"]
+    _seed_projection(
+        session_factory,
+        strategy_id=strategy_id,
+        instrument_id=EQ_ID,
+        product="CNC",
+        net_quantity=150,
+        environment="live",
+        account=live_account,
+    )
+    _seed_catalog(session_factory)
+
+    async with _client(
+        session_factory,
+        monkeypatch,
+        run_store=run_store,
+        owned_work_snapshot_service=snapshot,
+        owner_action_option_exit_runner=runner,
+    ) as client:
+        response = await _post_flatten(client, strategy_id)
+        assert response.status_code == 200, response.text
+        body = response.json()
+
+    # The option work that COULD be done is reported done...
+    option = _flatten_item(body, "option_exit", f"option_exit:{RUN_ID}")
+    assert option["state"] == "done", option
+    # ...and the live non-option book refuses by name instead of being liquidated.
+    reduction = _flatten_item(body, "nonoption_reduction")
+    assert reduction["state"] == "blocked", reduction
+    assert reduction["reason_code"] == "FLATTEN_LIVE_NONOPTION_UNSUPPORTED"
+    assert body["refusal"] == "FLATTEN_LIVE_NONOPTION_UNSUPPORTED"
+    assert body["status"] == "blocked"
+    assert "books_zero" in body["missing"]

@@ -30,7 +30,7 @@ install_dependency_stubs()
 
 import httpx  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
-from sqlalchemy import create_engine  # noqa: E402
+from sqlalchemy import create_engine, event, text  # noqa: E402
 from sqlalchemy.orm import sessionmaker  # noqa: E402
 from sqlalchemy.pool import StaticPool  # noqa: E402
 
@@ -64,6 +64,34 @@ def session_factory():
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
+
+    @event.listens_for(engine, "connect")
+    def _attach_public(dbapi_connection, connection_record):
+        _ = connection_record
+        cursor = dbapi_connection.cursor()
+        cursor.execute("ATTACH DATABASE ':memory:' AS public")
+        # The protection-owner read is ``public.``-qualified in production code
+        # (``OptionProtectionOwnerStore``), so it resolves here through the same
+        # ATTACH the other platform tables use.
+        cursor.execute(
+            """
+            CREATE TABLE public.option_protection_owners (
+                option_run_id TEXT PRIMARY KEY,
+                strategy_id TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                execution_environment TEXT NOT NULL,
+                owner_run_id TEXT,
+                owner_epoch INTEGER NOT NULL DEFAULT 1,
+                policy_version TEXT NOT NULL,
+                policy TEXT NOT NULL DEFAULT '{}',
+                action_state TEXT NOT NULL DEFAULT 'none',
+                stage_digest TEXT,
+                state TEXT NOT NULL DEFAULT 'active',
+                released_at TEXT
+            )
+            """
+        )
+
     Base.metadata.create_all(engine)
     yield sessionmaker(bind=engine, expire_on_commit=False)
     engine.dispose()
@@ -102,7 +130,15 @@ class _FakeRunStore:
         return self._runs[option_run_id]
 
 
-def _app(session_factory, monkeypatch, user, *, snapshot=None, run_store=None):
+def _app(
+    session_factory,
+    monkeypatch,
+    user,
+    *,
+    snapshot=None,
+    run_store=None,
+    owner_store=None,
+):
     from backend.app import auth as auth_module
 
     monkeypatch.setattr(auth_module, "get_optional_app_user", lambda _request: user)
@@ -117,6 +153,8 @@ def _app(session_factory, monkeypatch, user, *, snapshot=None, run_store=None):
         app.state.owned_work_snapshot_service = snapshot
     if run_store is not None:
         app.state.option_run_store = run_store
+    if owner_store is not None:
+        app.state.option_protection_owner_store = owner_store
     return app
 
 
@@ -383,6 +421,56 @@ def _seed_edges(session_factory, strategy_id):
         created_at=datetime(2026, 9, 25, 11, 0, tzinfo=timezone.utc),
         resolved=_resolved_plan(structure_digest="sha-exit-digest"),
     )
+
+
+class _FakeOwnerStore:
+    """The protection-owner store surface, with a caller-chosen failure mode."""
+
+    def __init__(self, row=None, error=None):
+        self._row = dict(row) if row else None
+        self._error = error
+        self.reads = []
+
+    def read(self, option_run_id):
+        self.reads.append(str(option_run_id))
+        if self._error is not None:
+            raise self._error
+        return dict(self._row) if self._row else None
+
+
+def _seed_owner_row(
+    session_factory,
+    *,
+    option_run_id="opt_run_1",
+    owner_run_id="worker-1",
+    state="active",
+    action_state="none",
+    policy_version="policy-v1",
+    owner_epoch=3,
+):
+    session = session_factory()
+    try:
+        session.execute(
+            text(
+                "INSERT OR REPLACE INTO public.option_protection_owners "
+                "(option_run_id, strategy_id, account_id, execution_environment, "
+                " owner_run_id, owner_epoch, policy_version, policy, action_state, "
+                " state) VALUES (:run, 'strategy', :account, 'paper', :owner, "
+                " :epoch, :policy_version, '{}', :action_state, :state)"
+            ),
+            {
+                "run": option_run_id,
+                "account": ACCOUNT,
+                "owner": owner_run_id,
+                "epoch": owner_epoch,
+                "policy_version": policy_version,
+                "action_state": action_state,
+                "state": state,
+            },
+        )
+        session.commit()
+    finally:
+        session.close()
 
 
 # ---------------------------------------------------------------------------
@@ -814,3 +902,65 @@ async def test_an_explicit_environment_query_cannot_widen_the_scope(
         ).status_code == 200
     assert snapshot.calls[-1]["environment"] == "live"
     assert snapshot.calls[-1]["account_id"] == ACCOUNT
+
+
+# ---------------------------------------------------------------------------
+# protection owner (B2.4 read, surfaced by B2.6b S3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_protection_owner_is_reported_on_the_list_and_the_detail(
+    session_factory, monkeypatch
+):
+    """The read the Options UI needs to name who owns a structure's protection."""
+    snapshot = _FakeSnapshot([_run_row()], {"coverage": "known", "reason": ""})
+    store = _FakeRunStore({"opt_run_1": _durable_run()})
+    async with _client(
+        session_factory, monkeypatch, snapshot=snapshot, run_store=store
+    ) as client:
+        strategy_id = await _create(client)
+        _seed_edges(session_factory, strategy_id)
+        _seed_owner_row(session_factory)
+
+        listed = (await client.get(f"{BASE}/{strategy_id}/option-runs")).json()
+        detail = (
+            await client.get(f"{BASE}/{strategy_id}/option-runs/opt_run_1")
+        ).json()
+
+    expected = {
+        "owner_run_id": "worker-1",
+        "owner_epoch": 3,
+        "state": "active",
+        "policy_version": "policy-v1",
+        "action_state": "none",
+    }
+    assert listed["runs"][0]["protection_owner"] == expected
+    assert detail["run"]["protection_owner"] == expected
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_protection_owner_row_is_unknown_never_null(
+    session_factory, monkeypatch
+):
+    """An unreadable row is a warning, not "this run has no owner"."""
+    snapshot = _FakeSnapshot([_run_row()], {"coverage": "known", "reason": ""})
+    store = _FakeRunStore({"opt_run_1": _durable_run()})
+    owner_store = _FakeOwnerStore(error=RuntimeError("owner read failed"))
+    async with _client(
+        session_factory,
+        monkeypatch,
+        snapshot=snapshot,
+        run_store=store,
+        owner_store=owner_store,
+    ) as client:
+        strategy_id = await _create(client)
+        _seed_edges(session_factory, strategy_id)
+        listed = (await client.get(f"{BASE}/{strategy_id}/option-runs")).json()
+        detail = (
+            await client.get(f"{BASE}/{strategy_id}/option-runs/opt_run_1")
+        ).json()
+
+    assert listed["runs"][0]["protection_owner"] == {"state": "unknown"}
+    assert detail["run"]["protection_owner"] == {"state": "unknown"}
+    assert owner_store.reads == ["opt_run_1", "opt_run_1"]

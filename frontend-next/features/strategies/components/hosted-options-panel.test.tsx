@@ -8,6 +8,7 @@ import { ApiClientError } from "@/lib/api/client";
 import type {
   DeadSubmissionEvidence,
   HostedJobSummary,
+  HostedStrategy,
   OptionExitAssessment,
   OptionRun,
   OptionRunDetail,
@@ -20,6 +21,7 @@ vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 
 vi.mock("@/lib/hosted-strategies/api", () => ({
   fetchHostedJobs: vi.fn(),
+  fetchHostedStrategy: vi.fn(),
   stopHostedJob: vi.fn(),
   fetchOptionRuns: vi.fn(),
   fetchOptionRun: vi.fn(),
@@ -31,18 +33,23 @@ vi.mock("@/lib/hosted-strategies/api", () => ({
   resolveDeadSubmission: vi.fn(),
   fetchOptionExit: vi.fn(),
   submitOptionExit: vi.fn(),
+  fetchFlattenStatus: vi.fn(),
+  submitFlatten: vi.fn(),
 }));
 
 import {
   cancelPendingWork,
   fetchDeadSubmission,
+  fetchFlattenStatus,
   fetchHostedJobs,
+  fetchHostedStrategy,
   fetchOptionExit,
   fetchOptionRun,
   fetchOptionRunRepair,
   fetchOptionRuns,
   fetchPendingWork,
   resolveDeadSubmission,
+  submitFlatten,
   submitOptionExit,
   submitOptionRunRepair,
 } from "@/lib/hosted-strategies/api";
@@ -72,6 +79,26 @@ function optionRun(overrides: Partial<OptionRun> = {}): OptionRun {
     ],
     repairable: true,
     protection_owner: null,
+    ...overrides,
+  };
+}
+
+function hostedStrategy(overrides: Partial<HostedStrategy> = {}): HostedStrategy {
+  return {
+    strategy_id: "s-1",
+    owner_id: "app:admin",
+    name: "Test Strategy",
+    template_id: "template-1",
+    description: null,
+    default_execution_mode: "paper",
+    default_job_kind: "continuous",
+    default_account_scope: "kite:paper",
+    max_duration_s: 3600,
+    progress_deadline_s: 60,
+    stale_exit_policy: "hold",
+    status: "enabled",
+    created_at: null,
+    updated_at: null,
     ...overrides,
   };
 }
@@ -116,6 +143,8 @@ function renderPanel() {
 beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(fetchHostedJobs).mockResolvedValue({ jobs: [] });
+  vi.mocked(fetchHostedStrategy).mockResolvedValue(hostedStrategy());
+  vi.mocked(fetchFlattenStatus).mockResolvedValue(null);
 });
 
 describe("hosted options panel: repair panel", () => {
@@ -244,16 +273,16 @@ describe("hosted options panel: controls", () => {
     };
   }
 
-  function renderControls(jobs: HostedJobSummary[]) {
+  function renderControls(jobs: HostedJobSummary[], strategyName = "Test Strategy") {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     return render(
       <QueryClientProvider client={client}>
-        <OptionsControls strategyId="s-1" jobs={jobs} />
+        <OptionsControls strategyId="s-1" strategyName={strategyName} jobs={jobs} />
       </QueryClientProvider>,
     );
   }
 
-  it("renders exit structure as an informational per-run pointer, and flatten as disabled", () => {
+  it("renders exit structure as an informational per-run pointer, and flatten as an enabled destructive control", () => {
     renderControls([job()]);
 
     // Exit structure now works per run (see the per-run panel), so the
@@ -263,9 +292,8 @@ describe("hosted options panel: controls", () => {
     expect(exitCard).toHaveTextContent(/details/i);
     expect(exitCard).toHaveTextContent(/exit structure/i);
 
-    // Flatten has no owner-facing route yet.
-    expect(screen.getByTestId("option-control-flatten")).toBeDisabled();
-    expect(screen.getAllByText(/not available yet/i)).toHaveLength(1);
+    // Flatten (B2.6b S3) is wired: it opens the strong confirm dialog.
+    expect(screen.getByTestId("option-control-flatten")).toBeEnabled();
 
     // Stop evaluator has a real route (job stop) and an active job, so it is wired.
     expect(screen.getByTestId("option-control-stop-evaluator")).toBeEnabled();
@@ -523,5 +551,211 @@ describe("hosted options panel: exit structure (B2.6b S2)", () => {
     expect(stageMessage).toHaveTextContent(/stays open/i);
     expect(screen.queryByTestId("option-exit-structure-complete-message")).not.toBeInTheDocument();
     expect(screen.queryByText(/run exited/i)).not.toBeInTheDocument();
+  });
+});
+
+describe("hosted options panel: flatten (B2.6b S3)", () => {
+  function renderControls(jobs: HostedJobSummary[] = []) {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    return render(
+      <QueryClientProvider client={client}>
+        <OptionsControls strategyId="s-1" strategyName="Test Strategy" jobs={jobs} />
+      </QueryClientProvider>,
+    );
+  }
+
+  it("refuses until the strategy name is typed exactly, then POSTs {reason, stop_evaluator: true}", async () => {
+    vi.mocked(fetchFlattenStatus).mockResolvedValue(null);
+    vi.mocked(submitFlatten).mockResolvedValue({ status: "accepted", action_id: "flat-1", items: [] });
+
+    renderControls();
+    const user = userEvent.setup();
+
+    await user.click(screen.getByTestId("option-control-flatten"));
+    const input = await screen.findByTestId("flatten-confirm-name-input");
+
+    // Wrong text keeps the destructive action refused — no POST fires.
+    await user.type(input, "not the name");
+    expect(screen.getByTestId("flatten-confirm")).toBeDisabled();
+    await user.click(screen.getByTestId("flatten-confirm"));
+    expect(submitFlatten).not.toHaveBeenCalled();
+
+    await user.clear(input);
+    await user.type(input, "Test Strategy");
+    expect(screen.getByTestId("flatten-confirm")).toBeEnabled();
+
+    await user.click(screen.getByTestId("flatten-confirm"));
+
+    await waitFor(() =>
+      expect(submitFlatten).toHaveBeenCalledWith("s-1", { reason: "owner_flatten", stop_evaluator: true }),
+    );
+  });
+
+  it("renders a blocked manifest item's own reason (label derived from kind + detail) and offers Resume flatten", async () => {
+    vi.mocked(fetchFlattenStatus).mockResolvedValue(null);
+    vi.mocked(submitFlatten).mockResolvedValue({
+      status: "blocked",
+      action_id: "flat-2",
+      items: [
+        {
+          kind: "option_exit",
+          key: "option_exit:opt_run_1",
+          state: "blocked",
+          reason_code: "OPTION_RUN_EVIDENCE_AMBIGUOUS",
+          detail: { option_run_id: "opt_run_1", rejection_reason: "OPTION_RUN_EVIDENCE_AMBIGUOUS" },
+        },
+        {
+          kind: "cancel_pending",
+          key: "cancel:plan-entry:1",
+          state: "done",
+          reason_code: null,
+          detail: { plan_id: "plan-entry", step_no: 1, order_id: "o-1" },
+        },
+      ],
+    });
+
+    renderControls();
+    const user = userEvent.setup();
+
+    await user.click(screen.getByTestId("option-control-flatten"));
+    await user.type(await screen.findByTestId("flatten-confirm-name-input"), "Test Strategy");
+    await user.click(screen.getByTestId("flatten-confirm"));
+
+    // Label is derived from kind + detail, not a server-sent label field.
+    expect(await screen.findByText("Option run opt_run_1")).toBeInTheDocument();
+    expect(screen.getByText("Pending entry plan-entry step 1")).toBeInTheDocument();
+
+    const blocked = screen.getByTestId("flatten-item-blocked-option_exit:opt_run_1");
+    expect(blocked).toHaveTextContent(/cannot read this run's own fills/i);
+    expect(blocked).toHaveTextContent("OPTION_RUN_EVIDENCE_AMBIGUOUS");
+    expect(screen.getByTestId("flatten-resume")).toBeInTheDocument();
+    // A resume does not require retyping the strategy name.
+    expect(screen.queryByTestId("flatten-confirm-name-input")).not.toBeInTheDocument();
+  });
+
+  it("shows a 409 FLATTEN_EVALUATION_ACTIVE refusal inline", async () => {
+    vi.mocked(fetchFlattenStatus).mockResolvedValue(null);
+    vi.mocked(submitFlatten).mockRejectedValue(
+      new ApiClientError(409, { detail: { rejection_reason: "FLATTEN_EVALUATION_ACTIVE" } }, "Conflict"),
+    );
+
+    renderControls();
+    const user = userEvent.setup();
+
+    await user.click(screen.getByTestId("option-control-flatten"));
+    await user.type(await screen.findByTestId("flatten-confirm-name-input"), "Test Strategy");
+    await user.click(screen.getByTestId("flatten-confirm"));
+
+    const error = await screen.findByTestId("flatten-error");
+    expect(error).toHaveTextContent(/active evaluation could not be proven stopped/i);
+    expect(error).toHaveTextContent("FLATTEN_EVALUATION_ACTIVE");
+  });
+
+  it("reads the DEAD_SUBMISSION_UNRESOLVED 409's own steps and protective_stages, not unresolved_steps", async () => {
+    vi.mocked(fetchFlattenStatus).mockResolvedValue(null);
+    vi.mocked(submitFlatten).mockRejectedValue(
+      new ApiClientError(
+        409,
+        {
+          detail: {
+            rejection_reason: "DEAD_SUBMISSION_UNRESOLVED",
+            strategy_id: "s-1",
+            steps: [{ plan_id: "plan-adjust", step_no: 2 }],
+            protective_stages: [{ stage_id: "stage-1", state: "sending" }],
+            waiting: [],
+            message: "Resolve before flatten.",
+          },
+        },
+        "Conflict",
+      ),
+    );
+
+    renderControls();
+    const user = userEvent.setup();
+
+    await user.click(screen.getByTestId("option-control-flatten"));
+    await user.type(await screen.findByTestId("flatten-confirm-name-input"), "Test Strategy");
+    await user.click(screen.getByTestId("flatten-confirm"));
+
+    const stepsBlock = await screen.findByTestId("flatten-unresolved-steps");
+    expect(stepsBlock).toHaveTextContent("plan-adjust");
+    expect(stepsBlock).toHaveTextContent(/step 2/);
+    expect(screen.getByTestId("flatten-protective-stages")).toHaveTextContent("stage-1");
+  });
+
+  it("shows the done-conditions checklist, what's missing, and the stop state from the response envelope", async () => {
+    vi.mocked(fetchFlattenStatus).mockResolvedValue(null);
+    vi.mocked(submitFlatten).mockResolvedValue({
+      status: "blocked",
+      action_id: "flat-3",
+      items: [],
+      stop: {
+        requested: true,
+        state: "confirmed",
+        jobs: ["job-1"],
+        approvals: [],
+        requested_by: "app:admin",
+        reason: "owner_flatten",
+      },
+      missing: ["option_runs_flat", "books_zero"],
+      done_conditions: {
+        no_qualifying_pending_entry: true,
+        no_live_unresolved_submission: true,
+        option_runs_flat: false,
+        books_zero: false,
+        no_live_evaluation_authority: true,
+        no_in_flight_governed_work: true,
+      },
+    });
+
+    renderControls();
+    const user = userEvent.setup();
+
+    await user.click(screen.getByTestId("option-control-flatten"));
+    await user.type(await screen.findByTestId("flatten-confirm-name-input"), "Test Strategy");
+    await user.click(screen.getByTestId("flatten-confirm"));
+
+    const stopState = await screen.findByTestId("flatten-stop-state");
+    expect(stopState).toHaveTextContent(/requested/i);
+    expect(stopState).toHaveTextContent("confirmed");
+
+    const conditions = screen.getByTestId("flatten-done-conditions");
+    expect(conditions).toHaveTextContent(/every option run's own fills are flat/i);
+
+    expect(screen.getByTestId("flatten-missing")).toHaveTextContent(/every option run's own fills are flat/i);
+  });
+});
+
+describe("hosted options panel: protection owner", () => {
+  it("renders the unknown-ownership warning instead of the old placeholder", async () => {
+    const run = optionRun({ protection_owner: { state: "unknown" } });
+    vi.mocked(fetchOptionRuns).mockResolvedValue({
+      strategy_id: "s-1",
+      coverage: "known",
+      coverage_reason: "",
+      runs: [run],
+    } satisfies OptionRunList);
+
+    renderPanel();
+
+    const warning = await screen.findByTestId(`protection-owner-unknown-${run.option_run_id}`);
+    expect(warning).toHaveTextContent(/could not read who owns/i);
+    expect(warning).toHaveTextContent(/new exposure is blocked/i);
+  });
+
+  it("renders the neutral 'no protection owner' line when there is none", async () => {
+    const run = optionRun({ protection_owner: null });
+    vi.mocked(fetchOptionRuns).mockResolvedValue({
+      strategy_id: "s-1",
+      coverage: "known",
+      coverage_reason: "",
+      runs: [run],
+    } satisfies OptionRunList);
+
+    renderPanel();
+
+    expect(await screen.findByTestId(`protection-owner-none-${run.option_run_id}`)).toHaveTextContent(
+      /no protection owner/i,
+    );
   });
 });

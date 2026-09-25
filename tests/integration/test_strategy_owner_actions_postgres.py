@@ -510,6 +510,255 @@ def _dead_url(strategy_id: str, plan_id: str, step_no: int = 1) -> str:
     return f"/api/strategies/{strategy_id}/plans/{plan_id}/steps/{step_no}/dead-submission"
 
 
+def _flatten_url(strategy_id: str) -> str:
+    return f"/api/strategies/{strategy_id}/owner-actions/flatten"
+
+
+def _flatten_item(body, kind, key=None):
+    for row in body["items"]:
+        if row["kind"] != kind:
+            continue
+        if key is None or row["key"] == key:
+            return row
+    return None
+
+
+def _seed_generic_plan(factory, *, strategy_id: str, signed_quantity: int) -> str:
+    """A frozen ``single_instrument`` plan the owner-action readers can classify."""
+    from sqlalchemy import text
+
+    plan_id = str(uuid.uuid4())
+    proposal_id = str(uuid.uuid4())
+    resolved = {
+        "target_kind": "single_instrument",
+        "catalog_generation": G1,
+        "legs": [
+            {
+                # A canonical instrument id is a UUID on the real schema.
+                "instrument_id": str(uuid.uuid4()),
+                "exchange": "NSE",
+                "tradingsymbol": "INFY",
+                "broker_exchange": "NSE",
+                "broker_symbol": "INFY",
+                "broker_token": 408065,
+                "product": "CNC",
+                "quantity": abs(int(signed_quantity)),
+                "signed_quantity": int(signed_quantity),
+                "reference_price": 1500.0,
+            }
+        ],
+    }
+    with factory() as session:
+        session.execute(
+            text(
+                "INSERT INTO strategy_proposals (proposal_id, strategy_id, account_id, "
+                " evaluation_id, evaluation_kind, strategy_run_id, target_kind, payload, "
+                " payload_sha256, status) VALUES (:pid, :sid, :account, :eval, 'run_now', "
+                " :run, 'single_instrument', '{}', :sha, 'validated')"
+            ),
+            {
+                "pid": proposal_id,
+                "sid": strategy_id,
+                "account": ACCOUNT,
+                "eval": f"eval-{plan_id}",
+                "run": f"run-{plan_id[:8]}",
+                "sha": f"sha-{plan_id}",
+            },
+        )
+        session.execute(
+            text(
+                "INSERT INTO strategy_plans (plan_id, proposal_id, strategy_id, account_id, "
+                " plan_kind, plan_hash, logical_plan, resolved_plan, pinned_catalog_generation) "
+                "VALUES (:pid, :prop, :sid, :account, 'single_instrument', :hash, '{}', "
+                " :resolved, :gen)"
+            ),
+            {
+                "pid": plan_id,
+                "prop": proposal_id,
+                "sid": strategy_id,
+                "account": ACCOUNT,
+                "hash": f"hash-{plan_id}",
+                "resolved": json.dumps(resolved),
+                "gen": G1,
+            },
+        )
+        session.commit()
+    return plan_id
+
+
+@pytest.mark.asyncio
+async def test_a_flatten_operation_is_durable_and_resumable(pg, monkeypatch):
+    """Section 3 step 6 on the REAL schema: the operation outlives the request.
+
+    Why PostgreSQL: the operation, the cancelled step's trail and the reducing
+    order's own outcome are written by different transactions, and the resume is
+    proved from a FRESH session. What must hold is that the second pass finds the
+    SAME operation, keeps the work the first pass completed, and only reports
+    ``complete`` once the remaining in-flight work has settled.
+    """
+    from sqlalchemy import text
+
+    from backend.strategies.repository import SqlAlchemyStrategyRepository
+
+    factory = pg["factory"]
+    repo = SqlAlchemyStrategyRepository(factory)
+    strategy = repo.create_strategy(
+        owner_id=OWNER,
+        name=f"flatten-resume-{uuid.uuid4().hex[:6]}",
+        description=None,
+        execution_mode="paper",
+        job_kind="finite",
+        account_scope=ACCOUNT,
+        max_duration_s=21600,
+        progress_deadline_s=600,
+        stale_exit_policy="exit_on_worker_stale",
+    )
+    strategy_id = str(strategy.id)
+    version = repo.create_version(
+        strategy_id=strategy_id,
+        source="# flatten resume\n",
+        source_sha256=f"sha-{uuid.uuid4().hex[:12]}",
+        parameters_schema={},
+        capabilities_snapshot={},
+        created_by=OWNER,
+    )
+    repo.create_job(
+        strategy_id=strategy_id,
+        version_id=str(version.id),
+        owner_id=OWNER,
+        job_kind="finite",
+        execution_mode="paper",
+        attempt=1,
+        desired_state="started",
+    )
+    entry_plan = _seed_generic_plan(factory, strategy_id=strategy_id, signed_quantity=150)
+    reduce_plan = _seed_generic_plan(factory, strategy_id=strategy_id, signed_quantity=0)
+    _seed_trail(
+        factory,
+        plan_id=entry_plan,
+        step_no=1,
+        rows=[("submitted", None, None), ("partially_filled", "PAPER-FLAT-A", 75)],
+    )
+    _seed_paper_order(
+        factory,
+        order_id="PAPER-FLAT-A",
+        status="partially_filled",
+        quantity=150,
+        filled=75,
+        pending=75,
+        plan_id=entry_plan,
+        step_no=1,
+    )
+    _seed_trail(
+        factory, plan_id=reduce_plan, step_no=1, rows=[("submitted", "PAPER-FLAT-B", None)]
+    )
+    _seed_paper_order(
+        factory,
+        order_id="PAPER-FLAT-B",
+        # ``open`` is the progress vocabulary's word for a working order.
+        status="open",
+        quantity=50,
+        filled=0,
+        pending=50,
+        plan_id=reduce_plan,
+        step_no=1,
+    )
+
+    async with _client(factory, monkeypatch) as client:
+        first = await client.post(
+            _flatten_url(strategy_id),
+            json={"reason": "owner_flatten", "stop_evaluator": True},
+        )
+        assert first.status_code == 200, first.text
+        body = first.json()
+        operation_id = body["operation_id"]
+        assert body["status"] == "in_progress", body
+        assert body["stop"]["state"] == "confirmed"
+        assert (
+            _flatten_item(body, "cancel_pending", f"cancel:{entry_plan}:1")["state"]
+            == "done"
+        )
+        reducing = _flatten_item(body, "cancel_pending", f"cancel:{reduce_plan}:1")
+        assert reducing["state"] == "in_progress", reducing
+        assert "no_in_flight_governed_work" in body["missing"]
+
+    # A FRESH session finds the same operation, with the finished work preserved.
+    async with _client(factory, monkeypatch) as client:
+        status = await client.get(_flatten_url(strategy_id))
+        assert status.status_code == 200, status.text
+        resumed = status.json()
+        assert resumed["operation_id"] == operation_id
+        assert resumed["status"] == "in_progress"
+        assert (
+            _flatten_item(resumed, "cancel_pending", f"cancel:{entry_plan}:1")["state"]
+            == "done"
+        )
+        assert (
+            _flatten_item(resumed, "cancel_pending", f"cancel:{reduce_plan}:1")["state"]
+            == "in_progress"
+        )
+
+    (row,) = _rows(
+        factory,
+        "SELECT status, stop, manifest FROM public.strategy_flatten_operations "
+        "WHERE operation_id = :op",
+        {"op": operation_id},
+    )
+    assert row["status"] == "in_progress"
+    stop = row["stop"] if isinstance(row["stop"], dict) else json.loads(row["stop"])
+    assert stop["state"] == "confirmed"
+    manifest = (
+        row["manifest"] if isinstance(row["manifest"], dict) else json.loads(row["manifest"])
+    )
+    assert {item["key"] for item in manifest["items"]} == {
+        f"cancel:{entry_plan}:1",
+        f"cancel:{reduce_plan}:1",
+    }
+
+    # The reducing order's own outcome lands: its step closes and the operation
+    # completes on the next POST.
+    _seed_trail(factory, plan_id=reduce_plan, step_no=1, rows=[("filled", "PAPER-FLAT-B", 50)])
+    with factory() as session:
+        session.execute(
+            text(
+                "UPDATE public.paper_orders SET status = 'filled', filled_quantity = 50, "
+                "pending_quantity = 0 WHERE order_id = 'PAPER-FLAT-B'"
+            )
+        )
+        session.execute(
+            text(
+                "UPDATE public.paper_order_fill_progress SET status = 'filled', "
+                "filled_quantity = 50, remaining_quantity = 0 "
+                "WHERE paper_order_id = 'PAPER-FLAT-B'"
+            )
+        )
+        session.commit()
+
+    async with _client(factory, monkeypatch) as client:
+        third = await client.post(
+            _flatten_url(strategy_id),
+            json={"reason": "owner_flatten", "stop_evaluator": True},
+        )
+        assert third.status_code == 200, third.text
+        final = third.json()
+        assert final["operation_id"] == operation_id
+        assert final["status"] == "complete", final
+        assert final["missing"] == []
+        assert (
+            _flatten_item(final, "cancel_pending", f"cancel:{entry_plan}:1")["state"]
+            == "done"
+        )
+
+    (row,) = _rows(
+        factory,
+        "SELECT status, refusal FROM public.strategy_flatten_operations "
+        "WHERE operation_id = :op",
+        {"op": operation_id},
+    )
+    assert row["status"] == "complete"
+    assert row["refusal"] is None
+
+
 @pytest.mark.asyncio
 async def test_cancel_pending_uses_the_real_paper_boundary_and_preserves_the_fill(
     pg, monkeypatch

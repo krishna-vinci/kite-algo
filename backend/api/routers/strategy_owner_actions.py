@@ -26,16 +26,19 @@ module is the HTTP mapping and nothing else.
 from __future__ import annotations
 
 import logging
-import uuid
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
-from backend.api.routers.strategies import require_strategy_owner
+from backend.api.routers.strategies import _plan_pipeline, require_strategy_owner
 from backend.api.schemas.strategy_owner_actions import (
     CancelPendingRequest,
     DeadSubmissionDispositionRequest,
     DeadSubmissionResponse,
+    FlattenItemResponse,
+    FlattenRequest,
+    FlattenResponse,
+    FlattenStopResponse,
     OwnerActionItemResponse,
     OwnerActionResponse,
     OptionRunExitActionResponse,
@@ -56,22 +59,11 @@ from backend.api.services.owner_actions import (
 from backend.api.services.option_run_repair import (
     build_option_run_repair_service,
     option_run_repair_scope,
-    owner_exit_gates,
     owner_exit_refusal,
-    owner_exit_stage_items,
-    owner_exit_submission_refusal,
     owner_exit_view,
-    record_owner_exit_audit,
-    require_owner_exit_boundary,
-    submit_owner_exit_stage,
+    run_owner_exit,
 )
-from backend.options.execution.repair import (
-    ACTION_OWNER_EXIT,
-    STATE_FLAT,
-    STATE_RESIDUAL,
-    TERMINAL_RUN_STATUSES,
-    OptionRunRepairRefusal,
-)
+from backend.options.execution.repair import OptionRunRepairRefusal
 from backend.strategies.repository import SqlAlchemyStrategyRepository
 
 router = APIRouter(prefix="/strategies", tags=["Hosted strategies (operator)"])
@@ -98,12 +90,19 @@ def _repository(
 
 
 def _service(
-    request: Request, session_factory: Any = Depends(_owner_actions_db)
+    request: Request,
+    strategy_id: str,
+    session_factory: Any = Depends(_owner_actions_db),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    owner: str = Depends(require_strategy_owner),
 ) -> OwnerActionsService:
     """The action service over the app's own durable stores.
 
     The paper runtime and the option-run store are whatever the app wired; a
     deployment that has none refuses by name rather than inventing a boundary.
+    Flatten (S3) additionally gets the SAME S2 owner-exit it would get from the
+    per-run route, and the governed execute route's own paper pipeline: one
+    implementation of each, wired from here.
     """
     state = getattr(getattr(request, "app", None), "state", None)
     return OwnerActionsService(
@@ -111,11 +110,73 @@ def _service(
         run_store=getattr(state, "option_run_store", None),
         paper_service=getattr(state, "paper_runtime_service", None),
         repository=SqlAlchemyStrategyRepository(session_factory),
+        #: The scope-derived run discovery. Absent, the platform's own snapshot
+        #: service is used; flatten's run set must be the same one the option-runs
+        #: read reports.
+        snapshot_service=getattr(state, "owned_work_snapshot_service", None),
         #: The existing fake-testable broker boundary. Its absence makes a live
         #: cancel UNKNOWN, which is reported as blocked - never assumed.
         broker_cancel=getattr(state, "owner_action_broker_cancel", None)
         or live_broker_cancel,
+        flatten_store=getattr(state, "owner_action_flatten_store", None),
+        option_exit_runner=_flatten_option_exit_runner(
+            request, session_factory, repo, strategy_id=str(strategy_id), owner=str(owner)
+        ),
+        reduction_plan_builder=getattr(
+            state, "owner_action_reduction_plan_builder", None
+        ),
+        reduction_pipeline=_reduction_pipeline(request, session_factory),
     )
+
+
+def _app_state(request: Request) -> Any:
+    return getattr(getattr(request, "app", None), "state", None)
+
+
+def _flatten_option_exit_runner(
+    request: Request,
+    session_factory: Any,
+    repo: SqlAlchemyStrategyRepository,
+    *,
+    strategy_id: str,
+    owner: str,
+):
+    """The S2 owner exit for ONE run, exactly as the per-run route would run it.
+
+    Flatten never gets a second exit engine: the runner calls the SAME shared
+    ``run_owner_exit``, so a flatten-driven exit and an owner-clicked exit cannot
+    disagree about the gates, the run CAS or the attribution.
+    """
+    injected = getattr(_app_state(request), "owner_action_option_exit_runner", None)
+    if injected is not None:
+        return injected
+
+    async def run(scope: Any, option_run_id: str, *, reason: str) -> Any:
+        _ = scope  # the run's own binding edge derives the scope, never flatten
+        return await run_owner_exit(
+            request,
+            session_factory,
+            repo,
+            strategy_id=str(strategy_id),
+            option_run_id=str(option_run_id),
+            reason=str(reason or ""),
+            actor=str(owner),
+        )
+
+    return run
+
+
+def _reduction_pipeline(request: Request, session_factory: Any) -> Any:
+    """The governed execute route's own paper pipeline (``admit`` / ``execute``).
+
+    Flatten closes a non-option book through the SAME pipeline the operator
+    ``/plans/{plan_id}/execute`` route uses - one admission decision and one
+    executor, not a liquidation lane invented here.
+    """
+    injected = getattr(_app_state(request), "owner_action_reduction_pipeline", None)
+    if injected is not None:
+        return injected
+    return _plan_pipeline(request, session_factory)
 
 
 def _plan_for(
@@ -251,6 +312,90 @@ async def cancel_pending_work(
     )
 
 
+# ---------------------------------------------------------------------------
+# flatten of the whole strategy (B2.6b S3, sections 3 and 5)
+# ---------------------------------------------------------------------------
+
+
+def _flatten_body(result: Any) -> FlattenResponse:
+    return FlattenResponse(
+        status=str(result.get("status") or "blocked"),
+        action_id=str(result.get("action_id") or ""),
+        operation_id=str(result.get("operation_id") or ""),
+        evidence_digest=str(result.get("evidence_digest") or ""),
+        stop=FlattenStopResponse(**dict(result.get("stop") or {})),
+        items=[FlattenItemResponse(**row) for row in (result.get("items") or [])],
+        missing=[str(name) for name in (result.get("missing") or [])],
+        done_conditions={
+            str(name): bool(value)
+            for name, value in (result.get("done_conditions") or {}).items()
+        },
+        refusal=result.get("refusal"),
+        audit_id=result.get("audit_id"),
+    )
+
+
+@router.post(
+    "/{strategy_id}/owner-actions/flatten", response_model=FlattenResponse
+)
+async def flatten_strategy(
+    strategy_id: str,
+    request: Request,
+    payload: FlattenRequest,
+    environment: Optional[str] = Query(default=None),
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_owner_actions_db),
+    service: OwnerActionsService = Depends(_service),
+):
+    """Flatten this strategy's exposure, or refuse by name.
+
+    The whole orchestration lives in the service: stop the evaluator and PROVE it,
+    refuse unanswered work that has to be dispositioned first, cancel only
+    qualifying pending entry work through the S1 classifier, exit option runs ONE
+    AT A TIME through the S2 owner exit, then close the non-option books with
+    target-zero reduction plans through the governed execute route.
+
+    A POST is resumable: the operation is durable before any work moves, so a
+    second POST continues it and preserves what already finished. ``status`` is
+    ``complete`` only when every section 3 done condition holds.
+    """
+    enforce_same_origin(request)
+    scope = owner_action_scope(repo, owner, strategy_id, environment)
+    try:
+        result = await service.flatten(
+            scope,
+            reason=str(payload.reason or ""),
+            stop_evaluator=bool(payload.stop_evaluator),
+            actor=str(owner),
+        )
+    except OwnerActionRefusal as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.as_detail()) from exc
+    return _flatten_body(result)
+
+
+@router.get("/{strategy_id}/owner-actions/flatten", response_model=FlattenResponse)
+async def inspect_flatten(
+    strategy_id: str,
+    request: Request,
+    environment: Optional[str] = Query(default=None),
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_owner_actions_db),
+    service: OwnerActionsService = Depends(_service),
+):
+    """The strategy's latest flatten operation, so the owner can resume it.
+
+    Read-only: the item outcomes are the durable ones, while the done conditions
+    (and therefore ``complete``) are re-derived from live evidence. A strategy
+    that was never flattened is a 404, not an invented "nothing to do".
+    """
+    _ = request
+    scope = owner_action_scope(repo, owner, strategy_id, environment)
+    result = service.flatten_status(scope)
+    return _flatten_body(result)
+
+
 @router.get(
     "/{strategy_id}/option-runs/{option_run_id}/exit",
     response_model=OptionRunExitResponse,
@@ -294,7 +439,6 @@ async def exit_option_run(
     owner: str = Depends(require_strategy_owner),
     repo: SqlAlchemyStrategyRepository = Depends(_repository),
     session_factory: Any = Depends(_owner_actions_db),
-    service: Any = Depends(_repair_service),
 ):
     """Owner-authorized discretionary exit of ONE option run.
 
@@ -305,82 +449,35 @@ async def exit_option_run(
     accepted a stage - completion is the run's own fills proving it flat.
     """
     enforce_same_origin(request)
-    scope = option_run_repair_scope(repo, owner, strategy_id, option_run_id, session_factory)
-    # The specific gates are asked on a fresh read BEFORE the transition: an
-    # unresolved stage or an unfinished adjust outranks "your evidence is stale"
-    # as the explanation, and nothing has moved yet either way.
     try:
-        owner_exit_gates(service.assessment(option_run_id, owner_exit=True))
-    except OptionRunRepairRefusal as exc:
-        raise HTTPException(
-            status_code=exc.status_code, detail=exc.as_detail()
-        ) from exc
-    try:
-        next_run, assessment = service.plan(
-            option_run_id=option_run_id,
-            action=ACTION_OWNER_EXIT,
+        payload_out = await run_owner_exit(
+            request,
+            session_factory,
+            repo,
+            strategy_id=str(strategy_id),
+            option_run_id=str(option_run_id),
+            reason=str(payload.reason or ""),
+            actor=str(owner),
             evidence_digest=str(payload.evidence_digest or ""),
-            owner_exit=True,
         )
     except OptionRunRepairRefusal as exc:
         mapped = owner_exit_refusal(exc)
         raise HTTPException(
             status_code=mapped.status_code, detail=mapped.as_detail()
         ) from exc
-    state = str(assessment.get("state") or "")
-    observed_status = str(assessment.get("status") or "")
-    # Everything that can refuse happens BEFORE the run moves: an unavailable
-    # live boundary must never leave a claimed stage that nothing can send.
-    boundary = None
-    if state == STATE_RESIDUAL:
-        boundary = await require_owner_exit_boundary(request, scope=scope, run=next_run)
-    if state == STATE_FLAT and observed_status in TERMINAL_RUN_STATUSES:
-        # Already past the exit: report it complete, do not write the same
-        # terminal status again.
-        committed = next_run
-    else:
-        try:
-            committed = service.commit(next_run, allowed_from=observed_status)
-        except OptionRunRepairRefusal as exc:
-            mapped = owner_exit_refusal(exc, status=observed_status)
-            raise HTTPException(
-                status_code=mapped.status_code, detail=mapped.as_detail()
-            ) from exc
-    action_id = str(uuid.uuid4())
-    submission: Any = {}
-    if boundary is not None:
-        submission = await submit_owner_exit_stage(
-            request, session_factory, run=committed, scope=scope, boundary=boundary
-        )
-    refusal = None if state == STATE_FLAT else owner_exit_submission_refusal(submission)
-    if state == STATE_FLAT:
-        status = "complete"
-    elif refusal is None and submission.get("submitted"):
-        status = "accepted"
-    else:
-        status = "blocked"
-    audit_id = record_owner_exit_audit(
-        session_factory,
-        repo,
-        strategy_id=str(strategy_id),
-        run=committed,
-        action_id=action_id,
-        assessment=assessment,
-        submission=submission,
-        reason=str(payload.reason or ""),
-        actor=str(owner),
-    )
     return OptionRunExitActionResponse(
-        status=status,
-        action_id=action_id,
-        option_run_id=str(committed.strategy_run_id),
-        run_status=str(committed.status),
-        state=state,
-        evidence_digest=str(assessment.get("evidence_digest") or ""),
-        items=[OptionRunExitItemResponse(**row) for row in owner_exit_stage_items(submission)],
-        refusal=refusal,
-        audit_id=audit_id,
-        submission=dict(submission or {}),
+        status=str(payload_out["status"]),
+        action_id=str(payload_out["action_id"]),
+        option_run_id=str(payload_out["option_run_id"]),
+        run_status=str(payload_out["run_status"]),
+        state=str(payload_out["state"]),
+        evidence_digest=str(payload_out["evidence_digest"]),
+        items=[
+            OptionRunExitItemResponse(**row) for row in (payload_out["items"] or [])
+        ],
+        refusal=payload_out.get("refusal"),
+        audit_id=payload_out.get("audit_id"),
+        submission=dict(payload_out.get("submission") or {}),
     )
 
 

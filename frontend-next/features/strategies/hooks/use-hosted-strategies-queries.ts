@@ -15,6 +15,7 @@ import {
   fetchDeadSubmission,
   fetchExecutionGrants,
   fetchExecutionRequests,
+  fetchFlattenStatus,
   fetchHostedJob,
   fetchHostedJobLogs,
   fetchHostedJobNotifications,
@@ -45,6 +46,7 @@ import {
   setAuthorizationMode,
   setHostedScheduleEnabled,
   stopHostedJob,
+  submitFlatten,
   submitOptionExit,
   submitOptionRunRepair,
   updateHostedStrategy,
@@ -514,6 +516,41 @@ export function useSubmitOptionExit(strategyId: string, optionRunId: string) {
       void client.invalidateQueries({ queryKey: hostedKeys.optionExit(strategyId, optionRunId) });
       void client.invalidateQueries({ queryKey: hostedKeys.optionRun(strategyId, optionRunId) });
       void client.invalidateQueries({ queryKey: hostedKeys.optionRuns(strategyId) });
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// B2.6b S3: owner-facing flatten orchestration
+// ---------------------------------------------------------------------------
+
+/**
+ * The latest flatten operation's manifest. `enabled` lets the caller defer the
+ * GET until the flatten control is actually opened. Polls while the operation
+ * is still moving (`in_progress`/`accepted`) and stops once it settles
+ * (`complete`/`blocked`), per design §3.
+ */
+export function useFlattenStatus(strategyId: string | null, enabled = true) {
+  return useQuery({
+    queryKey: hostedKeys.flatten(strategyId ?? ""),
+    queryFn: () => fetchFlattenStatus(strategyId as string),
+    enabled: Boolean(strategyId) && enabled,
+    refetchInterval: (query) => {
+      const status = query.state.data?.status;
+      return status === "in_progress" || status === "accepted" ? 4_000 : false;
+    },
+  });
+}
+
+export function useSubmitFlatten(strategyId: string) {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (payload: Parameters<typeof submitFlatten>[1]) => submitFlatten(strategyId, payload),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: hostedKeys.flatten(strategyId) });
+      void client.invalidateQueries({ queryKey: hostedKeys.optionRuns(strategyId) });
+      void client.invalidateQueries({ queryKey: hostedKeys.pendingWork(strategyId) });
+      void client.invalidateQueries({ queryKey: hostedKeys.jobs(strategyId) });
     },
   });
 }

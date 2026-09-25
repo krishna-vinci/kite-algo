@@ -11,7 +11,7 @@
  * coverage says so explicitly instead of going quiet.
  */
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { ReactNode } from "react";
 import { ChevronDownIcon, ChevronRightIcon, Loader2Icon } from "lucide-react";
 import { toast } from "sonner";
@@ -41,7 +41,9 @@ import {
 import {
   useCancelPendingWork,
   useDeadSubmission,
+  useFlattenStatus,
   useHostedJobs,
+  useHostedStrategy,
   useOptionExitAssessment,
   useOptionRun,
   useOptionRunRepairAssessment,
@@ -49,14 +51,24 @@ import {
   usePendingWork,
   useResolveDeadSubmission,
   useStopHostedJob,
+  useSubmitFlatten,
   useSubmitOptionExit,
   useSubmitOptionRunRepair,
 } from "@/features/strategies/hooks/use-hosted-strategies-queries";
 import {
   deadSubmissionDispositionLabel,
+  flattenDoneConditionLabel,
+  flattenItemKindLabel,
+  flattenItemLabel,
+  flattenItemReasonCode,
+  flattenItemStateLabel,
+  flattenItemStateTone,
+  flattenStatusLabel,
   formatTimestamp,
   hostedErrorMessage,
   hostedRefusalCode,
+  hostedRefusalDeadSubmissionSteps,
+  hostedRefusalProtectiveStages,
   optionLegStateLabel,
   optionLegStateTone,
   optionRunStatusLabel,
@@ -66,13 +78,57 @@ import {
 import type {
   DeadSubmissionDisposition,
   DeadSubmissionEvidence,
+  FlattenDeadSubmissionStepRef,
+  FlattenDoneConditions,
+  FlattenManifestItem,
+  FlattenOperationResult,
+  FlattenStopView,
   HostedJobSummary,
   OptionExitAssessment,
   OptionRun,
   OptionRunLeg,
   OptionRunRepairActionPayload,
   PendingWorkItem,
+  ProtectionOwner,
 } from "@/lib/hosted-strategies/types";
+
+// ---------------------------------------------------------------------------
+// Protection owner (design §5: option runs carry `protection_owner`)
+// ---------------------------------------------------------------------------
+
+/**
+ * `null` is a neutral fact — no protective stage currently owns this run.
+ * `{ state: "unknown" }` is NOT neutral: the platform could not read who (if
+ * anyone) owns this run's protection, so it is shown as a warning, because new
+ * exposure is blocked while ownership is unreadable.
+ */
+function ProtectionOwnerLine({ owner, optionRunId }: Readonly<{ owner: ProtectionOwner; optionRunId: string }>) {
+  if (owner === null) {
+    return (
+      <p className="text-xs text-muted-foreground" data-testid={`protection-owner-none-${optionRunId}`}>
+        No protection owner.
+      </p>
+    );
+  }
+  if (!("owner_run_id" in owner)) {
+    return (
+      <Alert variant="destructive" data-testid={`protection-owner-unknown-${optionRunId}`}>
+        <AlertTitle>Protection ownership unreadable</AlertTitle>
+        <AlertDescription>
+          The platform could not read who owns this run&apos;s protection. New exposure is blocked until it
+          can.
+        </AlertDescription>
+      </Alert>
+    );
+  }
+  return (
+    <p className="text-xs text-muted-foreground" data-testid={`protection-owner-info-${optionRunId}`}>
+      Protection owner: <span className="font-mono">{owner.owner_run_id.slice(0, 8)}…</span> · epoch{" "}
+      {owner.owner_epoch} · {owner.action_state} · policy{" "}
+      <span className="font-mono">{owner.policy_version.slice(0, 8)}…</span>
+    </p>
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Legs table
@@ -879,7 +935,7 @@ function OptionRunCard({
             incomplete.
           </p>
         ) : null}
-        <p className="text-xs text-muted-foreground">protection owner: not yet available</p>
+        <ProtectionOwnerLine owner={run.protection_owner} optionRunId={run.option_run_id} />
         <OptionLegsTable legs={run.legs} />
         {open ? (
           <div id={`option-run-detail-${run.option_run_id}`} className="flex flex-col gap-4 border-t pt-4">
@@ -1101,6 +1157,352 @@ function CancelPendingWorkControl({ strategyId }: Readonly<{ strategyId: string 
 }
 
 // ---------------------------------------------------------------------------
+// Flatten (B2.6b S3, design §3)
+// ---------------------------------------------------------------------------
+
+/** What the owner should do next for one blocked manifest item, by its kind. */
+function blockedItemGuidance(item: FlattenManifestItem): ReactNode {
+  if (item.kind === "option_exit") {
+    return (
+      <span className="text-foreground">
+        Open this run&apos;s <span className="font-medium">Details</span>, then use its own{" "}
+        <span className="font-medium">Exit structure</span> (or resolve its unanswered step) below.
+      </span>
+    );
+  }
+  if (item.kind === "cancel_pending") {
+    return (
+      <span className="text-foreground">
+        Review this candidate through <span className="font-medium">Cancel pending work</span> above.
+      </span>
+    );
+  }
+  if (item.kind === "nonoption_reduction") {
+    return <span className="text-foreground">Check the reason above before retrying flatten.</span>;
+  }
+  return null;
+}
+
+function FlattenManifestTable({ items }: Readonly<{ items: FlattenManifestItem[] }>) {
+  if (items.length === 0) {
+    return <p className="text-xs text-muted-foreground">No manifest items recorded yet.</p>;
+  }
+  return (
+    <Table>
+      <TableHeader>
+        <TableRow>
+          <TableHead>Item</TableHead>
+          <TableHead>Kind</TableHead>
+          <TableHead>State</TableHead>
+          <TableHead>Reason</TableHead>
+        </TableRow>
+      </TableHeader>
+      <TableBody>
+        {items.map((item) => {
+          const reasonCode = flattenItemReasonCode(item);
+          return (
+            <TableRow key={item.key} data-testid="flatten-manifest-row">
+              <TableCell className="text-sm">
+                <div className="flex flex-col">
+                  <span>{flattenItemLabel(item)}</span>
+                  <span className="font-mono text-xs text-muted-foreground">{item.key}</span>
+                </div>
+              </TableCell>
+              <TableCell className="text-xs text-muted-foreground">{flattenItemKindLabel(item.kind)}</TableCell>
+              <TableCell>
+                <span
+                  className={`inline-flex rounded-full border px-2 py-0.5 text-xs font-medium ${flattenItemStateTone(item.state)}`}
+                >
+                  {flattenItemStateLabel(item.state)}
+                </span>
+              </TableCell>
+              <TableCell className="text-xs text-muted-foreground">
+                {item.state === "blocked" ? (
+                  <div className="flex flex-col gap-1" data-testid={`flatten-item-blocked-${item.key}`}>
+                    <span>{reasonCode ? withRefusalCopy(reasonCode) : "Blocked."}</span>
+                    {blockedItemGuidance(item)}
+                  </div>
+                ) : (
+                  "—"
+                )}
+              </TableCell>
+            </TableRow>
+          );
+        })}
+      </TableBody>
+    </Table>
+  );
+}
+
+/** The evaluator-stop half of a flatten operation (design §3 step 1). */
+function FlattenStopSummary({ stop }: Readonly<{ stop: FlattenStopView | null | undefined }>) {
+  if (!stop) return null;
+  return (
+    <p className="text-xs text-muted-foreground" data-testid="flatten-stop-state">
+      Evaluator stop:{" "}
+      <span className="font-medium text-foreground">{stop.requested ? "requested" : "not requested"}</span> ·
+      state {stop.state}
+      {stop.jobs.length > 0 ? ` · ${stop.jobs.length} job(s)` : ""}
+      {stop.reason ? ` · ${stop.reason}` : ""}
+    </p>
+  );
+}
+
+/** The checklist flatten's own `done` proof requires (design §3, "Done means…"). */
+function FlattenDoneConditionsList({
+  doneConditions,
+  missing,
+}: Readonly<{ doneConditions: FlattenDoneConditions | null | undefined; missing: string[] }>) {
+  if (!doneConditions) return null;
+  const entries = Object.entries(doneConditions);
+  if (entries.length === 0) return null;
+  return (
+    <div className="flex flex-col gap-1" data-testid="flatten-done-conditions">
+      <h5 className="text-xs font-medium">Done conditions</h5>
+      <ul className="flex flex-col gap-0.5 text-xs">
+        {entries.map(([key, met]) => (
+          <li key={key} className="flex items-center gap-2">
+            <span
+              aria-hidden
+              className={met ? "text-emerald-600 dark:text-emerald-400" : "text-muted-foreground"}
+            >
+              {met ? "✓" : "○"}
+            </span>
+            <span className={met ? "" : "text-muted-foreground"}>{flattenDoneConditionLabel(key)}</span>
+          </li>
+        ))}
+      </ul>
+      {missing.length > 0 ? (
+        <p className="text-xs text-muted-foreground" data-testid="flatten-missing">
+          Still needed: {missing.map((key) => flattenDoneConditionLabel(key)).join(", ")}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * Strategy-scoped flatten orchestration (design §3): stops the evaluator
+ * first, cancels only eligible pending entries, exits option structures one
+ * at a time (shorts first), and closes other positions with governed
+ * reductions. This is never a whole-account liquidation. A fresh flatten
+ * needs the owner to type the strategy's own name; resuming an already
+ * confirmed, blocked operation does not re-prompt for it.
+ */
+function FlattenControl({
+  strategyId,
+  strategyName,
+}: Readonly<{ strategyId: string; strategyName: string }>) {
+  const [open, setOpen] = useState(false);
+  const [confirmText, setConfirmText] = useState("");
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [unresolvedSteps, setUnresolvedSteps] = useState<FlattenDeadSubmissionStepRef[]>([]);
+  const [protectiveStages, setProtectiveStages] = useState<unknown[]>([]);
+  const [result, setResult] = useState<FlattenOperationResult | null>(null);
+
+  const statusQuery = useFlattenStatus(strategyId, open);
+  const mutation = useSubmitFlatten(strategyId);
+
+  useEffect(() => {
+    if (statusQuery.data) setResult(statusQuery.data);
+  }, [statusQuery.data]);
+
+  const items = result?.items ?? [];
+  const missing = result?.missing ?? [];
+  const nameLoaded = strategyName.trim().length > 0;
+  const confirmed = nameLoaded && confirmText.trim() === strategyName.trim();
+
+  function reset() {
+    setConfirmText("");
+    setActionError(null);
+    setUnresolvedSteps([]);
+    setProtectiveStages([]);
+  }
+
+  async function runFlatten() {
+    setActionError(null);
+    setUnresolvedSteps([]);
+    setProtectiveStages([]);
+    try {
+      const response = await mutation.mutateAsync({ reason: "owner_flatten", stop_evaluator: true });
+      setResult(response);
+      toast.success(
+        response.status === "complete"
+          ? "Flatten complete. This strategy has no qualifying pending entry, open option risk or attributed exposure left."
+          : "Flatten started: evaluator stopped, then pending entries, option structures and other positions are worked through in order.",
+      );
+      setConfirmText("");
+    } catch (error) {
+      const code = hostedRefusalCode(error);
+      if (code === "DEAD_SUBMISSION_UNRESOLVED") {
+        setUnresolvedSteps(hostedRefusalDeadSubmissionSteps(error));
+        setProtectiveStages(hostedRefusalProtectiveStages(error));
+      }
+      setActionError(hostedErrorMessage(error));
+    } finally {
+      void statusQuery.refetch();
+    }
+  }
+
+  return (
+    <>
+      <Button
+        size="sm"
+        variant="destructive"
+        onClick={() => setOpen(true)}
+        data-testid="option-control-flatten"
+      >
+        Flatten
+      </Button>
+      <Dialog
+        open={open}
+        onOpenChange={(openState) => {
+          setOpen(openState);
+          if (!openState) reset();
+        }}
+      >
+        <DialogContent className="sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>Flatten this strategy?</DialogTitle>
+            <DialogDescription>
+              This is a governed sequence, not one instant order, and it is{" "}
+              <span className="font-medium text-foreground">not</span> an account-wide liquidation — it acts
+              only on this strategy&apos;s own attributed exposure.
+            </DialogDescription>
+          </DialogHeader>
+          <ul className="list-disc pl-5 text-xs text-muted-foreground">
+            <li>Stops the evaluator first, so no new plan can race this operation.</li>
+            <li>Cancels only pending entry work this strategy can prove it owns — never protective or reduction orders.</li>
+            <li>Exits open option structures one at a time, shorts first; hedges release only once proven closed.</li>
+            <li>Closes other positions with governed, risk-reducing orders.</li>
+          </ul>
+
+          {result && items.length > 0 ? (
+            <div className="flex flex-col gap-2">
+              <div className="flex items-center justify-between">
+                <h5 className="text-xs font-medium">Manifest</h5>
+                <span
+                  className={`inline-flex rounded-full border px-2 py-0.5 text-xs font-medium ${flattenItemStateTone(
+                    result.status === "complete" ? "done" : result.status === "blocked" ? "blocked" : "in_progress",
+                  )}`}
+                  data-testid="flatten-status"
+                >
+                  {flattenStatusLabel(result.status)}
+                </span>
+              </div>
+              <FlattenManifestTable items={items} />
+            </div>
+          ) : null}
+
+          {result ? <FlattenStopSummary stop={result.stop} /> : null}
+          {result ? <FlattenDoneConditionsList doneConditions={result.done_conditions} missing={missing} /> : null}
+
+          {result && (result.status === "in_progress" || result.status === "accepted") ? (
+            <p className="text-xs text-muted-foreground" data-testid="flatten-running-note">
+              This operation is still running. The manifest above refreshes automatically until it settles.
+            </p>
+          ) : null}
+
+          {!result || result.status === "blocked" ? (
+            result && result.status === "blocked" ? (
+              <p className="text-xs text-muted-foreground">
+                This operation is blocked on the item(s) above. Resolve what each one names, then resume —
+                completed work stays completed.
+              </p>
+            ) : (
+              <div className="flex flex-col gap-2">
+                <p className="text-xs text-muted-foreground">
+                  Type this strategy&apos;s name to confirm —{" "}
+                  <span className="font-mono text-foreground">
+                    {nameLoaded ? strategyName : "loading…"}
+                  </span>
+                  .
+                </p>
+                <Input
+                  aria-label="Type the strategy name to confirm flatten"
+                  placeholder={nameLoaded ? strategyName : ""}
+                  value={confirmText}
+                  onChange={(event) => setConfirmText(event.target.value)}
+                  disabled={!nameLoaded}
+                  data-testid="flatten-confirm-name-input"
+                />
+              </div>
+            )
+          ) : null}
+
+          {unresolvedSteps.length > 0 || protectiveStages.length > 0 ? (
+            <div
+              className="flex flex-col gap-2 rounded-md border border-destructive/40 p-2"
+              data-testid="flatten-unresolved-steps"
+            >
+              <p className="text-xs font-medium text-destructive">
+                {withRefusalCopy("DEAD_SUBMISSION_UNRESOLVED")}
+              </p>
+              {unresolvedSteps.length > 0 ? (
+                <div>
+                  <p className="text-xs font-medium">Steps to resolve:</p>
+                  <ul className="list-disc pl-5 text-xs">
+                    {unresolvedSteps.map((step) => (
+                      <li key={`${step.plan_id}-${step.step_no}`} className="font-mono">
+                        {step.plan_id} · step {step.step_no}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+              {protectiveStages.length > 0 ? (
+                <div data-testid="flatten-protective-stages">
+                  <p className="text-xs font-medium">Protective stages still open:</p>
+                  <ul className="list-disc pl-5 text-xs">
+                    {protectiveStages.map((stage, index) => (
+                      <li key={index} className="font-mono break-all">
+                        {typeof stage === "string" ? stage : JSON.stringify(stage)}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+
+          {actionError ? (
+            <p className="text-xs text-destructive" data-testid="flatten-error">
+              {actionError}
+            </p>
+          ) : null}
+
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setOpen(false)}>
+              Close
+            </Button>
+            {result && result.status === "blocked" ? (
+              <Button onClick={runFlatten} disabled={mutation.isPending} data-testid="flatten-resume">
+                {mutation.isPending ? <Loader2Icon className="size-3 animate-spin" aria-hidden /> : null}
+                Resume flatten
+              </Button>
+            ) : result && result.status === "complete" ? (
+              <Button variant="outline" onClick={() => setResult(null)} data-testid="flatten-restart">
+                Start a new flatten
+              </Button>
+            ) : !result ? (
+              <Button
+                variant="destructive"
+                onClick={runFlatten}
+                disabled={!confirmed || mutation.isPending}
+                data-testid="flatten-confirm"
+              >
+                {mutation.isPending ? <Loader2Icon className="size-3 animate-spin" aria-hidden /> : null}
+                Confirm flatten
+              </Button>
+            ) : null}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Four controls
 // ---------------------------------------------------------------------------
 
@@ -1120,8 +1522,9 @@ function ControlCard({
 
 export function OptionsControls({
   strategyId,
+  strategyName,
   jobs,
-}: Readonly<{ strategyId: string; jobs: HostedJobSummary[] }>) {
+}: Readonly<{ strategyId: string; strategyName: string; jobs: HostedJobSummary[] }>) {
   // Stop evaluator uses the existing per-attempt job stop
   // (`POST /{strategy_id}/jobs/{job_id}/stop`); its own note is explicit that
   // it "does not cancel orders or flatten" — exactly the "stop evaluator"
@@ -1130,7 +1533,7 @@ export function OptionsControls({
   // `OptionRunExitPanel` on each run's expanded card — because it acts on
   // exactly one run's own fills at a time. This top-level card stays purely
   // informational rather than acting on a run it cannot itself pick. Flatten
-  // has no owner-facing route yet, so it stays disabled.
+  // (B2.6b S3) is wired below through `FlattenControl`.
   const activeJob = jobs.find((job) =>
     ["queued", "starting", "running", "fencing"].includes(job.status),
   );
@@ -1180,11 +1583,11 @@ export function OptionsControls({
           separately, so hedges are never released across runs.
         </p>
       </ControlCard>
-      <ControlCard title="Flatten" description="Closes all of this strategy's exposure.">
-        <Button size="sm" variant="destructive" disabled data-testid="option-control-flatten">
-          Flatten
-        </Button>
-        <p className="text-xs text-muted-foreground">Not available yet.</p>
+      <ControlCard
+        title="Flatten"
+        description="Stops the evaluator, then closes this strategy's own exposure — never a whole-account liquidation."
+      >
+        <FlattenControl strategyId={strategyId} strategyName={strategyName} />
       </ControlCard>
       <Dialog open={confirmStop} onOpenChange={setConfirmStop}>
         <DialogContent>
@@ -1217,13 +1620,18 @@ export function OptionsControls({
 export function HostedOptionsPanel({ strategyId }: Readonly<{ strategyId: string }>) {
   const runsQuery = useOptionRuns(strategyId);
   const jobsQuery = useHostedJobs(strategyId);
+  const strategyQuery = useHostedStrategy(strategyId);
   const runs = runsQuery.data?.runs ?? [];
   const jobs = jobsQuery.data?.jobs ?? [];
   const coverage = runsQuery.data?.coverage;
 
   return (
     <div className="flex flex-col gap-6">
-      <OptionsControls strategyId={strategyId} jobs={jobs} />
+      <OptionsControls
+        strategyId={strategyId}
+        strategyName={strategyQuery.data?.name ?? ""}
+        jobs={jobs}
+      />
       {runsQuery.isLoading ? (
         <Skeleton className="h-24 w-full rounded-md" />
       ) : runsQuery.isError ? (

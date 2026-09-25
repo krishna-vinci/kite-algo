@@ -2924,6 +2924,37 @@ CREATE TABLE IF NOT EXISTS public.option_protection_owner_events (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- One durable, RESUMABLE owner flatten of one hosted strategy (B2.6b S3). The
+-- operation outlives the request because its items wait on fills: ``manifest``
+-- carries the work list with each item's outcome, ``stop`` carries the
+-- evaluator-stop evidence, and ``uq_sfo_open_scope`` allows at most ONE open
+-- operation per scope so a repeated POST resumes rather than restarts.
+CREATE TABLE IF NOT EXISTS public.strategy_flatten_operations (
+    operation_id          TEXT PRIMARY KEY,
+    strategy_id           TEXT NOT NULL,
+    account_id            TEXT NOT NULL,
+    execution_environment TEXT NOT NULL,
+    status                TEXT NOT NULL
+        CHECK (status IN ('complete','in_progress','blocked')),
+    reason                TEXT NOT NULL DEFAULT '',
+    actor_id              TEXT NOT NULL DEFAULT '',
+    evidence_digest       TEXT NOT NULL DEFAULT '',
+    stop                  JSONB NOT NULL DEFAULT '{}'::jsonb,
+    manifest              JSONB NOT NULL DEFAULT '{}'::jsonb,
+    refusal               TEXT,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT ck_sfo_environment
+        CHECK (execution_environment IN ('live','paper','dry_run')),
+    CONSTRAINT fk_sfo_strategy FOREIGN KEY (strategy_id, account_id)
+        REFERENCES public.strategies(id, account_scope) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_sfo_scope ON public.strategy_flatten_operations
+    (account_id, strategy_id, execution_environment);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_sfo_open_scope
+    ON public.strategy_flatten_operations (account_id, strategy_id, execution_environment)
+    WHERE status <> 'complete';
+
 -- The durable claim/outcome row for one live plan step (internal live adapter,
 -- public live routes remain closed). The UNIQUE (plan_id, step_no) claim is what
 -- stops two adapter instances or a restart from dispatching the same step twice.

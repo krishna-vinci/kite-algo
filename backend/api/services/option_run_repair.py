@@ -11,11 +11,19 @@ here leaves the router with the two handlers and their response mapping.
 from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
+from uuid import uuid4
 
 from fastapi import HTTPException
 
 from backend.api.services.hosted_strategy_authz import authorize_account_scope
-from backend.options.execution.repair import OptionRunRepairRefusal, OptionRunRepairService
+from backend.options.execution.repair import (
+    ACTION_OWNER_EXIT,
+    STATE_FLAT,
+    STATE_RESIDUAL,
+    TERMINAL_RUN_STATUSES,
+    OptionRunRepairRefusal,
+    OptionRunRepairService,
+)
 
 #: The audit outcome one repair writes. Distinct from ``reconciled`` on purpose:
 #: this path never clears the job's block, so it must not read as a reconciliation
@@ -659,6 +667,110 @@ async def submit_owner_exit_stage(
         },
         trigger={"status": "triggered"},
     )
+
+
+async def run_owner_exit(
+    request: Any,
+    session_factory: Any,
+    repo: Any,
+    *,
+    strategy_id: str,
+    option_run_id: str,
+    reason: str,
+    actor: str,
+    evidence_digest: Optional[str] = None,
+) -> Dict[str, Any]:
+    """One owner-authorized discretionary exit of ONE run: gate, take, submit, audit.
+
+    The route and the flatten orchestration (B2.6b S3) both call THIS function, so
+    there is exactly one implementation of the S2 exit: the same gates, the same
+    run CAS, the same staged submitter and the same audit. A route supplies the
+    digest the owner read; flatten omits it, and the digest is then taken from the
+    assessment read here rather than invented.
+
+    The run's own transition is the ownership token: exactly one caller takes
+    ``entered`` / ``exiting`` and submits ONE stage of the derived close plan.
+    Nothing is submitted when a gate refuses, and the run is never marked
+    ``exited`` merely because a broker accepted a stage - completion is the run's
+    own fills proving it flat.
+
+    Refusals are raised as ``OptionRunRepairRefusal`` (the caller maps them to the
+    §5 names) or ``HTTPException`` (a boundary the platform cannot reach, so no
+    stage may be claimed).
+    """
+    scope = option_run_repair_scope(
+        repo, str(actor), strategy_id, option_run_id, session_factory
+    )
+    service = build_option_run_repair_service(request, session_factory)
+    # The specific gates are asked on a fresh read BEFORE the transition: an
+    # unresolved stage or an unfinished adjust outranks "your evidence is stale"
+    # as the explanation, and nothing has moved yet either way.
+    observed = service.assessment(option_run_id, owner_exit=True)
+    owner_exit_gates(observed)
+    pinned_digest = str(evidence_digest or observed.get("evidence_digest") or "")
+    next_run, assessment = service.plan(
+        option_run_id=option_run_id,
+        action=ACTION_OWNER_EXIT,
+        evidence_digest=pinned_digest,
+        owner_exit=True,
+    )
+    state = str(assessment.get("state") or "")
+    observed_status = str(assessment.get("status") or "")
+    # Everything that can refuse happens BEFORE the run moves: an unavailable
+    # live boundary must never leave a claimed stage that nothing can send.
+    boundary = None
+    if state == STATE_RESIDUAL:
+        boundary = await require_owner_exit_boundary(request, scope=scope, run=next_run)
+    if state == STATE_FLAT and observed_status in TERMINAL_RUN_STATUSES:
+        # Already past the exit: report it complete, do not write the same
+        # terminal status again.
+        committed = next_run
+    else:
+        committed = service.commit(next_run, allowed_from=observed_status)
+    action_id = str(uuid4())
+    submission: Any = {}
+    if boundary is not None:
+        submission = await submit_owner_exit_stage(
+            request, session_factory, run=committed, scope=scope, boundary=boundary
+        )
+    refusal = None if state == STATE_FLAT else owner_exit_submission_refusal(submission)
+    if state == STATE_FLAT:
+        status = "complete"
+    elif refusal is None and submission.get("submitted"):
+        status = "accepted"
+    else:
+        status = "blocked"
+    audit_id = record_owner_exit_audit(
+        session_factory,
+        repo,
+        strategy_id=str(strategy_id),
+        run=committed,
+        action_id=action_id,
+        assessment=assessment,
+        submission=submission,
+        reason=str(reason or ""),
+        actor=str(actor),
+    )
+    evidence = dict(assessment.get("evidence") or {})
+    return {
+        "status": status,
+        "action_id": action_id,
+        "option_run_id": str(committed.strategy_run_id),
+        "run_status": str(committed.status),
+        "state": state,
+        "evidence_digest": str(assessment.get("evidence_digest") or ""),
+        "items": owner_exit_stage_items(submission),
+        "refusal": refusal,
+        "audit_id": audit_id,
+        "submission": dict(submission or {}),
+        # Flatten reads these two directly: they are what makes "the hedge is
+        # withheld until its short is PROVEN closed" observable in the operation's
+        # own manifest instead of only inside the run.
+        "shorts_proven_closed": bool(evidence.get("shorts_proven_closed")),
+        "withheld_hedges": [
+            dict(row or {}) for row in (assessment.get("withheld_hedges") or [])
+        ],
+    }
 
 
 def owner_exit_view(service: Any, option_run_id: str) -> Dict[str, Any]:

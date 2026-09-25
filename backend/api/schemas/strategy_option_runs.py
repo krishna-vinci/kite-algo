@@ -11,7 +11,7 @@ rather than as a zero, an empty list or a fabricated number.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -60,9 +60,45 @@ class OptionRunResponse(BaseModel):
     #: ``status in partial_entry|partial_exit|cleanup_required|adjusting`` -
     #: DERIVED so the UI never restates the rule and drifts from the backend.
     repairable: bool = False
-    #: Placeholder until B2.4 lands protection ownership; the UI shows
-    #: "protection owner: not yet available" while this is ``None``.
-    protection_owner: Optional[str] = None
+    #: The protection owner row (B2.4), or ``None`` when this run has none.
+    #: ``{"state": "unknown"}`` when the row could not be READ - the UI must show
+    #: that as a warning, never as "no owner". The two shapes are deliberately
+    #: exclusive: an unknown row carries ONLY its state, so nothing can be read out
+    #: of it as if it were an owner.
+    protection_owner: Optional[
+        Union["OptionRunProtectionOwnerResponse", "OptionRunProtectionOwnerUnknown"]
+    ] = None
+
+
+class OptionRunProtectionOwnerResponse(BaseModel):
+    """A READABLE protection owner row: who owns this run's protection, now.
+
+    ``owner_run_id`` is ``None`` only for a ``released`` row - the owner column is
+    empty by construction once a run has been released, which is a real state and
+    not an unreadable one.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    owner_run_id: Optional[str] = None
+    owner_epoch: int
+    #: ``active`` | ``released``.
+    state: str
+    policy_version: str
+    action_state: str
+
+
+class OptionRunProtectionOwnerUnknown(BaseModel):
+    """The owner row could not be read: a warning, never "no owner".
+
+    Deliberately carries nothing but its state. Protection ownership decides
+    whether a staged exit may release a hedge, so an unreadable row must not look
+    like an owner (nor like the neutral "no owner" of ``protection_owner: null``).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    state: Literal["unknown"] = "unknown"
 
 
 class OptionRunListResponse(BaseModel):

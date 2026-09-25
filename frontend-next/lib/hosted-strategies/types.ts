@@ -669,6 +669,25 @@ export type OptionRunStatus =
   | "settled"
   | "unknown";
 
+/** A readable protective-stage owner for this run's own confirmed fills. */
+export type ProtectionOwnerInfo = {
+  owner_run_id: string;
+  owner_epoch: number;
+  state: string;
+  policy_version: string;
+  action_state: string;
+};
+
+/** The platform could not read who (if anyone) owns this run's protection. */
+export type ProtectionOwnerUnknown = { state: "unknown" };
+
+/**
+ * `null` means no protective stage currently owns this run (neutral, not an
+ * error). `{ state: "unknown" }` means ownership could not be read, which
+ * MUST be shown as a warning: new exposure is blocked while it is unreadable.
+ */
+export type ProtectionOwner = ProtectionOwnerInfo | ProtectionOwnerUnknown | null;
+
 export type OptionRun = {
   option_run_id: string;
   status: OptionRunStatus | string;
@@ -682,8 +701,7 @@ export type OptionRun = {
   legs: OptionRunLeg[];
   /** status in partial_entry|partial_exit|cleanup_required|adjusting */
   repairable: boolean;
-  /** Placeholder until B2.4; the UI shows "protection owner: not yet available". */
-  protection_owner: string | null;
+  protection_owner: ProtectionOwner;
 };
 
 export type OptionRunList = {
@@ -936,3 +954,100 @@ export type OptionExitActionResult = {
   refusal?: string | null;
   audit_id?: string | null;
 };
+
+// ---------------------------------------------------------------------------
+// B2.6b S3: owner-facing flatten orchestration (design §3, §5; field names per
+// the landed backend response)
+// ---------------------------------------------------------------------------
+
+/** What kind of manifest row this is — a candidate the flatten acted on. */
+export type FlattenItemKind = "cancel_pending" | "option_exit" | "nonoption_reduction" | string;
+
+/** `pending` items have not been reached yet by the orchestration. */
+export type FlattenItemState = "done" | "in_progress" | "blocked" | "pending" | string;
+
+/**
+ * One per-item manifest row. `key` is a stable technical identity (e.g.
+ * `"cancel:plan-entry:1"`, `"option_exit:opt_run_1"`,
+ * `"reduction:NSE:INFY:CNC"`), never a display label on its own — the UI
+ * derives a readable label from `kind` + `detail`. `detail`'s own shape is
+ * per-kind:
+ *  - `cancel_pending`: `plan_id`, `step_no`, `order_id`, `outcome`,
+ *    `filled_quantity`, `remaining_quantity`, `disposition`, `run_status`.
+ *  - `option_exit`: `option_run_id` (+ `rejection_reason` when blocked).
+ *  - `nonoption_reduction`: `instrument_id`, `product`,
+ *    `attributed_open_quantity`, `plan_id`, `target_quantity`,
+ *    `remaining_quantity`.
+ */
+export type FlattenManifestItem = {
+  kind: FlattenItemKind;
+  key: string;
+  state: FlattenItemState;
+  /** Human-readable via `withRefusalCopy`; populated only while `blocked`. */
+  reason_code?: string | null;
+  detail?: Record<string, unknown> | null;
+};
+
+/**
+ * `in_progress` means the operation is still running (poll/refetch the
+ * status); `blocked` means at least one item needs owner action before the
+ * operation can finish; `complete` means done is proven, per design §3: no
+ * qualifying pending entry, no unresolved live submission, every option run
+ * flat and terminal, every attributed equity/future zero, no in-flight
+ * governed work, and no live evaluation authority. `accepted` is tolerated
+ * harmlessly (treated the same as `in_progress`) for forward compatibility,
+ * but the backend contract no longer emits it.
+ */
+export type FlattenStatus = "complete" | "in_progress" | "blocked" | "accepted" | string;
+
+/** The evaluator-stop half of a flatten operation (design §3 step 1). */
+export type FlattenStopView = {
+  requested: boolean;
+  state: string;
+  jobs: unknown[];
+  approvals: unknown[];
+  requested_by: string | null;
+  reason: string | null;
+};
+
+/** Every condition flatten's own `done` proof requires (design §3, "Done means…"). */
+export type FlattenDoneConditions = {
+  no_qualifying_pending_entry: boolean;
+  no_live_unresolved_submission: boolean;
+  option_runs_flat: boolean;
+  books_zero: boolean;
+  no_live_evaluation_authority: boolean;
+  no_in_flight_governed_work: boolean;
+};
+
+/** The shared owner-action response envelope (design §5), for flatten. */
+export type FlattenOperationResult = {
+  status: FlattenStatus;
+  action_id: string;
+  operation_id?: string | null;
+  evidence_digest?: string | null;
+  items: FlattenManifestItem[];
+  stop?: FlattenStopView | null;
+  /** Names of the `done_conditions` keys that are not yet met. */
+  missing?: string[];
+  done_conditions?: FlattenDoneConditions | null;
+  refusal?: string | null;
+  audit_id?: string | null;
+};
+
+export type FlattenActionPayload = {
+  reason: "owner_flatten" | string;
+  /** Flatten always stops the evaluator first (design §3, Decisions). */
+  stop_evaluator: true;
+};
+
+/**
+ * The `DEAD_SUBMISSION_UNRESOLVED` 409's own detail:
+ * `{ rejection_reason, strategy_id, steps, protective_stages, waiting, message }`.
+ * `steps` are the unanswered plan-step submissions the owner must resolve
+ * (via the per-run "Resolve unanswered step" dialog); `protective_stages` are
+ * still-open protective stages blocking flatten the same way. Other 409s
+ * share the generic `rejection_reason` shape `hostedErrorMessage`/
+ * `hostedRefusalCode` already read.
+ */
+export type FlattenDeadSubmissionStepRef = { plan_id: string; step_no: number };

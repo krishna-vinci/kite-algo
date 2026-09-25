@@ -124,6 +124,30 @@ def _as_float(value: Any) -> Optional[float]:
         return None
 
 
+def _owner_row_out(row: Mapping[str, Any]) -> Dict[str, Any]:
+    """A readable protection-owner row as the §5 contract's five fields.
+
+    A row that is present but cannot be READ in full is reported as
+    ``{"state": "unknown"}`` rather than with nulls an owner could mistake for a
+    real (empty) owner: an unreadable owner means new exposure is blocked, so the
+    response has to say so.
+    """
+    state = str(row.get("state") or "")
+    epoch = _as_int(row.get("owner_epoch"))
+    policy_version = str(row.get("policy_version") or "")
+    action_state = str(row.get("action_state") or "")
+    if not state or epoch is None or not policy_version or not action_state:
+        return {"state": "unknown"}
+    owner_run_id = row.get("owner_run_id")
+    return {
+        "owner_run_id": None if owner_run_id in (None, "") else str(owner_run_id),
+        "owner_epoch": epoch,
+        "state": state,
+        "policy_version": policy_version,
+        "action_state": action_state,
+    }
+
+
 def _owned_strategy(repo: SqlAlchemyStrategyRepository, owner: str, strategy_id: str):
     row = repo.get_strategy(owner, strategy_id)
     if row is None:
@@ -190,6 +214,21 @@ def _run_store(request: Request, session_factory: Any):
     return DurableOptionRunStore(session_factory=session_factory)
 
 
+def _protection_owner_store(request: Request, session_factory: Any):
+    """The durable protection-owner store (B2.4) this read resolves owners from.
+
+    A run's protection owner is what decides whether a staged exit may release a
+    hedge, so it is read through the SAME store the ownership rule writes: the
+    read and the rule cannot disagree about who owns the run.
+    """
+    injected = getattr(request.app.state, "option_protection_owner_store", None)
+    if injected is not None:
+        return injected
+    from backend.options.protection.ownership import OptionProtectionOwnerStore
+
+    return OptionProtectionOwnerStore(session_factory=session_factory)
+
+
 def _plan_order(plan: Any) -> tuple:
     """A stable "newest first" key for a plan row.
 
@@ -205,12 +244,16 @@ def _plan_order(plan: Any) -> tuple:
 class _RunReads:
     """Lazy, cached reads of the evidence the run list needs per run."""
 
-    def __init__(self, session_factory: Any, run_store: Any) -> None:
+    def __init__(
+        self, session_factory: Any, run_store: Any, owner_store: Any = None
+    ) -> None:
         self._session_factory = session_factory
         self._run_store = run_store
+        self._owner_store = owner_store
         self._plans_by_run: Dict[str, List[Any]] = {}
         self._runs: Dict[str, Any] = {}
         self._own_open: Dict[str, Optional[Dict[str, int]]] = {}
+        self._owners: Dict[str, Optional[Dict[str, Any]]] = {}
 
     def plans(self, row: Mapping[str, Any]) -> List[Any]:
         run_id = str(row.get("option_run_id") or "")
@@ -277,6 +320,36 @@ class _RunReads:
 
     def durable_run(self, option_run_id: str) -> Any:
         return self._run(option_run_id)
+
+    def protection_owner(self, option_run_id: str) -> Optional[Dict[str, Any]]:
+        """The run's protection owner row, ``None``, or ``{"state": "unknown"}``.
+
+        Three honest answers, and the difference matters: a row is the owner, a
+        MISSING row means no protective stage owns the run (neutral), and an
+        unreadable store is ``{"state": "unknown"}`` - never ``None``, which the
+        UI would render as "no owner" for a run the platform simply cannot read.
+        """
+        if option_run_id in self._owners:
+            return self._owners[option_run_id]
+        row: Any = None
+        unreadable = self._owner_store is None
+        if not unreadable:
+            try:
+                row = self._owner_store.read(str(option_run_id))
+            except Exception:  # noqa: BLE001 - an unreadable row is NOT "no owner"
+                logger.exception(
+                    "option_run_protection_owner_read_failed",
+                    extra={"option_run_id": option_run_id},
+                )
+                unreadable = True
+        if unreadable:
+            value: Optional[Dict[str, Any]] = {"state": "unknown"}
+        elif not isinstance(row, Mapping):
+            value = None
+        else:
+            value = _owner_row_out(row)
+        self._owners[option_run_id] = value
+        return value
 
 
 def _source_plan(row: Mapping[str, Any], plans: List[Any]) -> Any:
@@ -477,6 +550,7 @@ def _option_run_out(row: Mapping[str, Any], reads: _RunReads) -> OptionRunRespon
         getattr(source, "plan_id", "") or row.get("originating_plan_id") or ""
     )
     status = str(row.get("status") or "unknown")
+    owner = reads.protection_owner(run_id)
     return OptionRunResponse(
         option_run_id=run_id,
         status=status,
@@ -494,7 +568,11 @@ def _option_run_out(row: Mapping[str, Any], reads: _RunReads) -> OptionRunRespon
             own_open_by_leg=reads.own_open(run_id),
         ),
         repairable=status in REPAIRABLE_STATUSES,
-        protection_owner=None,
+        # The two shapes are exclusive (see ``_owner_row_out`` /
+        # ``OptionRunProtectionOwnerUnknown``): a readable row is the five-field
+        # object, an unreadable one is exactly ``{"state": "unknown"}``, and no row
+        # at all is ``None``.
+        protection_owner=owner,
     )
 
 
@@ -698,7 +776,11 @@ async def list_option_runs(
         strategy_id=str(strategy_id),
         environment=env,
     )
-    reads = _RunReads(session_factory, _run_store(request, session_factory))
+    reads = _RunReads(
+        session_factory,
+        _run_store(request, session_factory),
+        _protection_owner_store(request, session_factory),
+    )
     return OptionRunListResponse(
         strategy_id=str(strategy_id),
         coverage=str(coverage.get("coverage") or COVERAGE_UNKNOWN),
@@ -753,7 +835,11 @@ async def get_option_run(
             raise HTTPException(status_code=404, detail="Option run not found")
         row = _degraded_row(option_run_id, edges)
 
-    reads = _RunReads(session_factory, _run_store(request, session_factory))
+    reads = _RunReads(
+        session_factory,
+        _run_store(request, session_factory),
+        _protection_owner_store(request, session_factory),
+    )
     return OptionRunDetailResponse(
         run=_option_run_out(row, reads),
         edges=[

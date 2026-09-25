@@ -26,6 +26,8 @@ import type {
   ExecutionRequestDecisionResponse,
   ExecutionRequestList,
   ExecutionRequestRow,
+  FlattenActionPayload,
+  FlattenOperationResult,
   HostedPositionList,
   HostedJobDetail,
   HostedJobList,
@@ -523,6 +525,45 @@ export async function submitOptionExit(
 ): Promise<OptionExitActionResult> {
   return apiFetch<OptionExitActionResult>(
     `${BASE}/${encodeURIComponent(strategyId)}/option-runs/${encodeURIComponent(optionRunId)}/exit`,
+    { method: "POST", json: payload },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// B2.6b S3: owner-facing flatten orchestration (design §3, §5)
+// ---------------------------------------------------------------------------
+
+/**
+ * The latest flatten operation's own manifest and status for this strategy,
+ * or `null` when no flatten has ever been started (the backend returns 404
+ * `FLATTEN_OPERATION_NONE`), read the same way `fetchAdmissionPolicy`/
+ * `fetchHostedSchedule` treat "no record yet".
+ */
+export async function fetchFlattenStatus(strategyId: string): Promise<FlattenOperationResult | null> {
+  try {
+    return await apiFetch<FlattenOperationResult>(
+      `${BASE}/${encodeURIComponent(strategyId)}/owner-actions/flatten`,
+    );
+  } catch (error) {
+    if (error instanceof ApiClientError && error.status === 404) return null;
+    throw error;
+  }
+}
+
+/**
+ * Start, or resume, the strategy-scoped flatten orchestration (design §3):
+ * stop the evaluator first, cancel only qualifying pending entries, exit
+ * option structures one at a time (shorts first), and close other positions
+ * with governed reductions. This is never a whole-account liquidation. A 409
+ * names the refusal (e.g. an active evaluation, or unresolved dead
+ * submissions that must be disposed of first).
+ */
+export async function submitFlatten(
+  strategyId: string,
+  payload: FlattenActionPayload,
+): Promise<FlattenOperationResult> {
+  return apiFetch<FlattenOperationResult>(
+    `${BASE}/${encodeURIComponent(strategyId)}/owner-actions/flatten`,
     { method: "POST", json: payload },
   );
 }

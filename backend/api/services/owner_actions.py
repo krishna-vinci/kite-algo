@@ -41,15 +41,23 @@ from fastapi import HTTPException
 from sqlalchemy import select, text
 
 from backend.api.services.hosted_strategy_authz import authorize_account_scope
+from backend.options.execution.repair import (
+    STATE_FLAT,
+    TERMINAL_RUN_STATUSES,
+    OptionRunRepairRefusal,
+)
 from backend.strategies.attribution_models import (
     EXECUTION_ENVIRONMENTS,
     LivePlanSubmission,
     PaperOrderFillProgress,
+    StrategyApproval,
+    StrategyFlattenOperation,
     StrategyPlan,
     StrategyPlanExecutionEvent,
     StrategyPlanOptionRun,
     StrategyPositionProjection,
     StrategyProposalJournal,
+    StrategyRunBinding,
 )
 
 #: Coverage verdict. ``unknown`` means the list is NOT complete.
@@ -95,6 +103,66 @@ DEAD_SUBMISSION_DISPOSITION_MISMATCH = "DEAD_SUBMISSION_DISPOSITION_MISMATCH"
 #: §4 requires refusing while an active evaluator could still place work; named
 #: after the existing ``FLATTEN_EVALUATION_ACTIVE`` (§5) precedent.
 DEAD_SUBMISSION_EVALUATION_ACTIVE = "DEAD_SUBMISSION_EVALUATION_ACTIVE"
+
+# ---- flatten (B2.6b S3, §3) -----------------------------------------------
+
+#: The one pre-action refusal: flatten may not start while a live evaluation
+#: authority could still place work, and nothing is moved when it is returned.
+FLATTEN_EVALUATION_ACTIVE = "FLATTEN_EVALUATION_ACTIVE"
+#: Unanswered work the platform cannot resolve on its own must be dispositioned
+#: first (§3 step 2): flatten never guesses whether an order exists.
+DEAD_SUBMISSION_UNRESOLVED = "DEAD_SUBMISSION_UNRESOLVED"
+#: Live non-option books cannot be reduced by this lane yet (C1 owns it), so the
+#: item is refused by name while completed option work is still reported.
+FLATTEN_LIVE_NONOPTION_UNSUPPORTED = "FLATTEN_LIVE_NONOPTION_UNSUPPORTED"
+#: An item-level refusal: the derived plan would INCREASE exposure, so it is
+#: refused BEFORE admission. A flatten plan may only reduce.
+FLATTEN_PLAN_INCREASES_EXPOSURE = "FLATTEN_PLAN_INCREASES_EXPOSURE"
+#: A reduction plan needs a bound run to attribute its fills to; without one the
+#: platform refuses rather than inventing an attribution.
+FLATTEN_REDUCTION_RUN_UNBOUND = "FLATTEN_REDUCTION_RUN_UNBOUND"
+FLATTEN_REDUCTION_PLAN_REFUSED = "FLATTEN_REDUCTION_PLAN_REFUSED"
+FLATTEN_REDUCTION_PIPELINE_UNAVAILABLE = "FLATTEN_REDUCTION_PIPELINE_UNAVAILABLE"
+#: A book whose canonical instrument type cannot be read is never flushed: the
+#: platform cannot say whether it belongs to an option structure.
+FLATTEN_REDUCTION_INSTRUMENT_UNKNOWN = "FLATTEN_REDUCTION_INSTRUMENT_UNKNOWN"
+#: Unresolved (``raw``) exposure: the platform cannot say WHICH instrument it is.
+FLATTEN_UNATTRIBUTED_EXPOSURE = "FLATTEN_UNATTRIBUTED_EXPOSURE"
+#: The option-run set could not be read completely, so no run may be exited on the
+#: strength of an incomplete list.
+FLATTEN_OPTION_RUN_COVERAGE_UNKNOWN = "FLATTEN_OPTION_RUN_COVERAGE_UNKNOWN"
+
+#: The operation's own status vocabulary. ``complete`` is reserved for "every §3
+#: done condition holds"; a resumable operation is ``in_progress`` (waiting on
+#: fills) or ``blocked`` (a named refusal stopped an item).
+STATUS_IN_PROGRESS = "in_progress"
+
+#: One manifest item kind per §3 step.
+FLATTEN_ITEM_CANCEL = "cancel_pending"
+FLATTEN_ITEM_OPTION_EXIT = "option_exit"
+FLATTEN_ITEM_REDUCTION = "nonoption_reduction"
+
+ITEM_STATE_PENDING = "pending"
+ITEM_STATE_DONE = "done"
+ITEM_STATE_IN_PROGRESS = "in_progress"
+ITEM_STATE_BLOCKED = "blocked"
+
+#: §3's done conditions, one name each. ``complete`` requires ALL of them.
+DONE_NO_PENDING_ENTRY = "no_qualifying_pending_entry"
+DONE_NO_LIVE_UNRESOLVED = "no_live_unresolved_submission"
+DONE_OPTION_RUNS_FLAT = "option_runs_flat"
+DONE_BOOKS_ZERO = "books_zero"
+DONE_NO_INFLIGHT_WORK = "no_in_flight_governed_work"
+DONE_NO_EVALUATION_AUTHORITY = "no_live_evaluation_authority"
+
+#: The hosted job statuses that mean "this evaluation may still place work".
+ACTIVE_JOB_STATUSES = ("queued", "starting", "running")
+#: The job statuses that are terminal for a stop (the operator stop route's own
+#: set: ``cancelled`` is not one of them, and an unknown status is never proof).
+TERMINAL_JOB_STATUSES = ("stopped", "failed", "recovery_required")
+#: The catalog instrument types that are options. Their books are closed by their
+#: OWN run's staged exit, never by a single-instrument reduction plan.
+OPTION_INSTRUMENT_TYPES = ("CE", "PE")
 
 #: Per-item outcomes that are NOT named refusals (the response is ``blocked``).
 OUTCOME_CANCELLED = "cancelled"
@@ -215,6 +283,9 @@ def owner_action_scope(
         "account_id": account_id,
         "execution_environment": _environment_for(hosted, requested_environment),
         "hosted": hosted,
+        #: The hosted owner the job ledger is keyed by (``app:<username>``). Never
+        #: a caller value: it comes from ``require_strategy_owner``.
+        "owner_id": str(owner),
     }
 
 
@@ -509,11 +580,39 @@ class OwnerActionsService:
         barrier: Any = None,
         repository: Any = None,
         broker_cancel: Any = None,
+        flatten_store: Any = None,
+        snapshot_service: Any = None,
+        option_exit_runner: Any = None,
+        reduction_plan_builder: Any = None,
+        reduction_pipeline: Any = None,
     ) -> None:
         self.session_factory = session_factory
         self.run_store = run_store
         self.paper_service = paper_service
         self.repository = repository
+        #: The durable flatten operations (B2.6b S3). Absent, the default store
+        #: over this session factory is used.
+        self.flatten_store = flatten_store
+        #: The scope-derived option-run / pending-work snapshot reads. Absent, the
+        #: platform's own ``OwnedWorkSnapshotService`` is used.
+        self.snapshot_service = snapshot_service
+        #: ``async (scope, option_run_id, *, reason) -> dict``: the S2 owner exit
+        #: for ONE run. Absent, an option run cannot be exited and is reported
+        #: blocked rather than assumed flat.
+        self.option_exit_runner = option_exit_runner
+        #: ``(scope, book, *, operation_id, actor) -> {"plan": ..., "plan_id": ...}``
+        #: - the frozen target-zero plan for ONE attributed ``(instrument, product)``
+        #: book. Absent, ``default_reduction_planner`` builds it through the
+        #: proposal/compile path.
+        self.reduction_plan_builder = (
+            reduction_plan_builder
+            if reduction_plan_builder is not None
+            else default_reduction_planner(session_factory)
+        )
+        #: The governed execute route's paper pipeline: ``.admit(plan, environment=)``
+        #: and ``async .execute(plan, actor=)``. Absent, a reduction is reported
+        #: blocked by name rather than sent through an unknown boundary.
+        self.reduction_pipeline = reduction_pipeline
         #: The existing fake-testable broker cancel boundary, called as
         #: ``broker_cancel(account_id=..., order_id=...)``. Absent (or failing)
         #: means the live cancel is UNKNOWN, never an assumed cancellation.
@@ -2069,6 +2168,1239 @@ class OwnerActionsService:
             return None
         return str(getattr(row, "id", "") or "") or None
 
+    # ------------------------------------------------------------- flatten
+
+    def _flatten_store(self) -> "FlattenOperationStore":
+        if self.flatten_store is None:
+            self.flatten_store = FlattenOperationStore(
+                session_factory=self.session_factory
+            )
+        return self.flatten_store
+
+    def _snapshot_service(self) -> Any:
+        if self.snapshot_service is None:
+            from backend.strategies.execution_snapshot import OwnedWorkSnapshotService
+
+            self.snapshot_service = OwnedWorkSnapshotService(
+                session_factory=self.session_factory
+            )
+        return self.snapshot_service
+
+    def _evaluation_authority(self, scope: Mapping[str, Any]) -> Dict[str, Any]:
+        """The strategy's durable authority to still place work (§3 step 1).
+
+        Two sources, both the platform's own: the hosted job ledger
+        (``queued`` / ``starting`` / ``running``) and an ACTIVE approval for the
+        strategy in this account - the record S1's dead-submission path already
+        treats as evaluation authority. An unreadable read is ``None``, never an
+        absence of authority, so the caller refuses instead of flattening a book
+        something else may still be trading.
+        """
+        jobs: Optional[List[Any]] = None
+        owner_id = str(scope.get("owner_id") or "")
+        if self.repository is not None and owner_id:
+            try:
+                rows = self.repository.list_jobs_for_strategy(
+                    owner_id, str(scope["strategy_id"]), limit=200
+                )
+            except Exception:  # noqa: BLE001 - unreadable authority is not absent
+                rows = None
+            if rows is not None:
+                jobs = [
+                    row
+                    for row in rows
+                    if str(getattr(row, "status", "") or "") in ACTIVE_JOB_STATUSES
+                ]
+        approvals: Optional[List[str]] = None
+        try:
+            with self.session_factory() as session:
+                approvals = sorted(
+                    str(value)
+                    for value in session.execute(
+                        select(StrategyApproval.approval_id).where(
+                            StrategyApproval.strategy_id
+                            == str(scope["strategy_id"]),
+                            StrategyApproval.account_id
+                            == str(scope["account_id"]),
+                            StrategyApproval.status == "active",
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+        except Exception:  # noqa: BLE001 - unreadable authority is not absent
+            approvals = None
+        return {"jobs": jobs, "approvals": approvals}
+
+    def stop_evaluator(
+        self,
+        scope: Mapping[str, Any],
+        *,
+        stop_evaluator: bool,
+        actor: str,
+        reason: str,
+    ) -> Dict[str, Any]:
+        """Stop the evaluator first, or refuse ``FLATTEN_EVALUATION_ACTIVE``.
+
+        §3 step 1: stop, RECORD it, and only then take the snapshot flatten works
+        from - a live evaluation authority could otherwise place work between the
+        snapshot and the first close. The stop is proven with the operator stop
+        route's own rule (a terminal label is not enough for a launched attempt
+        until the supervisor confirms process cleanup), so a job that is merely
+        ``stopping`` refuses rather than being assumed stopped.
+        """
+        if self.repository is None:
+            raise OwnerActionRefusal(
+                FLATTEN_EVALUATION_ACTIVE,
+                {
+                    "strategy_id": str(scope["strategy_id"]),
+                    "message": (
+                        "the hosted job ledger is not available, so the evaluator's "
+                        "stop cannot be proven; refusing to flatten"
+                    ),
+                },
+            )
+        owner_id = str(scope.get("owner_id") or "")
+        authority = self._evaluation_authority(scope)
+        jobs = authority["jobs"]
+        approvals = authority["approvals"]
+        if jobs is None or approvals is None:
+            raise OwnerActionRefusal(
+                FLATTEN_EVALUATION_ACTIVE,
+                {
+                    "strategy_id": str(scope["strategy_id"]),
+                    "jobs_readable": jobs is not None,
+                    "approvals_readable": approvals is not None,
+                    "message": (
+                        "the strategy's evaluation authority could not be read, so "
+                        "it cannot be proven stopped; refusing to flatten"
+                    ),
+                },
+            )
+        views: List[Dict[str, Any]] = []
+        if jobs and not stop_evaluator:
+            # The caller explicitly declined the stop: an active job is an
+            # authority that may still trade, so flatten refuses.
+            views = [_job_stop_view(job) for job in jobs]
+        elif jobs:
+            for job in jobs:
+                status = str(getattr(job, "status", "") or "")
+                try:
+                    if status == "queued":
+                        self.repository.stop_queued_job(
+                            str(job.id),
+                            owner_id=owner_id,
+                            expected_attempt=int(job.attempt or 1),
+                            actor=str(actor),
+                        )
+                    elif status in ("starting", "running"):
+                        self.repository.request_stop_active(
+                            str(job.id),
+                            owner_id=owner_id,
+                            expected_attempt=int(job.attempt or 1),
+                            actor=str(actor),
+                        )
+                except Exception as exc:  # noqa: BLE001 - a failed stop is unproven
+                    raise OwnerActionRefusal(
+                        FLATTEN_EVALUATION_ACTIVE,
+                        {
+                            "strategy_id": str(scope["strategy_id"]),
+                            "job_id": str(getattr(job, "id", "") or ""),
+                            "error": type(exc).__name__,
+                            "message": (
+                                "the evaluator stop could not be requested; refusing "
+                                "to flatten under an authority that may still act"
+                            ),
+                        },
+                    ) from exc
+                try:
+                    refreshed = self.repository.get_job(owner_id, str(job.id))
+                except Exception:  # noqa: BLE001 - an unreadable stop is unproven
+                    refreshed = None
+                views.append(_job_stop_view(refreshed or job))
+        unproven = [view for view in views if not view["proven_stopped"]]
+        stop = {
+            "requested": bool(jobs) or bool(approvals),
+            "state": "unproven" if unproven else "confirmed",
+            "jobs": views,
+            "approvals": list(approvals),
+            "requested_by": str(actor) if jobs else None,
+            "reason": str(reason or ""),
+        }
+        if unproven or approvals:
+            # The stop itself is durable on the job row, and the refusal is
+            # recorded on the strategy's own journal before it is returned: the
+            # owner can see WHICH stop this flatten was gated on.
+            self.record_audit(
+                scope,
+                action="flatten_stop_evaluator",
+                actor=str(actor),
+                evidence={"stop": stop, "reason": str(reason or "")},
+            )
+            raise OwnerActionRefusal(
+                FLATTEN_EVALUATION_ACTIVE,
+                {
+                    "strategy_id": str(scope["strategy_id"]),
+                    "stop": stop,
+                    "message": (
+                        "the evaluator could not be PROVEN stopped, so no new plan "
+                        "may race the flatten snapshot"
+                        if unproven
+                        else (
+                            "the strategy holds an ACTIVE approval, so its evaluation "
+                            "authority may still place work"
+                        )
+                    ),
+                },
+            )
+        return stop
+
+    def _attribute_books(
+        self, scope: Mapping[str, Any]
+    ) -> Optional[List[Dict[str, Any]]]:
+        """This strategy's attributed books, one per ``(instrument, product)``.
+
+        ``None`` is "unreadable", never "flat": flatten may not report a book
+        closed from a read it could not make. Canonical rows are grouped by their
+        canonical instrument and product; ``raw`` rows are unresolved exposure
+        whose identity the platform cannot attribute, and they are reported as
+        their own entries so the caller refuses to call the book flat.
+        """
+        try:
+            with self.session_factory() as session:
+                rows = session.execute(
+                    select(
+                        StrategyPositionProjection.identity_kind,
+                        StrategyPositionProjection.identity_key,
+                        StrategyPositionProjection.canonical_instrument_id,
+                        StrategyPositionProjection.instrument_token,
+                        StrategyPositionProjection.exchange,
+                        StrategyPositionProjection.tradingsymbol,
+                        StrategyPositionProjection.product,
+                        StrategyPositionProjection.net_quantity,
+                    ).where(
+                        StrategyPositionProjection.account_id
+                        == str(scope["account_id"]),
+                        StrategyPositionProjection.strategy_id
+                        == str(scope["strategy_id"]),
+                        StrategyPositionProjection.execution_environment
+                        == str(scope["execution_environment"]),
+                    )
+                ).all()
+        except Exception:  # noqa: BLE001 - an unreadable book is not a flat one
+            return None
+        grouped: Dict[Any, Dict[str, Any]] = {}
+        for row in rows:
+            identity_kind = str(row[0] or "")
+            if identity_kind == "canonical":
+                key = ("canonical", str(row[2] or ""), str(row[6] or ""))
+                entry = grouped.setdefault(
+                    key,
+                    {
+                        "identity_kind": "canonical",
+                        "identity_key": str(row[2] or ""),
+                        "instrument_id": str(row[2] or ""),
+                        "instrument_token": int(row[3] or 0),
+                        "exchange": str(row[4] or ""),
+                        "tradingsymbol": str(row[5] or ""),
+                        "product": str(row[6] or ""),
+                        "net_quantity": 0,
+                    },
+                )
+            else:
+                key = ("raw", str(row[1] or ""), str(row[6] or ""))
+                entry = grouped.setdefault(
+                    key,
+                    {
+                        "identity_kind": "raw",
+                        "identity_key": str(row[1] or ""),
+                        "instrument_id": None,
+                        "instrument_token": int(row[3] or 0),
+                        "exchange": str(row[4] or ""),
+                        "tradingsymbol": str(row[5] or ""),
+                        "product": str(row[6] or ""),
+                        "net_quantity": 0,
+                    },
+                )
+            entry["net_quantity"] = int(entry["net_quantity"]) + int(row[7] or 0)
+        return [grouped[key] for key in sorted(grouped)]
+
+    def _book_quantity(
+        self, scope: Mapping[str, Any], *, instrument_id: str, product: str
+    ) -> Optional[int]:
+        """This strategy's attributed quantity for ONE book, or ``None``.
+
+        ``None`` is "unreadable", never zero: a reduction whose resulting book
+        cannot be read is not reported as flat.
+        """
+        if not instrument_id:
+            return None
+        try:
+            with self.session_factory() as session:
+                rows = session.execute(
+                    select(StrategyPositionProjection.net_quantity).where(
+                        StrategyPositionProjection.account_id
+                        == str(scope["account_id"]),
+                        StrategyPositionProjection.strategy_id
+                        == str(scope["strategy_id"]),
+                        StrategyPositionProjection.execution_environment
+                        == str(scope["execution_environment"]),
+                        StrategyPositionProjection.identity_kind == "canonical",
+                        StrategyPositionProjection.canonical_instrument_id
+                        == str(instrument_id),
+                        StrategyPositionProjection.product == str(product),
+                    )
+                ).scalars().all()
+        except Exception:  # noqa: BLE001 - an unreadable book is not a flat one
+            return None
+        return int(sum(int(value or 0) for value in rows))
+
+    def _owner_cancelled_steps(self, scope: Mapping[str, Any]) -> set:
+        """``(plan_id, step_no)`` this strategy's OWN cancel already settled.
+
+        Section 1 mandates the disposition word: a cancelled remainder is written
+        as ``failed`` with ``disposition=owner_cancelled``. That word is NOT in the
+        plan-execution fold's terminal vocabulary (the fold reports such a plan
+        ``unknown`` rather than finished), so a reader that only looked at the fold
+        would keep re-reporting work the owner already disbanded - and flatten
+        would ask the owner to disposition a remainder the platform itself
+        cancelled. This reader is the missing half: the disposition, its preserved
+        fill and the terminal order ARE the outcome.
+        """
+        out: set = set()
+        try:
+            plans = self._plan_rows(scope)
+            with self.session_factory() as session:
+                for plan in plans:
+                    rows = session.execute(
+                        select(
+                            StrategyPlanExecutionEvent.step_no,
+                            StrategyPlanExecutionEvent.detail,
+                        ).where(
+                            StrategyPlanExecutionEvent.plan_id
+                            == str(plan["plan_id"])
+                        )
+                    ).all()
+                    for step_no, detail in rows:
+                        payload = dict(detail or {})
+                        if (
+                            str(payload.get("disposition") or "")
+                            != DISPOSITION_OWNER_CANCELLED
+                        ):
+                            continue
+                        out.add((str(plan["plan_id"]), int(step_no or 0)))
+        except Exception:  # noqa: BLE001 - an unreadable trail is not "settled"
+            return set()
+        return out
+
+    def _instrument_types(
+        self, instrument_ids: Sequence[str]
+    ) -> Optional[Dict[str, str]]:
+        """The canonical ``instrument_type`` of each book (§3 step 5).
+
+        A book whose catalog record cannot be read is NOT classified by guessing:
+        ``None`` means the whole read failed, and a missing entry means this one
+        instrument's type is unknown - either refuses the item by name.
+        """
+        wanted = sorted({str(value) for value in instrument_ids if str(value or "")})
+        if not wanted:
+            return {}
+        from sqlalchemy import bindparam
+
+        try:
+            with self.session_factory() as session:
+                rows = session.execute(
+                    text(
+                        "SELECT instrument_id, COALESCE(instrument_type, '') "
+                        "FROM public.instrument_catalog_records "
+                        "WHERE instrument_id IN :ids"
+                    ).bindparams(bindparam("ids", expanding=True)),
+                    {"ids": wanted},
+                ).all()
+        except Exception:  # noqa: BLE001 - an unreadable catalog is not "not an option"
+            return None
+        return {str(row[0]): str(row[1] or "") for row in rows}
+
+    def _outstanding_plan_steps(
+        self, scope: Mapping[str, Any]
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Every submitted plan step whose trail has no terminal outcome yet.
+
+        ``None`` means a plan's own trail blocks could not be read, which is
+        in-flight evidence the platform cannot dismiss. A step this strategy's
+        owner already cancelled is excluded: its disposition IS its outcome (see
+        ``_owner_cancelled_steps``).
+        """
+        out: List[Dict[str, Any]] = []
+        settled = self._owner_cancelled_steps(scope)
+        try:
+            plans = self._plan_rows(scope)
+            with self.session_factory() as session:
+                for plan in plans:
+                    steps = self._trail_steps(session, plan["plan_id"])
+                    for step_no, entry in steps.items():
+                        if not entry["submitted"]:
+                            continue
+                        if (str(plan["plan_id"]), int(step_no)) in settled:
+                            continue
+                        if any(
+                            event in FOLD_TERMINAL_EVENTS for event in entry["events"]
+                        ):
+                            continue
+                        out.append(
+                            {
+                                "plan_id": str(plan["plan_id"]),
+                                "step_no": int(step_no),
+                                "state": str(entry["trail_state"]),
+                                "order_id": entry.get("paper_order_id")
+                                or entry.get("broker_order_id"),
+                            }
+                        )
+        except Exception:  # noqa: BLE001 - an unreadable trail is not quiet evidence
+            return None
+        out.sort(key=lambda row: (row["plan_id"], row["step_no"]))
+        return out
+
+    def _flatten_preflight(self, scope: Mapping[str, Any]) -> Dict[str, Any]:
+        """Work flatten must not GUESS about (§3 step 2).
+
+        The preview's own verdict decides: an INELIGIBLE candidate with no open
+        remainder is a dead submission the owner must disposition by name, while
+        one whose remainder is still open is in-flight work that resolves by
+        filling (flatten leaves it alone and waits). An option run whose own
+        durable records still own an unresolved protective stage is the third
+        source: it resolves through the staged exit's own pre-send records.
+        """
+        preview = self.preview_pending(scope)
+        settled = self._owner_cancelled_steps(scope)
+        dead: List[Dict[str, Any]] = []
+        waiting: List[Dict[str, Any]] = []
+        for candidate in preview["items"]:
+            if str(candidate.get("eligibility")) == ELIGIBLE:
+                continue
+            if (str(candidate["plan_id"]), int(candidate["step_no"])) in settled:
+                # This strategy's own cancel already disbanded the remainder:
+                # there is nothing left to wait for and nothing to disposition.
+                continue
+            remaining = int(candidate.get("remaining_quantity") or 0)
+            entry = {
+                "plan_id": str(candidate["plan_id"]),
+                "step_no": int(candidate["step_no"]),
+                "order_id": candidate.get("order_id"),
+                "environment": str(candidate.get("environment") or ""),
+                "remaining_quantity": remaining,
+                "reason_code": candidate.get("reason_code"),
+                "disposition_url": (
+                    f"/api/strategies/{str(scope['strategy_id'])}/plans/"
+                    f"{str(candidate['plan_id'])}/steps/{int(candidate['step_no'])}/"
+                    "dead-submission"
+                ),
+            }
+            (dead if remaining <= 0 else waiting).append(entry)
+        rows, coverage = self.option_runs_for_scope(scope)
+        protective: List[Dict[str, Any]] = []
+        for row in rows:
+            if not bool(row.get("protective_exit_unresolved")):
+                continue
+            option_run_id = str(row.get("option_run_id") or "")
+            protective.append(
+                {
+                    "option_run_id": option_run_id,
+                    "status": str(row.get("status") or ""),
+                    "exit_url": (
+                        f"/api/strategies/{str(scope['strategy_id'])}/option-runs/"
+                        f"{option_run_id}/exit"
+                    ),
+                }
+            )
+        return {
+            "dead": dead,
+            "waiting": waiting,
+            "protective_stages": protective,
+            "preview_digest": str(preview["evidence_digest"]),
+            "coverage": str(coverage.get("coverage") or COVERAGE_UNKNOWN),
+        }
+
+    def option_runs_for_scope(
+        self, scope: Mapping[str, Any]
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """This strategy's own option runs, plus the read's coverage verdict."""
+        try:
+            rows, coverage = self._snapshot_service().option_runs_for_scope(
+                account_id=str(scope["account_id"]),
+                strategy_id=str(scope["strategy_id"]),
+                environment=str(scope["execution_environment"]),
+            )
+        except Exception:  # noqa: BLE001 - an unreadable run set is not an empty one
+            return [], {
+                "coverage": COVERAGE_UNKNOWN,
+                "reason": "option_run_read_failed",
+            }
+        return list(rows or []), dict(coverage or {})
+
+    async def _flatten_cancel_items(
+        self, scope: Mapping[str, Any], *, reason: str, actor: str
+    ) -> List[Dict[str, Any]]:
+        """Cancel only what the S1 preview proves eligible (§3 step 3).
+
+        One classifier, not a second one: the cancel is pinned to the preview's
+        own digest, and a candidate the classifier refuses is reported with its
+        named reason instead of being cancelled.
+        """
+        preview = self.preview_pending(scope)
+        items: List[Dict[str, Any]] = []
+        settled = self._owner_cancelled_steps(scope)
+        if any(str(row.get("eligibility")) == ELIGIBLE for row in preview["items"]):
+            result = await self.cancel_pending(
+                scope,
+                evidence_digest=str(preview["evidence_digest"]),
+                reason=str(reason or ""),
+                actor=str(actor),
+            )
+            for row in result.get("items") or []:
+                outcome = str(row.get("outcome") or "")
+                done = outcome in (OUTCOME_CANCELLED, OUTCOME_ALREADY_CANCELLED)
+                remaining = int(row.get("remaining_quantity") or 0)
+                items.append(
+                    _flatten_item(
+                        FLATTEN_ITEM_CANCEL,
+                        f"cancel:{row['plan_id']}:{int(row['step_no'])}",
+                        # An item the classifier refused is left ALONE: while its
+                        # remainder is open it is working (``in_progress``), and
+                        # only an unprovable, already-stopped one is ``blocked``.
+                        ITEM_STATE_DONE
+                        if done
+                        else (
+                            ITEM_STATE_IN_PROGRESS
+                            if remaining > 0
+                            else ITEM_STATE_BLOCKED
+                        ),
+                        reason_code=None if done else row.get("reason_code"),
+                        detail={
+                            "plan_id": str(row["plan_id"]),
+                            "step_no": int(row["step_no"]),
+                            "order_id": row.get("order_id"),
+                            "outcome": outcome,
+                            "filled_quantity": int(row.get("filled_quantity") or 0),
+                            "remaining_quantity": remaining,
+                            "disposition": row.get("disposition"),
+                            "run_status": row.get("run_status"),
+                        },
+                    )
+                )
+        for row in preview["items"]:
+            if str(row.get("eligibility")) == ELIGIBLE:
+                continue
+            key = f"cancel:{row['plan_id']}:{int(row['step_no'])}"
+            if any(item["key"] == key for item in items):
+                continue
+            if (str(row["plan_id"]), int(row["step_no"])) in settled:
+                continue
+            # Defensive: the preflight refuses dead submissions before this runs,
+            # so an ineligible candidate here is work flatten must leave ALONE -
+            # a reducing or protective order that is still working (``in_progress``
+            # until its own fills settle), or a RACE that moved the evidence into
+            # an unprovable state (``blocked`` by name). It is never cancelled.
+            remaining = int(row.get("remaining_quantity") or 0)
+            items.append(
+                _flatten_item(
+                    FLATTEN_ITEM_CANCEL,
+                    key,
+                    ITEM_STATE_IN_PROGRESS if remaining > 0 else ITEM_STATE_BLOCKED,
+                    reason_code=str(row.get("reason_code") or CANCEL_ORDER_NOT_OWNED),
+                    detail={
+                        "plan_id": str(row["plan_id"]),
+                        "step_no": int(row["step_no"]),
+                        "order_id": row.get("order_id"),
+                        "eligibility": str(row.get("eligibility") or ""),
+                        "remaining_quantity": remaining,
+                    },
+                )
+            )
+        return items
+
+    async def _flatten_option_exit_items(
+        self, scope: Mapping[str, Any], *, reason: str
+    ) -> List[Dict[str, Any]]:
+        """Exit option runs ONE AT A TIME through the S2 path (§3 step 4).
+
+        Each run's own fills prove its hedge release, so legs are never merged
+        across runs. The pass stops at the first run that is not finished: its
+        staged exit is WAITING on fills, and starting the next run would trade a
+        structure whose hedge proof belongs to the first one.
+        """
+        rows, coverage = self.option_runs_for_scope(scope)
+        items: List[Dict[str, Any]] = []
+        if not rows:
+            return items
+        if str(coverage.get("coverage") or COVERAGE_UNKNOWN) != COVERAGE_KNOWN:
+            items.append(
+                _flatten_item(
+                    FLATTEN_ITEM_OPTION_EXIT,
+                    "option_exit:scope",
+                    ITEM_STATE_BLOCKED,
+                    reason_code=FLATTEN_OPTION_RUN_COVERAGE_UNKNOWN,
+                    detail={"reason": str(coverage.get("reason") or "")},
+                )
+            )
+            return items
+        for row in rows:
+            option_run_id = str(row.get("option_run_id") or "")
+            if not option_run_id:
+                continue
+            key = f"option_exit:{option_run_id}"
+            try:
+                result = await self._run_option_exit(
+                    scope, option_run_id=option_run_id, reason=str(reason or "")
+                )
+            except OwnerActionRefusal as exc:
+                items.append(
+                    _flatten_item(
+                        FLATTEN_ITEM_OPTION_EXIT,
+                        key,
+                        ITEM_STATE_BLOCKED,
+                        reason_code=exc.reason_code,
+                        detail=dict(exc.detail or {}),
+                    )
+                )
+                break
+            except OptionRunRepairRefusal as exc:
+                items.append(
+                    _flatten_item(
+                        FLATTEN_ITEM_OPTION_EXIT,
+                        key,
+                        ITEM_STATE_BLOCKED,
+                        reason_code=str(exc.reason_code),
+                        detail=exc.as_detail(),
+                    )
+                )
+                break
+            except HTTPException as exc:
+                detail = (
+                    dict(exc.detail)
+                    if isinstance(exc.detail, Mapping)
+                    else {"message": str(exc.detail)}
+                )
+                items.append(
+                    _flatten_item(
+                        FLATTEN_ITEM_OPTION_EXIT,
+                        key,
+                        ITEM_STATE_BLOCKED,
+                        reason_code=str(
+                            detail.get("rejection_reason")
+                            or "OPTION_OWNER_EXIT_BOUNDARY_UNAVAILABLE"
+                        ),
+                        detail=detail,
+                    )
+                )
+                break
+            state = str(result.get("state") or "")
+            run_status = str(result.get("run_status") or "")
+            detail = {
+                "option_run_id": option_run_id,
+                "state": state,
+                "run_status": run_status,
+                "evidence_digest": str(result.get("evidence_digest") or ""),
+                "shorts_proven_closed": bool(result.get("shorts_proven_closed")),
+                "withheld_hedges": list(result.get("withheld_hedges") or []),
+                "stage_items": list(result.get("items") or []),
+            }
+            if state == STATE_FLAT and run_status in TERMINAL_RUN_STATUSES:
+                items.append(
+                    _flatten_item(
+                        FLATTEN_ITEM_OPTION_EXIT, key, ITEM_STATE_DONE, detail=detail
+                    )
+                )
+                continue
+            if str(result.get("status") or "") == "accepted":
+                # ONE stage was submitted; the run's own fills decide the next
+                # stage, so this item is waiting, not done.
+                items.append(
+                    _flatten_item(
+                        FLATTEN_ITEM_OPTION_EXIT,
+                        key,
+                        ITEM_STATE_IN_PROGRESS,
+                        reason_code="option_exit_stage_submitted",
+                        detail=detail,
+                    )
+                )
+            else:
+                items.append(
+                    _flatten_item(
+                        FLATTEN_ITEM_OPTION_EXIT,
+                        key,
+                        ITEM_STATE_BLOCKED,
+                        reason_code=str(
+                            result.get("refusal")
+                            or "OPTION_OWNER_EXIT_STAGE_NOT_SUBMITTED"
+                        ),
+                        detail=detail,
+                    )
+                )
+            # ONE AT A TIME: this run is not finished, so no later run starts
+            # until the next pass - its hedge proof is its own.
+            break
+        return items
+
+    async def _run_option_exit(
+        self, scope: Mapping[str, Any], *, option_run_id: str, reason: str
+    ) -> Dict[str, Any]:
+        runner = self.option_exit_runner
+        if runner is None:
+            raise OwnerActionRefusal(
+                "OPTION_OWNER_EXIT_BOUNDARY_UNAVAILABLE",
+                {
+                    "option_run_id": str(option_run_id),
+                    "message": "no owner-exit boundary is wired for this deployment",
+                },
+            )
+        result = await _await_maybe(
+            runner(scope, str(option_run_id), reason=str(reason or ""))
+        )
+        return dict(result or {})
+
+    async def _flatten_reduction_items(
+        self,
+        scope: Mapping[str, Any],
+        *,
+        operation_id: str,
+        actor: str,
+    ) -> List[Dict[str, Any]]:
+        """Close the strategy's non-option books with target-zero plans (§3.5).
+
+        One frozen plan per ``(instrument, product)``: the frozen target is ZERO
+        and the executor derives the order from the strategy's own attributed
+        book, so the plan can only reduce. A plan that would increase exposure is
+        refused BEFORE admission, and live non-option flatten fails closed by name
+        until C1's governed live reduction lane can submit reductions.
+        """
+        books = self._attribute_books(scope)
+        if books is None:
+            return [
+                _flatten_item(
+                    FLATTEN_ITEM_REDUCTION,
+                    "reduction:books",
+                    ITEM_STATE_BLOCKED,
+                    reason_code="FLATTEN_BOOKS_UNREADABLE",
+                    detail={},
+                )
+            ]
+        nonzero = [book for book in books if int(book["net_quantity"] or 0) != 0]
+        types = self._instrument_types(
+            [str(book.get("instrument_id") or "") for book in nonzero]
+        )
+        environment = str(scope["execution_environment"])
+        items: List[Dict[str, Any]] = []
+        for book in nonzero:
+            key = (
+                f"reduction:raw:{book.get('identity_key')}:{book.get('product')}"
+                if str(book.get("identity_kind")) != "canonical"
+                else f"reduction:{book.get('instrument_id')}:{book.get('product')}"
+            )
+            if str(book.get("identity_kind")) != "canonical":
+                # Unresolved exposure: the platform cannot say WHICH instrument it
+                # is, so it will not flush it through a canonical plan.
+                items.append(
+                    _flatten_item(
+                        FLATTEN_ITEM_REDUCTION,
+                        key,
+                        ITEM_STATE_BLOCKED,
+                        reason_code=FLATTEN_UNATTRIBUTED_EXPOSURE,
+                        detail=dict(book),
+                    )
+                )
+                continue
+            instrument_type = (
+                None
+                if types is None
+                else types.get(str(book.get("instrument_id") or ""))
+            )
+            if instrument_type in OPTION_INSTRUMENT_TYPES:
+                # Options are closed by their OWN run's staged exit; a
+                # single-instrument reduction here would merge structures.
+                continue
+            if types is None or not instrument_type:
+                items.append(
+                    _flatten_item(
+                        FLATTEN_ITEM_REDUCTION,
+                        key,
+                        ITEM_STATE_BLOCKED,
+                        reason_code=FLATTEN_REDUCTION_INSTRUMENT_UNKNOWN,
+                        detail=dict(book),
+                    )
+                )
+                continue
+            if environment == "live":
+                items.append(
+                    _flatten_item(
+                        FLATTEN_ITEM_REDUCTION,
+                        key,
+                        ITEM_STATE_BLOCKED,
+                        reason_code=FLATTEN_LIVE_NONOPTION_UNSUPPORTED,
+                        detail=dict(book),
+                    )
+                )
+                continue
+            items.append(
+                await self._close_non_option_book(
+                    scope,
+                    book=book,
+                    key=key,
+                    operation_id=str(operation_id),
+                    actor=str(actor),
+                )
+            )
+        return items
+
+    async def _close_non_option_book(
+        self,
+        scope: Mapping[str, Any],
+        *,
+        book: Mapping[str, Any],
+        key: str,
+        operation_id: str,
+        actor: str,
+    ) -> Dict[str, Any]:
+        """Build, gate, admit and execute ONE target-zero reduction plan."""
+        attributed_open = int(book.get("net_quantity") or 0)
+        try:
+            built = dict(
+                await _await_maybe(
+                    self.reduction_plan_builder(
+                        scope,
+                        dict(book),
+                        operation_id=str(operation_id),
+                        actor=str(actor),
+                    )
+                )
+                or {}
+            )
+        except OwnerActionRefusal as exc:
+            return _flatten_item(
+                FLATTEN_ITEM_REDUCTION,
+                key,
+                ITEM_STATE_BLOCKED,
+                reason_code=exc.reason_code,
+                detail=dict(exc.detail or {}),
+            )
+        except Exception as exc:  # noqa: BLE001 - an unbuildable plan cannot run
+            return _flatten_item(
+                FLATTEN_ITEM_REDUCTION,
+                key,
+                ITEM_STATE_BLOCKED,
+                reason_code=FLATTEN_REDUCTION_PLAN_REFUSED,
+                detail={"error": type(exc).__name__, "message": str(exc)},
+            )
+        plan = dict(built.get("plan") or {})
+        detail: Dict[str, Any] = {
+            "instrument_id": book.get("instrument_id"),
+            "product": book.get("product"),
+            "attributed_open_quantity": int(attributed_open),
+            "plan_id": str(built.get("plan_id") or plan.get("plan_id") or ""),
+            "target_quantity": 0,
+        }
+        if not plan:
+            return _flatten_item(
+                FLATTEN_ITEM_REDUCTION,
+                key,
+                ITEM_STATE_BLOCKED,
+                reason_code=str(
+                    built.get("reason_code") or FLATTEN_REDUCTION_PLAN_REFUSED
+                ),
+                detail={**detail, "refusal": built.get("refusal")},
+            )
+        if plan_increases_exposure(plan, attributed_open=int(attributed_open)):
+            # BEFORE admission: the platform never admits a flatten plan whose
+            # frozen target would grow or reverse this book.
+            return _flatten_item(
+                FLATTEN_ITEM_REDUCTION,
+                key,
+                ITEM_STATE_BLOCKED,
+                reason_code=FLATTEN_PLAN_INCREASES_EXPOSURE,
+                detail=detail,
+            )
+        pipeline = self.reduction_pipeline
+        if pipeline is None:
+            return _flatten_item(
+                FLATTEN_ITEM_REDUCTION,
+                key,
+                ITEM_STATE_BLOCKED,
+                reason_code=FLATTEN_REDUCTION_PIPELINE_UNAVAILABLE,
+                detail=detail,
+            )
+        environment = str(scope["execution_environment"])
+        try:
+            verdict = dict(
+                await _await_maybe(
+                    pipeline.admit(plan, environment=environment)
+                )
+                or {}
+            )
+        except Exception as exc:  # noqa: BLE001 - an unadmitted plan is not executed
+            return _flatten_item(
+                FLATTEN_ITEM_REDUCTION,
+                key,
+                ITEM_STATE_BLOCKED,
+                reason_code="ADMISSION_REFUSED",
+                detail={
+                    **detail,
+                    "error": type(exc).__name__,
+                    "message": str(exc),
+                },
+            )
+        if not bool(verdict.get("admitted")):
+            return _flatten_item(
+                FLATTEN_ITEM_REDUCTION,
+                key,
+                ITEM_STATE_BLOCKED,
+                reason_code=str(
+                    verdict.get("reason_code")
+                    or verdict.get("rejection_reason")
+                    or verdict.get("reason")
+                    or "ADMISSION_REFUSED"
+                ),
+                detail={**detail, "admission": verdict},
+            )
+        detail["admission"] = verdict
+        try:
+            result = dict(
+                await _await_maybe(pipeline.execute(plan, actor=str(actor))) or {}
+            )
+        except Exception as exc:  # noqa: BLE001 - a failed execution blocks the item
+            return _flatten_item(
+                FLATTEN_ITEM_REDUCTION,
+                key,
+                ITEM_STATE_BLOCKED,
+                reason_code=str(
+                    getattr(exc, "reason_code", "") or "FLATTEN_REDUCTION_FAILED"
+                ),
+                detail={
+                    **detail,
+                    "error": type(exc).__name__,
+                    "message": str(exc),
+                },
+            )
+        status = str(result.get("status") or "")
+        # The COMMAND's word is not the book's state: a reduction is done only
+        # when the strategy's own attributed quantity for this book is ZERO
+        # afterwards (a coarse ``no_op``/partial pass is not proof of flat).
+        remaining = self._book_quantity(
+            scope,
+            instrument_id=str(book.get("instrument_id") or ""),
+            product=str(book.get("product") or ""),
+        )
+        done = status in ("filled", "no_op") and remaining == 0
+        detail["execution"] = {
+            "status": status,
+            "steps": list(result.get("steps") or []),
+        }
+        detail["remaining_quantity"] = remaining
+        return _flatten_item(
+            FLATTEN_ITEM_REDUCTION,
+            key,
+            ITEM_STATE_DONE if done else ITEM_STATE_BLOCKED,
+            reason_code=None if done else "FLATTEN_REDUCTION_INCOMPLETE",
+            detail=detail,
+        )
+
+    def _done_conditions(self, scope: Mapping[str, Any]) -> Dict[str, Any]:
+        """§3's done conditions, each with its own evidence.
+
+        ``complete`` requires ALL of them, so a condition the platform cannot
+        check is reported as unmet with its named reason rather than assumed.
+        """
+        out: Dict[str, Any] = {}
+        preview = self.preview_pending(scope)
+        eligible = [
+            row
+            for row in preview["items"]
+            if str(row.get("eligibility")) == ELIGIBLE
+        ]
+        out[DONE_NO_PENDING_ENTRY] = {
+            "satisfied": not eligible,
+            "evidence": {"eligible": len(eligible)},
+        }
+        outstanding = self._outstanding_plan_steps(scope)
+        live_claims: Optional[List[Dict[str, Any]]] = None
+        try:
+            with self.session_factory() as session:
+                rows = self._live_claim_rows(session, scope)
+            live_claims = None if rows is None else [dict(row) for row in rows]
+        except Exception:  # noqa: BLE001 - an unreadable claim set is not quiet
+            live_claims = None
+        out[DONE_NO_LIVE_UNRESOLVED] = {
+            "satisfied": live_claims is not None and not live_claims,
+            "evidence": {
+                "unreadable": live_claims is None,
+                "claims": list(live_claims or []),
+            },
+        }
+        runs, coverage = self.option_runs_for_scope(scope)
+        run_rows: List[Dict[str, Any]] = []
+        runs_flat = True
+        for row in runs:
+            option_run_id = str(row.get("option_run_id") or "")
+            status = str(row.get("status") or "")
+            state = "unknown"
+            try:
+                run = self._run_store().get_run(option_run_id)
+                from backend.options.protection.staged_exit import StagedStructureExit
+
+                own_open = StagedStructureExit.own_open_by_leg(run)
+                state = (
+                    "flat"
+                    if all(int(value or 0) == 0 for value in own_open.values())
+                    else "residual"
+                )
+            except Exception:  # noqa: BLE001 - an unreadable run is not flat
+                state = "unknown"
+            flat_and_terminal = state == "flat" and status in TERMINAL_RUN_STATUSES
+            runs_flat = runs_flat and flat_and_terminal
+            run_rows.append(
+                {
+                    "option_run_id": option_run_id,
+                    "status": status,
+                    "state": state,
+                    "protective_exit_unresolved": bool(
+                        row.get("protective_exit_unresolved")
+                    ),
+                }
+            )
+        coverage_known = (
+            str(coverage.get("coverage") or COVERAGE_UNKNOWN) == COVERAGE_KNOWN
+        )
+        out[DONE_OPTION_RUNS_FLAT] = {
+            "satisfied": bool(coverage_known and runs_flat),
+            "evidence": {
+                "coverage": str(coverage.get("coverage") or COVERAGE_UNKNOWN),
+                "coverage_reason": str(coverage.get("reason") or ""),
+                "runs": run_rows,
+            },
+        }
+        books = self._attribute_books(scope)
+        nonzero = (
+            None
+            if books is None
+            else [
+                {
+                    "instrument_id": book.get("instrument_id"),
+                    "identity_kind": book.get("identity_kind"),
+                    "product": book.get("product"),
+                    "tradingsymbol": book.get("tradingsymbol"),
+                    "net_quantity": int(book.get("net_quantity") or 0),
+                }
+                for book in books
+                if int(book.get("net_quantity") or 0) != 0
+            ]
+        )
+        out[DONE_BOOKS_ZERO] = {
+            "satisfied": nonzero is not None and not nonzero,
+            "evidence": {
+                "unreadable": nonzero is None,
+                "nonzero": list(nonzero or []),
+            },
+        }
+        authority = self._evaluation_authority(scope)
+        running = (
+            None
+            if authority["jobs"] is None
+            else [_job_stop_view(job) for job in authority["jobs"]]
+        )
+        out[DONE_NO_EVALUATION_AUTHORITY] = {
+            "satisfied": bool(
+                running is not None
+                and not running
+                and authority["approvals"] is not None
+                and not authority["approvals"]
+            ),
+            "evidence": {
+                "jobs": list(running or []),
+                "jobs_readable": running is not None,
+                "approvals": list(authority["approvals"] or []),
+                "approvals_readable": authority["approvals"] is not None,
+            },
+        }
+        in_flight = {
+            "outstanding_plan_steps": outstanding,
+            "option_runs": [
+                row
+                for row in run_rows
+                if row["state"] != "flat"
+                or row["status"] not in TERMINAL_RUN_STATUSES
+                or row["protective_exit_unresolved"]
+            ],
+            "live_unresolved_claims": live_claims,
+        }
+        out[DONE_NO_INFLIGHT_WORK] = {
+            "satisfied": bool(
+                outstanding is not None
+                and not outstanding
+                and not in_flight["option_runs"]
+                and live_claims is not None
+                and not live_claims
+            ),
+            "evidence": in_flight,
+        }
+        return out
+
+    async def flatten(
+        self,
+        scope: Mapping[str, Any],
+        *,
+        reason: str,
+        stop_evaluator: bool,
+        actor: str,
+    ) -> Dict[str, Any]:
+        """The §3 orchestration: stop, preflight, cancel, exit runs, close books.
+
+        The operation is durable BEFORE any work moves, and a repeated POST
+        RESUMES it: outcomes already recorded are merged into the freshly derived
+        manifest, so completed reductions are preserved and only what is left is
+        attempted again.
+        """
+        stop = self.stop_evaluator(
+            scope,
+            stop_evaluator=bool(stop_evaluator),
+            actor=str(actor),
+            reason=str(reason or ""),
+        )
+        preflight = self._flatten_preflight(scope)
+        if preflight["dead"] or preflight["protective_stages"]:
+            raise OwnerActionRefusal(
+                DEAD_SUBMISSION_UNRESOLVED,
+                {
+                    "strategy_id": str(scope["strategy_id"]),
+                    "steps": preflight["dead"],
+                    "protective_stages": preflight["protective_stages"],
+                    "waiting": preflight["waiting"],
+                    "message": (
+                        "this strategy has unanswered work the platform cannot "
+                        "resolve on its own; disposition it by name before flattening"
+                    ),
+                },
+            )
+        store = self._flatten_store()
+        operation = store.open(scope)
+        if operation is None:
+            operation = store.create(
+                scope,
+                operation_id=str(uuid.uuid4()),
+                actor=str(actor),
+                reason=str(reason or ""),
+                stop=stop,
+                status=STATUS_IN_PROGRESS,
+            )
+        else:
+            operation = store.save(
+                str(operation["operation_id"]),
+                status=STATUS_IN_PROGRESS,
+                stop=stop,
+                reason=str(reason or ""),
+                actor=str(actor),
+            )
+        previous = {
+            str(item.get("key") or ""): dict(item)
+            for item in (operation.get("items") or [])
+        }
+        items: List[Dict[str, Any]] = []
+        items.extend(
+            await self._flatten_cancel_items(
+                scope, reason=str(reason or ""), actor=str(actor)
+            )
+        )
+        items.extend(
+            await self._flatten_option_exit_items(scope, reason=str(reason or ""))
+        )
+        items.extend(
+            await self._flatten_reduction_items(
+                scope,
+                operation_id=str(operation["operation_id"]),
+                actor=str(actor),
+            )
+        )
+        merged = _merge_flatten_items(previous, items)
+        done = self._done_conditions(scope)
+        missing = [name for name, value in done.items() if not value["satisfied"]]
+        blocked = [
+            row for row in merged if str(row.get("state")) == ITEM_STATE_BLOCKED
+        ]
+        refusal = str(blocked[0].get("reason_code") or "") if blocked else None
+        if not missing:
+            status = STATUS_COMPLETE
+        elif blocked:
+            status = STATUS_BLOCKED
+        else:
+            status = STATUS_IN_PROGRESS
+        evidence_digest = _digest(
+            {
+                "strategy_id": str(scope["strategy_id"]),
+                "account_id": str(scope["account_id"]),
+                "execution_environment": str(scope["execution_environment"]),
+                "operation_id": str(operation["operation_id"]),
+                "stop": stop,
+                "items": merged,
+                "done": {name: value["satisfied"] for name, value in done.items()},
+            }
+        )
+        saved = store.save(
+            str(operation["operation_id"]),
+            status=status,
+            manifest={"items": merged},
+            evidence_digest=evidence_digest,
+            refusal=refusal,
+        )
+        audit_id = self.record_audit(
+            scope,
+            action="flatten",
+            actor=str(actor),
+            evidence={
+                "operation_id": str(saved["operation_id"]),
+                "reason": str(reason or ""),
+                "stop": stop,
+                "items": merged,
+                "missing": missing,
+                "refusal": refusal,
+            },
+        )
+        return _flatten_response(saved, done=done, missing=missing, audit_id=audit_id)
+
+    def flatten_status(self, scope: Mapping[str, Any]) -> Dict[str, Any]:
+        """The latest flatten operation for this scope, with the CURRENT verdict.
+
+        Read-only: the item outcomes are the stored ones, while the done
+        conditions (and therefore ``complete``) are re-derived from live evidence,
+        so a status read never reports a stale "still working" or a stale "done"
+        for a book that has moved since.
+        """
+        operation = self._flatten_store().latest(scope)
+        if operation is None:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "rejection_reason": "FLATTEN_OPERATION_NONE",
+                    "strategy_id": str(scope["strategy_id"]),
+                    "message": "this strategy has no flatten operation to resume",
+                },
+            )
+        done = self._done_conditions(scope)
+        missing = [name for name, value in done.items() if not value["satisfied"]]
+        blocked = [
+            row
+            for row in (operation.get("items") or [])
+            if str(row.get("state")) == ITEM_STATE_BLOCKED
+        ]
+        if not missing:
+            status = STATUS_COMPLETE
+        elif blocked:
+            status = STATUS_BLOCKED
+        else:
+            status = STATUS_IN_PROGRESS
+        operation = dict(operation)
+        operation["status"] = status
+        return _flatten_response(
+            operation, done=done, missing=missing, audit_id=None
+        )
+
 
 # ---------------------------------------------------------------------------
 # module-level rules
@@ -2209,15 +3541,18 @@ def _entry_state_after_cancel(run: Any, *, own_open: Mapping[str, Any]) -> Tuple
                 ),
                 True,
             )
-        return (
-            mark_partial_entry(
-                stage,
-                completed_legs=[],
-                failed_legs=[str(leg.get("leg_id") or "") for leg in legs],
-                pending_legs=[],
-            ),
-            True,
-        )
+        # Every leg is flat: the run is stranded in cleanup (the case this action
+        # exists for). The lifecycle has no single edge from ``entering`` there -
+        # ``mark_partial_entry``'s all-failed shape lands on ``cleanup_required``,
+        # which only a ``partial_entry`` run may enter - so walk the two edges it
+        # does allow and write the final state. The run is never left claiming an
+        # entry it does not hold.
+        from backend.options.execution.lifecycle import transition_to
+
+        stranded = stage
+        if str(getattr(stranded, "status", "") or "") == OptionRunStatus.ENTERING.value:
+            stranded = transition_to(stranded, OptionRunStatus.PARTIAL_ENTRY)
+        return mark_cleanup_required(stranded), True
     if (
         status == OptionRunStatus.PARTIAL_ENTRY.value
         and desired == OptionRunStatus.CLEANUP_REQUIRED.value
@@ -2275,3 +3610,451 @@ async def live_broker_cancel(*, account_id: str, order_id: str) -> Any:
     return await OrdersService().cancel_order(
         kite, "regular", str(order_id), f"owner-action-cancel-{order_id}"
     )
+
+
+# ---------------------------------------------------------------------------
+# flatten (B2.6b S3, section 3)
+# ---------------------------------------------------------------------------
+
+
+def _iso_at(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    return value.isoformat() if hasattr(value, "isoformat") else str(value)
+
+
+def _job_stop_view(job: Any) -> Dict[str, Any]:
+    """The stop evidence for ONE hosted job, and whether the stop is PROVEN.
+
+    The same rule the operator stop route reports (``_stop_view``): a terminal
+    label alone does not prove process cleanup, so a launched attempt stays
+    unproven until the supervisor reports ``process_cleanup_state == 'confirmed'``.
+    Flatten needs the boolean, so it is computed here once rather than read out of
+    a response body.
+    """
+    status = str(getattr(job, "status", "") or "")
+    launched = getattr(job, "handoff_at", None) is not None
+    requested = (
+        getattr(job, "stop_requested_at", None) is not None
+        or str(getattr(job, "desired_state", "") or "") == "stopped"
+    )
+    cleanup = str(getattr(job, "process_cleanup_state", "") or "")
+    if status in ACTIVE_JOB_STATUSES:
+        proven = False
+        state = "requested" if (status == "queued" or not launched) else "stopping"
+    elif status in TERMINAL_JOB_STATUSES:
+        proven = (cleanup == "confirmed") if launched else True
+        state = "confirmed" if proven else "cleanup_unresolved"
+    else:
+        # An unknown status is never proof that the child stopped.
+        proven = False
+        state = "unknown"
+    return {
+        "job_id": str(getattr(job, "id", "") or ""),
+        "attempt": int(getattr(job, "attempt", 0) or 0),
+        "status": status,
+        "desired_state": str(getattr(job, "desired_state", "") or ""),
+        "requested": bool(requested),
+        "state": state,
+        "proven_stopped": bool(proven),
+        "stop_requested_at": _iso_at(getattr(job, "stop_requested_at", None)),
+        "stop_requested_by": getattr(job, "stop_requested_by", None),
+        "handoff_at": _iso_at(getattr(job, "handoff_at", None)),
+        "process_cleanup_state": cleanup or None,
+    }
+
+
+class FlattenOperationStore:
+    """Durable, resumable flatten operations (``strategy_flatten_operations``).
+
+    One OPEN operation per ``(strategy, account, environment)``: ``open()`` finds
+    it or returns ``None``, and the schema's partial unique index is what makes a
+    second concurrent POST fail rather than run a parallel flatten of one book.
+    """
+
+    #: Distinguishes "leave this field alone" from "set it to NULL" in ``save``.
+    _UNSET = object()
+
+    def __init__(self, *, session_factory: Any) -> None:
+        self.session_factory = session_factory
+
+    def open(self, scope: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+        return self._one(scope, open_only=True)
+
+    def latest(self, scope: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+        return self._one(scope, open_only=False)
+
+    def _one(
+        self, scope: Mapping[str, Any], *, open_only: bool
+    ) -> Optional[Dict[str, Any]]:
+        stmt = select(StrategyFlattenOperation).where(
+            StrategyFlattenOperation.account_id == str(scope["account_id"]),
+            StrategyFlattenOperation.strategy_id == str(scope["strategy_id"]),
+            StrategyFlattenOperation.execution_environment
+            == str(scope["execution_environment"]),
+        )
+        if open_only:
+            stmt = stmt.where(StrategyFlattenOperation.status != STATUS_COMPLETE)
+        stmt = stmt.order_by(
+            StrategyFlattenOperation.created_at.desc(),
+            StrategyFlattenOperation.operation_id.desc(),
+        ).limit(1)
+        with self.session_factory() as session:
+            row = session.execute(stmt).scalars().first()
+        return None if row is None else _flatten_record(row)
+
+    def create(
+        self,
+        scope: Mapping[str, Any],
+        *,
+        operation_id: str,
+        actor: str,
+        reason: str,
+        stop: Mapping[str, Any],
+        status: str,
+    ) -> Dict[str, Any]:
+        at = _utcnow()
+        with self.session_factory() as session:
+            row = StrategyFlattenOperation(
+                operation_id=str(operation_id),
+                strategy_id=str(scope["strategy_id"]),
+                account_id=str(scope["account_id"]),
+                execution_environment=str(scope["execution_environment"]),
+                status=str(status),
+                reason=str(reason or ""),
+                actor_id=str(actor or ""),
+                evidence_digest="",
+                stop=dict(stop or {}),
+                manifest={"items": []},
+                created_at=at,
+                updated_at=at,
+            )
+            session.add(row)
+            session.commit()
+            saved = _flatten_record(row)
+        return saved
+
+    def save(
+        self,
+        operation_id: str,
+        *,
+        status: Optional[str] = None,
+        manifest: Optional[Mapping[str, Any]] = None,
+        evidence_digest: Optional[str] = None,
+        refusal: Any = _UNSET,
+        stop: Optional[Mapping[str, Any]] = None,
+        reason: Optional[str] = None,
+        actor: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Update the operation's own fields; unsupplied fields are left alone."""
+        with self.session_factory() as session:
+            row = session.execute(
+                select(StrategyFlattenOperation).where(
+                    StrategyFlattenOperation.operation_id == str(operation_id)
+                )
+            ).scalars().first()
+            if row is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        "rejection_reason": "FLATTEN_OPERATION_NONE",
+                        "operation_id": str(operation_id),
+                    },
+                )
+            if status is not None:
+                row.status = str(status)
+            if manifest is not None:
+                row.manifest = dict(manifest)
+            if evidence_digest is not None:
+                row.evidence_digest = str(evidence_digest)
+            if refusal is not self._UNSET:
+                row.refusal = None if refusal is None else str(refusal)
+            if stop is not None:
+                row.stop = dict(stop)
+            if reason is not None:
+                row.reason = str(reason)
+            if actor is not None:
+                row.actor_id = str(actor)
+            row.updated_at = _utcnow()
+            session.add(row)
+            session.commit()
+            saved = _flatten_record(row)
+        return saved
+
+
+def _flatten_record(row: Any) -> Dict[str, Any]:
+    """One operation row as the manifest-bearing dict the service works with."""
+    manifest = dict(getattr(row, "manifest", None) or {})
+    return {
+        "operation_id": str(getattr(row, "operation_id", "") or ""),
+        "strategy_id": str(getattr(row, "strategy_id", "") or ""),
+        "account_id": str(getattr(row, "account_id", "") or ""),
+        "execution_environment": str(getattr(row, "execution_environment", "") or ""),
+        "status": str(getattr(row, "status", "") or ""),
+        "reason": str(getattr(row, "reason", "") or ""),
+        "actor_id": str(getattr(row, "actor_id", "") or ""),
+        "evidence_digest": str(getattr(row, "evidence_digest", "") or ""),
+        "stop": dict(getattr(row, "stop", None) or {}),
+        "refusal": getattr(row, "refusal", None),
+        "items": [
+            dict(item or {}) for item in (manifest.get("items") or []) if item
+        ],
+        "created_at": _iso_at(getattr(row, "created_at", None)),
+        "updated_at": _iso_at(getattr(row, "updated_at", None)),
+    }
+
+
+def _flatten_item(
+    kind: str,
+    key: str,
+    state: str,
+    *,
+    reason_code: Optional[str] = None,
+    detail: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """One manifest item: what flatten did (or still has to do) for one unit."""
+    return {
+        "kind": str(kind),
+        "key": str(key),
+        "state": str(state),
+        "reason_code": None if reason_code in (None, "") else str(reason_code),
+        "detail": dict(detail or {}),
+    }
+
+
+def _flatten_response(
+    operation: Mapping[str, Any],
+    *,
+    done: Mapping[str, Any],
+    missing: Sequence[str],
+    audit_id: Optional[str],
+) -> Dict[str, Any]:
+    """The §5 body for a flatten POST / status GET.
+
+    ``status`` is the operation's own verdict (never ``accepted``: this action
+    either finished, is still working, or is blocked by name), ``missing`` is the
+    subset of §3's done conditions that is not satisfied YET, and the ``stop``
+    view is the evaluator evidence the whole operation was gated on.
+    """
+    operation_id = str(operation.get("operation_id") or "")
+    return {
+        "status": str(operation.get("status") or ""),
+        # The operation IS the action here: it is the durable handle the owner
+        # resumes, so it doubles as the action id.
+        "action_id": operation_id,
+        "operation_id": operation_id,
+        "evidence_digest": str(operation.get("evidence_digest") or ""),
+        "stop": dict(operation.get("stop") or {}),
+        "items": [dict(row or {}) for row in (operation.get("items") or [])],
+        "missing": [str(name) for name in (missing or [])],
+        "done_conditions": {
+            str(name): bool(dict(value or {}).get("satisfied"))
+            for name, value in (done or {}).items()
+        },
+        "refusal": operation.get("refusal"),
+        "audit_id": audit_id,
+    }
+
+
+def _merge_flatten_items(
+    previous: Mapping[str, Mapping[str, Any]],
+    current: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    """The recomputed manifest: fresh items, plus work already DONE and merged.
+
+    Two rules, both from §3 step 6. A key the fresh pass derived is the truth for
+    that key (its evidence moved, so the new outcome is the one to report). A key
+    that is only in the stored manifest and was ``done`` STAYS: it is completed
+    work that no longer appears in the derived set (a closed book, an exited run),
+    and forgetting it would make a resumed operation look like it never reduced
+    anything.
+    """
+    merged: List[Dict[str, Any]] = []
+    seen: set = set()
+    for row in current:
+        item = dict(row or {})
+        key = str(item.get("key") or "")
+        previous_row = dict(previous.get(key) or {})
+        if (
+            str(item.get("state")) == ITEM_STATE_BLOCKED
+            and str(previous_row.get("state")) == ITEM_STATE_DONE
+        ):
+            # A later pass re-tried a key it had already completed and got a
+            # refusal: the earlier terminal evidence outranks a retry's refusal
+            # (the work WAS done; the new refusal is about what moved after).
+            item = previous_row
+        merged.append(item)
+        seen.add(key)
+    for key, row in previous.items():
+        if key in seen or str(row.get("state")) != ITEM_STATE_DONE:
+            continue
+        merged.append(dict(row))
+    merged.sort(key=lambda row: (str(row.get("kind") or ""), str(row.get("key") or "")))
+    return merged
+
+
+def _plan_legs(plan: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    resolved = dict(plan.get("resolved_plan") or {})
+    legs = resolved.get("legs")
+    if not isinstance(legs, list):
+        return []
+    return [dict(leg) for leg in legs if isinstance(leg, Mapping)]
+
+
+def plan_increases_exposure(plan: Mapping[str, Any], *, attributed_open: int) -> bool:
+    """Whether this plan's OWN frozen target would increase the book's exposure.
+
+    The tested rule is the executor's (``_opens_or_grows_exposure``: the book
+    grows, or the trade crosses flat), so flatten and the paper executor cannot
+    disagree about what "this reduces" means. An unreadable target is refused as
+    an increase: the platform never admits a reduction it cannot prove reduces.
+    """
+    legs = _plan_legs(plan)
+    if not legs:
+        return True
+    for leg in legs:
+        target = _as_int(leg.get("signed_quantity"))
+        if target is None:
+            return True
+        if _opens_or_grows_exposure(int(target), int(attributed_open)):
+            return True
+    return False
+
+
+def target_zero_reduction_payload(book: Mapping[str, Any]) -> Dict[str, Any]:
+    """The compiler payload for ONE ``(instrument, product)`` target-zero plan.
+
+    Deliberately the executable single-instrument bundle: the frozen target is
+    ZERO (a real instruction, not an absence), so the executor derives the order
+    from the strategy's own attributed book and can only reduce. The payload is a
+    pure function of the book, which is what makes a resumed operation recall the
+    SAME frozen plan instead of freezing a new one.
+    """
+    return {
+        "instrument_token": int(book.get("instrument_token") or 0),
+        "exchange": str(book.get("exchange") or ""),
+        "tradingsymbol": str(book.get("tradingsymbol") or ""),
+        "product": str(book.get("product") or ""),
+        "target_quantity": 0,
+    }
+
+
+def reduction_evaluation_id(
+    operation_id: str, book: Mapping[str, Any]
+) -> str:
+    """The evaluation identity of ONE flatten reduction, stable across resumes."""
+    instrument = str(book.get("instrument_id") or book.get("identity_key") or "")
+    return f"flatten:{str(operation_id)}:{instrument}:{str(book.get('product') or '')}"
+
+
+def latest_bound_run_id(
+    session_factory: Any,
+    *,
+    account_id: str,
+    strategy_id: str,
+    execution_environment: str,
+) -> Optional[str]:
+    """The strategy's newest bound run in one environment, or ``None``.
+
+    A reduction plan needs a run to attribute its fills to (the executor's own
+    rule), and the strategy's own most recent attempt in this environment is the
+    honest target - never a minted one.
+    """
+    with session_factory() as session:
+        return session.execute(
+            select(StrategyRunBinding.strategy_run_id)
+            .where(
+                StrategyRunBinding.account_id == str(account_id),
+                StrategyRunBinding.strategy_id == str(strategy_id),
+                StrategyRunBinding.execution_environment
+                == str(execution_environment),
+            )
+            .order_by(
+                StrategyRunBinding.bound_at.desc(),
+                StrategyRunBinding.strategy_run_id.desc(),
+            )
+            .limit(1)
+        ).scalars().first()
+
+
+def default_reduction_planner(session_factory: Any) -> Any:
+    """The governed planner for ONE attributed non-option book.
+
+    The plan is created through the SAME proposal/compile path every other frozen
+    plan uses (``ProposalStore.submit``), so it is validated, pinned and recorded
+    before anything could admit it. The evaluation identity is derived from the
+    operation and the book, so a resume recalls the existing frozen plan rather
+    than freezing another one.
+    """
+
+    def build(
+        scope: Mapping[str, Any],
+        book: Mapping[str, Any],
+        *,
+        operation_id: str,
+        actor: str,
+    ) -> Dict[str, Any]:
+        environment = str(scope["execution_environment"])
+        run_id = latest_bound_run_id(
+            session_factory,
+            account_id=str(scope["account_id"]),
+            strategy_id=str(scope["strategy_id"]),
+            execution_environment=environment,
+        )
+        if not run_id:
+            raise OwnerActionRefusal(
+                FLATTEN_REDUCTION_RUN_UNBOUND,
+                {
+                    "strategy_id": str(scope["strategy_id"]),
+                    "account_id": str(scope["account_id"]),
+                    "execution_environment": environment,
+                    "instrument_id": book.get("instrument_id"),
+                    "product": book.get("product"),
+                    "message": (
+                        "no bound run exists to attribute this reduction to; a "
+                        "flatten plan is never admitted without an attribution"
+                    ),
+                },
+            )
+        from backend.strategies.proposals import ProposalStore, ProposalSubmission
+
+        store = ProposalStore(session_factory=session_factory)
+        result = store.submit(
+            ProposalSubmission(
+                strategy_id=str(scope["strategy_id"]),
+                account_id=str(scope["account_id"]),
+                evaluation_id=reduction_evaluation_id(str(operation_id), book),
+                evaluation_kind="run_now",
+                strategy_run_id=str(run_id),
+                target_kind="single_instrument",
+                payload=target_zero_reduction_payload(book),
+            )
+        )
+        plan_id = str((result.get("plan") or {}).get("plan_id") or "")
+        if not plan_id:
+            return {
+                "plan": None,
+                "reason_code": FLATTEN_REDUCTION_PLAN_REFUSED,
+                "refusal": result.get("refusal")
+                or {
+                    "status": str(result.get("status") or ""),
+                    "message": "the reduction plan was not validated",
+                },
+            }
+        # Re-read the stored plan so the caller sees exactly what was frozen (the
+        # same shape the admission and execute route work with).
+        plan = store.get_plan(plan_id)
+        if plan is None:
+            return {
+                "plan": None,
+                "reason_code": FLATTEN_REDUCTION_PLAN_REFUSED,
+                "refusal": {"plan_id": plan_id, "message": "frozen plan unreadable"},
+            }
+        return {
+            "plan": plan,
+            "plan_id": plan_id,
+            "idempotent": bool(result.get("idempotent")),
+            "actor": str(actor),
+        }
+
+    return build

@@ -34,4 +34,5 @@ export const hostedKeys = {
     ["hosted", "dead-submission", strategyId, planId, stepNo] as const,
   optionExit: (strategyId: string, optionRunId: string) =>
     ["hosted", "option-exit", strategyId, optionRunId] as const,
+  flatten: (strategyId: string) => ["hosted", "flatten", strategyId] as const,
 };

@@ -1223,6 +1223,82 @@ class StrategyPlanExecutionEvent(Base):
     )
 
 
+class StrategyFlattenOperation(Base):
+    """One durable owner flatten of one hosted strategy (B2.6b S3, section 3).
+
+    Flatten is an ORCHESTRATION, not one mutation: it cancels qualifying pending
+    entry work, exits option runs one at a time through their own staged exit, and
+    closes the strategy's non-option books with target-zero reduction plans. Each
+    of those can wait on fills or fail on its own, so the work list has to outlive
+    one request: a client that closes the tab mid-flatten finds the same
+    operation and resumes it rather than starting a second one.
+
+    ``manifest`` is that work list with its per-item outcome (the section 3 rule
+    "recompute the manifest after each terminal outcome"). The keys are stable
+    (``cancel:{plan}:{step}`` / ``option_exit:{run}`` /
+    ``reduction:{instrument}:{product}``), so a later pass merges an outcome it
+    already recorded into the freshly derived work instead of forgetting that
+    half the flatten is done. ``status`` is the operation's own verdict:
+    ``complete`` only while EVERY section 3 done condition holds, otherwise
+    ``in_progress`` (waiting) or ``blocked`` (a named refusal stopped an item).
+
+    At most one OPEN operation exists per ``(strategy, account, environment)``
+    (``uq_sfo_open_scope``), which is what makes a repeated POST a RESUME.
+    """
+
+    __tablename__ = "strategy_flatten_operations"
+
+    operation_id = Column(Text, primary_key=True)
+    strategy_id = Column(Text, nullable=False)
+    account_id = Column(Text, nullable=False)
+    execution_environment = Column(Text, nullable=False)
+    #: ``complete`` | ``in_progress`` | ``blocked``.
+    status = Column(Text, nullable=False)
+    reason = Column(Text, nullable=False, server_default="")
+    actor_id = Column(Text, nullable=False, server_default="")
+    #: The evidence the operation's own verdict rested on: the stop outcome, the
+    #: items and the done conditions that were checked.
+    evidence_digest = Column(Text, nullable=False, server_default="")
+    #: The evaluator-stop evidence (job ids, states) frozen with the operation, so
+    #: the audit says which stop this flatten was gated on.
+    stop = Column(JSON, nullable=False, server_default=text("'{}'"))
+    #: The work list with its per-item outcome.
+    manifest = Column(JSON, nullable=False, server_default=text("'{}'"))
+    #: The first item-level refusal, or ``None``.
+    refusal = Column(Text, nullable=True)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('complete', 'in_progress', 'blocked')",
+            name="ck_sfo_status",
+        ),
+        CheckConstraint(
+            "execution_environment IN ('live', 'paper', 'dry_run')",
+            name="ck_sfo_environment",
+        ),
+        Index("idx_sfo_scope", "account_id", "strategy_id", "execution_environment"),
+        # One OPEN operation per scope: a second POST resumes this row rather than
+        # running a parallel flatten of the same book. The partial predicate is
+        # declared for both dialects, so a SQLite fixture sees the same shape the
+        # migration creates on PostgreSQL.
+        Index(
+            "uq_sfo_open_scope",
+            "account_id",
+            "strategy_id",
+            "execution_environment",
+            unique=True,
+            sqlite_where=text("status <> 'complete'"),
+            postgresql_where=text("status <> 'complete'"),
+        ),
+    )
+
+
 class StrategyScheduleOccurrence(Base):
     """One materialised occurrence of a schedule (G11).
 

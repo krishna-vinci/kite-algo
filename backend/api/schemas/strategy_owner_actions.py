@@ -236,3 +236,84 @@ class OptionRunExitActionResponse(BaseModel):
     refusal: Optional[str] = None
     audit_id: Optional[str] = None
     submission: Dict[str, Any] = Field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# flatten of the whole strategy (B2.6b S3, sections 3 and 5)
+# ---------------------------------------------------------------------------
+
+
+class FlattenRequest(BaseModel):
+    """``POST .../owner-actions/flatten``.
+
+    The owner supplies a reason and whether flatten may stop the evaluator itself.
+    Never an account, an environment, a quantity or a plan: what flatten does is
+    derived from the strategy's own durable evidence.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str
+    #: Stop the evaluator first (section 3 step 1). The default is the safe one;
+    #: flatten refuses ``FLATTEN_EVALUATION_ACTIVE`` when an active evaluation
+    #: cannot be PROVEN stopped either way.
+    stop_evaluator: bool = True
+
+
+class FlattenItemResponse(BaseModel):
+    """One manifest item: what flatten did, or still has to do, for one unit.
+
+    ``kind`` is ``cancel_pending`` (one plan step's pending entry work),
+    ``option_exit`` (ONE option run's staged exit) or ``nonoption_reduction``
+    (ONE instrument+product book). ``state`` is ``done``, ``in_progress`` (a stage
+    is working or waiting on fills), ``blocked`` (``reason_code`` says why) or
+    ``pending``. Nothing here is optimistic: an item is ``done`` only when its own
+    evidence is terminal.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: str
+    key: str
+    state: str
+    reason_code: Optional[str] = None
+    detail: Dict[str, Any] = Field(default_factory=dict)
+
+
+class FlattenStopResponse(BaseModel):
+    """The evaluator-stop evidence the flatten was gated on (section 3 step 1)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    requested: bool = False
+    #: ``confirmed`` | ``unproven`` | ``none``.
+    state: str = "none"
+    jobs: List[Dict[str, Any]] = Field(default_factory=list)
+    approvals: List[str] = Field(default_factory=list)
+    requested_by: Optional[str] = None
+    reason: str = ""
+
+
+class FlattenResponse(BaseModel):
+    """``POST``/``GET .../owner-actions/flatten``.
+
+    ``status`` is the OPERATION's verdict: ``complete`` only while every section 3
+    done condition holds, otherwise ``in_progress`` (waiting on fills) or
+    ``blocked`` (``refusal`` names the item that stopped). ``operation_id`` is the
+    durable handle: posting again resumes it, and the outcomes already recorded
+    are preserved. ``missing`` lists the done conditions that are not satisfied
+    yet, by name.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: str
+    action_id: str
+    operation_id: str
+    evidence_digest: str
+    stop: FlattenStopResponse = Field(default_factory=FlattenStopResponse)
+    items: List[FlattenItemResponse] = Field(default_factory=list)
+    missing: List[str] = Field(default_factory=list)
+    done_conditions: Dict[str, bool] = Field(default_factory=dict)
+    refusal: Optional[str] = None
+    audit_id: Optional[str] = None

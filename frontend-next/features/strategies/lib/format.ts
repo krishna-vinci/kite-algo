@@ -9,6 +9,7 @@ import { newIdempotencyKey as sharedIdempotencyKey } from "@/lib/ids";
  */
 
 import { ApiClientError } from "@/lib/api/client";
+import type { FlattenManifestItem } from "@/lib/hosted-strategies/types";
 
 export const JOB_STATUS_LABELS: Record<string, string> = {
   queued: "Queued",
@@ -172,6 +173,23 @@ const ERROR_COPY: Record<string, string> = {
   FLATTEN_EVALUATION_ACTIVE: "An active evaluation could not be proven stopped, so flatten was refused.",
   FLATTEN_LIVE_NONOPTION_UNSUPPORTED:
     "Live flatten for non-option positions is not supported yet; option work already completed is still reported as done.",
+  DEAD_SUBMISSION_UNRESOLVED:
+    "This strategy has unanswered submissions that must be resolved before flatten can proceed. Resolve each listed step, then resume.",
+  FLATTEN_OPERATION_NONE: "No flatten operation has been started for this strategy yet.",
+  FLATTEN_PLAN_INCREASES_EXPOSURE:
+    "A candidate reduction plan would increase exposure instead of reducing it, so it was refused.",
+  FLATTEN_REDUCTION_RUN_UNBOUND:
+    "This reduction could not be bound to a governed run, so it was refused.",
+  FLATTEN_REDUCTION_PLAN_REFUSED:
+    "The governed reduction plan was refused by the platform's own admission checks.",
+  FLATTEN_REDUCTION_INSTRUMENT_UNKNOWN:
+    "This instrument could not be matched to the current instrument catalogue, so its reduction was refused.",
+  FLATTEN_REDUCTION_PIPELINE_UNAVAILABLE:
+    "The governed reduction pipeline is unavailable right now, so this position could not be closed.",
+  FLATTEN_UNATTRIBUTED_EXPOSURE:
+    "Exposure exists that could not be attributed to this strategy with proof, so flatten cannot certify it is done.",
+  FLATTEN_OPTION_RUN_COVERAGE_UNKNOWN:
+    "The platform could not prove it read every option run for this strategy, so flatten cannot certify option risk is flat.",
   OPTION_OWNER_EXIT_LIVE_UNAVAILABLE:
     "Live discretionary exit has no available execution boundary right now, so this stays refused rather than guessing.",
   OPTION_RUN_EXIT_EVIDENCE_CHANGED:
@@ -245,6 +263,44 @@ export function hostedRefusalCode(error: unknown): string | null {
     if (typeof reason === "string") return reason;
   }
   return null;
+}
+
+function hostedRefusalDetailField(error: unknown, field: string): unknown[] {
+  if (!(error instanceof ApiClientError)) return [];
+  const body = error.body as unknown;
+  if (!body || typeof body !== "object") return [];
+  const detail = (body as { detail?: unknown }).detail;
+  if (!detail || typeof detail !== "object") return [];
+  const value = (detail as Record<string, unknown>)[field];
+  return Array.isArray(value) ? value : [];
+}
+
+/**
+ * The unanswered steps a `DEAD_SUBMISSION_UNRESOLVED` 409 names (its own
+ * `detail.steps`), so flatten can point the owner at exactly what to resolve
+ * (design §3 step 2: "list the disposition URLs"). Empty for any other
+ * refusal or an unrecognized shape.
+ */
+export function hostedRefusalDeadSubmissionSteps(
+  error: unknown,
+): { plan_id: string; step_no: number }[] {
+  return hostedRefusalDetailField(error, "steps").filter(
+    (step): step is { plan_id: string; step_no: number } =>
+      Boolean(step) &&
+      typeof step === "object" &&
+      typeof (step as Record<string, unknown>).plan_id === "string" &&
+      typeof (step as Record<string, unknown>).step_no === "number",
+  );
+}
+
+/**
+ * The still-open protective stages a `DEAD_SUBMISSION_UNRESOLVED` 409 names
+ * (its own `detail.protective_stages`), which block flatten the same way an
+ * unanswered step does. Shape is not pinned down further than "an array", so
+ * this is rendered defensively.
+ */
+export function hostedRefusalProtectiveStages(error: unknown): unknown[] {
+  return hostedRefusalDetailField(error, "protective_stages");
 }
 
 /**
@@ -520,6 +576,112 @@ export const DEAD_SUBMISSION_DISPOSITION_LABELS: Record<string, string> = {
 export function deadSubmissionDispositionLabel(value: string | null | undefined): string {
   const key = String(value ?? "").trim();
   return DEAD_SUBMISSION_DISPOSITION_LABELS[key] ?? (key ? key : "Unknown");
+}
+
+// ---------------------------------------------------------------------------
+// B2.6b S3: owner-facing flatten orchestration
+// ---------------------------------------------------------------------------
+
+export const FLATTEN_ITEM_KIND_LABELS: Record<string, string> = {
+  cancel_pending: "Pending entry cancel",
+  option_exit: "Option structure exit",
+  nonoption_reduction: "Position reduction",
+};
+
+export function flattenItemKindLabel(kind: string | null | undefined): string {
+  const key = String(kind ?? "").trim();
+  return FLATTEN_ITEM_KIND_LABELS[key] ?? (key ? key : "Item");
+}
+
+/**
+ * A readable label for one manifest row, derived from `kind` + `detail` — the
+ * server's own `key` (e.g. `"cancel:plan-entry:1"`) is a technical identity,
+ * never a display label on its own.
+ */
+export function flattenItemLabel(item: FlattenManifestItem): string {
+  const detail = (item.detail ?? {}) as Record<string, unknown>;
+  switch (item.kind) {
+    case "cancel_pending": {
+      const planId = typeof detail.plan_id === "string" ? detail.plan_id : null;
+      const stepNo = typeof detail.step_no === "number" ? detail.step_no : null;
+      return planId && stepNo !== null ? `Pending entry ${planId} step ${stepNo}` : "Pending entry";
+    }
+    case "option_exit": {
+      const runId = typeof detail.option_run_id === "string" ? detail.option_run_id : null;
+      return runId ? `Option run ${runId}` : "Option structure";
+    }
+    case "nonoption_reduction": {
+      const instrumentId = typeof detail.instrument_id === "string" ? detail.instrument_id : null;
+      const product = typeof detail.product === "string" ? detail.product : null;
+      return instrumentId ? `${instrumentId}${product ? ` (${product})` : ""}` : "Position";
+    }
+    default:
+      return item.key;
+  }
+}
+
+/**
+ * The reason code for a blocked manifest row: the top-level `reason_code`
+ * when present, else `detail.rejection_reason` (populated on blocked
+ * `option_exit` rows per the backend contract).
+ */
+export function flattenItemReasonCode(item: FlattenManifestItem): string | null {
+  if (item.reason_code) return item.reason_code;
+  const nested = (item.detail as Record<string, unknown> | null | undefined)?.rejection_reason;
+  return typeof nested === "string" ? nested : null;
+}
+
+export const FLATTEN_ITEM_STATE_LABELS: Record<string, string> = {
+  done: "Done",
+  in_progress: "In progress",
+  blocked: "Blocked",
+  pending: "Not started yet",
+};
+
+export function flattenItemStateLabel(state: string | null | undefined): string {
+  const key = String(state ?? "").trim();
+  return FLATTEN_ITEM_STATE_LABELS[key] ?? (key ? key : "Unknown");
+}
+
+export function flattenItemStateTone(state: string | null | undefined): string {
+  switch (String(state ?? "")) {
+    case "done":
+      return "border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400";
+    case "in_progress":
+      return "border-sky-500/40 bg-sky-500/10 text-sky-600 dark:text-sky-400";
+    case "blocked":
+      return "border-destructive/40 bg-destructive/10 text-destructive";
+    case "pending":
+    default:
+      return "border-border bg-muted/40 text-muted-foreground";
+  }
+}
+
+export const FLATTEN_STATUS_LABELS: Record<string, string> = {
+  complete: "Complete",
+  accepted: "Accepted — running",
+  in_progress: "In progress",
+  blocked: "Blocked",
+};
+
+export function flattenStatusLabel(status: string | null | undefined): string {
+  const key = String(status ?? "").trim();
+  return FLATTEN_STATUS_LABELS[key] ?? (key ? key : "Unknown");
+}
+
+/** Every condition flatten's own `done` proof requires (design §3). */
+export const FLATTEN_DONE_CONDITION_LABELS: Record<string, string> = {
+  no_qualifying_pending_entry: "No qualifying pending entry work remains",
+  no_live_unresolved_submission: "No unresolved live submission remains",
+  option_runs_flat: "Every option run's own fills are flat and terminal",
+  books_zero: "Every attributed equity/future position is zero against broker truth",
+  no_live_evaluation_authority: "No live evaluation authority remains",
+  no_in_flight_governed_work: "No in-flight governed work remains",
+};
+
+export function flattenDoneConditionLabel(key: string | null | undefined): string {
+  const trimmed = String(key ?? "").trim();
+  return FLATTEN_DONE_CONDITION_LABELS[trimmed] ?? (trimmed ? trimmed : "Unknown condition");
 }
 
 export function schedulePolicyCopy(schedule: {
