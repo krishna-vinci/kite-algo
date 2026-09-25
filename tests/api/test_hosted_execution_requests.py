@@ -163,6 +163,23 @@ _PUBLIC_DDL = (
         created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
     """,
+    # The plan/run binding edge, exactly as ``schema.sql`` defines it. The raw
+    # options store both writes and reads it with a ``public.`` qualifier (the
+    # binding store, the adjust owner set and the run's bound-plan set), so the
+    # edge lives in the attached ``public`` schema rather than in ``main``: one
+    # row set, read the same way by every reader.
+    """
+    CREATE TABLE public.strategy_plan_option_runs (
+        plan_id TEXT PRIMARY KEY,
+        option_run_id TEXT NOT NULL,
+        worker_run_id TEXT,
+        strategy_id TEXT NOT NULL,
+        account_id TEXT NOT NULL,
+        execution_environment TEXT NOT NULL,
+        phase TEXT NOT NULL,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
 )
 
 
@@ -626,7 +643,19 @@ def world():
             cursor.execute(statement)
         cursor.close()
 
-    Base.metadata.create_all(engine)
+    # The option binding edge is deliberately NOT created here: it lives in the
+    # attached ``public`` schema with the run table it points at, because the raw
+    # store qualifies it. SQLite resolves an unqualified name to ``main`` first,
+    # so a second copy there would be the one the ORM wrote and read while the
+    # raw readers saw the empty ``public`` table - two views of one relation.
+    Base.metadata.create_all(
+        engine,
+        tables=[
+            table
+            for table in Base.metadata.sorted_tables
+            if table.name != "strategy_plan_option_runs"
+        ],
+    )
     factory = sessionmaker(bind=engine, expire_on_commit=False)
     _catalog_generation(engine)
     repo = SqlAlchemyStrategyRepository(factory)
