@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useState } from "react";
-import { PlusIcon, ServerCogIcon } from "lucide-react";
+import { ChevronDownIcon, ChevronRightIcon, PlusIcon, ServerCogIcon } from "lucide-react";
 import { toast } from "sonner";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -31,12 +31,15 @@ import { Textarea } from "@/components/ui/textarea";
 import { SectionLabel } from "@/components/operator/section-label";
 import {
   useCreateHostedStrategy,
+  useExecutionRequests,
+  useHostedJobs,
   useHostedOptions,
   useHostedStrategies,
+  useOptionRuns,
   usePendingApprovals,
   useUpdateHostedStrategy,
 } from "@/features/strategies/hooks/use-hosted-strategies-queries";
-import { hostedErrorMessage } from "@/features/strategies/lib/format";
+import { hostedErrorMessage, jobStatusLabel } from "@/features/strategies/lib/format";
 import {
   LIVE_MODE,
   executionModeLabel,
@@ -44,7 +47,96 @@ import {
   liveLaneSummary,
   preferredCreateMode,
 } from "@/features/strategies/lib/modes";
+import { plainStrategyState, PLAIN_STATE_LABELS, type PlainStateKind } from "@/features/strategies/lib/plain-state";
 import type { HostedStrategy, HostedStrategyOptions } from "@/lib/hosted-strategies/types";
+
+/** Tailwind classes for the five plain-state badges. */
+function plainStateTone(state: PlainStateKind): string {
+  switch (state) {
+    case "running":
+      return "border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400";
+    case "stopped":
+      return "border-border bg-muted/40 text-muted-foreground";
+    case "waiting_for_you":
+      return "border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400";
+    case "needs_attention":
+      return "border-orange-500/40 bg-orange-500/10 text-orange-600 dark:text-orange-400";
+    case "error":
+      return "border-destructive/40 bg-destructive/10 text-destructive";
+    default:
+      return "border-border bg-muted/40 text-muted-foreground";
+  }
+}
+
+/**
+ * The plain-state badge + sentence for one strategy, with the raw job/request/
+ * option-run codes available behind a "details" toggle. Per-row queries here
+ * are the same ones the detail page already uses; they are cheap and cached.
+ */
+function PlainStrategyStatus({ strategy }: Readonly<{ strategy: HostedStrategy }>) {
+  const jobsQuery = useHostedJobs(strategy.strategy_id);
+  const requestsQuery = useExecutionRequests(strategy.strategy_id);
+  const optionRunsQuery = useOptionRuns(strategy.strategy_id);
+  const [showDetails, setShowDetails] = useState(false);
+
+  const jobs = jobsQuery.data?.jobs ?? [];
+  const latestJob = jobs[0];
+  const requests = requestsQuery.data?.requests ?? [];
+  const optionRuns = optionRunsQuery.data?.runs ?? [];
+
+  const plain = plainStrategyState({
+    strategyId: strategy.strategy_id,
+    job: latestJob ? { status: latestJob.status, job_id: latestJob.job_id } : null,
+    executionRequests: requests.map((row) => ({ status: row.status })),
+    optionRuns: optionRuns.map((row) => ({ status: row.status, repairable: row.repairable })),
+  });
+
+  return (
+    <div className="flex flex-col gap-1" data-testid={`plain-state-${strategy.strategy_id}`}>
+      <div className="flex items-center gap-2">
+        <span
+          className={`inline-flex rounded-full border px-2 py-0.5 text-xs font-medium ${plainStateTone(plain.state)}`}
+        >
+          {PLAIN_STATE_LABELS[plain.state]}
+        </span>
+        {plain.action ? (
+          <Link href={plain.action.href ?? "#"} className="text-xs underline underline-offset-2">
+            {plain.action.label}
+          </Link>
+        ) : null}
+      </div>
+      <p className="text-xs text-muted-foreground">{plain.sentence}</p>
+      <button
+        type="button"
+        className="inline-flex items-center gap-1 self-start text-xs text-muted-foreground underline underline-offset-2"
+        onClick={() => setShowDetails((value) => !value)}
+      >
+        {showDetails ? <ChevronDownIcon className="size-3" aria-hidden /> : <ChevronRightIcon className="size-3" aria-hidden />}
+        Details
+      </button>
+      {showDetails ? (
+        <dl className="grid gap-0.5 text-[11px] text-muted-foreground">
+          <div>
+            <dt className="inline font-medium">Latest job:</dt>{" "}
+            <dd className="inline">{latestJob ? jobStatusLabel(latestJob.status) : "none yet"}</dd>
+          </div>
+          <div>
+            <dt className="inline font-medium">Execution requests:</dt>{" "}
+            <dd className="inline">
+              {requests.length === 0 ? "none" : requests.map((row) => row.status).join(", ")}
+            </dd>
+          </div>
+          <div>
+            <dt className="inline font-medium">Option runs:</dt>{" "}
+            <dd className="inline">
+              {optionRuns.length === 0 ? "none" : optionRuns.map((row) => row.status).join(", ")}
+            </dd>
+          </div>
+        </dl>
+      ) : null}
+    </div>
+  );
+}
 
 function StatusBadge({ status }: Readonly<{ status: string }>) {
   return (
@@ -259,6 +351,9 @@ function StrategyRow({
       <TableCell>
         <StatusBadge status={strategy.status} />
       </TableCell>
+      <TableCell className="min-w-48">
+        <PlainStrategyStatus strategy={strategy} />
+      </TableCell>
       <TableCell
         className="text-sm text-muted-foreground"
         data-testid={`strategy-mode-${strategy.strategy_id}`}
@@ -362,6 +457,7 @@ export function HostedStrategiesListPage() {
                 <TableRow>
                   <TableHead>Strategy</TableHead>
                   <TableHead>State</TableHead>
+                  <TableHead>Status</TableHead>
                   <TableHead>Mode</TableHead>
                   <TableHead>Account scope</TableHead>
                   <TableHead>Stale exit</TableHead>

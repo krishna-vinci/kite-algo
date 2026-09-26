@@ -26,7 +26,15 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { CheckCircle2Icon, FileCode2Icon, Loader2Icon, PlayIcon, UploadIcon } from "lucide-react";
+import {
+  CheckCircle2Icon,
+  ChevronDownIcon,
+  ChevronRightIcon,
+  FileCode2Icon,
+  Loader2Icon,
+  PlayIcon,
+  UploadIcon,
+} from "lucide-react";
 import { toast } from "sonner";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -56,6 +64,11 @@ import {
   ParamValueInput,
   useHostedParamValues,
 } from "@/features/strategies/components/hosted-params-editor";
+import {
+  knownTimezone,
+  TIMEZONES,
+  WEEKDAYS,
+} from "@/features/strategies/components/hosted-schedule-panel";
 import { hostedKeys } from "@/features/strategies/hooks/keys";
 import {
   useHostedOptions,
@@ -82,6 +95,7 @@ import {
   fieldConstraintSummary,
 } from "@/features/strategies/lib/schema";
 import { HOSTED_STARTER_SOURCE } from "@/features/strategies/lib/starter";
+import { usePlatformStatus } from "@/features/platform/hooks/use-platform-queries";
 import { ApiClientError } from "@/lib/api/client";
 import {
   checkSourceReadiness,
@@ -91,14 +105,37 @@ import {
   issueExecutionGrant,
   runHostedStrategy,
   saveAdmissionPolicy,
+  saveHostedSchedule,
   setAuthorizationMode,
 } from "@/lib/hosted-strategies/api";
 import type {
   CreateHostedVersionPayload,
   HostedStrategy,
   HostedVersion,
+  ScheduleKind,
   SourceReadiness,
 } from "@/lib/hosted-strategies/types";
+
+/** "Run now" launches immediately; "On a schedule" saves a recurring start time. */
+type RunStyle = "now" | "schedule";
+
+type ScheduleDraft = {
+  scheduleKind: ScheduleKind;
+  atTime: string;
+  weekday: number;
+  dayOfMonth: number;
+  calendarDates: string;
+  timezone: string;
+};
+
+const DEFAULT_SCHEDULE_DRAFT: ScheduleDraft = {
+  scheduleKind: "daily",
+  atTime: "09:30",
+  weekday: 1,
+  dayOfMonth: 1,
+  calendarDates: "",
+  timezone: "Asia/Kolkata",
+};
 
 /** The server's own bound: `SourceReadinessRequest.source` is 256 KiB max. */
 const MAX_SOURCE_BYTES = 256 * 1024;
@@ -247,13 +284,28 @@ export function HostedStrategyComposer() {
   const [maxDuration, setMaxDuration] = useState("21600");
   const [progressDeadline, setProgressDeadline] = useState("600");
 
-  const [permissions, setPermissions] = useState({ data: true, trade: false, notify: false });
+  // Sensible defaults: a strategy can read data and propose trades from the
+  // start, and review-first (below) means nothing trades without a decision.
+  const [permissions, setPermissions] = useState({ data: true, trade: true, notify: false });
   const [authorization, setAuthorization] = useState(APPROVAL_BASED);
   const [limits, setLimits] = useState<LimitDraft>(EMPTY_LIMITS);
 
   const [fields, setFields] = useState<SchemaField[]>([]);
   const [advancedSchema, setAdvancedSchema] = useState(false);
   const [schemaText, setSchemaText] = useState("");
+
+  // Everything with a sensible default (permissions, limits/authorization,
+  // job kind, stale-exit policy, duration/deadline, description) lives behind
+  // this disclosure so the primary flow is name -> code -> params -> mode ->
+  // run style -> Start.
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+
+  const [runStyle, setRunStyle] = useState<RunStyle>("now");
+  const [scheduleDraft, setScheduleDraft] = useState<ScheduleDraft>(DEFAULT_SCHEDULE_DRAFT);
+  const platformStatusQuery = usePlatformStatus();
+  // Only an explicit "live is off" answer disables the option; a loading or
+  // failed platform-status query never blocks a mode the server itself offers.
+  const liveDisabledByPlatform = platformStatusQuery.data ? !platformStatusQuery.data.live.enabled : false;
 
   const [steps, setSteps] = useState<CompletedSteps>({});
   const [busy, setBusy] = useState<string | null>(null);
@@ -376,6 +428,9 @@ export function HostedStrategyComposer() {
     if (!options || !isModeSupported(options, environment)) {
       return `This deployment does not offer ${environmentLabel(environment)} right now.`;
     }
+    if (environment === LIVE_MODE && liveDisabledByPlatform) {
+      return "This deployment's platform status reports live trading is off right now.";
+    }
     if (!versionSchema.ok) return versionSchema.error;
     if (trades && desiredMode === AUTONOMOUS && Object.keys(limitsPayload(limits)).length === 0) {
       return "Automatic trading needs your own limits: fill in at least the allocation.";
@@ -385,6 +440,17 @@ export function HostedStrategyComposer() {
     }
     if (!paramValues.valid) {
       return `Check the parameters: ${Object.values(paramValues.errors)[0] ?? "a value is missing."}`;
+    }
+    if (runStyle === "schedule") {
+      if (!knownTimezone(scheduleDraft.timezone)) {
+        return `"${scheduleDraft.timezone}" is not a timezone this browser knows.`;
+      }
+      if (
+        scheduleDraft.scheduleKind === "calendar" &&
+        scheduleDraft.calendarDates.split(",").map((entry) => entry.trim()).filter(Boolean).length === 0
+      ) {
+        return "Add at least one calendar date for the schedule.";
+      }
     }
     return null;
   }
@@ -678,30 +744,57 @@ export function HostedStrategyComposer() {
         setSteps({ ...next });
       }
 
-      const launchKey = JSON.stringify([next.versionId, environment, jobKind, paramValues.value]);
-      if (!next.launchKey || next.launchFingerprint !== launchKey) {
-        next.launchKey = newIdempotencyKey("launch");
-        next.launchFingerprint = launchKey;
-        setSteps({ ...next });
+      if (runStyle === "schedule") {
+        setBusy("Saving the schedule…");
+        await saveHostedSchedule(next.strategyId as string, {
+          version_id: next.versionId as string,
+          execution_mode: environment,
+          job_kind: jobKind,
+          params: paramValues.value,
+          schedule_kind: scheduleDraft.scheduleKind,
+          at_time: scheduleDraft.atTime,
+          weekday: scheduleDraft.scheduleKind === "weekly" ? scheduleDraft.weekday : null,
+          day_of_month: scheduleDraft.scheduleKind === "monthly" ? scheduleDraft.dayOfMonth : null,
+          calendar_dates:
+            scheduleDraft.scheduleKind === "calendar"
+              ? scheduleDraft.calendarDates
+                  .split(",")
+                  .map((entry) => entry.trim())
+                  .filter(Boolean)
+              : null,
+          timezone: scheduleDraft.timezone,
+          enabled: true,
+        });
+        void client.invalidateQueries({ queryKey: hostedKeys.strategies() });
+        void client.invalidateQueries({ queryKey: hostedKeys.schedule(next.strategyId as string) });
+        toast.success("Schedule saved. The strategy starts at its next occurrence.");
+        router.push(`/strategies/${next.strategyId}`);
+      } else {
+        const launchKey = JSON.stringify([next.versionId, environment, jobKind, paramValues.value]);
+        if (!next.launchKey || next.launchFingerprint !== launchKey) {
+          next.launchKey = newIdempotencyKey("launch");
+          next.launchFingerprint = launchKey;
+          setSteps({ ...next });
+        }
+        setBusy("Queueing the first attempt…");
+        await runHostedStrategy(next.strategyId as string, {
+          version_id: next.versionId as string,
+          params: paramValues.value,
+          execution_mode: environment,
+          job_kind: jobKind,
+          idempotency_key: next.launchKey,
+        });
+        void client.invalidateQueries({ queryKey: hostedKeys.strategies() });
+        void client.invalidateQueries({ queryKey: hostedKeys.jobs(next.strategyId as string) });
+        toast.success(
+          environment === LIVE_MODE && trades && desiredMode === AUTONOMOUS
+            ? "Queued. Live trades run under the authorization you just issued."
+            : environment === LIVE_MODE
+              ? "Queued. The live attempt still needs your approval of a plan before anything is sent."
+              : "Queued. The process has not started yet.",
+        );
+        router.push(`/strategies/${next.strategyId}`);
       }
-      setBusy("Queueing the first attempt…");
-      await runHostedStrategy(next.strategyId as string, {
-        version_id: next.versionId as string,
-        params: paramValues.value,
-        execution_mode: environment,
-        job_kind: jobKind,
-        idempotency_key: next.launchKey,
-      });
-      void client.invalidateQueries({ queryKey: hostedKeys.strategies() });
-      void client.invalidateQueries({ queryKey: hostedKeys.jobs(next.strategyId as string) });
-      toast.success(
-        environment === LIVE_MODE && trades && desiredMode === AUTONOMOUS
-          ? "Queued. Live trades run under the authorization you just issued."
-          : environment === LIVE_MODE
-            ? "Queued. The live attempt still needs your approval of a plan before anything is sent."
-            : "Queued. The process has not started yet.",
-      );
-      router.push(`/strategies/${next.strategyId}`);
     } catch (error) {
       setFailure(hostedErrorMessage(error));
     } finally {
@@ -725,6 +818,34 @@ export function HostedStrategyComposer() {
           </AlertDescription>
         </Alert>
       ) : null}
+      <Panel title="Name">
+        <div className="grid gap-4 md:grid-cols-2">
+          <div className="grid gap-1.5">
+            <Label htmlFor="composer-name">Name</Label>
+            <Input
+              id="composer-name"
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              placeholder="NIFTY opening range"
+            />
+          </div>
+          <div className="grid gap-1.5">
+            <Label htmlFor="composer-scope">Account</Label>
+            <Select value={accountScope} onValueChange={setAccountChoice}>
+              <SelectTrigger id="composer-scope" className="w-full">
+                <SelectValue placeholder="Select an authorized account" />
+              </SelectTrigger>
+              <SelectContent>
+                {(options?.account_scopes ?? []).map((scope) => (
+                  <SelectItem key={scope} value={scope}>
+                    {scope}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+        </div>
+      </Panel>
       <Panel title="Python source">
         <div className="flex flex-col gap-3">
           <div className="flex flex-wrap items-center gap-2">
@@ -801,179 +922,6 @@ export function HostedStrategyComposer() {
             </p>
           ) : null}
         </div>
-      </Panel>
-      <Panel title="Permissions">
-        <div className="flex flex-col gap-3">
-          {(
-            [
-              [
-                "data",
-                "Read market data",
-                "Quotes, candles, indices, indicators, option chains and owned universes.",
-              ],
-              [
-                "trade",
-                "Propose trades",
-                "Submit trade proposals for admission and approval. It never places an order by itself.",
-              ],
-              [
-                "notify",
-                "Send notifications",
-                "Publish run notifications through the configured channels.",
-              ],
-            ] as const
-          ).map(([key, label, help]) => (
-            <label key={key} className="flex items-start gap-3 text-sm">
-              <Checkbox
-                checked={permissions[key]}
-                onCheckedChange={(value) =>
-                  setPermissions((current) => ({ ...current, [key]: value === true }))
-                }
-                aria-label={label}
-              />
-              <span>
-                <span className="font-medium">{label}</span>
-                <span className="block text-xs text-muted-foreground">{help}</span>
-              </span>
-            </label>
-          ))}
-          <p className="text-xs text-muted-foreground">
-            What you choose here is the whole grant. Reading or scanning the code never grants anything.
-          </p>
-        </div>
-      </Panel>
-      <Panel title="Strategy and account">
-        <div className="grid gap-4 md:grid-cols-2">
-          <div className="grid gap-1.5">
-            <Label htmlFor="composer-name">Name</Label>
-            <Input
-              id="composer-name"
-              value={name}
-              onChange={(event) => setName(event.target.value)}
-              placeholder="NIFTY opening range"
-            />
-          </div>
-          <div className="grid gap-1.5">
-            <Label htmlFor="composer-scope">Account</Label>
-            <Select value={accountScope} onValueChange={setAccountChoice}>
-              <SelectTrigger id="composer-scope" className="w-full">
-                <SelectValue placeholder="Select an authorized account" />
-              </SelectTrigger>
-              <SelectContent>
-                {(options?.account_scopes ?? []).map((scope) => (
-                  <SelectItem key={scope} value={scope}>
-                    {scope}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-          <div className="grid gap-1.5">
-            <Label htmlFor="composer-environment">Environment</Label>
-            <Select value={environment} onValueChange={setEnvironmentChoice}>
-              <SelectTrigger id="composer-environment" className="w-full">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {supportedExecutionModes(options).map((mode) => (
-                  <SelectItem key={mode} value={mode}>
-                    {environmentLabel(mode)}
-                  </SelectItem>
-                ))}
-                {options && !isModeSupported(options, environment) ? (
-                  <SelectItem value={environment}>{environmentLabel(environment)}</SelectItem>
-                ) : null}
-              </SelectContent>
-            </Select>
-            {options && !liveModeSupported(options) ? (
-              <p className="text-xs text-muted-foreground">
-                Live execution is not enabled on this deployment, so it is not offered here.
-              </p>
-            ) : environment === LIVE_MODE ? (
-              <p className="text-xs text-muted-foreground">
-                Live places real orders
-                {liveLaneSummary(options) ? ` · lanes: ${liveLaneSummary(options)}` : ""}.
-                {liveRequiresOwnerApproval(options)
-                  ? " A live attempt needs your own authority, not the platform's: either your decision on the plan it submits, or the standing authorization you issue for this version, account, limits and environment. The platform never approves one for you."
-                  : " This deployment reports that it does not wait for your approval of live attempts."}
-              </p>
-            ) : null}
-          </div>
-          <div className="grid gap-1.5 md:col-span-2">
-            <Label htmlFor="composer-description">Description (optional)</Label>
-            <Textarea
-              id="composer-description"
-              rows={2}
-              value={description}
-              onChange={(event) => setDescription(event.target.value)}
-            />
-          </div>
-        </div>
-      </Panel>
-      <Panel title="Who approves trades">
-        {!trades ? (
-          <p className="text-sm text-muted-foreground" data-testid="authorization-inapplicable">
-            This strategy has no &quot;Propose trades&quot; permission, so it never asks for a trade
-            decision. Add that permission above to choose between review-first and automatic trading.
-          </p>
-        ) : (
-          <div className="flex flex-col gap-4">
-            <div className="grid gap-3 md:grid-cols-2">
-              <button
-                type="button"
-                onClick={() => setAuthorization(APPROVAL_BASED)}
-                aria-pressed={authorization === APPROVAL_BASED}
-                className={`rounded-lg border p-3 text-left text-sm transition ${
-                  authorization === APPROVAL_BASED
-                    ? "border-primary/60 bg-primary/5"
-                    : "border-border/70 hover:bg-muted/40"
-                }`}
-              >
-                <span className="flex items-center gap-2 font-semibold">
-                  {authorization === APPROVAL_BASED ? (
-                    <CheckCircle2Icon className="size-4" aria-hidden />
-                  ) : null}
-                  {authorizationModeLabel(APPROVAL_BASED)}
-                </span>
-                <span className="mt-1 block text-xs text-muted-foreground">
-                  {authorizationModeExplanation(APPROVAL_BASED)}
-                </span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setAuthorization(AUTONOMOUS)}
-                aria-pressed={authorization === AUTONOMOUS}
-                className={`rounded-lg border p-3 text-left text-sm transition ${
-                  authorization === AUTONOMOUS
-                    ? "border-primary/60 bg-primary/5"
-                    : "border-border/70 hover:bg-muted/40"
-                }`}
-              >
-                <span className="flex items-center gap-2 font-semibold">
-                  {authorization === AUTONOMOUS ? (
-                    <CheckCircle2Icon className="size-4" aria-hidden />
-                  ) : null}
-                  {authorizationModeLabel(AUTONOMOUS)}
-                </span>
-                <span className="mt-1 block text-xs text-muted-foreground">
-                  {authorizationModeExplanation(AUTONOMOUS)}
-                </span>
-              </button>
-            </div>
-            <div className="flex flex-col gap-2">
-              <p className="text-sm font-medium">
-                {desiredMode === AUTONOMOUS
-                  ? "Limits the authorization is bound to"
-                  : "Limits a trade is admitted against"}
-              </p>
-              <p className="text-xs text-muted-foreground">
-                These are your numbers, not defaults: admission checks them before any trade, whoever
-                approves it.
-              </p>
-              <LimitsFields limits={limits} onChange={setLimits} />
-            </div>
-          </div>
-        )}
       </Panel>
       <Panel title="Inputs">
         <div className="flex flex-col gap-4">
@@ -1062,64 +1010,388 @@ export function HostedStrategyComposer() {
           </div>
         </div>
       </Panel>
-      <Panel title="Timing and run protection">
-        <div className="grid gap-4 md:grid-cols-2">
-          <div className="grid gap-1.5">
-            <Label htmlFor="composer-kind">Run kind</Label>
-            <Select value={jobKind} onValueChange={setJobKindChoice}>
-              <SelectTrigger id="composer-kind" className="w-full">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {(options?.job_kinds ?? []).map((kind) => (
-                  <SelectItem key={kind} value={kind}>
-                    {kind === "continuous"
-                      ? "Continuous (runs until stopped)"
-                      : "Finite (finishes on its own)"}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-          <div className="grid gap-1.5">
-            <Label htmlFor="composer-stale">If the strategy stops reporting</Label>
-            <Select value={staleExitPolicy} onValueChange={setPolicyChoice}>
-              <SelectTrigger id="composer-stale" className="w-full">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {(options?.stale_exit_policies ?? []).map((policy) => (
-                  <SelectItem key={policy} value={policy}>
-                    {policy === "none" ? "Keep positions" : "Exit positions (platform risk reduction)"}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-          <div className="grid gap-1.5">
-            <Label htmlFor="composer-max">Max duration (seconds)</Label>
-            <Input
-              id="composer-max"
-              inputMode="numeric"
-              value={maxDuration}
-              onChange={(event) => setMaxDuration(event.target.value)}
-            />
-          </div>
-          <div className="grid gap-1.5">
-            <Label htmlFor="composer-deadline">Progress deadline (seconds)</Label>
-            <Input
-              id="composer-deadline"
-              inputMode="numeric"
-              value={progressDeadline}
-              onChange={(event) => setProgressDeadline(event.target.value)}
-            />
-          </div>
+      <Panel title="Mode">
+        <div className="grid gap-1.5 md:max-w-sm">
+          <Label htmlFor="composer-environment">Environment</Label>
+          <Select value={environment} onValueChange={setEnvironmentChoice}>
+            <SelectTrigger id="composer-environment" className="w-full">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {supportedExecutionModes(options).map((mode) => (
+                <SelectItem
+                  key={mode}
+                  value={mode}
+                  disabled={mode === LIVE_MODE && liveDisabledByPlatform}
+                >
+                  {environmentLabel(mode)}
+                  {mode === LIVE_MODE && liveDisabledByPlatform ? " (off right now)" : ""}
+                </SelectItem>
+              ))}
+              {options && !isModeSupported(options, environment) ? (
+                <SelectItem value={environment}>{environmentLabel(environment)}</SelectItem>
+              ) : null}
+            </SelectContent>
+          </Select>
+          {options && !liveModeSupported(options) ? (
+            <p className="text-xs text-muted-foreground">
+              Live execution is not enabled on this deployment, so it is not offered here.
+            </p>
+          ) : liveDisabledByPlatform ? (
+            <p className="text-xs text-muted-foreground" data-testid="live-disabled-by-platform">
+              This deployment&apos;s platform status reports live trading is off right now, so Live is
+              disabled here until it is turned back on.
+            </p>
+          ) : environment === LIVE_MODE ? (
+            <p className="text-xs text-muted-foreground">
+              Live places real orders
+              {liveLaneSummary(options) ? ` · lanes: ${liveLaneSummary(options)}` : ""}.
+              {liveRequiresOwnerApproval(options)
+                ? " A live attempt needs your own authority, not the platform's: either your decision on the plan it submits, or the standing authorization you issue for this version, account, limits and environment. The platform never approves one for you."
+                : " This deployment reports that it does not wait for your approval of live attempts."}
+            </p>
+          ) : null}
         </div>
-        <p className="mt-3 text-xs text-muted-foreground">
-          Stop always ends the process. It does not flatten positions and does not cancel orders a broker
-          already holds.
-        </p>
       </Panel>
+      <Panel title="Run style">
+        <div className="flex flex-col gap-4">
+          <div className="grid gap-3 md:grid-cols-2">
+            <button
+              type="button"
+              onClick={() => setRunStyle("now")}
+              aria-pressed={runStyle === "now"}
+              className={`rounded-lg border p-3 text-left text-sm transition ${
+                runStyle === "now" ? "border-primary/60 bg-primary/5" : "border-border/70 hover:bg-muted/40"
+              }`}
+            >
+              <span className="flex items-center gap-2 font-semibold">
+                {runStyle === "now" ? <CheckCircle2Icon className="size-4" aria-hidden /> : null}
+                Run now
+              </span>
+              <span className="mt-1 block text-xs text-muted-foreground">
+                Queues the first attempt as soon as Start finishes.
+              </span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setRunStyle("schedule")}
+              aria-pressed={runStyle === "schedule"}
+              className={`rounded-lg border p-3 text-left text-sm transition ${
+                runStyle === "schedule"
+                  ? "border-primary/60 bg-primary/5"
+                  : "border-border/70 hover:bg-muted/40"
+              }`}
+            >
+              <span className="flex items-center gap-2 font-semibold">
+                {runStyle === "schedule" ? <CheckCircle2Icon className="size-4" aria-hidden /> : null}
+                On a schedule
+              </span>
+              <span className="mt-1 block text-xs text-muted-foreground">
+                Starts a new attempt at a fixed local time instead of right away.
+              </span>
+            </button>
+          </div>
+          {runStyle === "schedule" ? (
+            <div className="grid gap-4 md:grid-cols-2">
+              <div className="grid gap-1.5">
+                <Label htmlFor="composer-schedule-kind">Cadence</Label>
+                <Select
+                  value={scheduleDraft.scheduleKind}
+                  onValueChange={(value) =>
+                    setScheduleDraft((current) => ({ ...current, scheduleKind: value as ScheduleKind }))
+                  }
+                >
+                  <SelectTrigger id="composer-schedule-kind" className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="daily">Every day</SelectItem>
+                    <SelectItem value="weekly">Every week</SelectItem>
+                    <SelectItem value="monthly">Every month</SelectItem>
+                    <SelectItem value="calendar">On chosen dates</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="grid gap-1.5">
+                <Label htmlFor="composer-schedule-time">Local time</Label>
+                <Input
+                  id="composer-schedule-time"
+                  type="time"
+                  value={scheduleDraft.atTime}
+                  onChange={(event) =>
+                    setScheduleDraft((current) => ({ ...current, atTime: event.target.value }))
+                  }
+                />
+              </div>
+              {scheduleDraft.scheduleKind === "weekly" ? (
+                <div className="grid gap-1.5">
+                  <Label htmlFor="composer-schedule-weekday">Weekday</Label>
+                  <Select
+                    value={String(scheduleDraft.weekday)}
+                    onValueChange={(value) =>
+                      setScheduleDraft((current) => ({ ...current, weekday: Number(value) }))
+                    }
+                  >
+                    <SelectTrigger id="composer-schedule-weekday" className="w-full">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {WEEKDAYS.map((day, index) => (
+                        <SelectItem key={day} value={String(index)}>
+                          {day}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              ) : null}
+              {scheduleDraft.scheduleKind === "monthly" ? (
+                <div className="grid gap-1.5">
+                  <Label htmlFor="composer-schedule-day">Day of month</Label>
+                  <Input
+                    id="composer-schedule-day"
+                    inputMode="numeric"
+                    value={String(scheduleDraft.dayOfMonth)}
+                    onChange={(event) =>
+                      setScheduleDraft((current) => ({
+                        ...current,
+                        dayOfMonth: Number(event.target.value) || 1,
+                      }))
+                    }
+                  />
+                </div>
+              ) : null}
+              {scheduleDraft.scheduleKind === "calendar" ? (
+                <div className="grid gap-1.5 md:col-span-2">
+                  <Label htmlFor="composer-schedule-dates">Dates (comma-separated, YYYY-MM-DD)</Label>
+                  <Input
+                    id="composer-schedule-dates"
+                    value={scheduleDraft.calendarDates}
+                    onChange={(event) =>
+                      setScheduleDraft((current) => ({ ...current, calendarDates: event.target.value }))
+                    }
+                  />
+                </div>
+              ) : null}
+              <div className="grid gap-1.5">
+                <Label htmlFor="composer-schedule-timezone">Timezone</Label>
+                <Select
+                  value={scheduleDraft.timezone}
+                  onValueChange={(value) =>
+                    setScheduleDraft((current) => ({ ...current, timezone: value }))
+                  }
+                >
+                  <SelectTrigger id="composer-schedule-timezone" className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {TIMEZONES.map((zone) => (
+                      <SelectItem key={zone} value={zone}>
+                        {zone}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+          ) : null}
+        </div>
+      </Panel>
+      <div className="flex flex-col gap-3">
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          className="self-start"
+          onClick={() => setAdvancedOpen((value) => !value)}
+        >
+          {advancedOpen ? (
+            <ChevronDownIcon className="size-4" aria-hidden />
+          ) : (
+            <ChevronRightIcon className="size-4" aria-hidden />
+          )}
+          Advanced
+        </Button>
+        {advancedOpen ? (
+          <div className="flex flex-col gap-5">
+            <Panel title="Description">
+              <div className="grid gap-1.5">
+                <Label htmlFor="composer-description">Description (optional)</Label>
+                <Textarea
+                  id="composer-description"
+                  rows={2}
+                  value={description}
+                  onChange={(event) => setDescription(event.target.value)}
+                />
+              </div>
+            </Panel>
+            <Panel title="Permissions">
+              <div className="flex flex-col gap-3">
+                {(
+                  [
+                    [
+                      "data",
+                      "Read market data",
+                      "Quotes, candles, indices, indicators, option chains and owned universes.",
+                    ],
+                    [
+                      "trade",
+                      "Propose trades",
+                      "Submit trade proposals for admission and approval. It never places an order by itself.",
+                    ],
+                    [
+                      "notify",
+                      "Send notifications",
+                      "Publish run notifications through the configured channels.",
+                    ],
+                  ] as const
+                ).map(([key, label, help]) => (
+                  <label key={key} className="flex items-start gap-3 text-sm">
+                    <Checkbox
+                      checked={permissions[key]}
+                      onCheckedChange={(value) =>
+                        setPermissions((current) => ({ ...current, [key]: value === true }))
+                      }
+                      aria-label={label}
+                    />
+                    <span>
+                      <span className="font-medium">{label}</span>
+                      <span className="block text-xs text-muted-foreground">{help}</span>
+                    </span>
+                  </label>
+                ))}
+                <p className="text-xs text-muted-foreground">
+                  What you choose here is the whole grant. Reading or scanning the code never grants
+                  anything.
+                </p>
+              </div>
+            </Panel>
+            <Panel title="Who approves trades">
+              {!trades ? (
+                <p className="text-sm text-muted-foreground" data-testid="authorization-inapplicable">
+                  This strategy has no &quot;Propose trades&quot; permission, so it never asks for a trade
+                  decision. Add that permission above to choose between review-first and automatic trading.
+                </p>
+              ) : (
+                <div className="flex flex-col gap-4">
+                  <div className="grid gap-3 md:grid-cols-2">
+                    <button
+                      type="button"
+                      onClick={() => setAuthorization(APPROVAL_BASED)}
+                      aria-pressed={authorization === APPROVAL_BASED}
+                      className={`rounded-lg border p-3 text-left text-sm transition ${
+                        authorization === APPROVAL_BASED
+                          ? "border-primary/60 bg-primary/5"
+                          : "border-border/70 hover:bg-muted/40"
+                      }`}
+                    >
+                      <span className="flex items-center gap-2 font-semibold">
+                        {authorization === APPROVAL_BASED ? (
+                          <CheckCircle2Icon className="size-4" aria-hidden />
+                        ) : null}
+                        {authorizationModeLabel(APPROVAL_BASED)}
+                      </span>
+                      <span className="mt-1 block text-xs text-muted-foreground">
+                        {authorizationModeExplanation(APPROVAL_BASED)}
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setAuthorization(AUTONOMOUS)}
+                      aria-pressed={authorization === AUTONOMOUS}
+                      className={`rounded-lg border p-3 text-left text-sm transition ${
+                        authorization === AUTONOMOUS
+                          ? "border-primary/60 bg-primary/5"
+                          : "border-border/70 hover:bg-muted/40"
+                      }`}
+                    >
+                      <span className="flex items-center gap-2 font-semibold">
+                        {authorization === AUTONOMOUS ? (
+                          <CheckCircle2Icon className="size-4" aria-hidden />
+                        ) : null}
+                        {authorizationModeLabel(AUTONOMOUS)}
+                      </span>
+                      <span className="mt-1 block text-xs text-muted-foreground">
+                        {authorizationModeExplanation(AUTONOMOUS)}
+                      </span>
+                    </button>
+                  </div>
+                  <div className="flex flex-col gap-2">
+                    <p className="text-sm font-medium">
+                      {desiredMode === AUTONOMOUS
+                        ? "Limits the authorization is bound to"
+                        : "Limits a trade is admitted against"}
+                    </p>
+                    <p className="text-xs text-muted-foreground">
+                      These are your numbers, not defaults: admission checks them before any trade,
+                      whoever approves it.
+                    </p>
+                    <LimitsFields limits={limits} onChange={setLimits} />
+                  </div>
+                </div>
+              )}
+            </Panel>
+            <Panel title="Timing and run protection">
+              <div className="grid gap-4 md:grid-cols-2">
+                <div className="grid gap-1.5">
+                  <Label htmlFor="composer-kind">Run kind</Label>
+                  <Select value={jobKind} onValueChange={setJobKindChoice}>
+                    <SelectTrigger id="composer-kind" className="w-full">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {(options?.job_kinds ?? []).map((kind) => (
+                        <SelectItem key={kind} value={kind}>
+                          {kind === "continuous"
+                            ? "Continuous (runs until stopped)"
+                            : "Finite (finishes on its own)"}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="grid gap-1.5">
+                  <Label htmlFor="composer-stale">If the strategy stops reporting</Label>
+                  <Select value={staleExitPolicy} onValueChange={setPolicyChoice}>
+                    <SelectTrigger id="composer-stale" className="w-full">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {(options?.stale_exit_policies ?? []).map((policy) => (
+                        <SelectItem key={policy} value={policy}>
+                          {policy === "none" ? "Keep positions" : "Exit positions (platform risk reduction)"}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="grid gap-1.5">
+                  <Label htmlFor="composer-max">Max duration (seconds)</Label>
+                  <Input
+                    id="composer-max"
+                    inputMode="numeric"
+                    value={maxDuration}
+                    onChange={(event) => setMaxDuration(event.target.value)}
+                  />
+                </div>
+                <div className="grid gap-1.5">
+                  <Label htmlFor="composer-deadline">Progress deadline (seconds)</Label>
+                  <Input
+                    id="composer-deadline"
+                    inputMode="numeric"
+                    value={progressDeadline}
+                    onChange={(event) => setProgressDeadline(event.target.value)}
+                  />
+                </div>
+              </div>
+              <p className="mt-3 text-xs text-muted-foreground">
+                Stop always ends the process. It does not flatten positions and does not cancel orders a
+                broker already holds.
+              </p>
+            </Panel>
+          </div>
+        ) : null}
+      </div>
       <Panel title="What this will do">
         <div className="flex flex-col gap-3">
           <p className="text-sm" data-testid="composer-summary">
@@ -1174,7 +1446,7 @@ export function HostedStrategyComposer() {
               ) : (
                 <PlayIcon className="size-4" aria-hidden />
               )}
-              {busy ?? "Create and run"}
+              {busy ?? "Start"}
             </Button>
             <Link href="/strategies" className="text-sm underline">
               Back to strategies

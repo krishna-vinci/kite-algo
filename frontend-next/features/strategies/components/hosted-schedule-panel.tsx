@@ -50,8 +50,9 @@ import type {
   HostedVersion,
 } from "@/lib/hosted-strategies/types";
 
-const WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
-const TIMEZONES = [
+/** Reused by the composer's inline "On a schedule" run style. */
+export const WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+export const TIMEZONES = [
   "Asia/Kolkata",
   "Asia/Dubai",
   "Asia/Singapore",
@@ -97,7 +98,7 @@ function formFromSchedule(
  * unlike `supportedValuesOf` it accepts the aliases operators actually type
  * (Asia/Kolkata as well as Asia/Calcutta).
  */
-function knownTimezone(name: string): boolean {
+export function knownTimezone(name: string): boolean {
   const raw = name.trim();
   if (!raw) return false;
   try {

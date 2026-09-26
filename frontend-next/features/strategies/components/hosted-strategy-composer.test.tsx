@@ -20,6 +20,18 @@ vi.mock("next/navigation", () => ({
 
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 
+vi.mock("@/lib/platform/api", () => ({
+  fetchPlatformStatus: vi.fn().mockResolvedValue({
+    mode: "paper",
+    broker: { state: "ok", detail: null },
+    market_data: { state: "ok", last_tick_age_s: 0 },
+    strategy_runner: { state: "ok", last_seen_age_s: 0 },
+    live: { enabled: true, lanes_open: [] },
+  }),
+  fetchPlatformLiveSettings: vi.fn(),
+  updatePlatformLiveSettings: vi.fn(),
+}));
+
 vi.mock("@/lib/hosted-strategies/api", () => ({
   fetchHostedOptions: vi.fn(),
   fetchHostedStrategies: vi.fn(),
@@ -32,6 +44,7 @@ vi.mock("@/lib/hosted-strategies/api", () => ({
   saveAdmissionPolicy: vi.fn(),
   issueExecutionGrant: vi.fn(),
   runHostedStrategy: vi.fn(),
+  saveHostedSchedule: vi.fn(),
   fetchAuthorization: vi.fn(),
   fetchExecutionGrants: vi.fn(),
   fetchExecutionRequests: vi.fn(),
@@ -201,6 +214,15 @@ function setSource(text: string) {
   fireEvent.change(screen.getByLabelText(/python source/i), { target: { value: text } });
 }
 
+/**
+ * Permissions, the trade-authorization choice, limits, job kind, stale-exit
+ * policy and duration all live behind the "Advanced" disclosure now that the
+ * primary flow only asks for name, code, params, mode and run style.
+ */
+async function openAdvanced(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(screen.getByRole("button", { name: /advanced/i }));
+}
+
 /** Radix Select is a button + listbox, not a native <select>. */
 async function chooseOption(
   user: ReturnType<typeof userEvent.setup>,
@@ -258,7 +280,7 @@ describe("hosted strategy composer", () => {
     await waitFor(() => expect(screen.getByTestId("readiness-blocked")).toBeInTheDocument(), {
       timeout: 15_000,
     });
-    expect(screen.getByRole("button", { name: /create and run/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /^start$/i })).toBeDisabled();
     expect(screen.getByLabelText(/python source/i)).toHaveValue("print('hello')\n");
     expect(createHostedStrategy).not.toHaveBeenCalled();
   });
@@ -272,10 +294,10 @@ describe("hosted strategy composer", () => {
     const warning = await screen.findByTestId("readiness-unknown", {}, { timeout: 15_000 });
     expect(warning).toHaveTextContent(/not certified ready/i);
     expect(screen.queryByTestId("readiness-ready")).toBeNull();
-    expect(screen.getByRole("button", { name: /create and run/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /^start$/i })).toBeDisabled();
 
     await userEvent.setup().click(screen.getByLabelText(/acknowledge the unverified source/i));
-    await waitFor(() => expect(screen.getByRole("button", { name: /create and run/i })).toBeEnabled());
+    await waitFor(() => expect(screen.getByRole("button", { name: /^start$/i })).toBeEnabled());
   });
 
   it("refuses an oversized paste without touching the editor contents", async () => {
@@ -302,7 +324,7 @@ describe("hosted strategy composer", () => {
     expect(await screen.findByText(/choose a python file/i)).toBeInTheDocument();
     expect(area).toHaveValue(READY_SOURCE);
 
-    await user.click(screen.getByRole("button", { name: /create and run/i }));
+    await user.click(screen.getByRole("button", { name: /^start$/i }));
     await waitFor(() => expect(runHostedStrategy).toHaveBeenCalledTimes(1), { timeout: 15_000 });
     expect(vi.mocked(toast.error).mock.calls).toEqual([]);
   });
@@ -310,14 +332,14 @@ describe("hosted strategy composer", () => {
   it("records the owner's limits for a review-first strategy, with no grant", async () => {
     renderComposer();
     const user = await fillBasics("review first limits");
-    await user.click(screen.getByRole("checkbox", { name: /propose trades/i }));
-    // Review-first is the default choice; the limits are the owner's own.
+    await openAdvanced(user);
+    // "Propose trades" is on by default now; review-first is the default choice.
     expect(screen.getByRole("button", { name: /review trades first/i })).toHaveAttribute(
       "aria-pressed",
       "true",
     );
     await user.type(screen.getByLabelText(/allocation \(inr\)/i), "250000");
-    await user.click(screen.getByRole("button", { name: /create and run/i }));
+    await user.click(screen.getByRole("button", { name: /^start$/i }));
 
     await waitFor(() => expect(runHostedStrategy).toHaveBeenCalledTimes(1), { timeout: 15_000 });
     expect(saveAdmissionPolicy).toHaveBeenCalledWith("s-1", { allocation_inr: 250000 });
@@ -360,14 +382,14 @@ describe("hosted strategy composer", () => {
 
     await waitFor(() => expect(screen.getByLabelText(/^quantity \*$/i)).toBeInTheDocument());
     // Required with no default: submitting before filling it is refused here.
-    await user.click(screen.getByRole("button", { name: /create and run/i }));
+    await user.click(screen.getByRole("button", { name: /^start$/i }));
     expect(toast.error).toHaveBeenCalledWith(expect.stringMatching(/check the parameters/i));
     expect(createHostedStrategy).not.toHaveBeenCalled();
     vi.mocked(toast.error).mockClear();
 
     await user.type(screen.getByLabelText(/^quantity \*$/i), "0");
     await chooseOption(user, /^mode$/i, "positional");
-    await user.click(screen.getByRole("button", { name: /create and run/i }));
+    await user.click(screen.getByRole("button", { name: /^start$/i }));
 
     expect(vi.mocked(toast.error).mock.calls).toEqual([]);
     await waitFor(() => expect(runHostedStrategy).toHaveBeenCalledTimes(1));
@@ -380,7 +402,7 @@ describe("hosted strategy composer", () => {
     vi.mocked(runHostedStrategy).mockRejectedValueOnce(new Error("launch failed"));
     renderComposer();
     const user = await fillBasics("edited after failure");
-    await user.click(screen.getByRole("button", { name: /create and run/i }));
+    await user.click(screen.getByRole("button", { name: /^start$/i }));
     await waitFor(() => expect(screen.getByTestId("composer-error")).toBeInTheDocument(), {
       timeout: 15_000,
     });
@@ -392,7 +414,7 @@ describe("hosted strategy composer", () => {
     await waitFor(() => expect(screen.getByTestId("readiness-ready")).toBeInTheDocument(), {
       timeout: 15_000,
     });
-    await user.click(screen.getByRole("button", { name: /create and run/i }));
+    await user.click(screen.getByRole("button", { name: /^start$/i }));
     await waitFor(() => expect(runHostedStrategy).toHaveBeenCalledTimes(2));
 
     expect(createHostedStrategy).toHaveBeenCalledTimes(1); // no duplicate strategy
@@ -406,10 +428,10 @@ describe("hosted strategy composer", () => {
     vi.mocked(runHostedStrategy).mockRejectedValueOnce(new Error("launch failed"));
     renderComposer();
     const user = await fillBasics("mode switch");
-    await user.click(screen.getByRole("checkbox", { name: /propose trades/i }));
+    await openAdvanced(user);
     await user.click(screen.getByRole("button", { name: /trade automatically within my limits/i }));
     await user.type(screen.getByLabelText(/allocation \(inr\)/i), "50000");
-    await user.click(screen.getByRole("button", { name: /create and run/i }));
+    await user.click(screen.getByRole("button", { name: /^start$/i }));
     await waitFor(() => expect(screen.getByTestId("composer-error")).toBeInTheDocument(), {
       timeout: 15_000,
     });
@@ -419,7 +441,7 @@ describe("hosted strategy composer", () => {
     });
 
     await user.click(screen.getByRole("button", { name: /review trades first/i }));
-    await user.click(screen.getByRole("button", { name: /create and run/i }));
+    await user.click(screen.getByRole("button", { name: /^start$/i }));
     await waitFor(() =>
       expect(setAuthorizationMode).toHaveBeenCalledWith("s-1", {
         mode: "approval_based",
@@ -436,12 +458,12 @@ describe("hosted strategy composer", () => {
     vi.mocked(runHostedStrategy).mockRejectedValueOnce(new Error("launch failed"));
     renderComposer();
     const user = await fillBasics("lost mode answer");
-    await user.click(screen.getByRole("checkbox", { name: /propose trades/i }));
+    await openAdvanced(user);
     await user.click(screen.getByRole("button", { name: /trade automatically within my limits/i }));
     await user.type(screen.getByLabelText(/allocation \(inr\)/i), "50000");
     // The mode-write answer itself is lost, so ``serverMode`` stays unknown.
     vi.mocked(setAuthorizationMode).mockRejectedValueOnce(new Error("Network request failed"));
-    await user.click(screen.getByRole("button", { name: /create and run/i }));
+    await user.click(screen.getByRole("button", { name: /^start$/i }));
     await waitFor(() => expect(setAuthorizationMode).toHaveBeenCalledTimes(1), { timeout: 15_000 });
     expect(setAuthorizationMode).toHaveBeenCalledWith("s-1", {
       mode: "autonomous",
@@ -449,7 +471,7 @@ describe("hosted strategy composer", () => {
     });
 
     await user.click(screen.getByRole("button", { name: /review trades first/i }));
-    await user.click(screen.getByRole("button", { name: /create and run/i }));
+    await user.click(screen.getByRole("button", { name: /^start$/i }));
     await waitFor(() =>
       expect(setAuthorizationMode).toHaveBeenCalledWith("s-1", {
         mode: "approval_based",
@@ -471,10 +493,10 @@ describe("hosted strategy composer", () => {
     });
     renderComposer();
     const user = await fillBasics("adopted autonomous");
-    await user.click(screen.getByRole("checkbox", { name: /propose trades/i }));
+    await openAdvanced(user);
     await user.click(screen.getByRole("button", { name: /review trades first/i }));
     await user.type(screen.getByLabelText(/allocation \(inr\)/i), "50000");
-    await user.click(screen.getByRole("button", { name: /create and run/i }));
+    await user.click(screen.getByRole("button", { name: /^start$/i }));
 
     await waitFor(
       () =>
@@ -491,10 +513,10 @@ describe("hosted strategy composer", () => {
     vi.mocked(runHostedStrategy).mockRejectedValueOnce(new Error("launch failed"));
     renderComposer();
     const user = await fillBasics("limits change");
-    await user.click(screen.getByRole("checkbox", { name: /propose trades/i }));
+    await openAdvanced(user);
     await user.click(screen.getByRole("button", { name: /trade automatically within my limits/i }));
     await user.type(screen.getByLabelText(/allocation \(inr\)/i), "50000");
-    await user.click(screen.getByRole("button", { name: /create and run/i }));
+    await user.click(screen.getByRole("button", { name: /^start$/i }));
     await waitFor(() => expect(issueExecutionGrant).toHaveBeenCalledTimes(1), { timeout: 15_000 });
     const firstGrantKey = vi.mocked(issueExecutionGrant).mock.calls[0][1].idempotency_key;
 
@@ -504,7 +526,7 @@ describe("hosted strategy composer", () => {
     const allocation = screen.getByLabelText(/allocation \(inr\)/i);
     await user.clear(allocation);
     await user.type(allocation, "75000");
-    await user.click(screen.getByRole("button", { name: /create and run/i }));
+    await user.click(screen.getByRole("button", { name: /^start$/i }));
 
     await waitFor(() => expect(issueExecutionGrant).toHaveBeenCalledTimes(2));
     expect(saveAdmissionPolicy).toHaveBeenLastCalledWith("s-1", { allocation_inr: 75000 });
@@ -516,7 +538,7 @@ describe("hosted strategy composer", () => {
     vi.mocked(runHostedStrategy).mockRejectedValueOnce(new Error("launch failed"));
     renderComposer();
     const user = await fillBasics("account change");
-    await user.click(screen.getByRole("button", { name: /create and run/i }));
+    await user.click(screen.getByRole("button", { name: /^start$/i }));
     await waitFor(() => expect(screen.getByTestId("composer-error")).toBeInTheDocument(), {
       timeout: 15_000,
     });
@@ -528,7 +550,7 @@ describe("hosted strategy composer", () => {
       timeout: 15_000,
     });
     await chooseOption(user, /^environment$/i, "Dry run (no orders at all)");
-    await user.click(screen.getByRole("button", { name: /create and run/i }));
+    await user.click(screen.getByRole("button", { name: /^start$/i }));
 
     // The refusal is stated on the page (not just a toast), with the way out.
     expect(screen.getByTestId("composer-error")).toHaveTextContent(
@@ -543,7 +565,7 @@ describe("hosted strategy composer", () => {
     renderComposer();
     const user = await fillBasics("opening range");
     vi.mocked(fetchHostedStrategies).mockResolvedValue({ strategies: [CREATED_STRATEGY] });
-    await user.click(screen.getByRole("button", { name: /create and run/i }));
+    await user.click(screen.getByRole("button", { name: /^start$/i }));
 
     await waitFor(() => expect(createHostedVersion).toHaveBeenCalledTimes(1), { timeout: 15_000 });
     expect(createHostedStrategy).toHaveBeenCalledTimes(1);
@@ -559,7 +581,7 @@ describe("hosted strategy composer", () => {
     vi.mocked(fetchHostedStrategies).mockResolvedValue({
       strategies: [{ ...CREATED_STRATEGY, default_job_kind: "continuous", max_duration_s: 3600 }],
     });
-    await user.click(screen.getByRole("button", { name: /create and run/i }));
+    await user.click(screen.getByRole("button", { name: /^start$/i }));
 
     const refusal = await screen.findByTestId("composer-error", {}, { timeout: 15_000 });
     expect(refusal).toHaveTextContent(/already exists with different name, account, environment/i);
@@ -579,11 +601,11 @@ describe("hosted strategy composer", () => {
           version_id: "v-3",
           source: READY_SOURCE,
           parameters_schema: {},
-          capabilities_snapshot: { data: true, trade: false, notify: false },
+          capabilities_snapshot: { data: true, trade: true, notify: false },
         }),
       ],
     });
-    await user.click(screen.getByRole("button", { name: /create and run/i }));
+    await user.click(screen.getByRole("button", { name: /^start$/i }));
 
     await waitFor(() => expect(runHostedStrategy).toHaveBeenCalledTimes(1), { timeout: 15_000 });
     // No second copy of the same source, and the launch points at the revision
@@ -605,23 +627,25 @@ describe("hosted strategy composer", () => {
         }),
       ],
     });
-    await user.click(screen.getByRole("button", { name: /create and run/i }));
+    await user.click(screen.getByRole("button", { name: /^start$/i }));
 
     const refusal = await screen.findByTestId("composer-error", {}, { timeout: 15_000 });
     expect(refusal).toHaveTextContent(/did not complete/i);
     expect(runHostedStrategy).not.toHaveBeenCalled();
   });
 
-  it("hides the trade decision for a data-only strategy and shows limits when it can trade", async () => {
+  it("shows the trade decision by default and hides it once trading is turned off", async () => {
     renderComposer();
     const user = await fillBasics("data only");
-    expect(screen.getByTestId("authorization-inapplicable")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /trade automatically within my limits/i })).toBeNull();
-
-    await user.click(screen.getByRole("checkbox", { name: /propose trades/i }));
+    await openAdvanced(user);
+    // "Propose trades" defaults on, so the trade decision is visible immediately.
     expect(screen.getByRole("button", { name: /review trades first/i })).toBeInTheDocument();
     // Review-first still needs admission limits: they are owner numbers, not a
     // default, so the fields are empty and the value is never invented.
     expect(screen.getByLabelText(/allocation \(inr\)/i)).toHaveValue("");
+
+    await user.click(screen.getByRole("checkbox", { name: /propose trades/i }));
+    expect(screen.getByTestId("authorization-inapplicable")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /trade automatically within my limits/i })).toBeNull();
   });
 });

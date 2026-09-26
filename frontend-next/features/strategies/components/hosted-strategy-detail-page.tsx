@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useRef, useState } from "react";
-import { PlayIcon, ShieldPlusIcon } from "lucide-react";
+import { ChevronDownIcon, ChevronRightIcon, PlayIcon, ShieldPlusIcon } from "lucide-react";
 import { toast } from "sonner";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -32,10 +32,12 @@ import { Textarea } from "@/components/ui/textarea";
 import { SectionLabel } from "@/components/operator/section-label";
 import {
   useCreateHostedVersion,
+  useExecutionRequests,
   useHostedJobs,
   useHostedOptions,
   useHostedStrategy,
   useHostedVersions,
+  useOptionRuns,
   useRunHostedStrategy,
   useUpdateHostedStrategy,
 } from "@/features/strategies/hooks/use-hosted-strategies-queries";
@@ -66,7 +68,93 @@ import {
   runNowGate,
   supportedExecutionModes,
 } from "@/features/strategies/lib/modes";
+import { plainStrategyState, PLAIN_STATE_LABELS, type PlainStateKind } from "@/features/strategies/lib/plain-state";
 import type { HostedJobSummary, HostedVersion } from "@/lib/hosted-strategies/types";
+
+function plainStateTone(state: PlainStateKind): string {
+  switch (state) {
+    case "running":
+      return "border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400";
+    case "stopped":
+      return "border-border bg-muted/40 text-muted-foreground";
+    case "waiting_for_you":
+      return "border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400";
+    case "needs_attention":
+      return "border-orange-500/40 bg-orange-500/10 text-orange-600 dark:text-orange-400";
+    case "error":
+      return "border-destructive/40 bg-destructive/10 text-destructive";
+    default:
+      return "border-border bg-muted/40 text-muted-foreground";
+  }
+}
+
+/**
+ * The one-sentence, one-action banner at the top of the detail page. Raw
+ * job/request/option-run codes stay available behind "Details" — this never
+ * replaces them, it just stops them from being the FIRST thing read.
+ */
+function PlainStateBanner({
+  strategyId,
+  latestJob,
+}: Readonly<{ strategyId: string; latestJob: HostedJobSummary | undefined }>) {
+  const requestsQuery = useExecutionRequests(strategyId);
+  const optionRunsQuery = useOptionRuns(strategyId);
+  const [showDetails, setShowDetails] = useState(false);
+
+  const requests = requestsQuery.data?.requests ?? [];
+  const optionRuns = optionRunsQuery.data?.runs ?? [];
+
+  const plain = plainStrategyState({
+    strategyId,
+    job: latestJob ? { status: latestJob.status, job_id: latestJob.job_id } : null,
+    executionRequests: requests.map((row) => ({ status: row.status })),
+    optionRuns: optionRuns.map((row) => ({ status: row.status, repairable: row.repairable })),
+  });
+
+  return (
+    <Card data-testid="plain-state-banner">
+      <CardContent className="flex flex-col gap-2 pt-6">
+        <div className="flex flex-wrap items-center gap-3">
+          <span
+            className={`inline-flex rounded-full border px-2.5 py-1 text-sm font-medium ${plainStateTone(plain.state)}`}
+          >
+            {PLAIN_STATE_LABELS[plain.state]}
+          </span>
+          <p className="text-sm">{plain.sentence}</p>
+          {plain.action ? (
+            <Button asChild size="sm" variant="outline">
+              <Link href={plain.action.href ?? "#"}>{plain.action.label}</Link>
+            </Button>
+          ) : null}
+        </div>
+        <button
+          type="button"
+          className="inline-flex items-center gap-1 self-start text-xs text-muted-foreground underline underline-offset-2"
+          onClick={() => setShowDetails((value) => !value)}
+        >
+          {showDetails ? <ChevronDownIcon className="size-3" aria-hidden /> : <ChevronRightIcon className="size-3" aria-hidden />}
+          Details
+        </button>
+        {showDetails ? (
+          <dl className="grid gap-1 text-xs text-muted-foreground sm:grid-cols-3">
+            <div>
+              <dt className="font-medium text-foreground">Latest job</dt>
+              <dd>{latestJob ? jobStatusLabel(latestJob.status) : "none yet"}</dd>
+            </div>
+            <div>
+              <dt className="font-medium text-foreground">Execution requests</dt>
+              <dd>{requests.length === 0 ? "none" : requests.map((row) => row.status).join(", ")}</dd>
+            </div>
+            <div>
+              <dt className="font-medium text-foreground">Option runs</dt>
+              <dd>{optionRuns.length === 0 ? "none" : optionRuns.map((row) => row.status).join(", ")}</dd>
+            </div>
+          </dl>
+        ) : null}
+      </CardContent>
+    </Card>
+  );
+}
 
 function RegisterVersionForm({ strategyId }: Readonly<{ strategyId: string }>) {
   const mutation = useCreateHostedVersion(strategyId);
@@ -415,6 +503,8 @@ export function HostedStrategyDetailPage({ strategyId }: Readonly<{ strategyId: 
           </Button>
         </div>
       </div>
+
+      <PlainStateBanner strategyId={strategyId} latestJob={jobs[0]} />
 
       <div className="grid gap-4 md:grid-cols-3">
         <Card>
