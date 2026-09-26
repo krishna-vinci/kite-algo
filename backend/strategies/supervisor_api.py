@@ -233,7 +233,14 @@ class LifecycleApiClient:
         lease_epoch: int,
         attempt: int,
         chunks: list,
+        live: bool = False,
     ) -> Dict[str, Any]:
+        """Push bounded child-log chunks.
+
+        ``live`` reports that the chunks were taken while the child was still
+        running, so the control plane can record that logs were streamed live
+        rather than only collected after termination.
+        """
         return self._request(
             "POST",
             f"/hosted-supervisor/jobs/{job_id}/logs",
@@ -242,6 +249,7 @@ class LifecycleApiClient:
                 "lease_epoch": lease_epoch,
                 "attempt": attempt,
                 "chunks": list(chunks),
+                "live": bool(live),
             },
         )
 

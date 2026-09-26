@@ -52,8 +52,6 @@ plans.
   - **No freeze-quantity slicing.**
   - **A live daily loss budget blocks all live admissions** once it is set.
   - **No market-hours gate** in the pipeline.
-  - **The supervisor runs one strategy child at a time.**
-  - **Logs arrive only after the child exits.**
   - **No real live order has been placed yet.** Everything live has been proven with a fake broker only.
 
 ---
@@ -222,7 +220,8 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
   - The detail page has: new version, run now, an authorization panel (mode, grants, admission policy), an
     execution-requests panel with approve and reject, a schedule panel and an options panel.
     - The options panel covers runs, repair, exit, cancel-pending, flatten and stop (`hosted-options-panel.tsx`).
-  - The job detail page shows stop, logs (polled every 5 s), notifications and reconciliation.
+  - The job detail page shows stop, logs (streamed live by the runner; the page polls every 5 s and can read
+    incrementally by `after_seq`), notifications and reconciliation.
 
 ### 4.3 Runtime (supervisor)
 
@@ -243,11 +242,19 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
 - **Stop:** SIGTERM, then SIGKILL after 10 s (`supervisor.py:1038-1043`). A plain Stop **does not flatten or
   cancel orders** (`strategies.py:3199-3203`); `POST .../jobs/{job}/stop` takes ``flatten: bool`` (default false)
   and, when true, follows the stop with the governed strategy flatten, reporting both outcomes.
-- **Concurrency: PARTIAL.** One child at a time per runner (`supervisor.py:720,1091-1102`). The `concurrency`
-  setting is validated but not used, and compose pins one container.
-- **Logs: PARTIAL.** They ship after the child terminates, are capped at 256 KiB, and are not streamed live
-  (`hosted_lifecycle.py:60-61`, `strategies.py:3276-3279`). Near-live signals are `ctx.progress` and
-  `log_decision_event`.
+- **Concurrency: EXISTS.** A cycle supervises up to `concurrency` children at once (default 3,
+  `HOSTED_SUPERVISOR_CONCURRENCY`), each keeping its own lease/heartbeat/progress/stop handling, and a freed
+  slot claims more queued work (`supervisor.py:811-937`). A child's failure is its own outcome and tears down
+  neither its siblings nor the loop (`supervisor.py:860-876`). `compose.supervisor.yml` still pins one runner
+  container, and no production run has yet exercised more than one child.
+- **Logs: EXISTS (streamed + post-termination).** The runner streams new child stdout to the lifecycle API about
+  every 5 s or 16 KiB while the child runs, then drains the remainder at exit; shipments are bounded per request
+  and idempotent by byte offset so the final shipment never duplicates a live one (`supervisor.py:448-508`). The
+  API redacts on ingest and keeps a 256 KiB **ring buffer over the newest output** in `strategy_job_logs`,
+  evicting the oldest chunks and setting `logs_discarded` when it does (`hosted_lifecycle.py:60-61`,
+  `repository.py:2097`). `strategy_jobs.logs_source` is `live` when any shipment arrived while the child ran and
+  `post_termination` otherwise. `GET .../jobs/{job}/logs?after_seq=<seq>` reads incrementally
+  (`strategies.py:3327`). Near-live signals are still `ctx.progress` and `log_decision_event`.
 - **`continuous` vs `finite`: `continuous` is effectively a label.** The supervisor never reads `job_kind`. The
   only difference is that continuous jobs never auto-continue (`continuation.py:454-456`).
 - **Many decisions per job:**

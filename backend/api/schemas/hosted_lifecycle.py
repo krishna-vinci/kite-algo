@@ -133,6 +133,9 @@ class ProcessLogsRequest(BaseModel):
     lease_epoch: int = Field(ge=0)
     attempt: int = Field(ge=1)
     chunks: List[str] = Field(min_length=1, max_length=64)
+    #: True when the chunks were captured while the child was still running.
+    #: Marks the attempt's logs as streamed live rather than post-termination.
+    live: bool = False
 
 
 class ProcessLogsResponse(BaseModel):

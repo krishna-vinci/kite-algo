@@ -455,3 +455,61 @@ async def test_logs_discarded_below_cap_is_reported_and_cleanup_untouched(sessio
     async with _client(session_factory, monkeypatch) as client:
         body = (await client.get(f"{BASE}/{strategy.id}/jobs/{job.id}/logs")).json()
         assert body["truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_live_log_stream_is_redacted_and_read_incrementally(session_factory, monkeypatch):
+    repo = _repo(session_factory)
+    strategy, version = _strategy(repo)
+    job = _to_running(repo, strategy, version)
+
+    await hosted_lifecycle.report_job_logs(
+        strategy_repo=repo, job_id=job.id, lease_owner="sup-A", lease_epoch=1, attempt=1,
+        chunks=["boot kwa_abcdefghijklmnop\n"], live=True,
+    )
+    assert repo.get_job(OWNER, job.id).logs_source == "live"
+    # A later shipment (e.g. the final drain) never downgrades a live attempt.
+    await hosted_lifecycle.report_job_logs(
+        strategy_repo=repo, job_id=job.id, lease_owner="sup-A", lease_epoch=1, attempt=1,
+        chunks=["bye\n"], live=False,
+    )
+    assert repo.get_job(OWNER, job.id).logs_source == "live"
+
+    async with _client(session_factory, monkeypatch) as client:
+        full = (await client.get(f"{BASE}/{strategy.id}/jobs/{job.id}/logs")).json()
+        assert full["source"] == "live" and full["available"] is True
+        assert "live" in full["notice"]
+        text = "".join(entry["content"] for entry in full["entries"])
+        assert "kwa_abcdefghijklmnop" not in text and "[redacted]" in text
+
+        first_seq = full["entries"][0]["seq"]
+        incremental = (
+            await client.get(
+                f"{BASE}/{strategy.id}/jobs/{job.id}/logs", params={"after_seq": first_seq}
+            )
+        ).json()
+        assert [entry["seq"] for entry in incremental["entries"]] == [first_seq + 1]
+        assert "bye" in incremental["entries"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_log_cap_drops_oldest_and_keeps_newest_with_marker(session_factory, monkeypatch):
+    repo = _repo(session_factory)
+    strategy, version = _strategy(repo)
+    job = _to_running(repo, strategy, version)
+    for index in range(20):  # 20 * 16 KiB = 320 KiB, over the 256 KiB cap
+        await hosted_lifecycle.report_job_logs(
+            strategy_repo=repo, job_id=job.id, lease_owner="sup-A", lease_epoch=1, attempt=1,
+            chunks=[f"chunk-{index:02d}".ljust(16 * 1024, "x")], live=True,
+        )
+    rows = repo.list_job_logs(job.id, limit=500)
+    assert repo.job_log_byte_count(job.id) <= 256 * 1024
+    assert repo.get_job(OWNER, job.id).logs_discarded is True
+    # The retained window is the newest output; the oldest chunks are gone.
+    assert any("chunk-19" in row.content for row in rows)
+    assert not any("chunk-00" in row.content for row in rows)
+    seqs = [row.seq for row in rows]
+    assert seqs == sorted(seqs) and seqs[-1] == 20
+    async with _client(session_factory, monkeypatch) as client:
+        body = (await client.get(f"{BASE}/{strategy.id}/jobs/{job.id}/logs")).json()
+        assert body["truncated"] is True

@@ -120,9 +120,7 @@ function LogsCard({ strategyId, jobId }: Readonly<{ strategyId: string; jobId: s
               {page.map((entry) => `[${entry.seq}] ${entry.content}`).join("")}
             </pre>
             <p className="text-xs text-muted-foreground">
-              {logs.source === "post_termination"
-                ? "Collected after the child terminated (live streaming is not implemented). "
-                : `${logs.notice} `}
+              {`${logs.notice} `}
               Showing {page.length} chunk(s) up to seq {lastSeq}.
             </p>
             {hasMore ? (

@@ -32,7 +32,7 @@ import copy
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
-from sqlalchemy import and_, func, or_, select, text, update
+from sqlalchemy import and_, delete, func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -2101,14 +2101,23 @@ class SqlAlchemyStrategyRepository:
         attempt: int,
         chunks: List[str],
         max_total_bytes: int,
+        source: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Append bounded, already-redacted log chunks under the total cap.
 
         Byte accounting is exact (``byte_len`` in UTF-8 bytes) and the job row is
         locked so concurrent ingestion/retries cannot corrupt sequence allocation
-        or over-consume the cap. Once the cap is reached, ``discarded`` is
-        returned and persisted on the job so browser truncation reflects real
-        loss. Returns ``{"stored", "truncated", "discarded", "next_seq"}``.
+        or over-consume the cap.
+
+        The cap is a **ring buffer over the newest output**: once the retained
+        bytes would exceed ``max_total_bytes``, the oldest chunks are evicted
+        (their sequence numbers are never reused) so a live-streaming attempt
+        keeps showing recent output instead of freezing on its first megabytes.
+        Eviction persists ``logs_discarded`` so browser truncation reflects real
+        loss. ``source`` records how the logs were collected (``live`` for a
+        shipment taken while the child was running), and is only written the
+        first time so an earlier live shipment is never downgraded.
+        Returns ``{"stored", "truncated", "discarded", "next_seq"}``.
         """
         cap = max(1, int(max_total_bytes))
         for attempt_no in (1, 2):
@@ -2119,34 +2128,22 @@ class SqlAlchemyStrategyRepository:
                 session.execute(
                     select(StrategyJob.id).where(StrategyJob.id == job_id).with_for_update()
                 ).first()
-                current_bytes = int(
-                    session.execute(
-                        select(func.coalesce(func.sum(StrategyJobLog.byte_len), 0)).where(
-                            StrategyJobLog.job_id == job_id,
-                            StrategyJobLog.attempt == attempt,
-                        )
-                    ).scalar_one()
-                )
-                max_seq = int(
-                    session.execute(
-                        select(func.coalesce(func.max(StrategyJobLog.seq), 0)).where(
-                            StrategyJobLog.job_id == job_id,
-                            StrategyJobLog.attempt == attempt,
-                        )
-                    ).scalar_one()
-                    or 0
-                )
-                next_seq = max_seq
-                stored = 0
-                discarded = False
+                existing = session.execute(
+                    select(StrategyJobLog.seq, StrategyJobLog.byte_len)
+                    .where(
+                        StrategyJobLog.job_id == job_id,
+                        StrategyJobLog.attempt == attempt,
+                    )
+                    .order_by(StrategyJobLog.seq.asc())
+                ).all()
+                retained: List[tuple] = [(int(seq), int(byte_len)) for seq, byte_len in existing]
+                next_seq = retained[-1][0] if retained else 0
+                new_seqs: List[int] = []
                 for chunk in chunks:
                     text = str(chunk or "")
                     if not text:
                         continue
                     size = len(text.encode("utf-8"))
-                    if current_bytes + size > cap:
-                        discarded = True
-                        break
                     next_seq += 1
                     session.add(
                         StrategyJobLog(
@@ -2157,16 +2154,40 @@ class SqlAlchemyStrategyRepository:
                             byte_len=size,
                         )
                     )
-                    current_bytes += size
-                    stored += 1
+                    retained.append((next_seq, size))
+                    new_seqs.append(next_seq)
+                total_bytes = sum(byte_len for _, byte_len in retained)
+                evicted = 0
+                drop_seqs: List[int] = []
+                while total_bytes > cap and evicted < len(retained):
+                    seq, byte_len = retained[evicted]
+                    drop_seqs.append(seq)
+                    total_bytes -= byte_len
+                    evicted += 1
+                dropped = set(drop_seqs)
+                if drop_seqs:
+                    session.execute(
+                        delete(StrategyJobLog).where(
+                            StrategyJobLog.job_id == job_id,
+                            StrategyJobLog.attempt == int(attempt),
+                            StrategyJobLog.seq.in_(drop_seqs),
+                        )
+                    )
+                # ``stored`` counts this request's chunks that survived eviction.
+                stored = sum(1 for seq in new_seqs if seq not in dropped)
                 job = session.get(StrategyJob, job_id)
                 if job is not None:
                     if job.logs_source is None:
-                        job.logs_source = "post_termination"
-                    if discarded:
+                        job.logs_source = str(source or "post_termination")
+                    if drop_seqs:
                         job.logs_discarded = True
                 session.commit()
-                return {"stored": stored, "truncated": discarded, "discarded": discarded, "next_seq": next_seq}
+                return {
+                    "stored": stored,
+                    "truncated": bool(drop_seqs),
+                    "discarded": bool(drop_seqs),
+                    "next_seq": next_seq,
+                }
             except IntegrityError:
                 session.rollback()
                 if attempt_no == 2:

@@ -204,6 +204,7 @@ async def report_job_logs(
             lease_epoch=payload.lease_epoch,
             attempt=payload.attempt,
             chunks=payload.chunks,
+            live=payload.live,
         )
     except hosted_lifecycle.HostedLifecycleError as exc:
         raise _raise(exc) from exc

@@ -28,17 +28,20 @@ Design rules (v1, trusted single-operator):
 
 from __future__ import annotations
 
+import codecs
 import hashlib
 import json
 import logging
 import os
 import socket
 import sys
+import threading
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from backend.strategies import supervisor_process as proc
 from backend.strategies.supervisor_api import (
@@ -68,6 +71,47 @@ _DEFAULT_SDK_PATH = str(Path(__file__).resolve().parents[2] / "sdk" / "python")
 #: Child-scratch subdirectory holding Numba's on-disk JIT cache.
 _NUMBA_CACHE_DIRNAME = ".numba-cache"
 
+#: Largest child-log chunk the lifecycle API accepts in one piece. Mirrors
+#: ``backend.api.services.hosted_lifecycle.LOG_CHUNK_MAX_BYTES``; the runner is a
+#: separate container and deliberately does not import the application package.
+_LOG_CHUNK_MAX_BYTES = 16 * 1024
+
+
+def _decode_complete_utf8(raw: bytes) -> Tuple[str, int]:
+    """Decode ``raw`` while holding back an incomplete trailing character.
+
+    Returns ``(text, consumed_bytes)``. Bytes at the end that form an incomplete
+    UTF-8 sequence are not consumed, so a log line split across a poll boundary
+    is shipped whole on the next read instead of being corrupted.
+    """
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    text = decoder.decode(raw, final=False)
+    buffered = decoder.getstate()[0]
+    return text, len(raw) - len(buffered)
+
+
+def _split_by_utf8_bytes(text: str, max_bytes: int) -> List[str]:
+    """Split ``text`` into pieces of at most ``max_bytes`` UTF-8 bytes.
+
+    Mirrors the API's ingest splitter: chunks are bounded in *bytes*, so a run of
+    multi-byte characters never overflows the per-chunk limit. A single
+    character is never split across pieces.
+    """
+    pieces: List[str] = []
+    current: List[str] = []
+    size = 0
+    for char in text:
+        char_size = len(char.encode("utf-8"))
+        if current and size + char_size > max_bytes:
+            pieces.append("".join(current))
+            current = []
+            size = 0
+        current.append(char)
+        size += char_size
+    if current:
+        pieces.append("".join(current))
+    return pieces
+
 
 def derive_child_base_url(lifecycle_base_url: str) -> str:
     """Host-root base URL for the hosted child's SDK.
@@ -94,13 +138,22 @@ class SupervisorConfig:
     credential: str
     workspace_root: str = "supervisor-workspace"
     lease_owner: str = field(default_factory=lambda: f"{socket.gethostname()}:{os.getpid()}")
-    concurrency: int = 1
+    concurrency: int = 3
     lease_seconds: float = 120.0
     heartbeat_interval_s: float = 30.0
     startup_grace_s: float = 30.0
     progress_poll_s: float = 5.0
     term_grace_s: float = 10.0
     max_log_bytes: int = 5 * 1024 * 1024
+    #: Live log shipping while the child runs. A shipment happens when either
+    #: the interval elapses or at least ``log_ship_min_bytes`` of new output has
+    #: accumulated. Each request carries at most ``log_ship_batch_bytes`` of new
+    #: output, split into chunks the API accepts; the API redacts and applies its
+    #: own 256 KiB per-attempt ring buffer.
+    log_ship_interval_s: float = 5.0
+    log_ship_min_bytes: int = 16 * 1024
+    log_ship_batch_bytes: int = 256 * 1024
+    log_chunk_bytes: int = _LOG_CHUNK_MAX_BYTES
     child_python: str = sys.executable
     child_pythonpath: str = _DEFAULT_SDK_PATH
     #: Base URL handed to the hosted child. The SDK appends its own
@@ -147,6 +200,16 @@ class SupervisorConfig:
             problems.append("max_log_bytes must be >= 1024")
         if self.concurrency < 1:
             problems.append("concurrency must be >= 1")
+        if self.log_ship_interval_s <= 0:
+            problems.append("log_ship_interval_s must be > 0")
+        if self.log_ship_min_bytes < 1:
+            problems.append("log_ship_min_bytes must be >= 1")
+        if self.log_ship_batch_bytes < 1024:
+            problems.append("log_ship_batch_bytes must be >= 1024")
+        if not 1 <= self.log_chunk_bytes <= _LOG_CHUNK_MAX_BYTES:
+            problems.append("log_chunk_bytes must be between 1 and 16384")
+        elif self.log_ship_batch_bytes < self.log_chunk_bytes:
+            problems.append("log_ship_batch_bytes must be >= log_chunk_bytes")
         if self.progress_observation_max_failures < 1:
             problems.append("progress_observation_max_failures must be >= 1")
         if (self.child_uid is None) != (self.child_gid is None):
@@ -186,12 +249,16 @@ class SupervisorConfig:
             credential=credential,
             workspace_root=env.get("HOSTED_SUPERVISOR_WORKSPACE", "supervisor-workspace"),
             lease_owner=env.get("HOSTED_SUPERVISOR_LEASE_OWNER") or f"{socket.gethostname()}:{os.getpid()}",
+            concurrency=int(_f("HOSTED_SUPERVISOR_CONCURRENCY", 3)),
             lease_seconds=_f("HOSTED_SUPERVISOR_LEASE_SECONDS", 120.0),
             heartbeat_interval_s=_f("HOSTED_SUPERVISOR_HEARTBEAT_INTERVAL_S", 30.0),
             startup_grace_s=_f("HOSTED_SUPERVISOR_STARTUP_GRACE_S", 30.0),
             progress_poll_s=_f("HOSTED_SUPERVISOR_PROGRESS_POLL_S", 5.0),
             term_grace_s=_f("HOSTED_SUPERVISOR_TERM_GRACE_S", 10.0),
             max_log_bytes=int(_f("HOSTED_SUPERVISOR_MAX_LOG_BYTES", 5 * 1024 * 1024)),
+            log_ship_interval_s=_f("HOSTED_SUPERVISOR_LOG_SHIP_INTERVAL_S", 5.0),
+            log_ship_min_bytes=int(_f("HOSTED_SUPERVISOR_LOG_SHIP_MIN_BYTES", 16 * 1024)),
+            log_ship_batch_bytes=int(_f("HOSTED_SUPERVISOR_LOG_SHIP_BATCH_BYTES", 256 * 1024)),
             child_python=env.get("HOSTED_SUPERVISOR_CHILD_PYTHON", sys.executable),
             child_pythonpath=env.get("HOSTED_SUPERVISOR_CHILD_PYTHONPATH", _DEFAULT_SDK_PATH),
             child_base_url=env.get("HOSTED_SUPERVISOR_CHILD_BASE_URL") or "",
@@ -264,6 +331,10 @@ class HostedSupervisor:
         self._sleep = sleep
         self._workspace = config.workspace()
         self._active: Dict[str, Any] = {}
+        #: Byte offset of the child log already handed to the API, per job. Keeps
+        #: live and final shipments from duplicating each other.
+        self._log_offsets: Dict[str, int] = {}
+        self._state_lock = threading.Lock()
         self._stopping = False
         self._prepare_workspace()
         self.health = SupervisorHealth(config.health_path())
@@ -357,23 +428,51 @@ class HostedSupervisor:
             )
             return False
 
-    def _ship_logs(self, job_id: str, epoch: int, attempt: int) -> bool:
-        """Push bounded local log chunks to the API (best effort, never raises).
+    # -- logs ---------------------------------------------------------------
 
-        The API redacts and caps them; the supervisor does not assume the API can
-        read its filesystem.
-        """
-        log_path = self._log_path(job_id)
+    def _log_offset(self, job_id: str) -> int:
+        with self._state_lock:
+            return int(self._log_offsets.get(job_id, 0))
+
+    def _set_log_offset(self, job_id: str, offset: int) -> None:
+        with self._state_lock:
+            self._log_offsets[job_id] = int(offset)
+
+    def _unshipped_log_bytes(self, job_id: str) -> int:
         try:
-            if not log_path.is_file():
-                return False
-            raw = log_path.read_bytes()[: 256 * 1024]
-            text = raw.decode("utf-8", errors="replace")
+            size = self._log_path(job_id).stat().st_size
+        except OSError:
+            return 0
+        return max(0, size - self._log_offset(job_id))
+
+    def _ship_logs(self, job_id: str, epoch: int, attempt: int, *, live: bool) -> bool:
+        """Push the next unshipped log bytes to the API (best effort, never raises).
+
+        Bounded per call (``log_ship_batch_bytes``) and **idempotent by offset**:
+        only bytes past the last *confirmed* shipment are read, and the offset
+        advances only after the API accepts them. The final shipment therefore
+        resumes exactly where the last live shipment stopped and never
+        duplicates it. The API redacts and applies its own per-attempt cap; the
+        supervisor does not assume the API can read its filesystem.
+
+        ``live`` marks a shipment taken while the child is still running, so the
+        API can record that logs really were streamed (vs. only collected after
+        termination).
+        """
+        offset = self._log_offset(job_id)
+        try:
+            with open(self._log_path(job_id), "rb") as stream:
+                stream.seek(offset)
+                raw = stream.read(self.config.log_ship_batch_bytes)
         except OSError:
             return False
-        chunks = [text[i : i + 8 * 1024] for i in range(0, len(text), 8 * 1024)]
-        if not chunks:
+        if not raw:
             return False
+        text, consumed = _decode_complete_utf8(raw)
+        if not text:
+            # Only an incomplete trailing character: wait for the next byte.
+            return False
+        chunks = _split_by_utf8_bytes(text, self.config.log_chunk_bytes)
         try:
             self.api.process_logs(
                 job_id,
@@ -381,14 +480,32 @@ class HostedSupervisor:
                 lease_epoch=epoch,
                 attempt=attempt,
                 chunks=chunks,
+                live=live,
             )
-            return True
-        except Exception as exc:  # best effort
+        except Exception as exc:  # best effort; the offset stays put for a retry
             logger.warning(
                 "hosted_supervisor_log_ship_failed",
                 extra={"job_id": job_id, "error": type(exc).__name__},
             )
             return False
+        self._set_log_offset(job_id, offset + consumed)
+        return True
+
+    def _ship_logs_final(self, job_id: str, epoch: int, attempt: int) -> bool:
+        """Drain every remaining log byte after the child is gone.
+
+        The local log file is bounded by ``max_log_bytes``; this loops the
+        bounded per-call shipment until it is exhausted so the final snapshot is
+        complete without a single unbounded request.
+        """
+        batch = max(1, int(self.config.log_ship_batch_bytes))
+        max_requests = (int(self.config.max_log_bytes) // batch) + 2
+        shipped = False
+        for _ in range(max(1, max_requests)):
+            if not self._ship_logs(job_id, epoch, attempt, live=False):
+                break
+            shipped = True
+        return shipped
 
     def _authority_check(self, job_id: str, epoch: int, attempt: int) -> Dict[str, Any]:
         """Full pre-spawn authority check: state, desired state, lease, attempt.
@@ -691,7 +808,17 @@ class HostedSupervisor:
         age = (self._wall_clock() - last).total_seconds()
         return age > graceful
 
-    def run_once(self, job_id: Optional[str] = None) -> Dict[str, Any]:
+    def run_once(
+        self, job_id: Optional[str] = None, *, max_children: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """Claim and supervise one cycle of queued work.
+
+        A named ``job_id`` is supervised alone. Otherwise up to ``concurrency``
+        children run at once, each with its own lease, heartbeat, progress and
+        stop handling; freed slots are refilled from the queued work until the
+        queue is drained. A single supervised job keeps the historical
+        single-result shape; several return an aggregate ``results`` list.
+        """
         try:
             jobs = self.discover()
         except SupervisorApiError as exc:
@@ -714,14 +841,100 @@ class HostedSupervisor:
             jobs = [entry for entry in jobs if str(entry.get("job_id")) == job_id]
             if not jobs:
                 return {"status": "not_found", "job_id": job_id}
+            result = self._supervise_safe(jobs[0])
+            # A failed CHILD is the job's outcome, not the supervisor's: the loop
+            # itself reached the control plane and did its work, so it stays
+            # healthy.
+            self._record_health(None)
+            return result
         if not jobs:
             self._record_health(None)
             return {"status": "idle"}
-        result = self._supervise(jobs[0])
-        # A failed CHILD is the job's outcome, not the supervisor's: the loop
-        # itself reached the control plane and did its work, so it stays healthy.
+        limit = max(1, int(self.config.concurrency if max_children is None else max_children))
+        results = self._supervise_concurrent(jobs, limit=limit)
         self._record_health(None)
-        return result
+        if len(results) == 1:
+            return results[0]
+        return {"status": "supervised", "count": len(results), "results": results}
+
+    def _supervise_safe(self, entry: Dict[str, Any]) -> Dict[str, Any]:
+        """Run one child's full lifecycle, converting any escape into a result.
+
+        ``_supervise`` already contains its own child/observation failures; this
+        outer guard keeps one job's unexpected error from tearing down its
+        concurrently supervised siblings.
+        """
+        try:
+            return self._supervise(entry)
+        except BaseException as exc:  # pragma: no cover - defensive per-child guard
+            job_id = str(entry.get("job_id"))
+            logger.exception("hosted_supervisor_child_failed", extra={"job_id": job_id})
+            return {
+                "status": "supervisor_exception",
+                "job_id": job_id,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+    def _supervise_concurrent(
+        self, jobs: List[Dict[str, Any]], *, limit: int
+    ) -> List[Dict[str, Any]]:
+        """Supervise up to ``limit`` children at once, refilling freed slots.
+
+        Each child runs the unchanged ``_supervise`` path on its own thread, so
+        every attempt keeps its own lease, heartbeat, progress poll, stop
+        observation, fencing and recovery. A job that is already scheduled (or
+        running) is never scheduled twice even if a re-discovery still reports
+        it as queued before its claim lands.
+        """
+        results: List[Dict[str, Any]] = []
+        scheduled: set = set()
+        pending: List[Dict[str, Any]] = list(jobs)
+        futures: Dict[Any, str] = {}
+
+        def _next_candidate() -> Optional[Dict[str, Any]]:
+            while pending:
+                entry = pending.pop(0)
+                key = str(entry.get("job_id"))
+                if key in scheduled:
+                    continue
+                scheduled.add(key)
+                return entry
+            return None
+
+        def _refill(pool: ThreadPoolExecutor, *, respect_stop: bool) -> None:
+            # Keep every free slot busy; once the known queue is drained, ask the
+            # control plane for more. Discovery runs at most once per freed slot,
+            # so an idle slot never spins on the API.
+            #
+            # The first batch is always started: a stop request observed between
+            # cycles must still terminate the child the loop owns rather than
+            # silently dropping the attempt. Later refills -- and any discovery
+            # of further queued work -- stop as soon as the flag is set, so a
+            # stop request never claims new jobs.
+            while len(futures) < limit:
+                if respect_stop and self._stopping:
+                    return
+                entry = _next_candidate()
+                if entry is None:
+                    try:
+                        discovered = self.discover()
+                    except (SupervisorApiError, SupervisorTransportError):
+                        return
+                    pending.extend(discovered)
+                    entry = _next_candidate()
+                    if entry is None:
+                        return
+                futures[pool.submit(self._supervise_safe, entry)] = str(entry.get("job_id"))
+
+        with ThreadPoolExecutor(max_workers=limit, thread_name_prefix="hosted-child") as pool:
+            _refill(pool, respect_stop=False)
+            while futures:
+                done, _ = wait(list(futures), return_when=FIRST_COMPLETED)
+                for future in done:
+                    futures.pop(future, None)
+                    results.append(future.result())
+                _refill(pool, respect_stop=True)
+        return results
 
     def _supervise(self, entry: Dict[str, Any]) -> Dict[str, Any]:
         job_id = str(entry["job_id"])
@@ -826,6 +1039,9 @@ class HostedSupervisor:
 
         scratch = self._scratch_path(job_id)
         log_path = self._log_path(job_id)
+        # A fresh attempt ships its own log from byte zero; the offset is what
+        # makes live and final shipments idempotent for this attempt.
+        self._set_log_offset(job_id, 0)
         env = self._child_env(launch, scratch)
         try:
             self._prepare_scratch(scratch)
@@ -859,7 +1075,8 @@ class HostedSupervisor:
             self._persist(record)
             return {"status": "spawn_failed", "job_id": job_id, **report}
 
-        self._active[job_id] = handle
+        with self._state_lock:
+            self._active[job_id] = handle
         started = self._monotonic()
         outcome = "supervisor_exception"
         detail: Dict[str, Any] = {}
@@ -881,7 +1098,8 @@ class HostedSupervisor:
             except Exception:  # pragma: no cover - defensive
                 stop_result = "stop_failed"
                 logger.exception("hosted_supervisor_stop_failed", extra={"job_id": job_id})
-            self._active.pop(job_id, None)
+            with self._state_lock:
+                self._active.pop(job_id, None)
 
         result: Dict[str, Any] = {
             "job_id": job_id,
@@ -907,7 +1125,7 @@ class HostedSupervisor:
         result["process_cleanup_reported"] = self._report_process_cleanup(
             job_id, epoch, attempt, "confirmed" if cleanup_confirmed else "unresolved"
         )
-        result["logs_shipped"] = self._ship_logs(job_id, epoch, attempt)
+        result["logs_shipped"] = self._ship_logs_final(job_id, epoch, attempt)
 
         process_unresolved = stop_result in {"group_unresolved", "stop_failed"}
         if outcome in {"exited", "stop_requested"} and not process_unresolved:
@@ -997,6 +1215,7 @@ class HostedSupervisor:
             else None
         )
         progress_failures = 0
+        next_log_ship = self._monotonic() + self.config.log_ship_interval_s
         while True:
             if self._stopping:
                 return "supervisor_stopping", {}
@@ -1007,6 +1226,13 @@ class HostedSupervisor:
                 return "max_duration_reached", {"max_duration_s": max_duration_s}
             if timeout_at is not None and now >= timeout_at:
                 return "observe_timeout", {}
+            # Ship new child stdout while it is still running, so the operator
+            # sees output before the job ends. Triggered by the interval or by a
+            # backlog of new bytes; each call is bounded and offset-based, so it
+            # never re-sends what the API already has.
+            if now >= next_log_ship or self._unshipped_log_bytes(job_id) >= self.config.log_ship_min_bytes:
+                self._ship_logs(job_id, epoch, attempt, live=True)
+                next_log_ship = self._monotonic() + self.config.log_ship_interval_s
             if now >= next_heartbeat:
                 try:
                     self.api.heartbeat(
@@ -1049,7 +1275,8 @@ class HostedSupervisor:
     def _record_health(self, failure: Optional[str], *, auth_failed: bool = False) -> None:
         """Publish the loop's snapshot. Never raises, never includes secrets."""
         try:
-            active = len(self._active)
+            with self._state_lock:
+                active = len(self._active)
             if failure is None:
                 self.health.record_success(active_children=active)
             else:
@@ -1079,7 +1306,9 @@ class HostedSupervisor:
     def terminate_active(self) -> List[Dict[str, Any]]:
         """Bounded process-group termination of any child the loop still owns."""
         results: List[Dict[str, Any]] = []
-        for job_id, handle in list(self._active.items()):
+        with self._state_lock:
+            active = list(self._active.items())
+        for job_id, handle in active:
             try:
                 outcome = handle.stop(self.config.term_grace_s)
             except Exception:  # pragma: no cover - defensive
@@ -1103,6 +1332,9 @@ class HostedSupervisor:
 
 
 def _result_is_unresolved(result: Dict[str, Any]) -> bool:
+    nested = result.get("results")
+    if isinstance(nested, list):
+        return any(_result_is_unresolved(item) for item in nested)
     if result.get("cleanup_required"):
         return True
     if str(result.get("stop") or "") in {"group_unresolved", "stop_failed", "identity_lost"}:
@@ -1143,7 +1375,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2 if unresolved else 0
     if args.once or args.job:
         try:
-            result = supervisor.run_once(job_id=args.job)
+            # ``--once`` without a named job keeps its historical contract: one
+            # cycle that supervises at most one job, then exit.
+            result = supervisor.run_once(job_id=args.job, max_children=1)
         finally:
             supervisor.terminate_active()
         logger.info("hosted_supervisor_once", extra={"result": result})

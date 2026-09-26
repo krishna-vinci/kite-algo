@@ -1220,6 +1220,7 @@ async def report_job_logs(
     lease_epoch: int,
     attempt: int,
     chunks,
+    live: bool = False,
 ) -> Dict[str, Any]:
     """Accept bounded, redacted child-log chunks from the supervisor.
 
@@ -1233,6 +1234,10 @@ async def report_job_logs(
     cannot guarantee removal of an arbitrary secret, and a secret split across
     *separate* ingestion requests may not be masked. Log collection is
     independent of process-cleanup confirmation.
+
+    ``live`` marks chunks captured while the child was still running; the first
+    such shipment records ``logs_source = "live"``. Logs that only ever arrive
+    after termination stay ``post_termination``.
     """
     if not chunks:
         raise HostedLifecycleError(422, "HOSTED_LOGS_EMPTY")
@@ -1265,6 +1270,7 @@ async def report_job_logs(
         attempt=int(attempt),
         chunks=pieces,
         max_total_bytes=LOG_TOTAL_MAX_BYTES,
+        source="live" if live else None,
     )
     return {
         "job_id": job.id,

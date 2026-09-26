@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import os
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -20,6 +21,7 @@ import pytest
 from backend.strategies import supervisor_process as proc
 from backend.strategies.supervisor import AttemptRecord, HostedSupervisor, SupervisorConfig
 from backend.strategies.supervisor_api import SupervisorApiError, SupervisorTransportError
+from backend.strategies.redaction import redact_text
 
 PY = sys.executable
 SOURCE = "def main(ctx):\n    return 0\n"
@@ -30,6 +32,8 @@ class FakeApi:
     def __init__(self) -> None:
         self.calls = []
         self.jobs = [{"job_id": "hsj_1", "strategy_id": "hs_1", "attempt": 1, "lease_epoch": 0, "status": "queued"}]
+        #: One dict per log shipment (job/live/raw text/redacted text), in order.
+        self.log_shipments = []
         self.lease_epoch = 1
         self.prepare_error = None
         self.source_error = None
@@ -129,6 +133,28 @@ class FakeApi:
     def process_cleanup(self, job_id, **kwargs):
         self._record("process_cleanup", job_id=job_id, **kwargs)
         return {"job_id": job_id, "process_cleanup_state": kwargs.get("state")}
+
+    def process_logs(self, job_id, **kwargs):
+        self._record("process_logs", job_id=job_id, **kwargs)
+        text = "".join(str(chunk) for chunk in (kwargs.get("chunks") or []))
+        # The real lifecycle API redacts on ingest; mirror it here so the
+        # supervisor tests exercise the same live-vs-final redaction path.
+        self.log_shipments.append(
+            {
+                "job_id": job_id,
+                "live": bool(kwargs.get("live")),
+                "text": text,
+                "redacted": redact_text(text),
+            }
+        )
+        return {
+            "job_id": job_id,
+            "attempt": kwargs.get("attempt"),
+            "stored": 1,
+            "truncated": False,
+            "discarded": False,
+            "next_seq": 1,
+        }
 
 
 class _HarnessSupervisor(HostedSupervisor):
@@ -633,3 +659,230 @@ def test_stop_request_refuses_spawn(tmp_path):
     authority = sup._authority_check("hsj_1", 1, 1)
     assert authority["ok"] is False
     assert authority["reason"] == "HOSTED_ATTEMPT_STOPPED"
+
+
+# ---------------------------------------------------------------------------
+# concurrency
+# ---------------------------------------------------------------------------
+
+
+def _queued(job_id: str, *, attempt: int = 1, epoch: int = 0) -> dict:
+    return {
+        "job_id": job_id,
+        "strategy_id": f"hs_{job_id}",
+        "attempt": attempt,
+        "lease_epoch": epoch,
+        "status": "queued",
+    }
+
+
+class _PerJobHarness(_HarnessSupervisor):
+    """Pick the child program by job id (read from the per-job source path)."""
+
+    scripts: dict = {}
+
+    def _child_command(self, source_path):  # noqa: D401
+        job_id = Path(source_path).parent.name
+        return [PY, "-c", self.scripts.get(job_id, "import sys; sys.exit(0)")]
+
+
+class _RosterApi(FakeApi):
+    """Discovery returns successive pages, then the last page forever."""
+
+    def __init__(self, pages) -> None:
+        super().__init__()
+        self._pages = [[dict(entry) for entry in page] for page in pages]
+        self._index = 0
+
+    def list_jobs(self, *, status="queued", limit=50):
+        self._record("list_jobs", status=status)
+        page = self._pages[min(self._index, len(self._pages) - 1)]
+        self._index += 1
+        return [dict(entry) for entry in page]
+
+
+def _barrier_spawn(barrier: threading.Barrier, spawned: list):
+    """Spawn wrapper that only returns once every expected child is in flight.
+
+    A sequential supervisor deadlocks at the barrier and fails loudly; a
+    concurrent one releases it as soon as both children reach the spawn.
+    """
+
+    def _spawn(command, **kwargs):
+        spawned.append(kwargs["log_path"])
+        barrier.wait(timeout=15.0)
+        return proc.spawn_child(command, **kwargs)
+
+    return _spawn
+
+
+def test_two_jobs_are_supervised_concurrently(tmp_path):
+    api = FakeApi()
+    api.jobs = [_queued("hsj_1"), _queued("hsj_2")]
+    barrier = threading.Barrier(2, timeout=15.0)
+    spawned: list = []
+    sup = _PerJobHarness(
+        _config(tmp_path, concurrency=2),
+        api=api,
+        spawn=_barrier_spawn(barrier, spawned),
+        sleep=lambda _s: None,
+    )
+
+    result = sup.run_once()
+
+    assert result["status"] == "supervised"
+    assert result["count"] == 2
+    assert {r["job_id"] for r in result["results"]} == {"hsj_1", "hsj_2"}
+    assert {r["outcome"] for r in result["results"]} == {"exited"}
+    names = [c[0] for c in api.calls]
+    assert names.count("claim") == 2
+    assert names.count("prepare") == 2
+    assert names.count("source") == 2
+    assert names.count("release") == 2
+    # Both children really were spawned before either was allowed to finish.
+    assert len(spawned) == 2
+
+
+def test_child_failure_does_not_affect_a_sibling(tmp_path):
+    api = FakeApi()
+    api.jobs = [_queued("hsj_1"), _queued("hsj_2")]
+    barrier = threading.Barrier(2, timeout=15.0)
+    sup = _PerJobHarness(
+        _config(tmp_path, concurrency=2),
+        api=api,
+        spawn=_barrier_spawn(barrier, []),
+        sleep=lambda _s: None,
+    )
+    sup.scripts = {"hsj_1": "import sys; sys.exit(0)", "hsj_2": "import sys; sys.exit(7)"}
+
+    result = sup.run_once()
+
+    by_job = {r["job_id"]: r for r in result["results"]}
+    assert set(by_job) == {"hsj_1", "hsj_2"}
+    # The healthy sibling completes normally despite its neighbour crashing.
+    assert by_job["hsj_1"]["outcome"] == "exited" and by_job["hsj_1"]["exit_code"] == 0
+    assert by_job["hsj_1"]["clean_exit"] is True
+    # The crash is the failing job's own outcome, not the supervisor's.
+    assert by_job["hsj_2"]["outcome"] == "exited" and by_job["hsj_2"]["exit_code"] == 7
+    assert by_job["hsj_2"]["clean_exit"] is False
+    names = [c[0] for c in api.calls]
+    assert names.count("release") == 2
+
+
+def test_freed_slot_claims_more_work(tmp_path):
+    api = _RosterApi(
+        [
+            [_queued("hsj_1"), _queued("hsj_2")],
+            [_queued("hsj_3")],  # only discoverable once a slot frees
+            [],
+        ]
+    )
+    sup = _HarnessSupervisor(
+        _config(tmp_path, concurrency=2),
+        api=api,
+        sleep=lambda _s: None,
+    )
+    sup.child_script = "import sys; sys.exit(0)"
+
+    result = sup.run_once()
+
+    assert result["status"] == "supervised"
+    assert result["count"] == 3
+    assert {r["job_id"] for r in result["results"]} == {"hsj_1", "hsj_2", "hsj_3"}
+    names = [c[0] for c in api.calls]
+    assert names.count("claim") == 3
+    assert names.count("release") == 3
+    # The third job was never in the first discovery page: a freed slot asked
+    # the control plane for more work.
+    assert api._index >= 2
+
+
+# ---------------------------------------------------------------------------
+# live log streaming
+# ---------------------------------------------------------------------------
+
+
+def test_live_log_shipment_is_incremental_and_does_not_duplicate(tmp_path):
+    api = FakeApi()
+    sup = _HarnessSupervisor(
+        _config(
+            tmp_path,
+            log_ship_interval_s=0.05,
+            log_ship_min_bytes=1,
+            progress_poll_s=0.05,
+            heartbeat_interval_s=30.0,
+        ),
+        api=api,
+        sleep=lambda _s: None,
+    )
+    sup.child_script = (
+        "import sys, time\n"
+        "print('line-1 kwa_abcdefghijklmnop', flush=True)\n"
+        "time.sleep(0.6)\n"
+        "print('line-2', flush=True)\n"
+    )
+
+    result = sup.run_once()
+
+    assert result["outcome"] == "exited"
+    live = [shipment for shipment in api.log_shipments if shipment["live"]]
+    assert live, "expected at least one shipment while the child was running"
+    # Offset idempotency: every byte arrives exactly once, live first then the
+    # remainder at exit, with no repeated line.
+    assembled = "".join(shipment["text"] for shipment in api.log_shipments)
+    assert assembled == "line-1 kwa_abcdefghijklmnop\nline-2\n"
+    assert assembled.count("line-1") == 1 and assembled.count("line-2") == 1
+    # Both shipments pass through the same redacting ingestion path.
+    redacted = "".join(shipment["redacted"] for shipment in api.log_shipments)
+    assert "kwa_abcdefghijklmnop" not in redacted
+    assert "[redacted]" in redacted
+
+
+def test_log_offset_is_idempotent_when_a_shipment_fails(tmp_path):
+    """A refused shipment must not advance the offset (no lost or duplicated bytes)."""
+    api = FakeApi()
+    original = api.process_logs
+    attempts = {"n": 0}
+
+    def _flaky(job_id, **kwargs):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise SupervisorTransportError("log endpoint down")
+        return original(job_id, **kwargs)
+
+    api.process_logs = _flaky  # type: ignore[assignment]
+    sup = _HarnessSupervisor(
+        _config(tmp_path, log_ship_interval_s=0.02, log_ship_min_bytes=1, progress_poll_s=0.05),
+        api=api,
+        sleep=lambda _s: None,
+    )
+    sup.child_script = "import sys, time\nprint('only-line', flush=True)\ntime.sleep(0.4)\n"
+
+    result = sup.run_once()
+
+    assert result["outcome"] == "exited"
+    assembled = "".join(shipment["text"] for shipment in api.log_shipments)
+    assert assembled == "only-line\n"
+    assert attempts["n"] >= 2
+
+
+def test_log_chunks_are_split_by_utf8_bytes():
+    from backend.strategies.supervisor import _split_by_utf8_bytes
+
+    grinning = "\U0001F600"  # one 4-byte UTF-8 character
+    # A 4-byte piece exactly fits one character and never splits it.
+    assert _split_by_utf8_bytes(grinning * 3, 4) == [grinning, grinning, grinning]
+    assert [len(piece) for piece in _split_by_utf8_bytes("x" * 10, 4)] == [4, 4, 2]
+    # Multi-byte runs stay within the byte budget (never 16 KiB of characters).
+    for piece in _split_by_utf8_bytes("\u00e9" * 40, 16):  # 'e' with an acute accent
+        assert len(piece.encode("utf-8")) <= 16
+
+
+def test_incremental_decoder_holds_back_a_split_character():
+    from backend.strategies.supervisor import _decode_complete_utf8
+
+    raw = "a\U0001F600".encode("utf-8")  # 1-byte 'a' then a 4-byte character
+    text, consumed = _decode_complete_utf8(raw[:-1])
+    assert text == "a" and consumed == 1
+    text, consumed = _decode_complete_utf8(raw)
+    assert text == "a\U0001F600" and consumed == 5

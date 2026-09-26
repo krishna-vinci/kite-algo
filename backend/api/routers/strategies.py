@@ -3353,11 +3353,13 @@ async def get_job_logs(
     # Truncation reflects actual loss: the persisted discarded flag OR the cap.
     truncated = bool(job.logs_discarded) or total_bytes >= LOG_TOTAL_MAX_BYTES
     if available:
-        notice = (
-            "Logs were collected after the child terminated (live streaming is not implemented). "
-            "Output was discarded at the size cap." if truncated
-            else "Logs were collected after the child terminated (live streaming is not implemented)."
-        )
+        if str(job.logs_source or "") == "live":
+            collected = "Streamed live while the child was running."
+        elif str(job.logs_source or "") == "post_termination":
+            collected = "Collected after the child terminated."
+        else:
+            collected = "Collected child output."
+        notice = collected + (" Output was discarded at the size cap." if truncated else "")
     elif job.handoff_at is None:
         notice = "No child was launched for this attempt; no logs exist."
     else:
