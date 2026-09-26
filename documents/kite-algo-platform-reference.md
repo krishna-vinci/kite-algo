@@ -263,10 +263,10 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
   - **MISSING for scheduled jobs.** A scheduled job is bound to one evaluation: `EVALUATION_IDENTITY_MISMATCH`,
     plus `UNIQUE(strategy_id, evaluation_id)`.
   - **No test or example runs a periodic market-hours loop.**
-- **Execution is tied to the live attempt.** The dispatcher refuses a request unless the originating job is still
-  running with a live lease and the same run, token, epoch and attempt
-  (`backend/strategies/execution_requests.py:1659-1696`). An approval that lands after the child has exited is
-  refused, which is why the examples poll and call `ctx.progress` while they wait.
+- **Execution is tied to the originating attempt.** The dispatcher rechecks the same run, token, epoch and attempt.
+  A live attempt also needs a live lease. A finished attempt may dispatch an already-valid request only if the
+  supervisor recorded a clean exit, confirmed cleanup and reconciliation cleared the attempt. Crashes, hangs, stops,
+  timeouts, missing proof and a newer attempt refuse by name. Approval and reservation validity still apply after exit.
 
 ### 4.4 Scheduling (`backend/strategies/scheduling.py`)
 
@@ -414,6 +414,7 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
   - A live grant is refused while `HOSTED_LIVE_ENABLED` is off.
 - **Requests and dispatcher** (`execution_requests.py`, `execution_dispatcher.py`):
   - Requests are idempotent per (owner, plan, key).
+  - A valid queued request can survive a clean, reconciled child exit when every authority pin still matches.
   - The dispatcher's claims time out after 900 s.
   - An unproven claim becomes `dispatch_unresolved` and is never replayed.
   - The dispatcher is on unless `HOSTED_EXECUTION_DISPATCH_ENABLED` is falsy.

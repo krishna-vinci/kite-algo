@@ -1552,23 +1552,18 @@ def _await_request(ctx, request_id: str, deadline_seconds: float) -> Dict[str, A
     if status in _TERMINAL_REQUEST_STATES:
         return row
 
-    # The child's own authority is an ATTEMPT-scoped credential: it expires with
-    # the attempt, while the request row stays durable. So a deadline that passes
-    # while the platform is still dispatching is reported as unresolved: the row
-    # keeps the decision for the record, but a claim re-reads the job's run, token,
-    # lease epoch and attempt
-    # (``backend/strategies/execution_requests.py:_attempt_refusal``), so once this
-    # attempt ends the row is NOT dispatchable - the claim refuses it by name
-    # (``HOSTED_ATTEMPT_FENCED``). A FRESH attempt is what acts on the decision,
-    # and this child cannot claim it decided anything.
+    # This child observed no decision by its own deadline, so it reports
+    # unresolved rather than inventing one. The durable request can still be
+    # dispatched after a clean, reconciled exit when its authority pins hold;
+    # this child simply cannot claim that it saw that outcome.
     return {
         "status": "timeout",
         "request_id": request_id,
         "last_status": status,
         "note": (
             "the request stayed non-terminal past this attempt's deadline; this "
-            "attempt's authority ends with the child, so the row is not "
-            "dispatchable afterwards and a fresh attempt is required"
+            "child observed no decision; the durable request remains subject to "
+            "the platform's authority checks"
         ),
     }
 

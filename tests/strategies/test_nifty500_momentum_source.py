@@ -1005,10 +1005,8 @@ def test_existing_holdings_keep_their_absolute_target():
 def test_a_parked_request_is_not_a_terminal_state():
     """The invariant the review-first hold rests on.
 
-    ``awaiting_approval`` is a decision that has NOT happened: if the adapter
-    listed it as terminal, the child would stop waiting, the attempt would end,
-    and the approval the owner later issues would be refused by name
-    (``HOSTED_ATTEMPT_FENCED``) against a lease nobody holds.
+    ``awaiting_approval`` is a decision that has NOT happened: the child must
+    not report it as an outcome merely because the owner has not clicked yet.
     """
     module = momentum_module()
     assert "awaiting_approval" not in module._TERMINAL_REQUEST_STATES
@@ -1032,11 +1030,8 @@ def test_platform_refusal_is_reported_by_name_without_orders():
 def test_the_child_holds_while_the_owner_decides(monkeypatch):
     """Review-first: a parked request is NOT an outcome.
 
-    The child keeps the attempt alive (and keeps reporting progress) until the
-    platform resolves the request, then exits 0 on the decision it observed. A
-    child that returned as soon as it saw ``awaiting_approval`` would end the
-    attempt, and the claim that later carries the owner's approval would refuse
-    it as ``HOSTED_ATTEMPT_FENCED`` - the parked request would be unactionable.
+    The child keeps waiting (and keeps reporting progress) until the platform
+    resolves the request, then exits 0 on the decision it observed.
     """
     monkeypatch.setattr(time, "sleep", lambda _seconds: None)
     fixture = Fixture()
@@ -1093,11 +1088,10 @@ def test_a_bounded_wait_polls_then_reports_the_durable_request():
     joined = " ".join(notes)
     assert "waiting on execution request" in joined
     # The progress note is capped at 200 characters by the platform; the wording
-    # is asserted on the part that survives that cap. The note must not promise
-    # that the parked row will be dispatched later: the claim re-reads the attempt,
-    # so a fresh attempt is what acts on the decision.
-    assert "this attempt's authority ends with the child" in joined
-    assert "dispatching after the child exits" not in joined
+    # is asserted on the part that survives that cap. The child reports its own
+    # observation honestly; it does not promise that any later dispatch occurred.
+    assert "this child observed no decision" in joined
+    assert "dispatch status=executed" not in joined
 
 
 def test_dispatch_unresolved_is_unresolved():

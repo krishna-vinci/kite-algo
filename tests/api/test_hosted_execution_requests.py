@@ -1732,6 +1732,155 @@ def test_fenced_or_expired_attempt_refuses_the_claim(world):
     assert world["executor"].calls == []
 
 
+def _finish_job_cleanly(world) -> None:
+    """Persist the same terminal proof the supervisor/continuation path writes."""
+    with world["factory"]() as session:
+        job = session.execute(
+            select(StrategyJob).where(StrategyJob.id == world["job"].id)
+        ).scalar_one()
+        job.status = "stopped"
+        job.lease_until = None
+        job.completion_state = "exited"
+        job.completion_at = NOW
+        job.exit_code = 0
+        job.process_cleanup_state = "confirmed"
+        job.process_cleanup_at = NOW
+        job.reconciled_at = NOW
+        session.commit()
+
+
+def test_approval_survives_a_clean_reconciled_exit(world):
+    _record_policy(world)
+    plan_id, _hash = _plan(world["factory"], strategy=world["strategy"])
+    created = world["service"].create_for_job(
+        job=world["job"], plan_id=plan_id, idempotency_key="exec-key-0018", now=NOW
+    )
+    _finish_job_cleanly(world)
+
+    approved = world["service"].approve(
+        created["request"]["request_id"],
+        owner_id=OWNER,
+        strategy_id=world["strategy"].id,
+        actor=OWNER,
+        now=NOW,
+    )
+    assert approved["request"]["status"] == "queued"
+    assert world["service"].claim_next(limit=10, now=NOW)
+    outcome = _dispatch(world["service"], created["request"]["request_id"])
+    assert outcome["status"] == "executed", outcome
+    assert [call["plan_id"] for call in world["executor"].calls] == [plan_id]
+
+
+def test_a_stopped_or_timed_out_child_refuses_by_name(world):
+    _record_policy(world)
+    _autonomous(world, key="grant-key-19")
+    plan_id, _hash = _plan(world["factory"], strategy=world["strategy"])
+    created = world["service"].create_for_job(
+        job=world["job"], plan_id=plan_id, idempotency_key="exec-key-0019", now=NOW
+    )
+
+    with world["factory"]() as session:
+        job = session.execute(
+            select(StrategyJob).where(StrategyJob.id == world["job"].id)
+        ).scalar_one()
+        job.status = "stopped"
+        job.desired_state = "stopped"
+        job.stop_requested_at = NOW
+        job.completion_state = "stop_requested"
+        session.commit()
+    assert world["service"].claim_next(limit=10, now=NOW) == []
+    row = world["service"].get(created["request"]["request_id"])
+    assert row["refusal_code"] == "HOSTED_ATTEMPT_STOPPED"
+
+    assert world["executor"].calls == []
+
+
+def test_a_terminal_shape_without_full_clean_proof_refuses_by_name(world):
+    _record_policy(world)
+    _autonomous(world, key="grant-key-19b")
+    plan_id, _hash = _plan(world["factory"], strategy=world["strategy"])
+    created = world["service"].create_for_job(
+        job=world["job"], plan_id=plan_id, idempotency_key="exec-key-0019b", now=NOW
+    )
+    with world["factory"]() as session:
+        job = session.execute(
+            select(StrategyJob).where(StrategyJob.id == world["job"].id)
+        ).scalar_one()
+        job.status = "stopped"
+        job.lease_until = None
+        job.completion_state = "exited"
+        job.completion_at = NOW
+        job.exit_code = 0
+        job.process_cleanup_state = "confirmed"
+        job.reconciled_at = None
+        session.commit()
+
+    assert world["service"].claim_next(limit=10, now=NOW) == []
+    row = world["service"].get(created["request"]["request_id"])
+    assert row["refusal_code"] == "HOSTED_ATTEMPT_NOT_CLEAN_EXIT"
+    assert world["executor"].calls == []
+
+
+def test_a_newer_attempt_replaces_an_old_clean_request(world):
+    _record_policy(world)
+    _autonomous(world, key="grant-key-21")
+    plan_id, _hash = _plan(world["factory"], strategy=world["strategy"])
+    created = world["service"].create_for_job(
+        job=world["job"], plan_id=plan_id, idempotency_key="exec-key-0022", now=NOW
+    )
+    _finish_job_cleanly(world)
+    # SQLite's server timestamps are wall-clock, not the fixture's deterministic
+    # NOW; pin both rows so the replacement ordering is explicit.
+    with world["factory"]() as session:
+        job = session.execute(
+            select(StrategyJob).where(StrategyJob.id == world["job"].id)
+        ).scalar_one()
+        job.created_at = NOW
+        session.commit()
+    newer = world["repo"].create_job(
+        strategy_id=world["strategy"].id,
+        version_id=world["version"].id,
+        owner_id=OWNER,
+        job_kind="finite",
+        execution_mode="paper",
+        params={},
+    )
+    with world["factory"]() as session:
+        job = session.execute(
+            select(StrategyJob).where(StrategyJob.id == newer.id)
+        ).scalar_one()
+        job.created_at = NOW + timedelta(seconds=1)
+        session.commit()
+
+    assert world["service"].claim_next(limit=10, now=NOW) == []
+    row = world["service"].get(created["request"]["request_id"])
+    assert row["refusal_code"] == "HOSTED_ATTEMPT_REPLACED"
+    assert world["executor"].calls == []
+
+
+def test_revoking_a_grant_after_a_clean_exit_refuses_the_claim(world):
+    _record_policy(world)
+    grant = _autonomous(world, key="grant-key-23")
+    plan_id, _hash = _plan(world["factory"], strategy=world["strategy"])
+    created = world["service"].create_for_job(
+        job=world["job"], plan_id=plan_id, idempotency_key="exec-key-0023", now=NOW
+    )
+    assert created["request"]["status"] == "queued"
+    _finish_job_cleanly(world)
+    world["authorization"].revoke_grant(
+        OWNER,
+        world["strategy"].id,
+        actor=OWNER,
+        reason="stop after exit",
+        grant_id=grant["grant_id"],
+    )
+
+    assert world["service"].claim_next(limit=10, now=NOW) == []
+    row = world["service"].get(created["request"]["request_id"])
+    assert row["refusal_code"] == "GRANT_REVOKED"
+    assert world["executor"].calls == []
+
+
 # ---------------------------------------------------------------------------
 # claims, duplicate protection and recovery
 # ---------------------------------------------------------------------------

@@ -31,7 +31,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Callable, Dict, Mapping, Optional
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from backend.strategies.attribution_models import StrategyPlan, StrategyReservation
@@ -1737,14 +1737,14 @@ class ExecutionRequestService:
     def _attempt_refusal(
         self, session: Any, row: HostedExecutionRequest, moment: datetime
     ) -> Optional[str]:
-        """The originating attempt must still be the one that holds authority.
+        """The originating attempt must still be the one that owns the decision.
 
         Every component of the fence is re-read from the persisted job: the
         attempted run, its credential, the lease epoch, the lease itself and the
-        attempt number. A replacement attempt (a new run, a rotated child token,
-        a stolen lease or a re-claim) refuses the work, so a queued request can
-        never be dispatched by an attempt that no longer owns it - and a stale
-        worker cannot finish it either.
+        attempt number. A live attempt keeps its ordinary lease authority. A
+        finished attempt may carry an already-queued request only after a clean
+        exit has been reconciled; a crash, stop, timeout, unresolved cleanup or
+        replacement attempt refuses the work.
         """
         if not row.job_id:
             return "HOSTED_ATTEMPT_UNKNOWN"
@@ -1753,13 +1753,43 @@ class ExecutionRequestService:
         ).scalar_one_or_none()
         if job is None:
             return "HOSTED_ATTEMPT_UNKNOWN"
-        if str(job.desired_state or "") != "started":
+        if (
+            str(job.desired_state or "") != "started"
+            or job.stop_requested_at is not None
+        ):
             return "HOSTED_ATTEMPT_STOPPED"
-        if str(job.status or "") not in ATTEMPT_AUTHORITY_STATUSES:
+
+        # A newer job, or another attempt now holding live authority, means the
+        # strategy has been taken over even if this old attempt's identity
+        # columns were never mutated again.
+        newer_job = session.execute(
+            select(StrategyJob.id)
+            .where(
+                StrategyJob.strategy_id == str(job.strategy_id),
+                StrategyJob.owner_id == str(job.owner_id),
+                StrategyJob.id != str(job.id),
+                or_(
+                    StrategyJob.created_at > job.created_at,
+                    StrategyJob.status.in_(ATTEMPT_AUTHORITY_STATUSES),
+                ),
+            )
+            .limit(1)
+        ).scalar_one_or_none()
+        if newer_job is not None:
+            return "HOSTED_ATTEMPT_REPLACED"
+
+        status = str(job.status or "")
+        if status in ATTEMPT_AUTHORITY_STATUSES:
+            lease_until = _as_utc(job.lease_until)
+            if lease_until is None or lease_until <= moment:
+                return "HOSTED_LEASE_EXPIRED"
+        elif status == "recovery_required":
             return "HOSTED_ATTEMPT_FENCED"
-        lease_until = _as_utc(job.lease_until)
-        if lease_until is None or lease_until <= moment:
-            return "HOSTED_LEASE_EXPIRED"
+        elif status != "stopped":
+            return "HOSTED_ATTEMPT_FENCED"
+        elif not self._clean_exit_job(job):
+            return "HOSTED_ATTEMPT_NOT_CLEAN_EXIT"
+
         if str(job.run_id or "") != str(row.strategy_run_id or ""):
             return "HOSTED_ATTEMPT_RUN_REPLACED"
         # The credential the request was created under must still be the job's
@@ -1773,6 +1803,24 @@ class ExecutionRequestService:
         if row.attempt is not None and int(job.attempt or 0) != int(row.attempt):
             return "HOSTED_ATTEMPT_REPLACED"
         return None
+
+    @staticmethod
+    def _clean_exit_job(job: StrategyJob) -> bool:
+        """Only the host's full clean-exit/reconciliation proof is usable.
+
+        The supervisor reports a normal exit, confirms process cleanup, and the
+        continuation/reconciliation path clears the block. Anything less is a
+        report-shaped terminal state, not proof that it is safe to spend the
+        request after the child is gone.
+        """
+        return (
+            job.lease_until is None
+            and str(job.completion_state or "") == "exited"
+            and job.completion_at is not None
+            and job.exit_code == 0
+            and str(job.process_cleanup_state or "") == "confirmed"
+            and job.reconciled_at is not None
+        )
 
     @staticmethod
     def _submission_proof(session: Any, plan_id: str) -> Dict[str, Any]:
