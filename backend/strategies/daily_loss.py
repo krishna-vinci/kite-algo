@@ -41,7 +41,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from sqlalchemy import bindparam, select, text
@@ -56,6 +56,12 @@ logger = logging.getLogger(__name__)
 #: The exchange's trading day is the IST calendar day. India has never observed
 #: DST, so a fixed +05:30 offset is exact and needs no tz database.
 IST = timezone(timedelta(hours=5, minutes=30))
+
+# The broker book is normally reconciled every few seconds. Four missed periods
+# is fresh enough for a control-plane read, while an overnight or outage-era row
+# can never masquerade as today's broker evidence.
+POSITIONS_FRESHNESS = timedelta(seconds=120)
+SESSION_OPEN = time(9, 15)
 
 
 def _utcnow() -> datetime:
@@ -459,26 +465,35 @@ def strategy_daily_realized_loss_inr(
 
 
 def account_day_pnl_inr(
-    *, account_id: str, session_factory: Optional[Callable[[], Any]] = None
+    *,
+    account_id: str,
+    session_factory: Optional[Callable[[], Any]] = None,
+    now: Optional[datetime] = None,
 ) -> Optional[float]:
     """The broker's own day P&L for the account, or ``None`` when unreadable.
 
     The figure is the sum over the reconciled ``account_positions`` book of
     ``realized_pnl + (last_price - average_price) * net_quantity`` - exactly the
-    ``pnl`` the realtime positions service publishes per position. A book with no
-    positions is a readable ``0.0``. A non-flat position whose price was never
-    marked is not readable evidence (a zero last price would fabricate a loss).
+    ``pnl`` the realtime positions service publishes per position. A book is
+    readable only when reconciliation is current for the active IST session. A
+    non-flat position whose price was never marked is not readable evidence (a
+    zero last price would fabricate a loss).
     """
     from backend.platform.settings import platform_session_factory
 
+    moment = now or _utcnow()
     session = None
     try:
         factory = platform_session_factory(session_factory)
         session = factory()
         rows = session.execute(
             text(
-                "SELECT realized_pnl, last_price, average_price, net_quantity "
-                "FROM public.account_positions WHERE account_id = :account_id"
+                """
+                SELECT realized_pnl, last_price, average_price, net_quantity,
+                       MAX(last_reconciled_at) AS last_reconciled_at
+                FROM public.account_positions WHERE account_id = :account_id
+                GROUP BY realized_pnl, last_price, average_price, net_quantity
+                """
             ),
             {"account_id": str(account_id)},
         ).fetchall()
@@ -488,6 +503,20 @@ def account_day_pnl_inr(
     finally:
         if session is not None:
             session.close()
+
+    last_reconciled = next(
+        (_as_datetime(_row_mapping(row).get("last_reconciled_at")) for row in rows),
+        None,
+    )
+    session_day = session_date(moment)
+    session_start = datetime.combine(session_day, SESSION_OPEN, IST)
+    if (
+        last_reconciled is None
+        or session_date(last_reconciled) != session_day
+        or last_reconciled < session_start
+        or moment - last_reconciled > POSITIONS_FRESHNESS
+    ):
+        return None
 
     total_pnl = 0.0
     for row in rows:

@@ -30,7 +30,7 @@ from backend.broker_api.session.kite_session import KiteSession, get_session_acc
 from .basket_execution import BasketExecutionStore, basket_execution_store
 from .bracket_runtime import BracketRuntimeStore, bracket_runtime_store
 from backend.broker_api.orders.worker_execution_links import WorkerExecutionLinksStore, worker_execution_links_store
-from backend.broker_api.orders.autoslice import autoslice_parent_id
+from backend.broker_api.orders.autoslice import EVENT_PROCESSOR_LOCK_ID, autoslice_parent_id
 
 
 logger = logging.getLogger(__name__)
@@ -44,7 +44,6 @@ TERMINAL_ORDER_STATUSES = {
     "LAPSED",
 }
 
-EVENT_PROCESSOR_LOCK_ID = 87234101
 POSITION_RECONCILE_LOCK_ID = 87234102
 _ORDER_RUNTIME_SCHEMA_COMPAT_READY = False
 
@@ -358,8 +357,8 @@ class CanonicalOrderEventRuntime:
         )
         return result.fetchall()
 
-    def _upsert_projection_from_event(self, db: Session, row: Any) -> None:
-        self._link_autoslice_child(db, row)
+    def _upsert_projection_from_event(self, db: Session, row: Any) -> bool:
+        autoslice_link_owned = self._link_autoslice_child(db, row)
         existing = db.execute(
             text(
                 """
@@ -410,7 +409,7 @@ class CanonicalOrderEventRuntime:
                     "transaction_type": row.transaction_type,
                 },
             )
-            return
+            return autoslice_link_owned
 
         prev_event_timestamp = _parse_timestamp(existing[0])
         prev_filled_quantity = _to_int(existing[1])
@@ -461,8 +460,9 @@ class CanonicalOrderEventRuntime:
                 "order_id": row.order_id,
             },
         )
+        return autoslice_link_owned
 
-    def _link_autoslice_child(self, db: Session, row: Any) -> None:
+    def _link_autoslice_child(self, db: Session, row: Any) -> bool:
         """Inherit the autoslice parent's execution link for a slice order.
 
         Kite assigns child order ids that never appear in the original place
@@ -472,10 +472,10 @@ class CanonicalOrderEventRuntime:
         """
         payload = row.payload_json
         if not isinstance(payload, Mapping):
-            return
+            return False
         parent_order_id = autoslice_parent_id(payload)
         if not parent_order_id or str(parent_order_id) == str(row.order_id):
-            return
+            return False
         owners = db.execute(
             text(
                 """
@@ -491,13 +491,14 @@ class CanonicalOrderEventRuntime:
         ).fetchall()
         run_ids = {str(value[0] or "") for value in owners if str(value[0] or "")}
         if len(run_ids) != 1:
-            return
+            return False
         self.execution_links_store.upsert_order_link(
             strategy_run_id=next(iter(run_ids)),
             account_id=str(row.account_id),
             broker_order_id=str(row.order_id),
             db=db,
         )
+        return True
 
     async def process_pending_events(self, batch_size: int = 100) -> int:
         await ensure_order_runtime_schema_compatibility()
@@ -513,7 +514,26 @@ class CanonicalOrderEventRuntime:
                 try:
                     basket_events: List[Dict[str, Any]] = []
                     bracket_events: List[Dict[str, Any]] = []
-                    self._upsert_projection_from_event(db, row)
+                    autoslice_link_owned = self._upsert_projection_from_event(db, row)
+                    if not autoslice_link_owned and autoslice_parent_id(
+                        row.payload_json if isinstance(row.payload_json, Mapping) else {}
+                    ):
+                        # A child seen before its parent intent/link existed must
+                        # be replayed; marking it processed would strand its fills.
+                        db.execute(
+                            text(
+                                """
+                                UPDATE canonical_order_events
+                                SET processing_state = 'pending',
+                                    processing_started_at = NULL,
+                                    last_error = 'autoslice parent link unavailable'
+                                WHERE id = :id
+                                """
+                            ),
+                            {"id": row.id},
+                        )
+                        db.commit()
+                        continue
                     try:
                         with db.begin_nested():
                             basket_events = self.basket_store.apply_order_event(db, canonical_event=row)

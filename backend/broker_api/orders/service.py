@@ -381,6 +381,8 @@ class OrdersService:
             if attribution and attribution.client_order_ref:
                 try:
                     from backend.broker_api.orders.live_order_intents import mark_live_order_intent_placed, seed_live_order_state_projection
+                    from backend.broker_api.orders.autoslice import recover_autoslice_children
+                    from backend.app.database import SessionLocal
 
                     mark_live_order_intent_placed(client_order_ref=attribution.client_order_ref, broker_order_id=str(order_id))
                     seed_live_order_state_projection(
@@ -397,6 +399,13 @@ class OrdersService:
                         basket_execution_id=basket_execution_id,
                         basket_leg_index=basket_leg_index,
                     )
+                    if params.get("autoslice") == "true":
+                        recover_autoslice_children(
+                            SessionLocal,
+                            account_id=str(attribution.account_ref),
+                            run_id=str(attribution.strategy_run_id),
+                            parent_order_id=str(order_id),
+                        )
                 except Exception as mark_error:
                     logger.error(
                         "Failed to mark live order accounting state after broker success",

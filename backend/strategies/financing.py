@@ -267,6 +267,25 @@ def plan_exposure(
         account_id=account_id,
         execution_environment=execution_environment,
     )
+    roll_peer_mismatches: List[Dict[str, Any]] = []
+    if (
+        str(resolved.get("target_kind") or "") == "target_futures"
+        and resolved.get("roll")
+    ):
+        for leg in list(resolved.get("old_legs") or []):
+            key = _leg_key(leg)
+            try:
+                expected = int(float(leg.get("signed_quantity")))
+            except (TypeError, ValueError):
+                expected = None
+            if expected is None or int(current.get(key, 0)) != expected:
+                roll_peer_mismatches.append(
+                    {
+                        "coordinate": list(key),
+                        "expected_quantity": expected,
+                        "attributed_quantity": int(current.get(key, 0)),
+                    }
+                )
     # An option ADJUST's frozen desired state IS the post-plan book: the engine
     # releases every leg the run holds that the target does not name (the release
     # half of a roll, and a removal). Leaving those coordinates at "held
@@ -367,6 +386,7 @@ def plan_exposure(
         "post_quantities": {f"{key[0]}:{key[1]}": value for key, value in post.items()},
         "per_instrument": per_instrument,
         "unvalued": unvalued,
+        "roll_peer_mismatches": roll_peer_mismatches,
         "unresolved_projection_facts": len(unresolved_facts),
     }
 

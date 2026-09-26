@@ -21,6 +21,8 @@ from __future__ import annotations
 import os
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
@@ -36,6 +38,8 @@ from backend.api.routers import platform as platform_router  # noqa: E402
 from backend.api.routers import strategies as strategies_router  # noqa: E402
 from backend.api.routers import strategy_owner_actions as owner_actions_router  # noqa: E402
 from backend.app.auth import AppUser  # noqa: E402
+from backend.api.services.kill_switch import strategy_exposure_targets  # noqa: E402
+from backend.strategies.attribution_models import StrategyPositionProjection  # noqa: E402
 from backend.platform.models import (  # noqa: E402
     PlatformLiveSetting,
     PlatformLiveSettingAudit,
@@ -349,3 +353,41 @@ async def test_kill_switch_spans_a_strategy_owned_by_another_operator(
     assert {row["strategy_id"] for row in body["strategies"]} == {other_id}
     assert body["strategies"][0]["status"] == "complete"
     assert len(pipeline.executed) == 1
+
+
+def test_exposure_targets_keep_each_leg_when_a_hedge_nets_to_zero():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    StrategyPositionProjection.__table__.create(engine)
+    factory = sessionmaker(bind=engine)
+
+    with factory() as session:
+        for instrument_id, token, quantity in (
+            ("opt-short", 101, -75),
+            ("opt-long", 102, 75),
+        ):
+            session.add(
+                StrategyPositionProjection(
+                    account_id="kite:A",
+                    strategy_id="stg-roll",
+                    execution_environment="live",
+                    identity_kind="canonical",
+                    identity_key=instrument_id,
+                    product="NRML",
+                    canonical_instrument_id=instrument_id,
+                    instrument_token=token,
+                    exchange="NFO",
+                    tradingsymbol=instrument_id,
+                    net_quantity=quantity,
+                    projection_version=1,
+                )
+            )
+        session.commit()
+
+    assert strategy_exposure_targets(factory, ["stg-roll"]) == [
+        {
+            "strategy_id": "stg-roll",
+            "account_id": "kite:A",
+            "execution_environment": "live",
+        }
+    ]
+    engine.dispose()

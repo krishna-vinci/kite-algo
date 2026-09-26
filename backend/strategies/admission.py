@@ -1032,6 +1032,20 @@ class AdmissionService:
 
         notional = self.plan_notional(plan)
         exposure = self.plan_exposure(plan, execution_environment=environment)
+        resolved_for_roll = plan.get("resolved_plan") or {}
+        roll_role = str((resolved_for_roll.get("roll") or {}).get("role") or "")
+        if exposure.get("roll_peer_mismatches") and roll_role == "open_new":
+            return AdmissionVerdict(
+                False,
+                "ROLL_PEER_MISMATCH",
+                {
+                    "roll_peer_mismatches": exposure["roll_peer_mismatches"],
+                    "message": (
+                        "The frozen roll peer does not match the strategy's current "
+                        "attributed book; re-freeze the roll from attributed evidence."
+                    ),
+                },
+            )
         # The market clock is the FIRST environmental precondition: a live plan
         # that OPENS or GROWS a position is refused while its exchange is shut,
         # before any limit or margin work is done on a decision that cannot run.

@@ -135,6 +135,9 @@ def strategy_exposure_targets(
                 StrategyPositionProjection.strategy_id,
                 StrategyPositionProjection.account_id,
                 StrategyPositionProjection.execution_environment,
+                StrategyPositionProjection.identity_kind,
+                StrategyPositionProjection.identity_key,
+                StrategyPositionProjection.product,
                 StrategyPositionProjection.net_quantity,
             ).where(
                 StrategyPositionProjection.strategy_id.in_(wanted),
@@ -143,18 +146,17 @@ def strategy_exposure_targets(
                 ),
             )
         ).all()
-    totals: Dict[tuple, int] = {}
-    for strategy_id, account_id, environment, quantity in rows:
-        key = (str(strategy_id), str(account_id), str(environment))
-        totals[key] = totals.get(key, 0) + int(quantity or 0)
+    exposed: set[tuple] = set()
+    for strategy_id, account_id, environment, _kind, _key, _product, quantity in rows:
+        if int(quantity or 0) != 0:
+            exposed.add((str(strategy_id), str(account_id), str(environment)))
     return [
         {
             "strategy_id": strategy_id,
             "account_id": account_id,
             "execution_environment": environment,
         }
-        for (strategy_id, account_id, environment), total in sorted(totals.items())
-        if total != 0
+        for strategy_id, account_id, environment in sorted(exposed)
     ]
 
 

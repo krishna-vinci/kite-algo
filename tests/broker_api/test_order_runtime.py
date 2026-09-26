@@ -16,7 +16,11 @@ from backend.broker_api.orders.order_runtime import (
     _close_locked_session,
     ensure_order_runtime_schema_compatibility,
 )
-from backend.broker_api.orders.autoslice import autoslice_parent_id, should_autoslice
+from backend.broker_api.orders.autoslice import (
+    autoslice_parent_id,
+    recover_autoslice_children,
+    should_autoslice,
+)
 
 
 async def _run_to_thread_inline(func, /, *args, **kwargs):
@@ -261,6 +265,87 @@ class OrderRuntimeTests(unittest.IsolatedAsyncioTestCase):
         runtime._link_autoslice_child(db, row)
 
         runtime.execution_links_store.upsert_order_link.assert_not_called()
+
+    async def test_an_unowned_autoslice_child_is_requeued_not_processed(self):
+        runtime = CanonicalOrderEventRuntime(
+            basket_store=MagicMock(),
+            bracket_store=MagicMock(),
+            execution_links_store=MagicMock(),
+        )
+        row = SimpleNamespace(
+            id=7,
+            account_id="kite:A",
+            order_id="CHILD-1",
+            payload_json={"tags": ["autoslice:PARENT-1"]},
+        )
+        db = MagicMock()
+        db.begin_nested.return_value = nullcontext()
+
+        with patch(
+            "backend.broker_api.orders.order_runtime.ensure_order_runtime_schema_compatibility",
+            AsyncMock(),
+        ), patch(
+            "backend.broker_api.orders.order_runtime._acquire_advisory_lock_session",
+            AsyncMock(return_value=db),
+        ), patch(
+            "backend.broker_api.orders.order_runtime._release_advisory_lock"
+        ), patch(
+            "backend.broker_api.orders.order_runtime._close_locked_session"
+        ), patch.object(
+            runtime, "_claim_pending_events", return_value=[row]
+        ), patch.object(
+            runtime, "_upsert_projection_from_event", return_value=False
+        ):
+            processed = await runtime.process_pending_events(batch_size=10)
+
+        self.assertEqual(processed, 0)
+        retry_sql = [str(call.args[0]) for call in db.execute.call_args_list]
+        self.assertTrue(any("processing_state = 'pending'" in sql for sql in retry_sql))
+        self.assertGreaterEqual(db.commit.call_count, 2)
+        runtime.basket_store.apply_order_event.assert_not_called()
+
+    def test_recover_autoslice_children_links_and_requeues_in_one_transaction(self):
+        class RecordingSession:
+            def __init__(self):
+                self.sql = []
+                self.committed = False
+
+            def execute(self, statement, params=None):
+                self.sql.append(str(statement))
+
+                class Result:
+                    rowcount = 2
+
+                return Result()
+
+            def commit(self):
+                self.committed = True
+
+            def rollback(self):
+                raise AssertionError("successful recovery must not roll back")
+
+            def close(self):
+                pass
+
+        class Factory:
+            def __init__(self):
+                self.session = RecordingSession()
+
+            def __call__(self):
+                return self.session
+
+        factory = Factory()
+        requeued = recover_autoslice_children(
+            factory,
+            account_id="kite:A",
+            run_id="run-1",
+            parent_order_id="PARENT-1",
+        )
+
+        self.assertEqual(requeued, 2)
+        self.assertTrue(factory.session.committed)
+        self.assertTrue(any("DO NOTHING" in sql for sql in factory.session.sql))
+        self.assertTrue(any("processing_state = 'pending'" in sql for sql in factory.session.sql))
 
     async def test_schema_compatibility_adds_processing_started_at_once(self):
         fake_db = FakeCompatDB()

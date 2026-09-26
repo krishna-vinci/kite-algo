@@ -9,6 +9,7 @@ from sqlalchemy import text
 
 AUTOSLICE_EXCHANGES = frozenset({"NFO", "BFO", "MCX", "CDS"})
 AUTOSLICE_TAG_PREFIX = "autoslice:"
+EVENT_PROCESSOR_LOCK_ID = 87234101
 
 
 def should_autoslice(exchange: Any) -> bool:
@@ -121,6 +122,102 @@ def autoslice_child_order_ids(
         if parent_id in set(parents):
             children.add(str(order_id or ""))
     return sorted(value for value in children if value)
+
+
+def recover_autoslice_children(
+    session_factory,
+    *,
+    account_id: str,
+    run_id: str,
+    parent_order_id: str,
+) -> int:
+    """Link and requeue tagged children observed before the parent was marked.
+
+    The broker response and its database bookkeeping are separate operations, so
+    Kite may deliver a child event in between. This closes that window with the
+    parent's now-authoritative ownership: insert the missing child links and put
+    already-processed child events back in the processor queue in one transaction.
+    """
+    parent = str(parent_order_id or "").strip()
+    run = str(run_id or "").strip()
+    account = str(account_id or "").strip()
+    if not parent or not run or not account:
+        return 0
+    needle = f"%{AUTOSLICE_TAG_PREFIX}{parent}%"
+    session = session_factory()
+    try:
+        # Serialize with canonical-event processing: a child claimed just before
+        # parent marking may be in flight, and its final write must not overwrite
+        # this recovery's pending state.
+        session.execute(
+            text("SELECT pg_advisory_xact_lock(:event_processor_lock_id)"),
+            {"event_processor_lock_id": EVENT_PROCESSOR_LOCK_ID},
+        )
+        session.execute(
+            text(
+                """
+                INSERT INTO public.worker_live_execution_links (
+                    strategy_run_id, account_id, broker_order_id, trade_id
+                )
+                SELECT DISTINCT :run_id, coe.account_id, coe.order_id, NULL
+                FROM public.canonical_order_events coe
+                WHERE coe.account_id = :account_id
+                  AND coe.order_id <> :parent_order_id
+                  AND (coe.payload_json ->> 'tags')::text LIKE :needle
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM public.worker_live_execution_links owner
+                      WHERE owner.account_id = coe.account_id
+                        AND owner.broker_order_id = coe.order_id
+                        AND owner.trade_id IS NULL
+                  )
+                ON CONFLICT (account_id, broker_order_id) WHERE trade_id IS NULL
+                DO NOTHING
+                """
+            ),
+            {
+                "run_id": run,
+                "account_id": account,
+                "parent_order_id": parent,
+                "needle": needle,
+            },
+        )
+        result = session.execute(
+            text(
+                """
+                UPDATE public.canonical_order_events coe
+                SET processing_state = 'pending',
+                    processing_started_at = NULL,
+                    last_error = NULL
+                WHERE coe.account_id = :account_id
+                  AND coe.order_id <> :parent_order_id
+                  AND (coe.payload_json ->> 'tags')::text LIKE :needle
+                  AND coe.processing_state IN ('processed', 'failed')
+                  AND EXISTS (
+                      SELECT 1
+                      FROM public.worker_live_execution_links owner
+                      WHERE owner.account_id = coe.account_id
+                        AND owner.broker_order_id = coe.order_id
+                        AND owner.trade_id IS NULL
+                        AND owner.strategy_run_id = :run_id
+                  )
+                """
+            ),
+            {
+                "run_id": run,
+                "account_id": account,
+                "parent_order_id": parent,
+                "needle": needle,
+            },
+        )
+        requeued = int(getattr(result, "rowcount", 0) or 0)
+        session.commit()
+        return requeued
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
 
 
 def merge_order_ids(*groups: Sequence[str]) -> list[str]:

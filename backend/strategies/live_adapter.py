@@ -623,6 +623,54 @@ class LivePlanAdapter:
                 {"plan_id": plan_id, "error": str(exc)},
             ) from exc
 
+    def _check_roll_peer_book(
+        self, plan: Mapping[str, Any], *, release: bool = False
+    ) -> None:
+        """Refuse a roll whose frozen peer no longer matches attributed truth.
+
+        The peer is the other contract a roll is expected to carry. Trusting its
+        caller-supplied quantity lets a stale payload hide twice the book and,
+        on release, close that larger book behind too little replacement.
+        """
+        resolved = plan.get("resolved_plan") or {}
+        roll_role = str((resolved.get("roll") or {}).get("role") or "")
+        wanted_role = "close_old" if release else "open_new"
+        if (
+            str(resolved.get("target_kind") or "") != "target_futures"
+            or roll_role != wanted_role
+        ):
+            return
+        mismatches = []
+        for peer in resolved.get("old_legs") or []:
+            try:
+                expected = int(peer.get("signed_quantity"))
+            except (TypeError, ValueError) as exc:
+                raise LiveRefusal(
+                    "ROLL_PEER_MISMATCH",
+                    {"plan_id": plan.get("plan_id"), "reason": str(exc)},
+                ) from exc
+            current = self._attributed_quantity(plan, dict(peer))
+            if current != expected:
+                mismatches.append(
+                    {
+                        "instrument_id": str(peer.get("instrument_id") or ""),
+                        "expected_quantity": expected,
+                        "attributed_quantity": current,
+                    }
+                )
+        if mismatches:
+            raise LiveRefusal(
+                "ROLL_PEER_MISMATCH",
+                {
+                    "plan_id": str(plan.get("plan_id") or ""),
+                    "roll_peer_mismatches": mismatches,
+                    "message": (
+                        "The frozen roll peer does not match the strategy's current "
+                        "attributed book"
+                    ),
+                },
+            )
+
     # -- validation ---------------------------------------------------------
 
     @staticmethod
@@ -1788,6 +1836,7 @@ class LivePlanAdapter:
                 strategy_id=strategy_id,
                 execution_environment="live",
             )
+            self._check_roll_peer_book(plan)
             _parent, created = sequence.materialize(
                 plan=plan,
                 lane=resolved_lane,
@@ -2796,6 +2845,7 @@ class LivePlanAdapter:
                 strategy_id=strategy_id,
                 execution_environment="live",
             )
+            self._check_roll_peer_book(plan, release=True)
             # Phase 2: the governed authorization is re-derived INSIDE this
             # transaction, after the hosted-strategy row lock and therefore before
             # the ``withheld -> releasing`` CAS below. Revocation takes the same
