@@ -82,7 +82,7 @@ def session_factory():
             "CREATE TABLE public.account_positions ("
             " account_id TEXT, instrument_token INTEGER, product TEXT, exchange TEXT,"
             " tradingsymbol TEXT, net_quantity INTEGER DEFAULT 0, realized_pnl REAL DEFAULT 0,"
-            " last_price REAL, average_price REAL)"
+            " last_price REAL, average_price REAL, last_reconciled_at TEXT)"
         )
         dbapi_connection.commit()
 
@@ -486,8 +486,14 @@ async def test_status_reports_the_evidence_it_actually_has(
 
 @pytest.mark.asyncio
 async def test_status_reports_the_account_day_pnl_and_the_cap_it_is_tested_against(
-    client, session_factory, gate_session
+    client, session_factory, gate_session, monkeypatch
 ):
+    # Day P&L is evidence only when reconciled inside the current IST session,
+    # so pin the clock to a trading-day morning and reconcile just before it.
+    from backend.strategies import daily_loss
+
+    trading_now = datetime(2026, 9, 28, 5, 0, tzinfo=timezone.utc)  # 10:30 IST Monday
+    monkeypatch.setattr(daily_loss, "_utcnow", lambda: trading_now)
     platform_settings.update_live_settings(
         {"cnc": False, "mis": True, "futures": False, "options": False},
         actor_id=OWNER,
@@ -499,9 +505,10 @@ async def test_status_reports_the_account_day_pnl_and_the_cap_it_is_tested_again
             text(
                 "INSERT INTO public.account_positions "
                 "(account_id, instrument_token, product, exchange, tradingsymbol, "
-                " net_quantity, realized_pnl, last_price, average_price) "
-                "VALUES ('kite:XJJ12345', 100, 'CNC', 'NSE', 'RELIANCE', 0, -4500.0, 0, 0)"
-            )
+                " net_quantity, realized_pnl, last_price, average_price, last_reconciled_at) "
+                "VALUES ('kite:XJJ12345', 100, 'CNC', 'NSE', 'RELIANCE', 0, -4500.0, 0, 0, :at)"
+            ),
+            {"at": (trading_now - timedelta(seconds=10)).isoformat()},
         )
         session.commit()
 

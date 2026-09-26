@@ -1018,6 +1018,7 @@ class RollEventRow(BaseModel):
 
     event: str
     detail: Dict[str, Any] = Field(default_factory=dict)
+    created_at: Optional[datetime] = None
 
 
 class RollResponse(BaseModel):
