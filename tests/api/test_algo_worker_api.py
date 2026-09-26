@@ -5879,5 +5879,30 @@ class ProtectionOwnerPolicySyncTests(unittest.TestCase):
         self.assertEqual(snapshot["blocking_reason"], "OPTIONS_PROTECTION_TRIGGERED")
 
 
+class LiveExitAutosliceTests(unittest.TestCase):
+    def test_owner_exit_and_flatten_autoslice_fno_but_not_equity(self):
+        from backend.api.routers.worker_execution import _live_exit_orders_from_legs
+
+        attribution = {"strategy_run_id": "run-1"}
+        orders = _live_exit_orders_from_legs(
+            [
+                {
+                    "exchange": "NFO",
+                    "tradingsymbol": "NIFTY26OCTFUT",
+                    "net_quantity": 100,
+                    "product": "NRML",
+                },
+                {
+                    "exchange": "NSE",
+                    "tradingsymbol": "INFY",
+                    "net_quantity": 5,
+                    "product": "CNC",
+                },
+            ],
+            attribution,
+        )
+        self.assertEqual([order["autoslice"] for order in orders], [True, False])
+
+
 if __name__ == "__main__":
     unittest.main()

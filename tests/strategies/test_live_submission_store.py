@@ -936,3 +936,139 @@ class LiveOptionChainFreshnessTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _RecordingSubmissions:
+    def __init__(self):
+        self.outcomes = []
+
+    def acquire_lease(self, **kwargs):
+        return None
+
+    def release_lease(self, **kwargs):
+        return None
+
+    def record_outcome(self, **kwargs):
+        self.outcomes.append(kwargs)
+        return dict(kwargs)
+
+
+class AutosliceAggregationTests(unittest.IsolatedAsyncioTestCase):
+    """Fake-broker evidence semantics: one cumulative step, never per slice."""
+
+    def test_trade_replay_is_deduplicated_before_cumulative_totals(self):
+        from backend.strategies.live_ingestion import LiveOutcomeConsumer
+
+        class _Session:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def execute(self, statement, params=None):
+                class _Result:
+                    def fetchall(result):
+                        return [
+                            ("T1", "PARENT", 2),
+                            ("T1", "PARENT", 2),
+                            ("T2", "CHILD-1", 5),
+                            ("T3", "CHILD-2", 3),
+                        ]
+
+                return _Result()
+
+        consumer = LiveOutcomeConsumer(session_factory=lambda: _Session())
+        fills = consumer._fills_by_order("kite:A", {"PARENT", "CHILD-1", "CHILD-2"})
+        self.assertEqual(fills, {"CHILD-1": 5, "CHILD-2": 3, "PARENT": 2})
+        self.assertEqual(sum(fills.values()), 10)
+
+    def _consumer(self, fills):
+        from backend.strategies.live_ingestion import LiveOutcomeConsumer
+
+        class _Consumer(LiveOutcomeConsumer):
+            def __init__(inner):
+                super().__init__(
+                    session_factory=lambda: None,
+                    submissions=_RecordingSubmissions(),
+                )
+
+            async def _publish_attribution(inner, **kwargs):
+                return None
+
+            def _bound_run(inner, plan_id):
+                return "run-1"
+
+            def _owned_orders(inner, account_id, run_id, order_ids):
+                return {"PARENT", "CHILD-1", "CHILD-2"}
+
+            def _fills_by_order(inner, account_id, owned):
+                return {order_id: fills.get(order_id, 0) for order_id in sorted(owned)}
+
+            def _terminal_statuses(inner, account_id, owned, fills):
+                return None
+
+            def _publication_generation(inner, account_id, strategy_id):
+                return None
+
+            def _advance_reservation(inner, plan_id):
+                return None
+
+            def _stage(inner, **kwargs):
+                inner.staged.append(kwargs)
+
+            async def _resume(inner, **kwargs):
+                inner.resumed.append(kwargs)
+
+        consumer = _Consumer()
+        consumer.staged = []
+        consumer.resumed = []
+        return consumer
+
+    async def test_parent_and_child_fills_reach_quantity_once(self):
+        consumer = self._consumer({"PARENT": 2, "CHILD-1": 5, "CHILD-2": 3})
+        # Replay rows are idempotent on the same broker trade ids; a repeated
+        # trade row is dropped before the per-order totals are summed.
+        replayed = consumer._fills_by_order(
+            "kite:A", {"PARENT", "CHILD-1", "CHILD-2"}
+        )
+        self.assertEqual(sum(replayed.values()), 10)
+        self.assertEqual(
+            sum(consumer._fills_by_order("kite:A", set(replayed)).values()), 10
+        )
+        await consumer._advance(
+            plan_id="plan-1",
+            step_no=1,
+            step_ref="ref",
+            account_id="kite:A",
+            strategy_id="stg",
+            orders=["PARENT"],
+            ordered=10,
+            state="pending",
+            stored_detail={},
+            counts={},
+        )
+        self.assertEqual(len(consumer.staged), 1)
+        self.assertEqual(len(consumer.resumed), 1)
+        self.assertEqual(consumer.resumed[0]["ordered"], 10)
+
+    async def test_partial_fills_across_children_stay_partial(self):
+        consumer = self._consumer({"PARENT": 1, "CHILD-1": 2, "CHILD-2": 0})
+        counts = {"partial": 0, "unknown": 0}
+        await consumer._advance(
+            plan_id="plan-1",
+            step_no=1,
+            step_ref="ref",
+            account_id="kite:A",
+            strategy_id="stg",
+            orders=["PARENT"],
+            ordered=10,
+            state="pending",
+            stored_detail={},
+            counts=counts,
+        )
+        self.assertEqual(counts.get("partial"), 1)
+        outcome = consumer.submissions.outcomes[-1]
+        self.assertEqual(outcome["state"], "partial")
+        self.assertEqual(outcome["detail"]["filled_quantity"], 3)
+        self.assertEqual(outcome["detail"]["residual_quantity"], 7)

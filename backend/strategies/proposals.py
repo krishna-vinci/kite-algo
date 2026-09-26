@@ -328,6 +328,15 @@ class ProposalStore:
         """
         payload = dict(submission.payload or {})
         target_kind = str(submission.target_kind or "").strip()
+        if target_kind == "target_futures":
+            from backend.algo_runtime.account_scope import parse_account_scope
+
+            try:
+                payload["execution_environment"] = parse_account_scope(
+                    str(submission.account_id or "")
+                ).mode
+            except ValueError:
+                payload.pop("execution_environment", None)
         if target_kind != "target_weights":
             # An exact-quantity proposal may STATE the allocation basis it was
             # sized against (an ``intent_bundle`` carrying whole shares is the

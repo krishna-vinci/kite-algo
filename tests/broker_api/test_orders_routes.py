@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 
 from fastapi import FastAPI
+import pytest
 from starlette.routing import Route
 
 from tests.support.test_support import install_dependency_stubs, iter_mounted_routes
@@ -83,3 +84,61 @@ def test_orders_router_registers_read_only_routes_only() -> None:
 def test_restored_routes_are_cookie_protected() -> None:
     for _method, path in READ_ROUTES:
         assert not auth_exempt_path(path), f"{path} must not be cookie-exempt"
+
+
+@pytest.mark.asyncio
+async def test_kite_place_payload_preserves_autoslice(monkeypatch) -> None:
+    from backend.broker_api.orders.models import PlaceOrderRequest
+    from backend.broker_api.orders.service import OrdersService
+
+    calls = []
+
+    class _Kite:
+        access_token = "test-token"
+
+        def _post(self, path, *, url_args, params):
+            calls.append((path, dict(url_args), dict(params)))
+            return {"order_id": "PARENT-1"}
+
+        def place_order(self, **params):
+            calls.append(("place_order", {}, dict(params)))
+            return "EQUITY-1"
+
+    async def _immediate(_action, _corr_id, func, **_kwargs):
+        return func()
+
+    monkeypatch.setattr(
+        "backend.broker_api.orders.service.run_kite_write_action", _immediate
+    )
+    fno = PlaceOrderRequest.model_validate(
+        {
+            "exchange": "NFO",
+            "tradingsymbol": "NIFTY26OCTFUT",
+            "transaction_type": "BUY",
+            "variety": "regular",
+            "product": "NRML",
+            "order_type": "MARKET",
+            "quantity": 100,
+            "autoslice": True,
+        }
+    )
+    result = await OrdersService().place_order(_Kite(), fno, "corr")
+    assert result.order_id == "PARENT-1"
+    assert calls[0][0] == "order.place"
+    assert calls[0][2]["autoslice"] == "true"
+
+    calls.clear()
+    equity = PlaceOrderRequest.model_validate(
+        {
+            "exchange": "NSE",
+            "tradingsymbol": "INFY",
+            "transaction_type": "BUY",
+            "variety": "regular",
+            "product": "CNC",
+            "order_type": "MARKET",
+            "quantity": 1,
+        }
+    )
+    await OrdersService().place_order(_Kite(), equity, "corr")
+    assert calls[0][0] == "place_order"
+    assert "autoslice" not in calls[0][2]

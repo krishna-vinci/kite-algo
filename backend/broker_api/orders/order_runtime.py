@@ -4,7 +4,18 @@ import json
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Any, AsyncGenerator, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import (
+    Any,
+    AsyncGenerator,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
 
 from kiteconnect import KiteConnect
 from pydantic import BaseModel, ConfigDict
@@ -19,6 +30,7 @@ from backend.broker_api.session.kite_session import KiteSession, get_session_acc
 from .basket_execution import BasketExecutionStore, basket_execution_store
 from .bracket_runtime import BracketRuntimeStore, bracket_runtime_store
 from backend.broker_api.orders.worker_execution_links import WorkerExecutionLinksStore, worker_execution_links_store
+from backend.broker_api.orders.autoslice import autoslice_parent_id
 
 
 logger = logging.getLogger(__name__)
@@ -339,7 +351,7 @@ class CanonicalOrderEventRuntime:
                 RETURNING c.id, c.account_id, c.order_id, c.status, c.event_timestamp,
                           c.exchange_update_timestamp, c.exchange, c.tradingsymbol,
                           c.instrument_token, c.product, c.transaction_type,
-                          c.quantity, c.filled_quantity, c.average_price
+                          c.quantity, c.filled_quantity, c.average_price, c.payload_json
                 """
             ),
             {"limit": limit},
@@ -347,6 +359,7 @@ class CanonicalOrderEventRuntime:
         return result.fetchall()
 
     def _upsert_projection_from_event(self, db: Session, row: Any) -> None:
+        self._link_autoslice_child(db, row)
         existing = db.execute(
             text(
                 """
@@ -447,6 +460,43 @@ class CanonicalOrderEventRuntime:
                 "account_id": row.account_id,
                 "order_id": row.order_id,
             },
+        )
+
+    def _link_autoslice_child(self, db: Session, row: Any) -> None:
+        """Inherit the autoslice parent's execution link for a slice order.
+
+        Kite assigns child order ids that never appear in the original place
+        response. The child order event carries the ``autoslice:<parent>`` tag;
+        copying the parent's run ownership here keeps attribution server-derived.
+        An ambiguous parent link is left unlinked rather than guessed.
+        """
+        payload = row.payload_json
+        if not isinstance(payload, Mapping):
+            return
+        parent_order_id = autoslice_parent_id(payload)
+        if not parent_order_id or str(parent_order_id) == str(row.order_id):
+            return
+        owners = db.execute(
+            text(
+                """
+                SELECT strategy_run_id FROM public.live_order_intents
+                WHERE account_id = :account_id AND broker_order_id = :parent_order_id
+                UNION ALL
+                SELECT strategy_run_id FROM public.worker_live_execution_links
+                WHERE account_id = :account_id AND broker_order_id = :parent_order_id
+                  AND trade_id IS NULL
+                """
+            ),
+            {"account_id": row.account_id, "parent_order_id": str(parent_order_id)},
+        ).fetchall()
+        run_ids = {str(value[0] or "") for value in owners if str(value[0] or "")}
+        if len(run_ids) != 1:
+            return
+        self.execution_links_store.upsert_order_link(
+            strategy_run_id=next(iter(run_ids)),
+            account_id=str(row.account_id),
+            broker_order_id=str(row.order_id),
+            db=db,
         )
 
     async def process_pending_events(self, batch_size: int = 100) -> int:

@@ -52,6 +52,12 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 from sqlalchemy import text
 
 from backend.app.database import SessionLocal
+from backend.broker_api.orders.autoslice import should_autoslice
+from backend.broker_api.orders.autoslice import (
+    autoslice_child_order_ids,
+    bound_run_for_plan,
+    merge_order_ids,
+)
 
 from .admission import AdmissionService, margin_max_age_seconds
 from .approvals import ApprovalService
@@ -2126,6 +2132,9 @@ class LivePlanAdapter:
                 ),
                 "quantity": int(quantity),
                 **({"price": float(execution_order["price"])} if execution_order else {}),
+                "autoslice": should_autoslice(
+                    str(spec.broker_exchange or spec.exchange or "")
+                ),
                 # Attribution binds the broker order id to THIS plan step's run
                 # BEFORE the order exists, so ingestion can attribute the fill
                 # without the child ever asserting ownership.
@@ -2387,9 +2396,17 @@ class LivePlanAdapter:
             # The cancel is NEVER repeated - not by a later pass, and not by the
             # same pass after a restart.
             return None
-        orders = [str(value) for value in (row.get("broker_order_ids") or []) if str(value)]
-        if not orders:
+        submitted_orders = [str(value) for value in (row.get("broker_order_ids") or []) if str(value)]
+        if not submitted_orders:
             return None
+        run_id = bound_run_for_plan(self.session_factory, plan_id=plan_id)
+        child_orders = autoslice_child_order_ids(
+            self.session_factory,
+            account_id=str(row.get("account_id") or ""),
+            run_id=str(run_id or ""),
+            parent_order_ids=submitted_orders,
+        )
+        orders = merge_order_ids(submitted_orders, child_orders)
         delta = dict(row.get("delta_snapshot") or {})
         ordered = abs(int(delta.get("quantity") or execution_order.get("quantity") or 0))
         risk_reducing = not bool(delta.get("increases_exposure", True))

@@ -1048,6 +1048,7 @@ class _ProtectionBasket:
                     "tradingsymbol": str(order.tradingsymbol),
                     "transaction_type": side,
                     "quantity": int(order.quantity),
+                    "autoslice": bool(order.autoslice),
                     "order_type": order_type,
                     "price": getattr(order, "price", None),
                     "idempotency_key": idempotency_key,
@@ -1524,6 +1525,7 @@ async def test_live_protective_exit_restart_never_creates_a_second_stage(
             (row["tradingsymbol"], row["transaction_type"], row["quantity"])
             for row in basket.placed
         ] == [(OPT_SHORT, "BUY", LOT)], basket.placed
+        assert all(order["autoslice"] is True for order in basket.placed), basket.placed
         assert _owner_row(pg["factory"], run["id"])["action_state"] == "staging"
 
         # A RESTART: the exit claim's own window has elapsed, so the loop

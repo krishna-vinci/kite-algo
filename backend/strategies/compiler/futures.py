@@ -31,6 +31,7 @@ from backend.strategies.compiler.base import (
     TargetCompiler,
     ValidationRefusal,
 )
+from backend.broker_api.orders.autoslice import should_autoslice
 
 #: The catalog instrument type that means "futures contract".
 FUTURES_INSTRUMENT_TYPE = "FUT"
@@ -190,7 +191,14 @@ class FuturesCompiler(TargetCompiler):
 
         quantity = lots * lot_size
         freeze_quantity = _as_optional_int(payload.get("freeze_quantity"))
-        if freeze_quantity is not None and quantity > freeze_quantity:
+        autoslice_applies = should_autoslice(exchange) and (
+            str(payload.get("execution_environment") or "").lower() == "live"
+        )
+        if (
+            freeze_quantity is not None
+            and quantity > freeze_quantity
+            and not autoslice_applies
+        ):
             raise ValidationRefusal(
                 "FREEZE_LIMIT_EXCEEDED",
                 {

@@ -16,6 +16,7 @@ from uuid import uuid4
 from fastapi import HTTPException
 
 from backend.api.services.hosted_strategy_authz import authorize_account_scope
+from backend.broker_api.orders.autoslice import should_autoslice
 from backend.options.execution.repair import (
     ACTION_OWNER_EXIT,
     STATE_FLAT,
@@ -515,6 +516,7 @@ def live_owner_exit_basket_boundary(request: Any, *, kite: Any):
                     "variety": str(leg.get("variety") or "regular"),
                     "product": str(leg.get("product") or "NRML"),
                     "order_type": str(leg.get("order_type") or "MARKET"),
+                    "autoslice": should_autoslice(str(leg.get("exchange") or "")),
                     "attribution": attribution,
                 }
             )

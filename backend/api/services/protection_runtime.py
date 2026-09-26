@@ -9,6 +9,7 @@ from typing import Any, Awaitable, Callable, Dict, Optional
 
 from backend.api.services.protection import evaluate_backend_protection, validate_backend_protection_payload
 from backend.broker_api.core.redis_events import publish_event
+from backend.broker_api.orders.autoslice import should_autoslice
 from backend.options.protection.live_metrics import (
     derive_live_option_protection_metrics,
     open_option_positions,
@@ -1203,6 +1204,7 @@ async def submit_worker_protection_structure_exit(
                     "variety": str(leg.get("variety") or "regular"),
                     "product": str(leg.get("product") or "NRML"),
                     "order_type": str(leg.get("order_type") or "MARKET"),
+                    "autoslice": should_autoslice(str(leg.get("exchange") or "")),
                     "attribution": attribution,
                 }
             )

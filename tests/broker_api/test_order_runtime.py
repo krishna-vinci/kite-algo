@@ -16,6 +16,7 @@ from backend.broker_api.orders.order_runtime import (
     _close_locked_session,
     ensure_order_runtime_schema_compatibility,
 )
+from backend.broker_api.orders.autoslice import autoslice_parent_id, should_autoslice
 
 
 async def _run_to_thread_inline(func, /, *args, **kwargs):
@@ -211,6 +212,56 @@ class FakeCompatDB:
 
 
 class OrderRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    def test_autoslice_parent_is_read_from_kite_child_tags(self):
+        self.assertEqual(
+            autoslice_parent_id({"tags": ["autoslice", "autoslice:240001"]}),
+            "240001",
+        )
+        self.assertIsNone(autoslice_parent_id({"tags": ["autoslice"]}))
+        self.assertTrue(should_autoslice("NFO"))
+        self.assertFalse(should_autoslice("NSE"))
+
+    def test_autoslice_child_inherits_exactly_one_parent_run_link(self):
+        runtime = CanonicalOrderEventRuntime(
+            basket_store=MagicMock(),
+            bracket_store=MagicMock(),
+            execution_links_store=MagicMock(),
+        )
+        row = SimpleNamespace(
+            account_id="kite:A",
+            order_id="CHILD-1",
+            payload_json={"tags": ["autoslice:PARENT-1"]},
+        )
+        db = MagicMock()
+        db.execute.return_value = FakeResult(rows=[("run-1",), ("run-1",)])
+
+        runtime._link_autoslice_child(db, row)
+
+        runtime.execution_links_store.upsert_order_link.assert_called_once_with(
+            strategy_run_id="run-1",
+            account_id="kite:A",
+            broker_order_id="CHILD-1",
+            db=db,
+        )
+
+    def test_ambiguous_autoslice_parent_ownership_is_not_linked(self):
+        runtime = CanonicalOrderEventRuntime(
+            basket_store=MagicMock(),
+            bracket_store=MagicMock(),
+            execution_links_store=MagicMock(),
+        )
+        row = SimpleNamespace(
+            account_id="kite:A",
+            order_id="CHILD-1",
+            payload_json={"tags": ["autoslice:PARENT-1"]},
+        )
+        db = MagicMock()
+        db.execute.return_value = FakeResult(rows=[("run-1",), ("run-2",)])
+
+        runtime._link_autoslice_child(db, row)
+
+        runtime.execution_links_store.upsert_order_link.assert_not_called()
+
     async def test_schema_compatibility_adds_processing_started_at_once(self):
         fake_db = FakeCompatDB()
 

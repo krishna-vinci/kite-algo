@@ -21,6 +21,7 @@ from backend.api.services.hosted_attempt import (
 from backend.shared.serialization import _json_dumps
 from backend.api.routers.worker_protection import _build_worker_run_pnl_snapshot, validate_worker_run_safety_token
 from backend.algo_runtime.execution_attribution import build_execution_attribution, build_paper_execution_attribution
+from backend.broker_api.orders.autoslice import should_autoslice
 
 router = APIRouter(prefix='/algo-workers', tags=['Algo Workers'])
 
@@ -301,6 +302,7 @@ def _live_exit_orders_from_legs(legs: List[Dict[str, Any]], attribution: Dict[st
                 "quantity": abs(net_quantity),
                 "validity": "DAY",
                 "market_protection": -1,
+                "autoslice": should_autoslice(str(leg["exchange"])),
                 "attribution": dict(attribution),
             }
         )

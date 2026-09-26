@@ -356,10 +356,25 @@ class OrdersService:
                 )
             variety = params.pop('variety')
             variety_value = variety.value if isinstance(variety, Variety) else str(variety)
+            if "autoslice" in params:
+                # Kite documents the value as the literal ``true``/``false``.
+                params["autoslice"] = "true" if params["autoslice"] else "false"
+                # The installed KiteConnect.place_order signature predates
+                # autoslice. This is exactly the underlying order.place POST
+                # that method builds, with the model-validated field preserved.
+                send_order = lambda: kite._post(
+                    "order.place",
+                    url_args={"variety": variety_value},
+                    params=params,
+                )["order_id"]
+            else:
+                send_order = lambda: kite.place_order(
+                    variety=variety_value, **params
+                )
             order_id = await run_kite_write_action(
                 "place_order",
                 corr_id,
-                lambda: kite.place_order(variety=variety_value, **params),
+                send_order,
                 meta=log_ctx,
             )
             log_ctx["order_id"] = order_id

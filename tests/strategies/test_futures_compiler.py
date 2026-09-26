@@ -248,6 +248,25 @@ class FreezeTests(FuturesCompilerTestCase):
         leg = self.compile(freeze_quantity=150).resolved["legs"][0]
         self.assertEqual(leg["quantity"], 150)
 
+    def test_live_autoslice_allows_a_declared_freeze_limit_to_be_exceeded(self):
+        self.contract()
+        leg = self.compile(
+            freeze_quantity=100,
+            execution_environment="live",
+        ).resolved["legs"][0]
+        self.assertEqual(leg["quantity"], 150)
+
+    def test_paper_still_refuses_a_declared_freeze_limit(self):
+        from backend.strategies.compiler.base import ValidationRefusal
+
+        self.contract()
+        with self.assertRaises(ValidationRefusal) as ctx:
+            self.compile(
+                freeze_quantity=100,
+                execution_environment="paper",
+            )
+        self.assertEqual(ctx.exception.reason_code, "FREEZE_LIMIT_EXCEEDED")
+
     def test_an_undeclared_freeze_limit_is_recorded_as_unavailable(self):
         """The catalog has no freeze column, so the gap is visible, not silent."""
         self.contract()

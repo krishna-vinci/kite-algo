@@ -54,6 +54,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 from sqlalchemy import text
 
 from backend.app.database import SessionLocal
+from backend.broker_api.orders.autoslice import autoslice_child_order_ids
 from backend.strategies.live_adapter import LiveSubmissionStore
 from backend.strategies.reservations import ReservationLedger
 from backend.strategies.settlement import ExecutionBarrier
@@ -276,6 +277,17 @@ class LiveOutcomeConsumer:
             if str(owner_run or "") != str(run_id):
                 continue
             owned.add(oid)
+        # Kite keeps the submitted order id as the autoslice parent and gives
+        # every slice its own order id. The child event's execution link was
+        # inherited from that parent, so cumulative fills can be read through
+        # the same owned-order evidence path.
+        for child_order_id in autoslice_child_order_ids(
+            self.session_factory,
+            account_id=account_id,
+            run_id=str(run_id or ""),
+            parent_order_ids=list(order_ids),
+        ):
+            owned.add(child_order_id)
         return owned
 
     def _fills_by_order(self, account_id: str, owned: set[str]) -> Dict[str, int]:

@@ -157,8 +157,8 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
     there is a local-lock fallback (`:78-87`).
 - **`PlaceOrderRequest`** (`backend/broker_api/orders/models.py:55-65`) has the fields `market_protection`,
   `autoslice`, and `iceberg_legs` (2–10).
-  - **Nothing in the backend sets `autoslice`.** Kite's autoslice is the obvious cheap route to freeze-limit safety.
-    Confirm the Kite semantics before relying on it.
+  - Live F&O orders set `autoslice=true`; equity and paper sends do not. Kite child slices are linked back to the
+    submitted parent through its `autoslice:<parent>` tag so fills remain step-attributed.
 - **Broker REST routes: PARTIAL.** Their decorators were lost by accident in the `c598871` refactor.
   - Phase 0 (`15ab018`) **restored the read-only ones** under `/api`: orders, trades, positions, margins, charges,
     trigger range, realtime positions (initialize, realtime, stream, reconcile), order-runtime status, GTT reads and
@@ -451,7 +451,9 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
 - **Weight sizing: one rule.** `financing.weight_target_quantity` (weight × buffered capital / price, floored to
   the lot) is shared by admission, paper and live. Fixed in Phase 0 (`3ceed0e`); live used to round a sub-lot
   weight up to 1 lot.
-- **MISSING: freeze-quantity slicing.** Every step is one order for its full quantity (`live_adapter.py:2104-2113`).
+- **Freeze-quantity slicing: via Kite autoslice.** Every step remains one API order for its full quantity, with
+  `autoslice=true` on live F&O sends (`live_adapter.py:2104-2125`); Kite creates the child orders and the ingestion
+  ledger aggregates parent/slice fills by cumulative quantity.
 
 ### 5.7 Attribution, accounting, owner actions
 
@@ -532,7 +534,7 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
   - Live prices come from `realtime_positions_service` (`worker_protection.py:427-483`).
   - A durable claim precedes any submit. Structures exit through `StagedStructureExit`; others exit the whole book
     (`protection_runtime.py:58-313,633-784`).
-  - Exit orders are MARKET without `market_protection` and without freeze slicing (`:719-733`).
+  - Exit orders are MARKET without `market_protection`; live F&O exits use Kite autoslice (`:719-733`).
 - **Option rule vocabulary: PARTIAL, effectively dead.**
   - The metrics are `index_ltp`, `combined_premium`, `combined_premium_change_pct`, `strategy_mtm` and
     `open_quantity` (`backend/options/protection/models.py:24-30`).
