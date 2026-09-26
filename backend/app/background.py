@@ -137,6 +137,23 @@ async def _worker_protection_loop(app: FastAPI):
         repo = SqlAlchemyAlgoWorkerRepository()
         app.state.algo_worker_repository = repo
     ensure_attribution_state(app)
+
+    async def option_greeks_loader(underlying: str, expiry_key: str):
+        """``net_delta``/``net_vega`` evidence: this app's own live chain session."""
+        from fastapi import HTTPException
+
+        from backend.options.api.market_router import get_options_session_manager
+        from backend.options.market.service import OptionsMarketService
+
+        def read() -> dict | None:
+            try:
+                manager = get_options_session_manager(request)
+                return OptionsMarketService(manager).get_greeks(underlying, expiry_key)
+            except HTTPException:
+                return None
+
+        return await asyncio.to_thread(read)
+
     runtime = WorkerProtectionRuntime(
         repo=repo,
         pnl_loader=lambda run: load_worker_run_pnl_for_protection(request, run),
@@ -149,6 +166,7 @@ async def _worker_protection_loop(app: FastAPI):
             request, run, state
         ),
         squareoff_schedule=_worker_protection_squareoff_schedule(),
+        option_greeks_loader=option_greeks_loader,
     )
     set_component_status("worker_protection", "healthy", detail="Worker protection runtime started")
     while True:

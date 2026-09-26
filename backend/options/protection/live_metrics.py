@@ -10,6 +10,9 @@ if TYPE_CHECKING:  # pragma: no cover - import avoids runtime options-model coup
 
 TickLoader = Callable[[int], Awaitable[dict[str, Any] | None]]
 TokenResolver = Callable[[str, str], Awaitable[int | None]]
+#: ``(underlying, expiry_key) -> OptionsMarketService.get_greeks()``'s payload,
+#: or ``None`` when no live chain session covers it.
+GreeksLoader = Callable[[str, str], Awaitable[dict[str, Any] | None]]
 
 
 async def derive_live_option_protection_metrics(
@@ -20,6 +23,7 @@ async def derive_live_option_protection_metrics(
     option_tick_loader: TickLoader,
     now: datetime,
     option_token_resolver: TokenResolver | None = None,
+    option_greeks_loader: GreeksLoader | None = None,
     max_age_seconds: float = 10.0,
 ) -> tuple[dict[str, Any], dict[str, str]]:
     """Derive fresh option metrics from the run's own open legs and fills.
@@ -113,7 +117,75 @@ async def derive_live_option_protection_metrics(
     elif positions:
         errors["strategy_mtm"] = "one or more open option LTPs are missing or stale"
 
+    if option_greeks_loader is not None:
+        net_delta, net_vega, greeks_error = await _derive_net_greeks(
+            run, positions, option_greeks_loader, now, max_age_seconds
+        )
+        if greeks_error is not None:
+            errors["net_delta"] = greeks_error
+            errors["net_vega"] = greeks_error
+        else:
+            metrics["net_delta"] = net_delta
+            metrics["net_vega"] = net_vega
+
     return metrics, errors
+
+
+async def _derive_net_greeks(
+    run: "OptionRunState",
+    positions: list[dict[str, Any]],
+    loader: GreeksLoader,
+    now: datetime,
+    max_age_seconds: float,
+) -> tuple[float | None, float | None, str | None]:
+    """Run-level net delta/vega: signed open quantity times per-contract Greeks.
+
+    Fails the WHOLE pair (never one side) when the underlying/expiry is not
+    uniquely known, the loader reports no live session, or any open leg's
+    Greek is missing or older than ``max_age_seconds`` - a partial sum would be
+    a guess, not a value.
+    """
+    from backend.options.market.greeks import aggregate_run_greeks
+
+    if not positions:
+        return None, None, "run has no open option legs"
+
+    underlying = _underlying(run)
+    expiry_keys = {
+        str(leg.get("expiry_key") or "").strip()
+        for leg in (run.legs or [])
+        if isinstance(leg, dict)
+    }
+    expiry_keys.discard("")
+    if not underlying or len(expiry_keys) != 1:
+        return None, None, "the run's underlying or expiry is not uniquely known"
+    expiry_key = next(iter(expiry_keys))
+
+    try:
+        payload = await loader(underlying, expiry_key)
+    except Exception:
+        return None, None, "option greeks session is unavailable"
+    if not isinstance(payload, dict):
+        return None, None, "option greeks session is unavailable"
+
+    leg_pairs = [
+        (
+            str(position.get("symbol") or ""),
+            float(position["quantity"]) * (1.0 if str(position.get("entry_side")) == "BUY" else -1.0),
+        )
+        for position in positions
+    ]
+    result = aggregate_run_greeks(
+        leg_pairs, payload.get("contracts") or [], now=now, max_age_seconds=max_age_seconds
+    )
+    if not result["available"]:
+        reason = (
+            "one or more open legs' Greeks are older than 10 seconds"
+            if result["reason"] == "stale"
+            else "one or more open legs' Greeks are missing from the chain session"
+        )
+        return None, None, reason
+    return result["delta"], result["vega"], None
 
 
 async def _position_token(

@@ -8,6 +8,7 @@ from backend.options.execution.models import OptionRunState
 from .evaluator import evaluate_option_rules
 from .exit_builder import build_grouped_exit_orders
 from .metrics import derive_protection_metrics
+from .models import SUPPORTED_PROTECTION_METRIC_KEYS
 
 
 def normalize_protection_config(protection: Any) -> dict[str, Any]:
@@ -28,13 +29,7 @@ def normalize_protection_config(protection: Any) -> dict[str, Any]:
             raise ValueError(f"Protection rule at index {index} must be an object")
         metric = str(raw.get("metric") or "").strip()
         operator = str(raw.get("operator") or "").strip().lower()
-        if metric not in {
-            "index_ltp",
-            "combined_premium",
-            "combined_premium_change_pct",
-            "strategy_mtm",
-            "open_quantity",
-        }:
+        if metric not in SUPPORTED_PROTECTION_METRIC_KEYS:
             raise ValueError(f"Unsupported protection metric: {metric or '<missing>'}")
         if operator not in {"gte", "lte"}:
             raise ValueError(f"Unsupported protection operator: {operator or '<missing>'}")

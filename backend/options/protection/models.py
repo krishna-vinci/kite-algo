@@ -27,6 +27,8 @@ SUPPORTED_PROTECTION_METRIC_KEYS = {
     "combined_premium_change_pct",
     "strategy_mtm",
     "open_quantity",
+    "net_delta",
+    "net_vega",
 }
 
 
@@ -63,6 +65,8 @@ class OptionProtectionMetricSnapshotModel(BaseModel):
     combined_premium_change_pct: float | None = None
     strategy_mtm: float | None = None
     open_quantity: float | int | None = None
+    net_delta: float | None = None
+    net_vega: float | None = None
 
 
 class OptionProtectionReplayRequest(BaseModel):

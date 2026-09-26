@@ -163,6 +163,147 @@ def test_live_option_metrics_use_signed_premium_and_own_fill_mtm():
     assert errors == {}
 
 
+def test_live_option_metrics_derive_net_delta_and_vega_from_a_greeks_loader():
+    now = datetime(2026, 4, 25, 12, 0, tzinfo=timezone.utc)
+
+    async def index_token(_underlying, _exchange):
+        return 1
+
+    async def read_tick(token):
+        ticks = {
+            1: {"last_price": 21900.0, "received_at": now.isoformat()},
+            101: {"last_price": 140.0, "received_at": now.isoformat()},
+            102: {"last_price": 80.0, "received_at": now.isoformat()},
+        }
+        return ticks.get(token)
+
+    async def greeks_loader(underlying, expiry_key):
+        assert underlying == "NIFTY"
+        assert expiry_key == "2026-05-26"
+        return {
+            "contracts": [
+                {
+                    "strike": 22500,
+                    "ce": {
+                        "tsym": "NIFTY22500CE",
+                        "delta": 0.4,
+                        "gamma": 0.001,
+                        "theta": -2.0,
+                        "vega": 8.0,
+                        "updated_at": now.isoformat(),
+                    },
+                },
+                {
+                    "strike": 22300,
+                    "pe": {
+                        "tsym": "NIFTY22300PE",
+                        "delta": -0.3,
+                        "gamma": 0.0009,
+                        "theta": -1.4,
+                        "vega": 6.5,
+                        "updated_at": now.isoformat(),
+                    },
+                },
+            ],
+        }
+
+    run = _option_run()
+    for leg in run.legs:
+        leg["expiry_key"] = "2026-05-26"
+    run.trades = [
+        {
+            "leg_id": "short_ce",
+            "transaction_type": "SELL",
+            "quantity": 75,
+            "price": 100.0,
+            "phase": "entry",
+        },
+        {
+            "leg_id": "long_pe",
+            "transaction_type": "BUY",
+            "quantity": 75,
+            "price": 60.0,
+            "phase": "entry",
+        },
+    ]
+
+    metrics, errors = asyncio.run(derive_live_option_protection_metrics(
+        run,
+        index_token_resolver=index_token,
+        index_tick_loader=read_tick,
+        option_tick_loader=read_tick,
+        option_greeks_loader=greeks_loader,
+        now=now,
+    ))
+
+    # Short 75 CE, long 75 PE.
+    assert metrics["net_delta"] == -75.0 * 0.4 + 75.0 * -0.3
+    assert metrics["net_vega"] == -75.0 * 8.0 + 75.0 * 6.5
+    assert "net_delta" not in errors
+    assert "net_vega" not in errors
+
+
+def test_live_option_metrics_omit_net_delta_when_a_leg_greek_is_stale():
+    now = datetime(2026, 4, 25, 12, 0, tzinfo=timezone.utc)
+
+    async def index_token(_underlying, _exchange):
+        return 1
+
+    async def read_tick(token):
+        return {"last_price": 100.0, "received_at": now.isoformat()}
+
+    async def greeks_loader(_underlying, _expiry_key):
+        return {
+            "contracts": [
+                {
+                    "strike": 22500,
+                    "ce": {
+                        "tsym": "NIFTY22500CE",
+                        "delta": 0.4,
+                        "gamma": 0.001,
+                        "theta": -2.0,
+                        "vega": 8.0,
+                        # 30 seconds stale, past the 10-second freshness bound.
+                        "updated_at": "2026-04-25T11:59:30+00:00",
+                    },
+                },
+                {
+                    "strike": 22300,
+                    "pe": {
+                        "tsym": "NIFTY22300PE",
+                        "delta": -0.3,
+                        "gamma": 0.0009,
+                        "theta": -1.4,
+                        "vega": 6.5,
+                        "updated_at": now.isoformat(),
+                    },
+                },
+            ],
+        }
+
+    run = _option_run()
+    for leg in run.legs:
+        leg["expiry_key"] = "2026-05-26"
+    run.trades = [
+        {"leg_id": "short_ce", "transaction_type": "SELL", "quantity": 75, "price": 100.0, "phase": "entry"},
+        {"leg_id": "long_pe", "transaction_type": "BUY", "quantity": 75, "price": 60.0, "phase": "entry"},
+    ]
+
+    metrics, errors = asyncio.run(derive_live_option_protection_metrics(
+        run,
+        index_token_resolver=index_token,
+        index_tick_loader=read_tick,
+        option_tick_loader=read_tick,
+        option_greeks_loader=greeks_loader,
+        now=now,
+    ))
+
+    assert "net_delta" not in metrics
+    assert "net_vega" not in metrics
+    assert "older than 10 seconds" in errors["net_delta"]
+    assert errors["net_vega"] == errors["net_delta"]
+
+
 def test_live_option_metrics_omit_stale_market_inputs():
     now = datetime(2026, 4, 25, 12, 0, tzinfo=timezone.utc)
 

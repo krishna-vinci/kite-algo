@@ -138,6 +138,7 @@ def _app(
     snapshot=None,
     run_store=None,
     owner_store=None,
+    options_session_manager=None,
 ):
     from backend.app import auth as auth_module
 
@@ -155,6 +156,8 @@ def _app(
         app.state.option_run_store = run_store
     if owner_store is not None:
         app.state.option_protection_owner_store = owner_store
+    if options_session_manager is not None:
+        app.state.options_session_manager = options_session_manager
     return app
 
 
@@ -604,7 +607,7 @@ async def test_an_owned_run_with_unreadable_state_is_unknown_not_404(
         "mtm": None,
     }
     assert body["greeks"]["available"] is False
-    assert body["greeks"]["reason"] == "no_reusable_read"
+    assert body["greeks"]["reason"] == "option_run_unreadable"
 
 
 # ---------------------------------------------------------------------------
@@ -745,10 +748,11 @@ async def test_detail_shape_matches_the_contract(session_factory, monkeypatch):
         "stage": "request",
         "detail": {"stage": "request", "checked_at": "2026-09-25T12:00:00+00:00"},
     }
-    # Run-level greeks have no existing read, so they stay a named absence.
+    # No live options session is wired into this test app, so greeks stay a
+    # named absence rather than a guess.
     assert body["greeks"] == {
         "available": False,
-        "reason": "no_reusable_read",
+        "reason": "no_option_session",
         "delta": None,
         "gamma": None,
         "theta": None,
@@ -760,6 +764,80 @@ async def test_detail_shape_matches_the_contract(session_factory, monkeypatch):
         "reason": "",
         "premium": 4321.5,
         "mtm": -120.25,
+    }
+
+
+class _FakeOptionsSessionManager:
+    """A minimal ``OptionsSessionManager`` surface: one fixed snapshot."""
+
+    def __init__(self, snapshot):
+        self._snapshot = snapshot
+
+    def get_snapshot(self, _underlying):
+        return self._snapshot
+
+
+@pytest.mark.asyncio
+async def test_greeks_are_the_signed_sum_of_the_open_legs_contracts(
+    session_factory, monkeypatch
+):
+    snapshot = _FakeSnapshot([_run_row()], {"coverage": "known", "reason": ""})
+    runs = {"opt_run_1": _durable_run()}
+    now_iso = datetime(2026, 11, 20, 9, 0, tzinfo=timezone.utc).isoformat()
+    manager = _FakeOptionsSessionManager(
+        {
+            "expiries": ["2026-11-26"],
+            "per_expiry": {
+                "2026-11-26": {
+                    "rows": [
+                        {
+                            "strike": 22500,
+                            "ce": {
+                                "token": 1,
+                                "tsym": SHORT,
+                                "delta": -0.6,
+                                "gamma": 0.001,
+                                "theta": -2.0,
+                                "vega": 8.0,
+                                "updated_at": now_iso,
+                            },
+                        },
+                        {
+                            "strike": 21500,
+                            "pe": {
+                                "token": 2,
+                                "tsym": HEDGE,
+                                "delta": 0.35,
+                                "gamma": 0.0009,
+                                "theta": -1.4,
+                                "vega": 6.0,
+                                "updated_at": now_iso,
+                            },
+                        },
+                    ],
+                },
+            },
+        }
+    )
+    async with _client(
+        session_factory,
+        monkeypatch,
+        snapshot=snapshot,
+        run_store=_FakeRunStore(runs),
+        options_session_manager=manager,
+    ) as client:
+        strategy_id = await _create(client)
+        _seed_edges(session_factory, strategy_id)
+        body = (await client.get(f"{BASE}/{strategy_id}/option-runs/opt_run_1")).json()
+
+    # SHORT is own_open -150 (sold), HEDGE is own_open +150 (bought).
+    assert body["greeks"] == {
+        "available": True,
+        "reason": "",
+        "delta": -150.0 * -0.6 + 150.0 * 0.35,
+        "gamma": -150.0 * 0.001 + 150.0 * 0.0009,
+        "theta": -150.0 * -2.0 + 150.0 * -1.4,
+        "vega": -150.0 * 8.0 + 150.0 * 6.0,
     }
 
 

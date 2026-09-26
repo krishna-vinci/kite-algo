@@ -27,6 +27,7 @@ What this router deliberately does NOT do:
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -45,8 +46,11 @@ from backend.api.schemas.strategy_option_runs import (
     OptionRunResponse,
 )
 from backend.api.services.hosted_strategy_authz import authorize_account_scope
+from backend.options.api.market_router import get_options_session_manager
 from backend.options.execution.plan_binding import _leg_identity, _run_leg_identity
 from backend.options.execution.repair import REPAIRABLE_RUN_STATUSES
+from backend.options.market.greeks import aggregate_run_greeks
+from backend.options.market.service import OptionsMarketService
 from backend.strategies.attribution import EXECUTION_ENVIRONMENTS
 from backend.strategies.attribution_models import StrategyPlan, StrategyPlanOptionRun
 from backend.strategies.repository import SqlAlchemyStrategyRepository
@@ -66,6 +70,13 @@ COVERAGE_UNKNOWN = "unknown"
 #: for an option run; the route refuses to invent one.
 NO_REUSABLE_READ = "no_reusable_read"
 OPTION_RUN_UNREADABLE = "option_run_unreadable"
+#: Run-level greeks specific reasons - see ``_greeks``.
+NO_OPEN_LEGS = "no_open_legs"
+NO_OPTION_SESSION = "no_option_session"
+OPTION_GREEKS_STALE = "option_greeks_stale"
+OPTION_GREEKS_MISSING = "option_greeks_missing"
+#: A per-contract Greek older than this is refused, never averaged in stale.
+GREEKS_MAX_AGE_SECONDS = 10.0
 
 #: A leg's own state, derived from the run's own confirmed fills first.
 LEG_OPEN = "open"
@@ -717,15 +728,67 @@ def _refusals(
     return out
 
 
-def _greeks() -> OptionRunGreeksResponse:
-    """Run-level greeks are not derivable from any existing run read.
+def _greeks(
+    row: Mapping[str, Any],
+    legs: List[OptionRunLegResponse],
+    request: Request,
+) -> OptionRunGreeksResponse:
+    """Run-level net delta/gamma/theta/vega, or the named reason they are not.
 
-    ``OptionsMarketService.get_greeks`` derives them per CONTRACT from a live
-    session's chain snapshot - it is not a run-level aggregate and needs an
-    active session, so this reports the named absence instead of summing a chain
-    the owner did not ask for.
+    Summed over the run's OWN open legs (state ``open`` with a readable signed
+    ``own_open_quantity``), each weighted by ``OptionsMarketService.get_greeks``'s
+    per-CONTRACT snapshot for this run's ``(underlying, expiry)``. A stale
+    (>``GREEKS_MAX_AGE_SECONDS``) or missing per-contract Greek fails the whole
+    aggregate rather than silently dropping one leg's contribution - a partial
+    sum would be a guess, not a value.
     """
-    return OptionRunGreeksResponse(available=False, reason=NO_REUSABLE_READ)
+    if str(row.get("coverage") or "") == COVERAGE_UNKNOWN:
+        return OptionRunGreeksResponse(available=False, reason=OPTION_RUN_UNREADABLE)
+
+    open_legs = [
+        (leg.tradingsymbol, float(leg.own_open_quantity))
+        for leg in legs
+        if leg.state == LEG_OPEN
+        and leg.own_open_quantity is not None
+        and leg.own_open_quantity != 0
+    ]
+    if not open_legs:
+        return OptionRunGreeksResponse(available=False, reason=NO_OPEN_LEGS)
+
+    underlying = str(row.get("underlying") or "")
+    expiry = str(row.get("expiry") or "")
+    if not underlying or not expiry:
+        return OptionRunGreeksResponse(available=False, reason=NO_OPTION_SESSION)
+
+    try:
+        manager = get_options_session_manager(request)
+        chain_greeks = OptionsMarketService(manager).get_greeks(underlying, expiry)
+    except HTTPException:
+        return OptionRunGreeksResponse(available=False, reason=NO_OPTION_SESSION)
+    except Exception:  # noqa: BLE001 - an unreadable session is not a value
+        logger.exception(
+            "option_run_greeks_session_read_failed",
+            extra={"underlying": underlying, "expiry": expiry},
+        )
+        return OptionRunGreeksResponse(available=False, reason=NO_OPTION_SESSION)
+
+    result = aggregate_run_greeks(
+        open_legs,
+        chain_greeks.get("contracts") or [],
+        now=datetime.now(timezone.utc),
+        max_age_seconds=GREEKS_MAX_AGE_SECONDS,
+    )
+    if not result["available"]:
+        reason = OPTION_GREEKS_STALE if result["reason"] == "stale" else OPTION_GREEKS_MISSING
+        return OptionRunGreeksResponse(available=False, reason=reason)
+    return OptionRunGreeksResponse(
+        available=True,
+        reason="",
+        delta=result["delta"],
+        gamma=result["gamma"],
+        theta=result["theta"],
+        vega=result["vega"],
+    )
 
 
 def _pnl(run: Any) -> OptionRunPnlResponse:
@@ -840,8 +903,9 @@ async def get_option_run(
         _run_store(request, session_factory),
         _protection_owner_store(request, session_factory),
     )
+    run_out = _option_run_out(row, reads)
     return OptionRunDetailResponse(
-        run=_option_run_out(row, reads),
+        run=run_out,
         edges=[
             OptionRunEdgeResponse(
                 plan_id=str(edge.plan_id),
@@ -852,6 +916,6 @@ async def get_option_run(
         ],
         frozen=_frozen(row, reads.plans(row)),
         refusals=_refusals(session_factory, strategy_id=str(strategy_id)),
-        greeks=_greeks(),
+        greeks=_greeks(row, run_out.legs, request),
         pnl=_pnl(reads.durable_run(str(option_run_id))),
     )

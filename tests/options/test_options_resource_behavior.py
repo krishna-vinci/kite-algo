@@ -149,6 +149,42 @@ def test_protection_runtime_uses_only_run_and_metric_snapshot():
     assert len(state["recommended_exit_orders"]) == 1
 
 
+def test_protection_runtime_triggers_on_net_delta_metric():
+    run = OptionRunState(
+        strategy_run_id="opt_run_protection_net_delta",
+        strategy_name="delta_guard",
+        product="MIS",
+        legs=[
+            {
+                "leg_id": "sell_ce",
+                "transaction_type": "SELL",
+                "tradingsymbol": "NIFTY30MAY22500CE",
+                "quantity": 75,
+            }
+        ],
+        protection={
+            "rules": [
+                {
+                    "metric": "net_delta",
+                    "operator": "lte",
+                    "threshold": -20.0,
+                    "action": "exit",
+                }
+            ]
+        },
+    )
+    run.completed_legs = ["sell_ce"]
+
+    state = evaluate_option_protection_state(
+        run=run,
+        metric_snapshot={"net_delta": -30.0, "open_quantity": 1},
+    )
+
+    assert state["triggered"] is True
+    assert state["matched_rule"]["metric"] == "net_delta"
+    assert len(state["recommended_exit_orders"]) == 1
+
+
 def test_market_service_passes_through_resource_error_without_crashing():
     snapshot = _build_snapshot_with_many_strikes()
     snapshot["resource_error"] = {

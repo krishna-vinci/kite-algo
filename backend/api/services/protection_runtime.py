@@ -14,6 +14,7 @@ from backend.options.protection.live_metrics import (
     derive_live_option_protection_metrics,
     open_option_positions,
 )
+from backend.options.protection.models import SUPPORTED_PROTECTION_METRIC_KEYS
 from backend.options.protection.runtime import (
     evaluate_option_protection_state,
     normalize_protection_config as normalize_option_protection_config,
@@ -53,6 +54,9 @@ class WorkerProtectionRuntime:
         option_tick_loader: Optional[Callable[[int], Awaitable[Dict[str, Any] | None]]] = None,
         index_token_resolver: Optional[Callable[[str, str], Awaitable[int | None]]] = None,
         option_token_resolver: Optional[Callable[[str, str], Awaitable[int | None]]] = None,
+        option_greeks_loader: Optional[
+            Callable[[str, str], Awaitable[Dict[str, Any] | None]]
+        ] = None,
     ) -> None:
         self.repo = repo
         self.pnl_loader = pnl_loader
@@ -77,6 +81,11 @@ class WorkerProtectionRuntime:
         self.option_tick_loader = option_tick_loader
         self.index_token_resolver = index_token_resolver
         self.option_token_resolver = option_token_resolver
+        #: ``(underlying, expiry_key) -> OptionsMarketService.get_greeks()``'s
+        #: payload, or ``None`` when no session covers it. ``None`` here (the
+        #: default) means the feature is off: ``net_delta``/``net_vega`` are
+        #: simply never derived, never a guess.
+        self.option_greeks_loader = option_greeks_loader
 
     async def evaluate_once(self) -> Dict[str, int]:
         # OPTION STRUCTURES are enumerated by OWNER ROW, not by the worker run's
@@ -472,6 +481,7 @@ class WorkerProtectionRuntime:
             index_tick_loader=self._index_tick_loader(),
             option_tick_loader=self._option_tick_loader(),
             option_token_resolver=self._option_token_resolver(),
+            option_greeks_loader=self._option_greeks_loader(),
             now=now,
         )
         persisted_metrics = {**metrics, "as_of": now.isoformat()}
@@ -740,7 +750,7 @@ class WorkerProtectionRuntime:
 
         rules: list[dict[str, Any]] = []
         precedence: list[str] = []
-        option_metrics = {"index_ltp", "combined_premium", "combined_premium_change_pct", "strategy_mtm", "open_quantity"}
+        option_metrics = SUPPORTED_PROTECTION_METRIC_KEYS
         for source in sources:
             raw_rules = source.get("rules") if isinstance(source, dict) else None
             if not isinstance(raw_rules, list):
@@ -837,6 +847,24 @@ class WorkerProtectionRuntime:
 
         self.option_token_resolver = resolve
         return self.option_token_resolver
+
+    def _option_greeks_loader(self) -> Callable[[str, str], Awaitable[Dict[str, Any] | None]]:
+        """``(underlying, expiry_key) -> get_greeks() payload`` or ``None``.
+
+        No production default exists: unlike a tick or a token, a live chain
+        session needs the app's own ``options_session_manager`` and this
+        runtime is not request-scoped, so the caller injects it (background.py
+        does, from the app it owns). Uninjected, the loader is a no-op and
+        ``net_delta``/``net_vega`` are simply never derived.
+        """
+        if self.option_greeks_loader is not None:
+            return self.option_greeks_loader
+
+        async def unavailable(_underlying: str, _expiry_key: str) -> Dict[str, Any] | None:
+            return None
+
+        self.option_greeks_loader = unavailable
+        return self.option_greeks_loader
 
     def _has_recent_exit_claim(self, state: Dict[str, Any], now: datetime) -> bool:
         if state.get("exit_submitted") or not state.get("exit_claim_id"):
