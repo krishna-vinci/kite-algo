@@ -1,5 +1,7 @@
-import { redirect } from "next/navigation";
+"use client";
+
+import { OptionsChainPage } from "@/features/options/components/options-chain-page";
 
 export default function OptionsPage() {
-  redirect("/strategies");
+  return <OptionsChainPage />;
 }
