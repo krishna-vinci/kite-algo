@@ -473,7 +473,7 @@ export type ExecutionRequestDecisionResponse = {
 // Phase 4: schedules (operator create/edit/disable)
 // ---------------------------------------------------------------------------
 
-export type ScheduleKind = "daily" | "weekly" | "monthly" | "calendar";
+export type ScheduleKind = "daily" | "weekly" | "monthly" | "calendar" | "market_session";
 
 export type HostedScheduleOccurrence = {
   occurrence_key: string;
@@ -502,6 +502,10 @@ export type HostedSchedule = {
   timezone: string;
   window_end: string | null;
   squareoff_at: string | null;
+  /** Only on a `market_session` schedule: minutes after open it starts (default 0). */
+  start_offset_min: number | null;
+  /** Only on a `market_session` schedule: minutes before close it stops (default 5). */
+  stop_offset_min: number | null;
   enabled: boolean;
   manually_paused: boolean;
   max_duration_s: number;
@@ -529,6 +533,9 @@ export type HostedSchedulePayload = {
   timezone: string;
   window_end?: string | null;
   squareoff_at?: string | null;
+  /** Only for `schedule_kind: "market_session"`; ignored otherwise. */
+  start_offset_min?: number | null;
+  stop_offset_min?: number | null;
   enabled: boolean;
 };
 

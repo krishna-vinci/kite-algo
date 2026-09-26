@@ -437,6 +437,7 @@ export const SCHEDULE_KIND_LABELS: Record<string, string> = {
   weekly: "Every week",
   monthly: "Every month",
   calendar: "On chosen dates",
+  market_session: "Live session (runs all market hours)",
 };
 
 export function scheduleKindLabel(kind: string | null | undefined): string {
@@ -459,6 +460,8 @@ export function scheduleCadenceLabel(schedule: {
   day_of_month?: number | null;
   calendar_dates?: string[];
   timezone: string;
+  start_offset_min?: number | null;
+  stop_offset_min?: number | null;
 }): string {
   const time = `${schedule.at_time} ${schedule.timezone}`;
   switch (String(schedule.schedule_kind)) {
@@ -471,6 +474,12 @@ export function scheduleCadenceLabel(schedule: {
     case "calendar": {
       const dates = schedule.calendar_dates ?? [];
       return dates.length > 0 ? `On ${dates.join(", ")} at ${time}` : `On chosen dates at ${time}`;
+    }
+    case "market_session": {
+      const start = schedule.start_offset_min ?? 0;
+      const stop = schedule.stop_offset_min ?? 5;
+      const startText = start > 0 ? `${start} min after market open` : "market open";
+      return `Every trading day from ${startText} until ${stop} min before close`;
     }
     default:
       return `Every day at ${time}`;

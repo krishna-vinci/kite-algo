@@ -93,6 +93,8 @@ function schedule(overrides: Partial<HostedSchedule> = {}): HostedSchedule {
     timezone: "Asia/Kolkata",
     window_end: null,
     squareoff_at: null,
+    start_offset_min: null,
+    stop_offset_min: null,
     enabled: true,
     manually_paused: false,
     max_duration_s: 21600,
@@ -208,6 +210,44 @@ describe("hosted schedule panel", () => {
           enabled: true,
           // Exactly the operator's parameters: the platform stamps nothing.
           params: { quantity: 3 },
+        }),
+      ),
+    );
+  });
+
+  it("shows a market-session schedule's readable cadence and offsets", async () => {
+    vi.mocked(fetchHostedSchedule).mockResolvedValue(
+      schedule({
+        schedule_kind: "market_session",
+        at_time: "09:15",
+        start_offset_min: 10,
+        stop_offset_min: 5,
+      }),
+    );
+    renderPanel();
+
+    expect(await screen.findByText(/10 min after market open/i)).toBeInTheDocument();
+    expect(screen.getByText(/5 min before close/i)).toBeInTheDocument();
+  });
+
+  it("creates a market-session schedule with the configured offsets", async () => {
+    renderPanel();
+    const user = userEvent.setup();
+    await screen.findByRole("button", { name: /create schedule/i });
+    await user.type(screen.getByLabelText(/^quantity \*$/i), "3");
+    await user.click(screen.getByLabelText(/repeats/i));
+    await user.click(await screen.findByRole("option", { name: /live session/i }));
+    await user.clear(screen.getByLabelText(/start offset/i));
+    await user.type(screen.getByLabelText(/start offset/i), "15");
+    await user.click(screen.getByRole("button", { name: /create schedule/i }));
+
+    await waitFor(() =>
+      expect(saveHostedSchedule).toHaveBeenCalledWith(
+        "s-1",
+        expect.objectContaining({
+          schedule_kind: "market_session",
+          start_offset_min: 15,
+          stop_offset_min: 5,
         }),
       ),
     );

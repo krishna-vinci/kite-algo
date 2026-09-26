@@ -116,8 +116,12 @@ import type {
   SourceReadiness,
 } from "@/lib/hosted-strategies/types";
 
-/** "Run now" launches immediately; "On a schedule" saves a recurring start time. */
-type RunStyle = "now" | "schedule";
+/**
+ * "Run now" launches immediately; "On a schedule" saves a recurring start
+ * time; "Live session" saves a `market_session` schedule that starts at
+ * market open and stops shortly before close on every trading day.
+ */
+type RunStyle = "now" | "schedule" | "session";
 
 type ScheduleDraft = {
   scheduleKind: ScheduleKind;
@@ -744,30 +748,42 @@ export function HostedStrategyComposer() {
         setSteps({ ...next });
       }
 
-      if (runStyle === "schedule") {
+      if (runStyle === "schedule" || runStyle === "session") {
         setBusy("Saving the schedule…");
         await saveHostedSchedule(next.strategyId as string, {
           version_id: next.versionId as string,
           execution_mode: environment,
           job_kind: jobKind,
           params: paramValues.value,
-          schedule_kind: scheduleDraft.scheduleKind,
-          at_time: scheduleDraft.atTime,
-          weekday: scheduleDraft.scheduleKind === "weekly" ? scheduleDraft.weekday : null,
-          day_of_month: scheduleDraft.scheduleKind === "monthly" ? scheduleDraft.dayOfMonth : null,
+          schedule_kind: runStyle === "session" ? "market_session" : scheduleDraft.scheduleKind,
+          at_time: runStyle === "session" ? "09:15" : scheduleDraft.atTime,
+          weekday:
+            runStyle === "schedule" && scheduleDraft.scheduleKind === "weekly"
+              ? scheduleDraft.weekday
+              : null,
+          day_of_month:
+            runStyle === "schedule" && scheduleDraft.scheduleKind === "monthly"
+              ? scheduleDraft.dayOfMonth
+              : null,
           calendar_dates:
-            scheduleDraft.scheduleKind === "calendar"
+            runStyle === "schedule" && scheduleDraft.scheduleKind === "calendar"
               ? scheduleDraft.calendarDates
                   .split(",")
                   .map((entry) => entry.trim())
                   .filter(Boolean)
               : null,
           timezone: scheduleDraft.timezone,
+          start_offset_min: runStyle === "session" ? 0 : null,
+          stop_offset_min: runStyle === "session" ? 5 : null,
           enabled: true,
         });
         void client.invalidateQueries({ queryKey: hostedKeys.strategies() });
         void client.invalidateQueries({ queryKey: hostedKeys.schedule(next.strategyId as string) });
-        toast.success("Schedule saved. The strategy starts at its next occurrence.");
+        toast.success(
+          runStyle === "session"
+            ? "Live session saved. It starts at the next market open and stops before close."
+            : "Schedule saved. The strategy starts at its next occurrence.",
+        );
         router.push(`/strategies/${next.strategyId}`);
       } else {
         const launchKey = JSON.stringify([next.versionId, environment, jobKind, paramValues.value]);
@@ -1055,7 +1071,7 @@ export function HostedStrategyComposer() {
       </Panel>
       <Panel title="Run style">
         <div className="flex flex-col gap-4">
-          <div className="grid gap-3 md:grid-cols-2">
+          <div className="grid gap-3 md:grid-cols-3">
             <button
               type="button"
               onClick={() => setRunStyle("now")}
@@ -1088,6 +1104,25 @@ export function HostedStrategyComposer() {
               </span>
               <span className="mt-1 block text-xs text-muted-foreground">
                 Starts a new attempt at a fixed local time instead of right away.
+              </span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setRunStyle("session")}
+              aria-pressed={runStyle === "session"}
+              className={`rounded-lg border p-3 text-left text-sm transition ${
+                runStyle === "session"
+                  ? "border-primary/60 bg-primary/5"
+                  : "border-border/70 hover:bg-muted/40"
+              }`}
+            >
+              <span className="flex items-center gap-2 font-semibold">
+                {runStyle === "session" ? <CheckCircle2Icon className="size-4" aria-hidden /> : null}
+                Live session
+              </span>
+              <span className="mt-1 block text-xs text-muted-foreground">
+                Starts at market open on trading days, stops shortly before close. Your code can decide
+                many times during the day.
               </span>
             </button>
           </div>

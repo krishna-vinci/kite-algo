@@ -66,6 +66,7 @@ import {
   issueExecutionGrant,
   runHostedStrategy,
   saveAdmissionPolicy,
+  saveHostedSchedule,
   setAuthorizationMode,
 } from "@/lib/hosted-strategies/api";
 import { toast } from "sonner";
@@ -346,6 +347,56 @@ describe("hosted strategy composer", () => {
     // Review-first is not a standing authorization: nothing is granted.
     expect(issueExecutionGrant).not.toHaveBeenCalled();
     expect(setAuthorizationMode).not.toHaveBeenCalled();
+  });
+
+  it("saves and enables a market-session schedule for the Live session run style", async () => {
+    vi.mocked(saveHostedSchedule).mockResolvedValue({
+      schedule_id: "sch-1",
+      strategy_id: "s-1",
+      version_id: "v-1",
+      version_number: 1,
+      account_scope: "kite:paper",
+      execution_mode: "paper",
+      job_kind: "finite",
+      params_snapshot: {},
+      schedule_kind: "market_session",
+      at_time: "09:15",
+      weekday: null,
+      day_of_month: null,
+      calendar_dates: [],
+      timezone: "Asia/Kolkata",
+      window_end: null,
+      squareoff_at: null,
+      start_offset_min: 0,
+      stop_offset_min: 5,
+      enabled: true,
+      manually_paused: false,
+      max_duration_s: 21600,
+      progress_deadline_s: 600,
+      misfire_grace_seconds: 3600,
+      overlap_policy: "defer_until_resolved",
+      next_occurrence_at: null,
+      next_occurrence_key: null,
+      last_occurrence: null,
+      created_at: null,
+      updated_at: null,
+    });
+    renderComposer();
+    const user = await fillBasics("live session strategy");
+    await user.click(screen.getByRole("button", { name: /live session/i }));
+    await user.click(screen.getByRole("button", { name: /^start$/i }));
+
+    await waitFor(() => expect(saveHostedSchedule).toHaveBeenCalledTimes(1), { timeout: 15_000 });
+    expect(saveHostedSchedule).toHaveBeenCalledWith(
+      "s-1",
+      expect.objectContaining({
+        schedule_kind: "market_session",
+        start_offset_min: 0,
+        stop_offset_min: 5,
+        enabled: true,
+      }),
+    );
+    expect(runHostedStrategy).not.toHaveBeenCalled();
   });
 
   it("offers the data-only starter that needs no hidden parameters", async () => {

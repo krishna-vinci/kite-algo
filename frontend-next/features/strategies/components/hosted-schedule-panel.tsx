@@ -65,12 +65,14 @@ type ScheduleForm = {
   versionId: string;
   environment: string;
   jobKind: string;
-  scheduleKind: "daily" | "weekly" | "monthly" | "calendar";
+  scheduleKind: "daily" | "weekly" | "monthly" | "calendar" | "market_session";
   atTime: string;
   weekday: number;
   dayOfMonth: number;
   calendarDates: string;
   timezone: string;
+  startOffsetMin: number;
+  stopOffsetMin: number;
   enabled: boolean;
 };
 
@@ -88,6 +90,8 @@ function formFromSchedule(
     dayOfMonth: schedule?.day_of_month ?? 1,
     calendarDates: (schedule?.calendar_dates ?? []).join(", "),
     timezone: schedule?.timezone ?? "Asia/Kolkata",
+    startOffsetMin: schedule?.start_offset_min ?? 0,
+    stopOffsetMin: schedule?.stop_offset_min ?? 5,
     enabled: schedule?.enabled ?? true,
   };
 }
@@ -190,6 +194,8 @@ export function HostedSchedulePanel({
                 .filter(Boolean)
             : null,
         timezone: form.timezone,
+        start_offset_min: form.scheduleKind === "market_session" ? form.startOffsetMin : null,
+        stop_offset_min: form.scheduleKind === "market_session" ? form.stopOffsetMin : null,
         enabled: form.enabled,
       });
       toast.success("Schedule saved.");
@@ -378,7 +384,7 @@ export function HostedSchedulePanel({
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  {(["daily", "weekly", "monthly", "calendar"] as const).map((kind) => (
+                  {(["daily", "weekly", "monthly", "calendar", "market_session"] as const).map((kind) => (
                     <SelectItem key={kind} value={kind}>
                       {scheduleKindLabel(kind)}
                     </SelectItem>
@@ -386,15 +392,53 @@ export function HostedSchedulePanel({
                 </SelectContent>
               </Select>
             </div>
-            <div className="grid gap-1.5">
-              <Label htmlFor="schedule-time">At (local time, HH:MM)</Label>
-              <Input
-                id="schedule-time"
-                value={form.atTime}
-                placeholder="09:30"
-                onChange={(event) => setForm((current) => ({ ...current, atTime: event.target.value }))}
-              />
-            </div>
+            {form.scheduleKind !== "market_session" ? (
+              <div className="grid gap-1.5">
+                <Label htmlFor="schedule-time">At (local time, HH:MM)</Label>
+                <Input
+                  id="schedule-time"
+                  value={form.atTime}
+                  placeholder="09:30"
+                  onChange={(event) => setForm((current) => ({ ...current, atTime: event.target.value }))}
+                />
+              </div>
+            ) : null}
+            {form.scheduleKind === "market_session" ? (
+              <div className="grid gap-4 sm:grid-cols-2 md:col-span-2">
+                <div className="grid gap-1.5">
+                  <Label htmlFor="schedule-start-offset">Start offset (minutes after open)</Label>
+                  <Input
+                    id="schedule-start-offset"
+                    inputMode="numeric"
+                    value={String(form.startOffsetMin)}
+                    onChange={(event) =>
+                      setForm((current) => ({
+                        ...current,
+                        startOffsetMin: Number(event.target.value) || 0,
+                      }))
+                    }
+                  />
+                </div>
+                <div className="grid gap-1.5">
+                  <Label htmlFor="schedule-stop-offset">Stop offset (minutes before close)</Label>
+                  <Input
+                    id="schedule-stop-offset"
+                    inputMode="numeric"
+                    value={String(form.stopOffsetMin)}
+                    onChange={(event) =>
+                      setForm((current) => ({
+                        ...current,
+                        stopOffsetMin: Number(event.target.value) || 0,
+                      }))
+                    }
+                  />
+                </div>
+                <p className="text-xs text-muted-foreground sm:col-span-2">
+                  Starts at market open on trading days, stops N min before close, skips holidays. Your
+                  code can decide many times during the day.
+                </p>
+              </div>
+            ) : null}
             {form.scheduleKind === "weekly" ? (
               <div className="grid gap-1.5">
                 <Label htmlFor="schedule-weekday">Day of week</Label>
