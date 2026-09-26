@@ -17,6 +17,12 @@ from backend.broker_api.session.kite_session import get_kite, get_kite_session_i
 router = APIRouter(tags=["Orders"])
 service = OrdersService()
 
+# NOTE: Broker WRITE / state-changing handlers in this module (place/modify/
+# cancel order, basket place, convert position, GTT create/modify/delete,
+# order-runtime process-now, ws order-updates enable/disable, and the postback
+# receiver) are intentionally left WITHOUT route decorators pending an owner
+# decision; hosted trading goes through the governed pipeline. Only read-only
+# status/list/calculation routes are registered here.
 
 async def place_order(
     req: PlaceOrderRequest,
@@ -29,21 +35,27 @@ async def place_order(
     sid = get_kite_session_id(request)
     return await service.place_order(kite, req, corr_id, idempotency_key, sid, response)
 
+@router.get("/orders", response_model=List[Order], description="Retrieve the list of all orders for the day.")
 def get_orders(kite: KiteConnect = Depends(get_kite), corr_id: str = Depends(get_correlation_id)):
     return service.orders(kite, corr_id)
 
+@router.get("/orders/{order_id}", response_model=Order, description="Retrieve a snapshot of a specific order, with fallback to history.")
 def get_order_snapshot(order_id: str, kite: KiteConnect = Depends(get_kite), corr_id: str = Depends(get_correlation_id)):
     return service.order_snapshot(kite, order_id, corr_id)
 
+@router.get("/orders/{order_id}/history", response_model=List[OrderHistoryRecord], description="Retrieve the history of a specific order.")
 def get_order_history(order_id: str, kite: KiteConnect = Depends(get_kite), corr_id: str = Depends(get_correlation_id)):
     return service.order_history(kite, order_id, corr_id)
 
+@router.get("/orders/{order_id}/trades", response_model=List[Trade], description="Retrieve trades for a specific order.")
 def get_order_trades(order_id: str, kite: KiteConnect = Depends(get_kite), corr_id: str = Depends(get_correlation_id)):
     return service.order_trades(kite, order_id, corr_id)
 
+@router.get("/trades", response_model=List[Trade], description="Retrieve all trades for the day.")
 def get_trades(kite: KiteConnect = Depends(get_kite), corr_id: str = Depends(get_correlation_id)):
     return service.trades(kite, corr_id)
 
+@router.get("/positions", response_model=Any, description="Retrieve the current holdings and positions.")
 def get_positions(kite: KiteConnect = Depends(get_kite), corr_id: str = Depends(get_correlation_id)):
     return service.positions(kite, corr_id)
 
@@ -73,15 +85,19 @@ async def cancel_order(
 ):
     return await service.cancel_order(kite, variety, order_id, corr_id, parent_order_id)
 
+@router.post("/margins/orders", response_model=List[OrderMarginsResponseItem], description="Calculate margins for a list of orders.")
 def get_order_margins(items: List[OrderMarginInput], mode: Optional[str] = Query(None, enum=["compact", "full"]), kite: KiteConnect = Depends(get_kite), corr_id: str = Depends(get_correlation_id)):
     return service.order_margins(kite, items, corr_id, mode)
 
+@router.post("/margins/basket", response_model=BasketMarginsResponse, description="Calculate margins for a basket of orders.")
 def get_basket_margins(items: List[OrderMarginInput], consider_positions: bool = Query(True), mode: Optional[str] = Query(None, enum=["compact", "full"]), kite: KiteConnect = Depends(get_kite), corr_id: str = Depends(get_correlation_id)):
     return service.basket_margins(kite, items, consider_positions, corr_id, mode)
 
+@router.post("/charges/orders", response_model=List[ChargesOrderResponseItem], description="Calculate charges for a list of orders.")
 def get_charges_orders(items: List[ChargesOrderInput], kite: KiteConnect = Depends(get_kite), corr_id: str = Depends(get_correlation_id)):
     return service.charges_orders(kite, items, corr_id)
 
+@router.get("/trigger-range", response_model=Any, description="Retrieve the buy/sell trigger range for Cover Orders.")
 def get_trigger_range(transaction_type: TransactionType, instruments: List[str] = Query(...), kite: KiteConnect = Depends(get_kite), corr_id: str = Depends(get_correlation_id)):
     return service.trigger_range(kite, transaction_type, instruments, corr_id)
 
@@ -101,6 +117,7 @@ async def place_basket_orders(
     sid = get_kite_session_id(request)
     return await service.place_basket(kite, req, corr_id, sid, idempotency_key, response)
 
+@router.post("/positions/initialize", description="Initialize real-time position tracking from Kite API")
 async def initialize_realtime_positions(
     request: Request,
     kite: KiteConnect = Depends(get_kite),
@@ -127,6 +144,7 @@ async def initialize_realtime_positions(
         "positions": {k: v.model_dump() for k, v in positions.items()}
     }
 
+@router.get("/positions/realtime", description="Get current real-time positions")
 async def get_realtime_positions(
     request: Request,
     db: Session = Depends(get_db),
@@ -158,6 +176,7 @@ async def get_realtime_positions(
         "positions": {k: v.model_dump() for k, v in positions.items()}
     }
 
+@router.get("/positions/stream", description="SSE stream for real-time position updates")
 async def stream_realtime_positions(
     request: Request,
     db: Session = Depends(get_db),
@@ -188,6 +207,7 @@ async def stream_realtime_positions(
         }
     )
 
+@router.post("/positions/reconcile", description="Reconcile real-time positions against broker truth")
 async def reconcile_realtime_positions(
     request: Request,
     kite: KiteConnect = Depends(get_kite),
@@ -225,6 +245,7 @@ async def reconcile_realtime_positions(
         "mode": "reconciled",
     }
 
+@router.get("/order-runtime/status", description="Get canonical order runtime status")
 async def get_order_runtime_status(
     request: Request,
     db: Session = Depends(get_db),
@@ -323,6 +344,7 @@ async def place_gtt_trigger(
     """
     return await gtt_service.place_gtt(kite, req, corr_id)
 
+@router.get("/gtt/triggers", response_model=List[GTTTrigger], description="Retrieve all GTT triggers")
 def get_gtt_triggers(
     kite: KiteConnect = Depends(get_kite),
     corr_id: str = Depends(get_correlation_id)
@@ -341,6 +363,7 @@ def get_gtt_triggers(
     """
     return gtt_service.get_gtts(kite, corr_id)
 
+@router.get("/gtt/triggers/{trigger_id}", response_model=GTTTrigger, description="Retrieve a specific GTT trigger")
 def get_gtt_trigger(
     trigger_id: int,
     kite: KiteConnect = Depends(get_kite),
@@ -509,6 +532,11 @@ async def receive_order_postback(
             detail=f"Webhook processing failed: {str(e)}"
         )
 
+@router.get(
+    "/webhooks/orders/events",
+    response_model=List[OrderEventResponse],
+    description="Query stored webhook events"
+)
 async def query_webhook_events(
     order_id: Optional[str] = Query(None, description="Filter by order ID"),
     user_id: Optional[str] = Query(None, description="Filter by user ID"),
@@ -538,6 +566,7 @@ async def query_webhook_events(
         offset=offset
     )
 
+@router.get("/order-events/stream")
 async def sse_order_events(request: Request, source: Optional[str] = Query(None, description="Filter by 'webhook', 'ws' or 'all'")):
     async def event_stream():
         try:
@@ -582,6 +611,7 @@ async def disable_ws_order_updates(request: Request):
     runtime.order_updates_enabled = False
     return {"status": "ok", "enabled": False}
 
+@router.get("/ws/orders/updates/status")
 async def ws_order_updates_status(request: Request):
     runtime = getattr(request.app.state, "market_data_runtime", None)
     if not runtime:
@@ -592,6 +622,7 @@ async def ws_order_updates_status(request: Request):
         "last_order_update_at": getattr(runtime, "last_order_update_at", None),
     }
 
+@router.get("/ws/orders/events", response_model=List[OrderEventResponse])
 async def get_ws_order_events(
     db: Session = Depends(get_db),
     order_id: Optional[str] = Query(None),
