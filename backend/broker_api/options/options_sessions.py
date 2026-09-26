@@ -3,6 +3,7 @@ import logging
 from datetime import date, datetime, timezone, timedelta
 from math import floor
 from typing import Any, Dict, List, Optional, Set
+from zoneinfo import ZoneInfo
 import numpy as np
 
 from backend.broker_api.instruments.instruments_repository import InstrumentsRepository
@@ -35,6 +36,11 @@ OPTIONS_SESSIONS_USE_VECTORIZED = True
 TOKEN_CAP = 2500
 YEAR_IN_DAYS = 365.0
 MIN_T = 1e-6  # Min time to expiry to avoid zero division
+# NSE/NFO options expire at 15:30 IST (Asia/Kolkata), so time-to-expiry must be
+# anchored to that wall clock rather than 15:30 UTC.
+IST = ZoneInfo("Asia/Kolkata")
+EXPIRY_CLOSE_HOUR_IST = 15
+EXPIRY_CLOSE_MINUTE_IST = 30
 
 
 class OptionsSession:
@@ -594,7 +600,12 @@ class OptionsSession:
         """
         now = datetime.now(timezone.utc)
         expiry_dt = datetime(
-            expiry.year, expiry.month, expiry.day, 15, 30, tzinfo=timezone.utc
+            expiry.year,
+            expiry.month,
+            expiry.day,
+            EXPIRY_CLOSE_HOUR_IST,
+            EXPIRY_CLOSE_MINUTE_IST,
+            tzinfo=IST,
         )
         time_left = (expiry_dt - now).total_seconds()
         if time_left <= 0:

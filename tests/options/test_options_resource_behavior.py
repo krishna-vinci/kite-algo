@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import pytest
+from fastapi import HTTPException
+
 from backend.options.execution.models import OptionRunState
 from backend.options.market.service import OptionsMarketService
 from backend.options.protection.runtime import evaluate_option_protection_state
@@ -46,11 +49,15 @@ def _build_snapshot_with_many_strikes() -> dict:
                     "token": 10000 + i,
                     "tsym": f"NIFTY30MAY{current}CE",
                     "ltp": 100.0 - i,
+                    "lot_size": 75,
+                    "delta": round(0.95 - 0.045 * i, 3),
                 },
                 "PE": {
                     "token": 20000 + i,
                     "tsym": f"NIFTY30MAY{current}PE",
                     "ltp": 80.0 + i,
+                    "lot_size": 75,
+                    "delta": round(-0.05 - 0.045 * i, 3),
                 },
             }
         )
@@ -157,3 +164,53 @@ def test_market_service_passes_through_resource_error_without_crashing():
 
     assert session["resource_error"]["code"] == "OPTIONS_MARKET_RESOURCE_LIMIT"
     assert chain["resource_error"]["retryable"] is True
+
+
+def test_market_selection_inherits_contract_lot_size_when_leg_omits_it():
+    service = OptionsMarketService(_CountingManager(_build_snapshot_with_many_strikes()))
+
+    selection = service.resolve_selection(
+        "NIFTY",
+        {
+            "expiry": "nearest",
+            "legs": [
+                {"option_type": "CE", "offset": "OTM1"},
+                {"option_type": "PE", "delta_target": 0.3},
+            ],
+        },
+    )
+
+    # The worker helpers never send lot_size, so the server must size each
+    # resolved leg from the contract rather than falling back to 1.
+    assert [leg["lot_size"] for leg in selection["resolved"]] == [75, 75]
+
+
+def test_market_selection_keeps_explicit_leg_lot_size():
+    service = OptionsMarketService(_CountingManager(_build_snapshot_with_many_strikes()))
+
+    selection = service.resolve_selection(
+        "NIFTY",
+        {
+            "expiry": "nearest",
+            "legs": [{"option_type": "CE", "strike": 22500, "lot_size": 50}],
+        },
+    )
+
+    assert selection["resolved"][0]["lot_size"] == 50
+
+
+def test_market_selection_refuses_when_contract_lot_size_missing():
+    snapshot = _build_snapshot_with_many_strikes()
+    for row in snapshot["per_expiry"]["2030-05-09"]["rows"]:
+        row["CE"].pop("lot_size", None)
+    service = OptionsMarketService(_CountingManager(snapshot))
+
+    with pytest.raises(HTTPException) as exc_info:
+        service.resolve_selection(
+            "NIFTY",
+            {"expiry": "nearest", "legs": [{"option_type": "CE", "strike": 22500}]},
+        )
+
+    detail = exc_info.value.detail
+    assert detail["code"] == "OPTION_SELECTION_LOT_SIZE_UNAVAILABLE"
+    assert "NIFTY30MAY22500CE" in detail["message"]

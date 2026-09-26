@@ -7,6 +7,8 @@ import types
 from datetime import date, datetime, timezone
 from typing import Any, cast
 
+import pytest
+
 sys.modules.setdefault("mibian", types.ModuleType("mibian"))
 if "numba" not in sys.modules:
     numba_stub: Any = types.ModuleType("numba")
@@ -20,7 +22,12 @@ if "numba" not in sys.modules:
     numba_stub.njit = _njit
     sys.modules["numba"] = numba_stub
 
-from backend.broker_api.options.options_sessions import OptionsSessionManager
+import backend.broker_api.options.options_sessions as options_sessions
+from backend.broker_api.options.options_sessions import (
+    MIN_T,
+    OptionsSession,
+    OptionsSessionManager,
+)
 from backend.options.market.redis_cache import (
     OPTION_SNAPSHOT_SCHEMA_VERSION,
     OPTION_SNAPSHOT_TTL_SECONDS,
@@ -159,3 +166,41 @@ def test_reader_decodes_v1_json_and_rejects_invalid_json_or_schema():
 
     redis_client.values[key] = json.dumps({"schema_version": 2})
     assert asyncio.run(read_option_snapshot_from_redis(redis_client, "nifty")) is None
+
+
+def _freeze_options_session_clock(monkeypatch, moment_utc: datetime) -> None:
+    """Freeze the module-level ``datetime.now`` used by time-to-expiry."""
+    real_datetime = options_sessions.datetime
+
+    class _FrozenDatetime(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return moment_utc.astimezone(timezone.utc).replace(tzinfo=None)
+            return moment_utc.astimezone(tz)
+
+    monkeypatch.setattr(options_sessions, "datetime", _FrozenDatetime)
+
+
+def test_time_to_expiry_anchors_to_1530_ist_on_expiry_day(monkeypatch):
+    session = OptionsSession("NIFTY", cast(Any, object()))
+    expiry = date(2026, 5, 7)
+
+    # 15:00 IST on the expiry day == 09:30 UTC, so 30 minutes of life remain.
+    _freeze_options_session_clock(monkeypatch, datetime(2026, 5, 7, 9, 30, tzinfo=timezone.utc))
+    time_to_expiry = session._time_to_expiry(expiry)
+
+    expected = (30 * 60) / (365.0 * 24 * 60 * 60)
+    assert time_to_expiry == pytest.approx(expected, rel=1e-9)
+    # A UTC anchor would report ~6h of life here (T ~ 6.8e-4).
+    assert time_to_expiry < 1e-4
+
+
+def test_time_to_expiry_floors_after_1530_ist_on_expiry_day(monkeypatch):
+    session = OptionsSession("NIFTY", cast(Any, object()))
+    expiry = date(2026, 5, 7)
+
+    # 15:45 IST on the expiry day == 10:15 UTC: the contract has expired.
+    _freeze_options_session_clock(monkeypatch, datetime(2026, 5, 7, 10, 15, tzinfo=timezone.utc))
+
+    assert session._time_to_expiry(expiry) == MIN_T

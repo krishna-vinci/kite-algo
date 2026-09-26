@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import date, datetime
 from typing import Any, Mapping, Sequence
 
@@ -150,6 +150,19 @@ class OptionsMarketService:
                     },
                 )
 
+            leg_lot_size: int | None = None
+            if leg.get("lot_size") is not None:
+                leg_lot_size = self._int_or_default(leg.get("lot_size"), 0)
+                if leg_lot_size <= 0:
+                    raise HTTPException(
+                        status_code=422,
+                        detail={
+                            "code": "OPTION_SELECTION_INVALID_LEG",
+                            "message": f"Leg at index {index} has an invalid lot_size: {leg.get('lot_size')}",
+                        },
+                    )
+            resolver_lot_size = leg_lot_size if leg_lot_size is not None else 1
+
             contracts = by_type[option_type]
             delta_target = leg.get("delta_target") if leg.get("delta_target") is not None else leg.get("target_delta")
             if delta_target is not None:
@@ -160,7 +173,7 @@ class OptionsMarketService:
                         option_type=option_type,
                         delta_target=float(delta_target),
                         contracts_by_strike=contracts,
-                        lot_size=self._int_or_default(leg.get("lot_size"), 1),
+                        lot_size=resolver_lot_size,
                         tick_size=self._float_or_default(leg.get("tick_size"), 0.05),
                     )
                 except ValueError as exc:
@@ -207,7 +220,7 @@ class OptionsMarketService:
                         available_strikes=available_strikes,
                         tradingsymbol_by_strike={k: str(v.get("tsym") or "") for k, v in contracts.items()},
                         instrument_token_by_strike={k: v.get("token") for k, v in contracts.items()},
-                        lot_size=self._int_or_default(leg.get("lot_size"), 1),
+                        lot_size=resolver_lot_size,
                         tick_size=self._float_or_default(leg.get("tick_size"), 0.05),
                         ltp_by_strike={k: self._float_or_default(v.get("ltp"), 0.0) for k, v in contracts.items()},
                     )
@@ -228,6 +241,24 @@ class OptionsMarketService:
                         "message": f"Leg at index {index} must include strike, offset, delta_target, or target_delta",
                     },
                 )
+
+            resolved_lot_size = leg_lot_size
+            if resolved_lot_size is None:
+                resolved_lot_size = self._contract_lot_size(contracts, resolved_contract.strike)
+                if resolved_lot_size is None:
+                    raise HTTPException(
+                        status_code=422,
+                        detail={
+                            "code": "OPTION_SELECTION_LOT_SIZE_UNAVAILABLE",
+                            "message": (
+                                f"Lot size is unavailable for {resolved_contract.tradingsymbol} "
+                                f"({option_type} strike {resolved_contract.strike})"
+                            ),
+                            "leg_index": index,
+                        },
+                    )
+            if resolved_contract.lot_size != resolved_lot_size:
+                resolved_contract = replace(resolved_contract, lot_size=resolved_lot_size)
 
             resolved.append(self._resolved_contract_to_dict(resolved_contract))
 
@@ -364,6 +395,7 @@ class OptionsMarketService:
         return {
             "token": payload.get("token") or payload.get("instrument_token"),
             "tsym": payload.get("tsym") or payload.get("tradingsymbol"),
+            "lot_size": payload.get("lot_size"),
             "ltp": payload.get("ltp"),
             "iv": payload.get("iv"),
             "oi": payload.get("oi"),
@@ -389,6 +421,19 @@ class OptionsMarketService:
             if isinstance(pe, Mapping) and pe.get("tsym") and pe.get("token") is not None:
                 by_type["PE"][strike_key] = pe
         return by_type
+
+    def _contract_lot_size(
+        self, contracts: Mapping[float, Mapping[str, Any]], strike: float
+    ) -> int | None:
+        """Return the resolved contract's lot size, or None when unavailable."""
+        payload = contracts.get(float(strike))
+        if not isinstance(payload, Mapping):
+            return None
+        try:
+            lot_size = int(payload.get("lot_size"))
+        except (TypeError, ValueError):
+            return None
+        return lot_size if lot_size > 0 else None
 
     def _resolve_exact_strike_contract(
         self,
