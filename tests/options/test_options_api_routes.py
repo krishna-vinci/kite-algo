@@ -12,6 +12,7 @@ install_dependency_stubs()
 
 from backend.api.routers.worker_shared import require_worker_token
 from backend.api.routers.worker_auth import router as algo_workers_router
+from backend.api.routers.worker_protection import router as worker_protection_router
 from backend.options.api.execution_router import get_option_execution_runtime_instance
 from backend.options.api.execution_router import router as options_execution_router
 from backend.options.api.market_router import router as options_market_router
@@ -66,12 +67,16 @@ def test_options_protection_route_family_scaffolding_is_registered() -> None:
 
 
 def test_main_registers_canonical_options_routers() -> None:
-    main_source = Path("/home/krishna/kite-algo/main.py").read_text(encoding="utf-8")
+    main_source = (Path(__file__).resolve().parents[2] / "backend" / "main.py").read_text(encoding="utf-8")
     assert "app.include_router(options_market_router)" in main_source
     assert "app.include_router(options_strategy_router)" in main_source
     assert "app.include_router(options_execution_router)" in main_source
     assert "app.include_router(options_protection_router)" in main_source
-    assert "app.include_router(worker_options_router)" in main_source
+    # The worker options router moved to router auto-discovery (b8c2b18).
+    from backend.api.routers import ALL_ROUTERS
+    from backend.options.api.worker_options_router import router as worker_options_router
+
+    assert any(router is worker_options_router for router, _prefix in ALL_ROUTERS)
 
 
 def test_worker_options_market_routes_are_registered() -> None:
@@ -151,6 +156,7 @@ class _FakeAlgoWorkerRepo:
 def _worker_test_app() -> tuple[FastAPI, OptionRunStore, _FakeAlgoWorkerRepo]:
     local_app = FastAPI()
     local_app.include_router(algo_workers_router, prefix="/api")
+    local_app.include_router(worker_protection_router, prefix="/api")
     local_app.include_router(options_execution_router)
     local_app.include_router(worker_options_router)
     store = OptionRunStore()
@@ -272,7 +278,7 @@ def test_worker_option_enter_rejects_stale_safety_token(monkeypatch):
 
     from backend.api.routers import worker_protection as algo_workers_module
 
-    async def _fresh_snapshot(_request, _run_id):
+    async def _fresh_snapshot(_request, _run_id, *, worker_run=None):
         return {
             "applicable": True,
             "run_status": "created",
@@ -293,7 +299,7 @@ def test_worker_option_enter_rejects_stale_safety_token(monkeypatch):
         )
         token = response.json()["safety_token"]
 
-        async def _stale_snapshot(_request, _run_id):
+        async def _stale_snapshot(_request, _run_id, *, worker_run=None):
             return {
                 "applicable": True,
                 "run_status": "exiting",
@@ -333,7 +339,7 @@ def test_worker_option_exit_rejects_stale_safety_token_before_state_mutation(mon
 
     from backend.api.routers import worker_protection as algo_workers_module
 
-    async def _fresh_snapshot(_request, _run_id):
+    async def _fresh_snapshot(_request, _run_id, *, worker_run=None):
         return {
             "applicable": True,
             "run_status": "created",
@@ -354,7 +360,7 @@ def test_worker_option_exit_rejects_stale_safety_token_before_state_mutation(mon
         )
         token = response.json()["safety_token"]
 
-        async def _stale_snapshot(_request, _run_id):
+        async def _stale_snapshot(_request, _run_id, *, worker_run=None):
             return {
                 "applicable": True,
                 "run_status": "cleanup_required",

@@ -105,8 +105,8 @@ def test_session_update_writes_v1_json_and_legacy_key(monkeypatch):
     async def _fake_publish_event(channel: str, payload: dict):
         published_legacy.append((channel, payload))
 
-    monkeypatch.setattr("broker_api.options_sessions.get_redis", lambda: fake_redis)
-    monkeypatch.setattr("broker_api.options_sessions.publish_event", _fake_publish_event)
+    monkeypatch.setattr("backend.broker_api.options.options_sessions.get_redis", lambda: fake_redis)
+    monkeypatch.setattr("backend.broker_api.options.options_sessions.publish_event", _fake_publish_event)
 
     manager = OptionsSessionManager(
         market_data=cast(Any, _FakeMarketData()),

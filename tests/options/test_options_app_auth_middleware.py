@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
+import pytest
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
@@ -14,6 +16,12 @@ from backend.options.api.market_router import get_options_session_manager, route
 from backend.options.api.protection_router import router as protection_router
 from backend.options.api.worker_options_router import router as worker_options_router
 from backend.options.execution.store import OptionRunStore, get_option_run_store
+
+
+@pytest.fixture(autouse=True)
+def _app_auth_jwt_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("APP_JWT_SECRET", "test-app-jwt-secret")
+    monkeypatch.setenv("JWT_SECRET", "test-app-jwt-secret")
 
 
 class _FakeInstrumentRepo:

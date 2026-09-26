@@ -10,8 +10,18 @@ def _create_request(product: Literal["MIS", "NRML"] = "MIS") -> OptionRunCreateR
         strategy_name="bull_call_spread",
         product=product,
         legs=[
-            {"leg_id": "buy_1", "transaction_type": "BUY", "quantity": 75},
-            {"leg_id": "sell_1", "transaction_type": "SELL", "quantity": 75},
+            {
+                "leg_id": "buy_1",
+                "tradingsymbol": "NIFTY26OCT25000CE",
+                "transaction_type": "BUY",
+                "quantity": 75,
+            },
+            {
+                "leg_id": "sell_1",
+                "tradingsymbol": "NIFTY26OCT26000CE",
+                "transaction_type": "SELL",
+                "quantity": 75,
+            },
         ],
         protection={"stoploss_pct": 20},
         metadata={"source": "test"},
@@ -28,8 +38,26 @@ def test_create_run_persists_canonical_state_with_product_and_defaults():
     assert run.product == "MIS"
     assert run.status == "created"
     assert run.legs == [
-        {"leg_id": "buy_1", "transaction_type": "BUY", "quantity": 75},
-        {"leg_id": "sell_1", "transaction_type": "SELL", "quantity": 75},
+        {
+            "leg_id": "buy_1",
+            "tradingsymbol": "NIFTY26OCT25000CE",
+            "transaction_type": "BUY",
+            "quantity": 75,
+            "exchange": "NFO",
+            "product": "MIS",
+            "order_type": "MARKET",
+            "metadata": {},
+        },
+        {
+            "leg_id": "sell_1",
+            "tradingsymbol": "NIFTY26OCT26000CE",
+            "transaction_type": "SELL",
+            "quantity": 75,
+            "exchange": "NFO",
+            "product": "MIS",
+            "order_type": "MARKET",
+            "metadata": {},
+        },
     ]
     assert run.protection == {"stoploss_pct": 20}
     assert run.metadata == {"source": "test"}

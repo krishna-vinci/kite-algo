@@ -1,11 +1,29 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from backend.options.api.market_router import get_options_session_manager, router as market_router
+
+
+# Expiries are derived from today so the ``nearest`` selector keeps resolving
+# instead of matching a fixture date that has since expired.
+_TODAY = date.today()
+_NEAREST_EXPIRY = _TODAY + timedelta(days=7)
+_MID_EXPIRY = _TODAY + timedelta(days=14)
+_FAR_EXPIRY = _TODAY + timedelta(days=28)
+
+_NEAREST_EXPIRY_ISO = _NEAREST_EXPIRY.isoformat()
+_MID_EXPIRY_ISO = _MID_EXPIRY.isoformat()
+_FAR_EXPIRY_ISO = _FAR_EXPIRY.isoformat()
+
+_MONTH_CODES = "JAN FEB MAR APR MAY JUN JUL AUG SEP OCT NOV DEC".split()
+
+
+def _contract_tsym(expiry: date, strike: int, option_type: str) -> str:
+    return f"NIFTY{expiry:%y}{_MONTH_CODES[expiry.month - 1]}{strike}{option_type}"
 
 
 class _FakeInstrumentRepo:
@@ -37,30 +55,72 @@ def _build_snapshot() -> dict:
         "underlying": "NIFTY",
         "spot_ltp": 22520.0,
         "updated_at": "2026-04-29T10:00:00Z",
-        "expiries": ["2026-05-07", "2026-05-14", "2026-05-28"],
+        "expiries": [_NEAREST_EXPIRY_ISO, _MID_EXPIRY_ISO, _FAR_EXPIRY_ISO],
         "per_expiry": {
-            "2026-05-07": {
+            _NEAREST_EXPIRY_ISO: {
                 "atm_strike": 22500,
                 "rows": [
                     {
                         "strike": 22450,
-                        "CE": {"token": 1001, "tsym": "NIFTY26MAY22450CE", "ltp": 121.0, "oi": 100, "delta": 0.58},
-                        "PE": {"token": 2001, "tsym": "NIFTY26MAY22450PE", "ltp": 84.0, "oi": 140, "delta": -0.42},
+                        "CE": {
+                            "token": 1001,
+                            "tsym": _contract_tsym(_NEAREST_EXPIRY, 22450, "CE"),
+                            "ltp": 121.0,
+                            "oi": 100,
+                            "delta": 0.58,
+                            "lot_size": 75,
+                        },
+                        "PE": {
+                            "token": 2001,
+                            "tsym": _contract_tsym(_NEAREST_EXPIRY, 22450, "PE"),
+                            "ltp": 84.0,
+                            "oi": 140,
+                            "delta": -0.42,
+                            "lot_size": 75,
+                        },
                     },
                     {
                         "strike": 22500,
-                        "CE": {"token": 1002, "tsym": "NIFTY26MAY22500CE", "ltp": 101.0, "oi": 130, "delta": 0.51},
-                        "PE": {"token": 2002, "tsym": "NIFTY26MAY22500PE", "ltp": 96.0, "oi": 160, "delta": -0.49},
+                        "CE": {
+                            "token": 1002,
+                            "tsym": _contract_tsym(_NEAREST_EXPIRY, 22500, "CE"),
+                            "ltp": 101.0,
+                            "oi": 130,
+                            "delta": 0.51,
+                            "lot_size": 75,
+                        },
+                        "PE": {
+                            "token": 2002,
+                            "tsym": _contract_tsym(_NEAREST_EXPIRY, 22500, "PE"),
+                            "ltp": 96.0,
+                            "oi": 160,
+                            "delta": -0.49,
+                            "lot_size": 75,
+                        },
                     },
                     {
                         "strike": 22550,
-                        "CE": {"token": 1003, "tsym": "NIFTY26MAY22550CE", "ltp": 86.0, "oi": 90, "delta": 0.44},
-                        "PE": {"token": 2003, "tsym": "NIFTY26MAY22550PE", "ltp": 115.0, "oi": 170, "delta": -0.56},
+                        "CE": {
+                            "token": 1003,
+                            "tsym": _contract_tsym(_NEAREST_EXPIRY, 22550, "CE"),
+                            "ltp": 86.0,
+                            "oi": 90,
+                            "delta": 0.44,
+                            "lot_size": 75,
+                        },
+                        "PE": {
+                            "token": 2003,
+                            "tsym": _contract_tsym(_NEAREST_EXPIRY, 22550, "PE"),
+                            "ltp": 115.0,
+                            "oi": 170,
+                            "delta": -0.56,
+                            "lot_size": 75,
+                        },
                     },
                 ],
             },
-            "2026-05-14": {"atm_strike": 22500, "rows": []},
-            "2026-05-28": {"atm_strike": 22500, "rows": []},
+            _MID_EXPIRY_ISO: {"atm_strike": 22500, "rows": []},
+            _FAR_EXPIRY_ISO: {"atm_strike": 22500, "rows": []},
         },
     }
 
@@ -127,7 +187,7 @@ def test_market_chain_route_uses_selector_consistently():
     assert response.status_code == 200
     body = response.json()
     assert body["underlying"] == "NIFTY"
-    assert body["expiry"] == "2026-05-07"
+    assert body["expiry"] == _NEAREST_EXPIRY_ISO
     assert isinstance(body["chain"], list)
 
 
@@ -139,7 +199,7 @@ def test_market_mini_chain_route_with_window_2():
     assert response.status_code == 200
     body = response.json()
     assert body["underlying"] == "NIFTY"
-    assert body["expiry"] == "2026-05-07"
+    assert body["expiry"] == _NEAREST_EXPIRY_ISO
     assert "contracts" in body
 
 
@@ -156,7 +216,7 @@ def test_market_greeks_route_returns_contracts():
     assert response.status_code == 200
     body = response.json()
     assert body["underlying"] == "NIFTY"
-    assert body["expiry"] == "2026-05-07"
+    assert body["expiry"] == _NEAREST_EXPIRY_ISO
     assert "contracts" in body
 
 
@@ -171,7 +231,7 @@ def test_market_selection_resolve_exact_strike():
     assert response.status_code == 200
     body = response.json()
     assert body["underlying"] == "NIFTY"
-    assert body["expiry"] == "2026-05-07"
+    assert body["expiry"] == _NEAREST_EXPIRY_ISO
     assert body["resolved"][0]["resolver"] == "exact"
     assert body["resolved"][0]["strike"] == 22500.0
 
@@ -209,7 +269,7 @@ def test_market_selection_resolves_target_delta_alias():
 
 def test_market_selection_returns_delta_unresolvable_when_snapshot_lacks_deltas():
     snapshot = _build_snapshot()
-    for row in snapshot["per_expiry"]["2026-05-07"]["rows"]:
+    for row in snapshot["per_expiry"][_NEAREST_EXPIRY_ISO]["rows"]:
         row["CE"].pop("delta", None)
     response = _client(snapshot).post(
         "/api/options/underlyings/NIFTY/selection/resolve",
@@ -224,7 +284,7 @@ def test_market_selection_returns_delta_unresolvable_when_snapshot_lacks_deltas(
 
 def test_market_selection_rejects_malformed_offset_contract_token():
     snapshot = _build_snapshot()
-    snapshot["per_expiry"]["2026-05-07"]["rows"][2]["CE"]["token"] = "bad-token"
+    snapshot["per_expiry"][_NEAREST_EXPIRY_ISO]["rows"][2]["CE"]["token"] = "bad-token"
     response = _client(snapshot).post(
         "/api/options/underlyings/NIFTY/selection/resolve",
         json={
@@ -247,8 +307,8 @@ def test_market_analytics_routes_return_value_packets():
     assert max_pain.status_code == 200
     assert pcr.json()["underlying"] == "NIFTY"
     assert max_pain.json()["underlying"] == "NIFTY"
-    assert pcr.json()["expiry"] == "2026-05-07"
-    assert max_pain.json()["expiry"] == "2026-05-07"
+    assert pcr.json()["expiry"] == _NEAREST_EXPIRY_ISO
+    assert max_pain.json()["expiry"] == _NEAREST_EXPIRY_ISO
 
 
 def test_market_routes_reject_unavailable_expiry_selector():
