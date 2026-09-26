@@ -52,6 +52,7 @@ from backend.strategies.attribution_models import (
     StrategyProposal,
     StrategyRunBinding,
 )
+from backend.strategies.financing import weight_target_quantity
 from backend.strategies.reservations import (
     CapacityExceeded,
     HOLDING_STATUSES,
@@ -2995,7 +2996,6 @@ class PaperPlanExecutor:
                     "current_allocation_inr": current,
                 },
             )
-        notional = weight * basis * max(0.0, 1.0 - buffer_pct)
         price = leg.get("reference_price")
         try:
             price = float(price) if price is not None else None
@@ -3011,9 +3011,14 @@ class PaperPlanExecutor:
                     "message": "a weight-sized leg needs a pinned reference price",
                 },
             )
-        units = int(notional // price)
-        floored = (units // lot) * lot if lot > 1 else units
-        return int(floored)
+        # The shared rule: NOTHING here invents its own arithmetic, so the paper
+        # lane cannot size a weight differently from admission or live.
+        return weight_target_quantity(
+            weight=weight,
+            capital=basis * max(0.0, 1.0 - buffer_pct),
+            price=price,
+            lot=lot,
+        )
 
     def _current_policy_allocation(self, plan: Mapping[str, Any]) -> Optional[float]:
         """The strategy's CURRENT recorded allocation, for drift detection only.

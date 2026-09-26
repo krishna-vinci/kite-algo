@@ -493,15 +493,16 @@ def build_portfolio_steps(ctx: LaneContext) -> List[StepSpec]:
     ``withheld``s until every reducing leg is ``filled``; the sells themselves are
     ready immediately, because reducing the book is always permitted.
 
-    ``weights.WeightsPortfolioCompiler._target_quantity`` is reused verbatim so
-    the live size is the same arithmetic the paper lane and the compiler use.
+    ``financing.weight_target_quantity`` - the ONE weight -> quantity rule the
+    paper lane and admission also call - is reused verbatim, so the live size is
+    the same arithmetic they use (a sub-lot weight floors to ZERO).
 
     A dependent increase of a plan ADMISSION marked as staged (``staged_increase_inr``)
     is released by :data:`RULE_STAGED_FUNDING_GATE`, not by the generic
     prerequisite rule: its reductions filling does not prove the buy is funded.
     Every other portfolio plan keeps ``RULE_ALL_PREREQUISITES_FILLED``.
     """
-    from .compiler.weights import WeightsPortfolioCompiler
+    from .financing import weight_target_quantity
 
     plan_id = ctx.plan_id
     legs = list((ctx.plan.get("resolved_plan") or {}).get("legs") or [])
@@ -567,9 +568,9 @@ def build_portfolio_steps(ctx: LaneContext) -> List[StepSpec]:
             price = float(price) if price is not None else 0.0
         except (TypeError, ValueError):
             price = 0.0
-        # Re-read the target through the compiler's own arithmetic so the live
-        # and paper lanes can never disagree about a frozen weight.
-        target = WeightsPortfolioCompiler._target_quantity(
+        # Re-read the target through the shared sizing rule so the live, paper
+        # and admission lanes can never disagree about a frozen weight.
+        target = weight_target_quantity(
             weight=float(leg.get("target_weight") or 0.0),
             capital=capital * max(0.0, 1.0 - buffer_pct),
             price=price,

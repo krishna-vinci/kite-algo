@@ -263,7 +263,7 @@ class DeltaTests(WeightsCompilerTestCase):
             self.plan([self.leg("NIFTYBEES", 0.5, 100.0)]), execution_environment="paper"
         )
         leg = compilation.legs[0]
-        # 500 target, lot 75: 500 -> 450, and a non-zero target is never floored away.
+        # 500 target, lot 75: 500 -> 450.
         self.assertEqual(leg["target_quantity"], 450)
 
 
@@ -416,6 +416,103 @@ class RefusalTests(WeightsCompilerTestCase):
         self.assertFalse(compilation.refused)
         self.assertEqual(compilation.legs, [])
         self.assertEqual(compilation.gross_cash_reservation_inr, 0.0)
+
+
+class CrossLaneWeightSizingTests(WeightsCompilerTestCase):
+    """One plan, one number: live, paper and admission size a weight leg alike.
+
+    ADMISSION's floored target is the number the reservation and the capacity
+    check were made against, so both executors must reproduce it exactly. A lane
+    that rounds a non-zero SUB-lot weight up to a whole lot buys exposure no lane
+    funded: the live lane used to do exactly that.
+    """
+
+    LOT = 10
+    PRICE = 100.0
+    BASIS = 100000.0
+
+    def _plan(self, legs):
+        return {
+            "plan_id": "plan-1",
+            "strategy_id": "stg-A",
+            "account_id": "kite:A",
+            "plan_kind": "target_weights",
+            "resolved_plan": {
+                "legs": legs,
+                "capital_basis_inr": self.BASIS,
+                "cash_buffer_pct": 0.0,
+            },
+        }
+
+    def _leg(self, symbol, weight):
+        return {
+            "instrument_id": f"inst-{symbol}",
+            "exchange": "NSE",
+            "tradingsymbol": symbol,
+            "broker_exchange": "NSE",
+            "broker_symbol": symbol,
+            "broker_token": 100,
+            "product": "CNC",
+            "target_weight": weight,
+            "reference_price": self.PRICE,
+            "lot_size": self.LOT,
+            "lot_source": "catalog",
+        }
+
+    def test_live_sizes_a_weight_leg_exactly_as_paper_and_admission(self):
+        """Same plan: a 0.6-lot leg is ZERO everywhere, a 2.4-lot leg TWO lots.
+
+        Same frozen basis, buffer and pinned lot, so the three lanes must agree
+        about everything - and the sub-lot leg is not rounded up to the one lot
+        nobody reserved, admitted or bought.
+        """
+        from backend.strategies.execution import PaperPlanExecutor
+        from backend.strategies.financing import plan_exposure
+        from backend.strategies.live_adapter import LivePlanAdapter
+        from backend.strategies.live_sequence import LaneContext, build_portfolio_steps
+
+        self.policy(self.BASIS)
+        sub_lot = self._leg("RELIANCE", 0.006)  # 6 units = 0.6 of a 10-unit lot
+        multi_lot = self._leg("INFY", 0.024)  # 24 units = 2.4 lots -> 2 whole lots
+        plan = self._plan([sub_lot, multi_lot])
+
+        executor = PaperPlanExecutor(session_factory=self.factory)
+        adapter = LivePlanAdapter(
+            session_factory=lambda: None, position_reader=lambda **_kwargs: 0
+        )
+        with self.factory() as session:
+            exposure = plan_exposure(session, plan, execution_environment="live")
+        admission = {
+            row["coordinate"][0]: int(row["target_quantity"])
+            for row in exposure["per_instrument"]
+        }
+
+        ctx = LaneContext(
+            plan=plan,
+            binding={},
+            authority={},
+            execution_id="ex-1",
+            size_leg=lambda leg: adapter._resolve_delta(plan, dict(leg)),
+            attributed_quantity=lambda leg: 0,
+            staged_financing=False,
+        )
+        specs = {spec.instrument_id: spec for spec in build_portfolio_steps(ctx)}
+
+        for leg, expected in ((sub_lot, 0), (multi_lot, 20)):
+            symbol = leg["tradingsymbol"]
+            with self.subTest(symbol=symbol):
+                self.assertEqual(adapter._weight_target(plan, leg, self.LOT), expected)
+                self.assertEqual(executor._sized_quantity(plan, leg, self.LOT), expected)
+                self.assertEqual(admission[f"inst-{symbol}"], expected)
+                self.assertEqual(
+                    adapter._resolve_delta(plan, dict(leg))["quantity"], expected
+                )
+
+        # A sub-lot leg sizes to a zero delta, so it is not work at all; the
+        # multi-lot leg's frozen step carries the same two whole lots.
+        self.assertNotIn("inst-RELIANCE", specs)
+        self.assertEqual(specs["inst-INFY"].target_quantity, 20)
+        self.assertEqual(specs["inst-INFY"].quantity, 20)
 
 
 if __name__ == "__main__":

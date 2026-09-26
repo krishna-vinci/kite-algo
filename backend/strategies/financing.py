@@ -56,6 +56,7 @@ __all__ = [
     "opens_or_grows_exposure",
     "plan_exposure",
     "staged_funding",
+    "weight_target_quantity",
 ]
 
 #: Statuses that hold capacity as an UNFILLED commitment.
@@ -108,6 +109,32 @@ def _floor_to_lot(delta: int, lot: int) -> int:
         return delta
     sign = 1 if delta > 0 else -1
     return sign * ((abs(delta) // lot) * lot)
+
+
+def weight_target_quantity(
+    *, weight: float, capital: float, price: float, lot: int
+) -> int:
+    """The ONE ``target_weight`` -> quantity rule, shared by every lane.
+
+    ``weight x capital / price``, floored to a whole lot toward zero; the sign
+    of ``weight`` is preserved. ``capital`` is the ALREADY-BUFFERED sizing
+    capital - ``basis x (1 - cash_buffer_pct)`` - so every caller applies the
+    frozen buffer exactly once, never twice and never not at all.
+
+    A weight that resolves to less than ONE lot floors to ZERO rather than up to
+    a lot. Admission reserved no capital for a lot it did not fund and the paper
+    executor bought none, so the live lane must not buy one either: rounding up
+    would trade exposure no lane counted against allocation or capacity. A leg
+    that genuinely wants exposure must carry a weight that resolves to a lot.
+
+    Long-only callers pass ``|weight|`` (admission) or clamp the delta downstream
+    (paper and live), so the sign here is the plan's, never a lane's invention.
+    """
+    if weight == 0.0 or price <= 0:
+        return 0
+    raw = float(weight) * float(capital) / float(price)
+    floored = _floor_to_lot(int(abs(raw)), lot)
+    return floored if raw >= 0 else -floored
 
 
 def current_book(
@@ -208,15 +235,12 @@ def plan_exposure(
             if capital_basis is None or not valid_price:
                 target_qty = None
             else:
-                units = int(
-                    (
-                        abs(float(weight or 0.0))
-                        * capital_basis
-                        * max(0.0, 1.0 - buffer_pct)
-                    )
-                    // abs(float(price))
+                target_qty = weight_target_quantity(
+                    weight=abs(float(weight or 0.0)),
+                    capital=capital_basis * max(0.0, 1.0 - buffer_pct),
+                    price=abs(float(price)),
+                    lot=lot,
                 )
-                target_qty = _floor_to_lot(units, lot) if lot > 1 else units
             long_only.add(key)
         else:
             target_qty = None

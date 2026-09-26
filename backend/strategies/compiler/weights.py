@@ -370,18 +370,16 @@ class WeightsPortfolioCompiler:
 
     @staticmethod
     def _target_quantity(*, weight: float, capital: float, price: float, lot: int) -> int:
-        """``round_to_lot(weight x capital / price)``.
+        """``floor_to_lot(weight x capital / price)``: the shared sizing rule.
 
-        A weight that resolves to *some* exposure must never floor to zero: the
-        caller asked for a position, and silently dropping it would leave the
-        book quietly short of its target. So a non-zero weight floors up to one
-        lot rather than down to nothing.
+        Thin alias for :func:`backend.strategies.financing.weight_target_quantity`,
+        which is the ONE implementation the admission, paper and live lanes all
+        call. A sub-lot weight floors to ZERO here exactly as it does there: the
+        round-up this used to apply bought a lot no lane had reserved, admitted
+        or funded.
         """
-        if weight == 0.0 or price <= 0:
-            return 0
-        raw = weight * capital / price
-        lots = int(abs(raw) // lot)
-        if lots == 0 and abs(raw) > 0:
-            lots = 1
-        quantity = lots * lot
-        return int(quantity) if raw > 0 else -int(quantity)
+        from backend.strategies.financing import weight_target_quantity
+
+        return weight_target_quantity(
+            weight=weight, capital=capital, price=price, lot=lot
+        )

@@ -1490,13 +1490,15 @@ class LivePlanAdapter:
 
         Re-reading the current admission policy here would silently re-size an
         already-approved target, so the frozen ``capital_basis_inr`` is the only
-        sizing input. The arithmetic is the compiler's own
-        (``WeightsPortfolioCompiler._target_quantity``), so the live, paper and
-        compile-time answers can never disagree. The current policy allocation is
-        read for DRIFT only: an authority that no longer covers the frozen basis
-        refuses rather than executing against a limit that no longer exists.
+        sizing input. The arithmetic is the ONE shared rule admission and paper
+        also call (``financing.weight_target_quantity``: ``basis x (1 - buffer)``
+        and a floor to the pinned lot), so the live, paper and admission answers
+        can never disagree - a sub-lot weight sizes to ZERO rather than up to a
+        lot nobody reserved or bought. The current policy allocation is read for
+        DRIFT only: an authority that no longer covers the frozen basis refuses
+        rather than executing against a limit that no longer exists.
         """
-        from .compiler.weights import WeightsPortfolioCompiler
+        from .financing import weight_target_quantity
 
         plan_id = str(plan.get("plan_id") or "")
         resolved = dict(plan.get("resolved_plan") or {})
@@ -1548,7 +1550,7 @@ class LivePlanAdapter:
                 },
             )
         return int(
-            WeightsPortfolioCompiler._target_quantity(
+            weight_target_quantity(
                 weight=float(leg.get("target_weight") or 0.0),
                 capital=basis * max(0.0, 1.0 - buffer_pct),
                 price=price,
