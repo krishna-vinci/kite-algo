@@ -23,6 +23,9 @@ def _authorized_scopes(monkeypatch):
 
 def test_live_is_not_advertised_while_the_deployment_flag_is_off(monkeypatch):
     monkeypatch.delenv("HOSTED_LIVE_ENABLED", raising=False)
+    # Even a deployment whose per-lane allowlist names every lane advertises
+    # nothing while the master gate is off.
+    monkeypatch.setenv("HOSTED_LIVE_LANES", "cnc,mis,futures,options")
 
     body = asyncio.run(strategies_router.get_hosted_options(owner="app:admin"))
 
@@ -37,6 +40,7 @@ def test_live_is_not_advertised_while_the_deployment_flag_is_off(monkeypatch):
 
 def test_live_is_advertised_with_its_wired_lanes_when_enabled(monkeypatch):
     monkeypatch.setenv("HOSTED_LIVE_ENABLED", "true")
+    monkeypatch.setenv("HOSTED_LIVE_LANES", "cnc,mis,futures,options")
 
     body = asyncio.run(strategies_router.get_hosted_options(owner="app:admin"))
 
@@ -50,6 +54,7 @@ def test_live_is_advertised_with_its_wired_lanes_when_enabled(monkeypatch):
 def test_an_unwired_lane_is_not_advertised(monkeypatch):
     """A lane whose builder is missing disappears, even with live enabled."""
     monkeypatch.setenv("HOSTED_LIVE_ENABLED", "true")
+    monkeypatch.setenv("HOSTED_LIVE_LANES", "cnc,mis,futures,options")
 
     from backend.strategies import live_sequence
 
@@ -67,3 +72,16 @@ def test_an_unwired_lane_is_not_advertised(monkeypatch):
     assert body.live_lanes == ["cnc", "mis", "futures"], body.live_lanes
     # And an arbitrary lane name is never reported, whatever a client asks for.
     assert "equities_only" not in body.live_lanes
+
+
+def test_only_the_allowed_lanes_are_advertised(monkeypatch):
+    """``HOSTED_LIVE_LANES`` narrows the capability surface, default deny."""
+    monkeypatch.setenv("HOSTED_LIVE_ENABLED", "true")
+    monkeypatch.delenv("HOSTED_LIVE_LANES", raising=False)
+
+    body = asyncio.run(strategies_router.get_hosted_options(owner="app:admin"))
+    assert body.live_lanes == [], body.live_lanes
+
+    monkeypatch.setenv("HOSTED_LIVE_LANES", "options,equities_only")
+    body = asyncio.run(strategies_router.get_hosted_options(owner="app:admin"))
+    assert body.live_lanes == ["options"], body.live_lanes

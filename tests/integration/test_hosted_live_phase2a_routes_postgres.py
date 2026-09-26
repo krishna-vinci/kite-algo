@@ -125,6 +125,7 @@ def live_env(pg):
             "HOSTED_SUPERVISOR_CREDENTIAL": SUPERVISOR_CREDENTIAL,
             "HOSTED_STRATEGY_ACCOUNT_SCOPES": account_scope,
             "HOSTED_LIVE_ENABLED": "true",
+            "HOSTED_LIVE_LANES": "cnc,mis,futures,options",
         }
     )
     # The live session reader resolves the account's broker session from the
@@ -150,6 +151,7 @@ def live_env(pg):
             "JWT_SECRET",
             "HOSTED_STRATEGY_ACCOUNT_SCOPES",
             "HOSTED_LIVE_ENABLED",
+            "HOSTED_LIVE_LANES",
             "HOSTED_SUPERVISOR_CREDENTIAL",
         ):
             os.environ.pop(key, None)

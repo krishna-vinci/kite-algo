@@ -14,7 +14,7 @@ the B2.6b owner-actions design
 
 **What it does live.** One durable option run per structure on the existing
 options engine, admitted as plan kind `option_structure`
-(`backend/strategies/live_service.py:73,1346`). Run lifecycle:
+(`backend/strategies/live_service.py:82,1388`). Run lifecycle:
 `created -> entering -> entered -> exiting -> exited/settled`, plus
 `partial_entry`, `cleanup_required`, `partial_exit`
 (`documents/hosted-strategies-production-live-readiness-plan-2026-09-25.md:32-34`;
@@ -37,7 +37,7 @@ status vocabulary `backend/options/execution/repair.py:41-77`).
   the gate proves every acquisition is `filled` AND the run's own ledger holds the
   exact desired quantities, otherwise the step records `option_roll_not_proven` or
   refuses `LIVE_OPTION_RUN_LEDGER_INCONSISTENT`
-  (`backend/strategies/live_service.py:1060-1155`). A live adjust completes only
+  (`backend/strategies/live_service.py:1102-1197`). A live adjust completes only
   from the run's own ledger: it bumps `structure_generation`, rewrites the held
   legs and freezes the new protection policy on the owner row in the same CAS write
   (`backend/strategies/live_lane_ledger.py:273-400`).
@@ -125,13 +125,20 @@ step marked **[owner approval]** needs the owner's explicit go-ahead.
 2. **[owner approval]** Add the account scope to `HOSTED_STRATEGY_ACCOUNT_SCOPES`
    and confirm account ingest covers it
    (`documents/hosted-strategies-live-deployment.md:169-190`).
-3. **[owner approval]** Follow the deploy order in
+3. **[owner approval]** Open this lane for new exposure: add `options` to
+   `HOSTED_LIVE_LANES` in the deployment's untracked `.env` (all open lanes are
+   listed, e.g. `HOSTED_LIVE_LANES=cnc,mis,futures,options`), then restart
+   `finance-app`. Default deny: unset or empty opens no lane, an unknown name is
+   ignored with a startup warning, and closing a lane still releases reductions,
+   exits, protective exits and square-offs
+   (`backend/strategies/live_service.py:1413,1443-1481`).
+4. **[owner approval]** Follow the deploy order in
    [README.md](README.md#deployment-order-shared-c2-procedure). Options is the
    LAST lane in the C2 order and opens only after the others pass
    (`documents/hosted-strategies-production-live-readiness-plan-2026-09-25.md:134`).
-4. Verify (section 3), including that the option-chain snapshot service is fresh
+5. Verify (section 3), including that the option-chain snapshot service is fresh
    and the broker basket-margin read is available.
-5. Configure the strategy's `live` mode, select the allowlisted scope, and obtain
+6. Configure the strategy's `live` mode, select the allowlisted scope, and obtain
    the owner approval bound to the plan
    (`POST /api/strategies/{strategy_id}/plans/{plan_id}/approval`,
    `backend/api/routers/strategies.py:1771`). The approval pins the strategy
@@ -205,7 +212,7 @@ is the run's own fills proving flat (`backend/options/execution/repair.py:73-77`
 | Option run `partial_entry` / `partial_exit` / `cleanup_required` | the run's own confirmed fills | `GET`/`POST .../option-runs/{option_run_id}/repair` (`backend/api/routers/strategies.py:1338,1365`). Verdicts: `flat`, `residual`, `ambiguous`, `not_repairable` (`backend/options/execution/repair.py:78-81`). Actions: `close_flat`, `close_residual` (`:109-113`) | an `ambiguous` run escalates as `OPTION_RUN_REPAIR_AMBIGUOUS`; it is never auto-adopted (`backend/options/execution/repair.py:83-85`) |
 | Live residual repair | the claim's residual | **Refused in live**: `close_residual` against a live environment returns `OPTION_RUN_REPAIR_LIVE_UNSUPPORTED` - there is no governed live residual-close submission path yet (`backend/api/routers/strategies.py:1404`; `backend/options/execution/repair.py:88`) | no live residual close is invented by the operator route |
 | `adjusting` run whose adjust may still submit | the owning adjust must be provably finished | assessment reason `adjust_in_flight`; the takeover/repair gate refuses until it is terminal (`backend/options/execution/repair.py:103,296`) | a run whose adjust process died with an unanswered submission keeps `adjusting` until disposition (`documents/hosted-strategies-production-live-readiness-plan-2026-09-25.md:148`) |
-| Roll acquisition partial or stalled | the roll's own acquisition outcomes AND the run ledger holding the exact desired generation | the OLD generation stays `withheld`: the release gate records `option_roll_not_proven` (unfilled acquisition) or `LIVE_OPTION_RUN_LEDGER_INCONSISTENT` (ledger divergence) and releases nothing (`backend/strategies/live_service.py:1092-1155`); remedy is a new observed-state plan, never an auto-unwind (`documents/hosted-live-options-c1-2-design-2026-09-25.md:303,314`) | a partial roll never unwinds itself and never releases the old generation (`backend/strategies/live_service.py:1106,1115,1148`) |
+| Roll acquisition partial or stalled | the roll's own acquisition outcomes AND the run ledger holding the exact desired generation | the OLD generation stays `withheld`: the release gate records `option_roll_not_proven` (unfilled acquisition) or `LIVE_OPTION_RUN_LEDGER_INCONSISTENT` (ledger divergence) and releases nothing (`backend/strategies/live_service.py:1134-1197`); remedy is a new observed-state plan, never an auto-unwind (`documents/hosted-live-options-c1-2-design-2026-09-25.md:303,314`) | a partial roll never unwinds itself and never releases the old generation (`backend/strategies/live_service.py:1148,1157,1190`) |
 | Ledger cannot be read completely | the run's own ledger | assessment reason `ledger_incomplete` (`backend/options/execution/repair.py:104`); a frozen option step with no durable run leg refuses `LIVE_OPTION_RUN_LEG_UNRESOLVED` and keeps the parent in flight (`backend/strategies/live_lane_ledger.py:211-222`) | never derives a new generation from an incomplete ledger (`documents/hosted-live-options-c1-2-design-2026-09-25.md:94-98`) |
 | Protective stage unresolved (`sending`/`unknown`) | the stage's own pre-send records | owner exit refuses `OPTION_PROTECTIVE_EXIT_UNRESOLVED`; the stage resolves through `StagedStructureExit` and ordinary fills (`backend/options/execution/repair.py:95`; `documents/hosted-owner-actions-b2-6b-design-2026-09-25.md:102-112`) | never bypassed by cancel-pending or a fresh order |
 | Protection owner unknown | an active owner row, or a release proof | unknown blocks exposure growth, not risk-reducing work (`OPTION_PROTECTION_OWNER_UNKNOWN`, `backend/options/protection/ownership.py:113`; `backend/options/execution/plan_binding.py:552`; live release `backend/strategies/live_adapter.py:1054-1061`) | never assumed owned; never auto-transferred |
@@ -216,7 +223,7 @@ is the run's own fills proving flat (`backend/options/execution/repair.py:73-77`
 names it for a roll whose steps do not name exactly one run, whose ledger cannot be
 read, or whose ledger does not hold the exact replacement generation
 (`documents/hosted-live-options-c1-2-design-2026-09-25.md:94-98`); the code raises it
-at `backend/strategies/live_service.py:1106,1115,1148`. The leg-level refusal
+at `backend/strategies/live_service.py:1148,1157,1190`. The leg-level refusal
 `LIVE_OPTION_RUN_LEG_UNRESOLVED` (`backend/strategies/live_lane_ledger.py:220`) and
 the `ledger_incomplete` assessment reason
 (`backend/options/execution/repair.py:104`) remain as before.

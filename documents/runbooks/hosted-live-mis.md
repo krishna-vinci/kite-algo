@@ -6,7 +6,7 @@ refusal lookup: [README.md](README.md).
 ## 1. Scope and prerequisites
 
 **What it does live.** MIS is a single-leg intraday lane. The only plan kind it
-admits is `single_instrument` (`backend/strategies/live_service.py:66,1174`), and
+admits is `single_instrument` (`backend/strategies/live_service.py:75,1216`), and
 the plan's frozen product must be exactly `MIS` or the builder refuses
 `LIVE_MIS_PRODUCT_REQUIRED` (`backend/strategies/live_sequence.py:416-440`).
 
@@ -15,12 +15,12 @@ the plan's frozen product must be exactly `MIS` or the builder refuses
 - A **risk-reducing** MIS step is materialized `withheld` under
   `RULE_MIS_SQUAREOFF` (`backend/strategies/live_sequence.py:118,445-458`). It is
   released only by the platform's own authority, never by a guessed exchange
-  close (see the release rule at `backend/strategies/live_service.py:777-837`).
+  close (see the release rule at `backend/strategies/live_service.py:819-879`).
 - Release authorities, in the order the rule checks them: the exchange-local
   square-off clock (`squareoff_clock`), an operator-requested stop
   (`operator_stop`), or the MIS stale-worker exit policy
   (`stale_worker_exit`). Otherwise the rule refuses `MIS_SQUAREOFF_NOT_DUE`
-  (`backend/strategies/live_service.py:809-837`).
+  (`backend/strategies/live_service.py:851-879`).
 - The square-off schedule is exchange-local wall clock and delegates to the
   protection runtime's own resolver so the two cannot drift
   (`backend/strategies/mis_squareoff.py:47-76`). Defaults: `NSE:MIS`/`BSE:MIS`
@@ -44,7 +44,7 @@ depends on:
 | `HOSTED_EXECUTION_DISPATCH_ENABLED` | must not be falsy or dispatch never runs | `backend/strategies/execution_dispatcher.py:35-39` |
 | `WORKER_PROTECTION_SQUAREOFF_SCHEDULE_JSON` | optional schedule override the MIS rule and the protection runtime share | `backend/app/background.py:28-38`; `backend/strategies/mis_squareoff.py:66-70` |
 | `ADMISSION_MARGIN_MAX_AGE_SECONDS` | margin evidence freshness | `backend/strategies/admission.py:77,134-142` |
-| stale-exit policy (`none`/`exit_on_worker_stale`) | arms the stale-worker exit authority | `backend/api/routers/strategies.py:581` (`stale_exit_policies`); `backend/strategies/live_service.py:827-836` |
+| stale-exit policy (`none`/`exit_on_worker_stale`) | arms the stale-worker exit authority | `backend/api/routers/strategies.py:581` (`stale_exit_policies`); `backend/strategies/live_service.py:869-878` |
 
 **Migration head.** Code head `20260926_000051`
 (`backend/alembic/versions/20260926_000051_live_approval_binding.py`); verify the
@@ -53,7 +53,7 @@ deployed head read-only ([README.md](README.md#verification-commands-read-only))
 **Services.** `finance-app`, `alerts-worker`, `strategy-runner`, `frontend-next`
 (`compose.yml:88,144`; `compose.worker.yml:11`; `compose.supervisor.yml:13`).
 The MIS stale-worker exit depends on the runner publishing heartbeats
-(`backend/strategies/live_service.py:1015-1060`).
+(`backend/strategies/live_service.py:1057-1102`).
 
 ## 2. Enable
 
@@ -65,12 +65,18 @@ step marked **[owner approval]** needs the owner's explicit go-ahead.
 2. **[owner approval]** Add the account scope to `HOSTED_STRATEGY_ACCOUNT_SCOPES`
    and confirm account ingest covers it
    (`documents/hosted-strategies-live-deployment.md:169-190`).
-3. **[owner approval]** Follow the deploy order in
+3. **[owner approval]** Open this lane for new exposure: add `mis` to
+   `HOSTED_LIVE_LANES` in the deployment's untracked `.env` (all open lanes are
+   listed, e.g. `HOSTED_LIVE_LANES=cnc,mis`), then restart `finance-app`. Default
+   deny: unset or empty opens no lane, an unknown name is ignored with a startup
+   warning, and closing a lane still releases reductions, exits and square-offs
+   (`backend/strategies/live_service.py:1413,1443-1481`).
+4. **[owner approval]** Follow the deploy order in
    [README.md](README.md#deployment-order-shared-c2-procedure). MIS opens after
    CNC in the C2 lane order
    (`documents/hosted-strategies-production-live-readiness-plan-2026-09-25.md:134`).
-4. Verify (section 3) before configuring a version.
-5. Configure the strategy's `live` mode and select the allowlisted scope.
+5. Verify (section 3) before configuring a version.
+6. Configure the strategy's `live` mode and select the allowlisted scope.
 
 ## 3. Verify
 
@@ -97,7 +103,7 @@ Ordered least to most drastic. Full semantics: [README.md](README.md#halt-ladder
    (`backend/api/routers/strategies.py:3189`). For MIS this is also the release
    authority: a durable stop request makes `_mis_context.stop_requested` true, so
    a withheld reducing step is released under `operator_stop`
-   (`backend/strategies/live_service.py:823-825,1058`). It still does not
+   (`backend/strategies/live_service.py:865-867,1100`). It still does not
    cancel or flatten anything by itself. Refusals: `STALE_ATTEMPT`,
    `STALE_LEASE_EPOCH`, `STOP_RACE_LOST`
    (`backend/api/routers/strategies.py:3205-3228`).
@@ -118,7 +124,7 @@ Ordered least to most drastic. Full semantics: [README.md](README.md#halt-ladder
    ([README.md](README.md#rollback-doctrine-shared)).
 
 Useful refusals while halting: `MIS_SQUAREOFF_NOT_DUE` means the release rule
-has no authority yet (`backend/strategies/live_service.py:837`);
+has no authority yet (`backend/strategies/live_service.py:879`);
 `LIVE_MIS_PRODUCT_REQUIRED` means the frozen product is not MIS
 (`backend/strategies/live_sequence.py:436`).
 
@@ -126,7 +132,7 @@ has no authority yet (`backend/strategies/live_service.py:837`);
 
 | Blocked state | Evidence required | Repair path | Never auto-resolved |
 | --- | --- | --- | --- |
-| Reducing step `withheld`, square-off not yet due | exchange-local clock, operator stop, or a proven stale worker | wait for the clock, request a stop (lever 1), or let the stale-worker policy arm the release (`backend/strategies/live_service.py:809-837`) | never released on a guessed exchange close (`backend/strategies/live_sequence.py:419-424`) |
+| Reducing step `withheld`, square-off not yet due | exchange-local clock, operator stop, or a proven stale worker | wait for the clock, request a stop (lever 1), or let the stale-worker policy arm the release (`backend/strategies/live_service.py:851-879`) | never released on a guessed exchange close (`backend/strategies/live_sequence.py:419-424`) |
 | Square-off shows `action_required` / `missed_by_broker` | the recorded square-off outcome | read it via `GET .../squareoffs`; the platform keeps reconciling and never treats it as settlement (`backend/strategies/mis_squareoff.py:40-46`) | unresolved outcomes are never settlement |
 | Unanswered plan step (unknown send / open remainder) | the platform's own evidence | dead-submission disposition (`backend/api/routers/strategy_owner_actions.py:484,539`); only evidence-backed dispositions are offered (`backend/api/services/owner_actions.py:3410-3450`) | not auto-resolved, and a staged protective order refuses (`DEAD_SUBMISSION_PROTECTIVE_FORBIDDEN`, `backend/api/services/owner_actions.py:98`) |
 | Multi-day MIS intent | the intent's declared `hold_days` | none — the correct fix is a different product (CNC/NRML or futures/options); the refusal names it (`backend/strategies/mis_policy.py:55-94`) | never downgraded silently to intraday |
@@ -160,4 +166,4 @@ Migrations are fix-forward; do not downgrade
   dependent legs.
 - **The square-off clock is exchange-local wall clock.** A container clock/zone
   mistake would mis-time it; the rule compares in `EXCHANGE_TZ`, not UTC
-  (`backend/strategies/live_service.py:811-818`).
+  (`backend/strategies/live_service.py:853-860`).

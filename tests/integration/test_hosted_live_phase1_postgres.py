@@ -393,7 +393,16 @@ class _LiveFixture:
 def _executor(pg, fixture, *, live_enabled: bool, broker: _FakeBroker, adapter=None):
     from backend.strategies.live_service import LivePlanExecutor
 
-    environ = {"HOSTED_LIVE_ENABLED": "true"} if live_enabled else {}
+    # This deployment's own live configuration: the master switch AND the C2
+    # per-lane allowlist with every lane a suite in this release may use.
+    environ = (
+        {
+            "HOSTED_LIVE_ENABLED": "true",
+            "HOSTED_LIVE_LANES": "cnc,mis,futures,options",
+        }
+        if live_enabled
+        else {}
+    )
     if adapter is None and live_enabled:
         from backend.strategies.live_readers import (
             attributed_position_reader,

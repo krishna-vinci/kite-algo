@@ -17,8 +17,8 @@ lane file says so instead of describing a command that would fail.
 | Futures | [hosted-live-futures.md](hosted-live-futures.md) | `futures` | `target_futures` | `LANE_FUTURES_ROLL` |
 | Options | [hosted-live-options.md](hosted-live-options.md) | `options` | `option_structure` | `LANE_OPTION_STRUCTURE` |
 
-Lane -> plan-kind mapping: `backend/strategies/live_service.py:1342` (`_LANE_PLAN_KINDS`)
-and the executor's admitted kinds at `backend/strategies/live_service.py:69`
+Lane -> plan-kind mapping: `backend/strategies/live_service.py:1384` (`_LANE_PLAN_KINDS`)
+and the executor's admitted kinds at `backend/strategies/live_service.py:78`
 (`LIVE_PLAN_KINDS`). Public lane names and their builders:
 `backend/strategies/live_sequence.py:351` (`PUBLIC_LANE_NAMES`) and
 `backend/strategies/live_sequence.py:359` (`hosted_live_lanes`).
@@ -53,6 +53,7 @@ adapter's quote bound, which is a constructor parameter.
 | Variable | Default | Effect | Source |
 | --- | --- | --- | --- |
 | `HOSTED_LIVE_ENABLED` | off | master gate for hosted live. Only `1/true/yes/on` enable it; anything else (unset, typo) is false. | `backend/strategies/live_settings.py:21,24,27-37` |
+| `HOSTED_LIVE_LANES` | empty (deny all) | per-lane allowlist for **new exposure**: a comma-separated subset of `cnc,mis,futures,options`. Unset or empty opens **no** lane. An unknown name is ignored with a startup warning. A closed lane still releases reductions, exits, staged/protective exits, the MIS square-off, repair and flatten (refusal: `LIVE_LANE_NOT_ENABLED`). | `backend/strategies/live_service.py:1413,1443-1481`; admission gate `:249`, release gate `:700` |
 | `HOSTED_STRATEGY_ACCOUNT_SCOPES` | empty (deny all) | comma-separated exact account-scope allowlist; unlisted scope is 403 | `backend/api/services/hosted_strategy_authz.py:31,38-48,50-66` |
 | `HOSTED_EXECUTION_DISPATCH_ENABLED` | enabled | disabled only for an explicit falsy spelling (`0/false/no/off/disabled`) | `backend/strategies/execution_dispatcher.py:25,32,35-39` |
 | `ACCOUNT_INGEST_ENABLED` | `true` | starts the account-wide fill ingest loop | `backend/app/bootstrap.py:705-708` |
@@ -82,8 +83,10 @@ the recorded procedure in `documents/hosted-strategies-live-deployment.md:99-129
 
 1. Confirm the required migration head and that no live account is armed
    (read-only, below). Owner approval: yes.
-2. Set the lane's env (account scope, `HOSTED_LIVE_ENABLED`) in the deployment's
-   untracked `.env`. Owner approval: yes.
+2. Set the lane's env in the deployment's untracked `.env`: add the lane to
+   `HOSTED_LIVE_LANES` (`HOSTED_LIVE_LANES=cnc,mis,futures,options` names every
+   lane; unset or empty opens none), set the account scope and
+   `HOSTED_LIVE_ENABLED`, then restart `finance-app`. Owner approval: yes.
 3. Build all images from the reviewed worktree, before replacing any container
    (`documents/hosted-strategies-live-deployment.md:18-30`). Owner approval: yes.
 4. Recreate `finance-app` first (it owns Alembic), wait for migration + health.
@@ -151,8 +154,9 @@ Capabilities / selectors (`GET /api/strategies/options`,
 `backend/api/routers/strategies.py:554-580`):
 
 - `live_lanes` is populated **only** while `HOSTED_LIVE_ENABLED` is on, and only
-  with lanes whose builder is registered **and** whose plan kind the executor
-  admits (`backend/strategies/live_service.py:1350-1368`).
+  with lanes whose builder is registered, whose plan kind the executor admits,
+  **and** which `HOSTED_LIVE_LANES` has opened
+  (`backend/strategies/live_service.py:1392-1408`).
 - `execution_modes` includes `live` only while live is enabled
   (`backend/api/routers/strategies.py:572-576`).
 - `account_scopes` comes from the server allowlist; the browser cannot invent one
@@ -187,7 +191,8 @@ same-origin.
 | 2 | Cancel pending work | `POST .../owner-actions/cancel-pending` (`backend/api/routers/strategy_owner_actions.py:278`); preview `GET .../owner-actions/pending-work` (`:240`) | cancels only ENTRY candidates the preview proved eligible; preserves a partial fill | never touches protective hedges, reductions, exit/adjust/roll/square-off work, or unowned/unreadable orders (`backend/api/services/owner_actions.py:64-70,76,90-93,98`) |
 | 3 | Exit structure (options, per run, short-first) | `GET`/`POST /api/strategies/{strategy_id}/option-runs/{option_run_id}/exit` (`backend/api/routers/strategy_owner_actions.py:403,434`) | one governed stage of the staged structure exit derived from the run's own confirmed fills; shorts first, hedge withheld until its short is proven closed | never marks the run exited because a broker accepted a stage; completion is the run's own fills proving flat (`backend/options/execution/repair.py:73-77`) |
 | 4 | Flatten (strategy-scoped, resumable) | `GET`/`POST /api/strategies/{strategy_id}/owner-actions/flatten` (`backend/api/routers/strategy_owner_actions.py:378,341`) | stops the evaluator and proves it, cancels qualifying pending entry, exits option runs one at a time, closes non-option books with target-zero reductions; a second POST resumes and preserves finished work | not a whole-account liquidation; refuses rather than guessing an unanswered order; a plan that would increase exposure is refused before admission (`backend/api/services/owner_actions.py:111-133`) |
-| 5 | Disable the lane | set `HOSTED_LIVE_ENABLED` non-truthy, recreate `finance-app` (`documents/hosted-strategies-live-deployment.md:118-122`) | live admission/launch/submission refuse; the outcome consumer reports `disabled` | does not close broker positions; there is no route that liquidates the book on flag-off. Removing the account scope from `HOSTED_STRATEGY_ACCOUNT_SCOPES` similarly 403s the lane (`backend/api/services/hosted_strategy_authz.py:50-66`) |
+| 5 | Close the lane (new exposure only) | remove the lane from `HOSTED_LIVE_LANES` (or unset it), recreate `finance-app` | new plans and exposure-increasing releases refuse `LIVE_LANE_NOT_ENABLED`; reductions, exits, staged/protective exits, MIS square-off, repair and flatten keep releasing (`backend/strategies/live_service.py:249,700`) | does not cancel working orders or close broker positions |
+| 6 | Disable all live | set `HOSTED_LIVE_ENABLED` non-truthy, recreate `finance-app` (`documents/hosted-strategies-live-deployment.md:118-122`) | live admission/launch/submission refuse; the outcome consumer reports `disabled` | does not close broker positions; there is no route that liquidates the book on flag-off. Removing the account scope from `HOSTED_STRATEGY_ACCOUNT_SCOPES` similarly 403s the lane (`backend/api/services/hosted_strategy_authz.py:50-66`) |
 
 Stop-evaluator refusals (409): `STALE_ATTEMPT`, `STALE_LEASE_EPOCH`,
 `STOP_RACE_LOST` (`backend/api/routers/strategies.py:3210-3232`).
@@ -275,6 +280,7 @@ intentionally not a rollback path: it fails while live vocabulary rows exist"
 | Code | Meaning | Source |
 | --- | --- | --- |
 | `LIVE_ADMISSION_REFUSED` | admission refused a live leg; inner `reason_code` names why | `backend/strategies/live_adapter.py:1239` |
+| `LIVE_LANE_NOT_ENABLED` | this lane is not in `HOSTED_LIVE_LANES`: a new plan that would open exposure, or an exposure-increasing dependent release, is refused. A reducing release is never refused by this gate. | `backend/strategies/live_service.py:243-256,693-712,1484-1498` |
 | `LIVE_QUOTE_MISSING` / `LIVE_QUOTE_STALE` / `LIVE_QUOTE_MISMATCH` | quote absent, older than 5 s, or wrong instrument | `backend/strategies/live_adapter.py:1191-1206` |
 | `LIVE_EVALUATION_AUTHORITY_MISSING` / `_MISMATCH` / `_STALE` | the start request's authority is gone, changed, or expired | `backend/strategies/live_adapter.py:867,876,887` |
 | `LIVE_APPROVAL_INVALID` | an approval pin moved | `backend/strategies/live_adapter.py:900`, `:2850` |
@@ -286,7 +292,7 @@ intentionally not a rollback path: it fails while live vocabulary rows exist"
 | `LIVE_POSITION_EVIDENCE_UNAVAILABLE` | authoritative attributed reader unavailable | `backend/strategies/live_sequence.py:684`; `backend/strategies/live_readers.py:120,152` |
 | `LIVE_BROKER_SESSION_UNAVAILABLE` / `LIVE_ACCOUNT_SCOPE_REQUIRED` | broker/session boundary cannot serve the read | `backend/strategies/live_readers.py:35,60` |
 | `LIVE_QUOTE_INSTRUMENT_MISMATCH` | reader returned a quote for a different instrument | `backend/strategies/live_readers.py:219` |
-| `STAGED_FUNDING_REDUCTION_NOT_CONFIRMED` | a dependent buy's funding reduction is not confirmed `filled` | `backend/strategies/live_adapter.py:1313`; `backend/strategies/live_service.py:653` |
+| `STAGED_FUNDING_REDUCTION_NOT_CONFIRMED` | a dependent buy's funding reduction is not confirmed `filled` | `backend/strategies/live_adapter.py:1313`; `backend/strategies/live_service.py:673` |
 | `STAGED_FUNDING_EVIDENCE_UNAVAILABLE` / `_STALE` | staged funds evidence is missing/unreadable or older than `ADMISSION_MARGIN_MAX_AGE_SECONDS` | `backend/strategies/live_adapter.py:1390,1398,1410` |
 | `LIVE_FINANCING_PRICE_DRIFT` | staged buy quote beyond `LIVE_STAGED_BUY_MAX_PRICE_DRIFT_PCT` from the frozen reference | `backend/strategies/live_adapter.py:1349` |
 | `LIVE_LIMIT_PRICE_UNAVAILABLE` / `LIVE_LIMIT_PRICE_BOUND_EXCEEDED` / `LIVE_LIMIT_TICK_UNKNOWN` | a gated leg has no in-band LIMIT price, or the tick is unknown; MARKET is never a fallback | `backend/strategies/live_limit_orders.py:34,37,40`; `backend/strategies/live_adapter.py:1855,1864,1877` |
@@ -298,7 +304,7 @@ intentionally not a rollback path: it fails while live vocabulary rows exist"
 | `LIVE_OPTION_MARGIN_EVIDENCE_SCOPE_MISMATCH` / `LIVE_OPTION_ROLL_PEAK_UNAVAILABLE` | the basket read answered for another account, or a roll's overlap peak is unreadable | `backend/strategies/plan_pipeline.py:302,324,330` |
 | `OPTION_CHAIN_SNAPSHOT_*` / `OPTION_GREEKS_*` | frozen chain/Greeks evidence missing, stale, or missing a required field | `backend/options/market/freshness.py:93-119,129,165-189,215-266` |
 | `LIVE_OPTION_RUN_UNAVAILABLE` / `LIVE_OPTION_RUN_LEG_UNRESOLVED` | the durable option run/binding or a run leg cannot be resolved | `backend/strategies/live_sequence.py:790`; `backend/strategies/live_lane_ledger.py:220` |
-| `option_roll_not_proven` / `LIVE_OPTION_RUN_LEDGER_INCONSISTENT` | a roll's acquisition is not fully filled, or the run ledger does not hold the exact replacement generation | `backend/strategies/live_service.py:1098,1106,1115,1148` |
+| `option_roll_not_proven` / `LIVE_OPTION_RUN_LEDGER_INCONSISTENT` | a roll's acquisition is not fully filled, or the run ledger does not hold the exact replacement generation | `backend/strategies/live_service.py:1140,1148,1157,1190` |
 | `HOSTED_STOP_REQUESTED` | a stop is queued against the job | `backend/strategies/live_repair.py:185` |
 | `LIVE_REPAIR_*` | residual/staged-dependent disposition refusals | `backend/strategies/live_repair.py:161-686` |
 

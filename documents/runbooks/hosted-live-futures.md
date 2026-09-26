@@ -6,7 +6,7 @@ refusal lookup: [README.md](README.md).
 ## 1. Scope and prerequisites
 
 **What it does live.** The futures lane is one pinned contract with a pinned lot
-size, admitted as plan kind `target_futures` (`backend/strategies/live_service.py:66,1175`),
+size, admitted as plan kind `target_futures` (`backend/strategies/live_service.py:75,1217`),
 and its only step builder is `build_futures_steps`
 (`backend/strategies/live_sequence.py:612`). Two shapes:
 
@@ -18,10 +18,10 @@ and its only step builder is `build_futures_steps`
   is released only when the roll's own state machine reaches `releasing_old`,
   i.e. the FULL required replacement quantity is proven filled by the roll's own
   recorded replacement executions
-  (`backend/strategies/live_service.py:839-892`). A partial, rejected, stalled or
+  (`backend/strategies/live_service.py:881-934`). A partial, rejected, stalled or
   unknown acquisition never reaches that state and refuses
   `BLOCKER_ROLL_CLOSE_NOT_RELEASED` / a named roll refusal
-  (`backend/strategies/live_service.py:854,864,886-892`).
+  (`backend/strategies/live_service.py:896,906,928-934`).
 - The close is an **absolute flat** for this strategy's own attributed book, not a
   target-minus-current delta, and the released quantity is clamped again to the
   current attributed quantity
@@ -70,12 +70,18 @@ step marked **[owner approval]** needs the owner's explicit go-ahead.
 2. **[owner approval]** Add the account scope to `HOSTED_STRATEGY_ACCOUNT_SCOPES`
    and confirm account ingest covers it
    (`documents/hosted-strategies-live-deployment.md:169-190`).
-3. **[owner approval]** Follow the deploy order in
+3. **[owner approval]** Open this lane for new exposure: add `futures` to
+   `HOSTED_LIVE_LANES` in the deployment's untracked `.env` (all open lanes are
+   listed, e.g. `HOSTED_LIVE_LANES=cnc,mis,futures`), then restart `finance-app`.
+   Default deny: unset or empty opens no lane, an unknown name is ignored with a
+   startup warning, and closing a lane still releases reductions, exits and
+   square-offs (`backend/strategies/live_service.py:1413,1443-1481`).
+4. **[owner approval]** Follow the deploy order in
    [README.md](README.md#deployment-order-shared-c2-procedure). Futures opens
    after MIS in the C2 lane order
    (`documents/hosted-strategies-production-live-readiness-plan-2026-09-25.md:134`).
-4. Verify (section 3) before configuring a version.
-5. Configure the strategy's `live` mode and select the allowlisted scope.
+5. Verify (section 3) before configuring a version.
+6. Configure the strategy's `live` mode and select the allowlisted scope.
 
 ## 3. Verify
 
@@ -110,7 +116,7 @@ Ordered least to most drastic. Full semantics: [README.md](README.md#halt-ladder
 3. **Roll stall** — `POST .../rolls/{roll_id}/stall`
    (`backend/api/routers/strategies.py:1693`) records a stalled roll rather than
    releasing its close; the close stays withheld
-   (`backend/strategies/live_service.py:839-864`).
+   (`backend/strategies/live_service.py:881-906`).
 4. **Flatten** — `POST .../owner-actions/flatten`
    (`backend/api/routers/strategy_owner_actions.py:338`). For a live futures book
    the non-option reduction is not yet wired, so flatten refuses
@@ -129,8 +135,8 @@ fully proven), `ROLL_FILL_NOT_PROVEN`, `ROLL_ALREADY_OPEN`, `ROLL_PLAN_MISMATCH`
 
 | Blocked state | Evidence required | Repair path | Never auto-resolved |
 | --- | --- | --- | --- |
-| `close_old` withheld; acquisition partial/stalled/rejected/unknown | the roll's own recorded replacement executions must reach the FULL required quantity | `POST .../rolls/{roll_id}/prove-filled` (`backend/api/routers/strategies.py:1613`); a stall is recorded via `/stall` (`:1693`) | the close is never released on a partial or unknown acquisition (`backend/strategies/live_service.py:843-864`) |
-| Roll unknown / unbound | the roll binding on the frozen plan | re-derive via the roll read routes; an unbound plan may not close an open roll (`backend/strategies/live_service.py:860-871`) | a close is never aimed at another roll/account/quantity (`backend/strategies/live_service.py:845-850`) |
+| `close_old` withheld; acquisition partial/stalled/rejected/unknown | the roll's own recorded replacement executions must reach the FULL required quantity | `POST .../rolls/{roll_id}/prove-filled` (`backend/api/routers/strategies.py:1613`); a stall is recorded via `/stall` (`:1693`) | the close is never released on a partial or unknown acquisition (`backend/strategies/live_service.py:885-906`) |
+| Roll unknown / unbound | the roll binding on the frozen plan | re-derive via the roll read routes; an unbound plan may not close an open roll (`backend/strategies/live_service.py:902-913`) | a close is never aimed at another roll/account/quantity (`backend/strategies/live_service.py:887-892`) |
 | Roll old contract not flat | attributed book must prove zero | `POST .../rolls/{roll_id}/old-flat` (`backend/api/routers/strategies.py:1666`); quantity is clamped to the attributed book (`backend/strategies/live_sequence.py:700-712`) | never assumes flat from a partial close |
 | Unanswered plan step | the platform's own evidence | dead-submission disposition (`backend/api/routers/strategy_owner_actions.py:484,539`) | not auto-resolved; a staged protective order refuses (`DEAD_SUBMISSION_PROTECTIVE_FORBIDDEN`, `backend/api/services/owner_actions.py:98`) |
 | Live residual on a roll step | the claim's `repair_required` residual | owner residual disposition `POST .../plans/{plan_id}/residual` `action="abandon"` (`backend/api/routers/strategies.py:2384`) | never fabricates a fill; refuses while authority could still fill it (`backend/strategies/live_repair.py:20-26`) |
@@ -163,4 +169,4 @@ Migrations are fix-forward; do not downgrade
   nothing is sent (`backend/strategies/live_sequence.py:665-676`).
 - **`RollStateMachine` storage is not imported into the options lane**, but the
   futures lane reuses it directly; a roll's release is decided by its own state,
-  not by the plan (`backend/strategies/live_service.py:843-864`).
+  not by the plan (`backend/strategies/live_service.py:885-906`).

@@ -94,7 +94,17 @@ async def start_live_outcome_consumer(app: FastAPI) -> Optional[asyncio.Task]:
         # inside the release claim transaction, so a revocation (or a switch back
         # to manual mode) between two legs prevents the second submission.
         from backend.strategies.execution_requests import ExecutionRequestService
-        from backend.strategies.live_service import LivePlanExecutor
+        from backend.strategies.live_service import LivePlanExecutor, enabled_live_lanes
+
+        # The C2 per-lane allowlist is read here too, so STARTUP (not only the
+        # first admitted plan) reports which lanes this deployment will open for
+        # new exposure - and an unknown name in ``HOSTED_LIVE_LANES`` warns and is
+        # ignored instead of passing unnoticed. The reader is per call, so an env
+        # change plus a restart takes effect.
+        logger.info(
+            "hosted live lanes open for new exposure: %s",
+            ",".join(enabled_live_lanes()) or "(none)",
+        )
 
         factory = getattr(app.state, "strategies_session_factory", None)
         if factory is None:

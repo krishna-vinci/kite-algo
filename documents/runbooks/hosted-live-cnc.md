@@ -12,7 +12,7 @@ readiness plan's C1/C2 sections
 
 **What it does live.** The CNC lane executes two plan kinds against the real
 account: `target_weights` (portfolio rebalance) and `single_instrument` (one leg)
-(`backend/strategies/live_service.py:69,1342`; lane constants
+(`backend/strategies/live_service.py:78,1384`; lane constants
 `backend/strategies/live_sequence.py:57-58`). A portfolio plan materializes
 **reductions first**, then increases; each dependent buy is
 materialized `withheld` and released only by its lane's release rule
@@ -84,15 +84,21 @@ run.
    `HOSTED_STRATEGY_ACCOUNT_SCOPES` in the deployment's untracked `.env`. This is
    the expansion that was previously rejected by automatic review in
    `documents/hosted-strategies-live-deployment.md:203-230`.
-4. **[owner approval]** Confirm the account-fill ingest scope
+4. **[owner approval]** Open this lane for new exposure: add `cnc` to
+   `HOSTED_LIVE_LANES` in the deployment's untracked `.env` (all open lanes are
+   listed, e.g. `HOSTED_LIVE_LANES=cnc`), then restart `finance-app`. Default deny:
+   unset or empty opens no lane, an unknown name is ignored with a startup
+   warning, and closing a lane still releases reductions, exits and square-offs
+   (`backend/strategies/live_service.py:1413,1443-1481`).
+5. **[owner approval]** Confirm the account-fill ingest scope
    (`ACCOUNT_INGEST_ACCOUNT_SCOPES`) covers the same account, otherwise live
    settlement cannot prove flatness
    (`documents/hosted-strategies-live-deployment.md:169-190`).
-5. **[owner approval]** Follow the deployment order in [README.md](README.md#deployment-order-shared-c2-procedure):
+6. **[owner approval]** Follow the deployment order in [README.md](README.md#deployment-order-shared-c2-procedure):
    build -> recreate `finance-app` -> wait for migration + health -> recreate the
    other three services.
-6. Verify (section 3) before configuring any strategy version.
-7. Configure the strategy's `live` mode and select the allowlisted account scope;
+7. Verify (section 3) before configuring any strategy version.
+8. Configure the strategy's `live` mode and select the allowlisted account scope;
    `live_requires_owner_approval` is always true
    (`backend/api/routers/strategies.py:581`).
 
@@ -151,7 +157,7 @@ Ordered least to most drastic. Full semantics and the exact "never does" list:
 
 | Blocked state | Evidence required | Repair path | Never auto-resolved |
 | --- | --- | --- | --- |
-| Dependent buy stays `withheld` because a reduction is not confirmed | the reduction's own confirmed fills | wait for the reduction to fill; if it is rejected/cancelled with no fill the buy records `STAGED_FUNDING_REDUCTION_NOT_CONFIRMED` and stays in flight (`backend/strategies/live_service.py:653`; `backend/strategies/live_adapter.py:1313`). A buy whose every funding leg is terminal-but-unfilled is closed by the bounded `staged_dependent_abandoned` disposition (`backend/strategies/live_repair.py:624-717`) | the buy is never auto-released, and a *projected* sale never funds it (`documents/hosted-live-staged-financing-c1-1-design-2026-09-25.md:83`) |
+| Dependent buy stays `withheld` because a reduction is not confirmed | the reduction's own confirmed fills | wait for the reduction to fill; if it is rejected/cancelled with no fill the buy records `STAGED_FUNDING_REDUCTION_NOT_CONFIRMED` and stays in flight (`backend/strategies/live_service.py:673`; `backend/strategies/live_adapter.py:1313`). A buy whose every funding leg is terminal-but-unfilled is closed by the bounded `staged_dependent_abandoned` disposition (`backend/strategies/live_repair.py:624-717`) | the buy is never auto-released, and a *projected* sale never funds it (`documents/hosted-live-staged-financing-c1-1-design-2026-09-25.md:83`) |
 | Reduction terminal cancel with a residual fill | the claim's `repair_required` state and its proven residual | owner disposition `POST .../plans/{plan_id}/residual` with `action="abandon"` (`backend/api/routers/strategies.py:2385`; `backend/api/schemas/proposals.py:163`); writes `residual_abandoned` (`backend/strategies/live_repair.py:78`) | never fabricates a fill or a rejection; refuses while the plan's authority could still fill the residual (`backend/strategies/live_repair.py:470,768`) |
 | Dependent buy can never be funded (every funding leg terminal but unfilled, authority provably gone) | funding-leg evidence + proven-gone authority | staged dependent abandonment, disposition `staged_dependent_abandoned` (`backend/strategies/live_repair.py:84,622-717`) | unknown authority stays `LIVE_REPAIR_AUTHORITY_UNKNOWN` (`backend/strategies/live_repair.py:470,768`) |
 | Unanswered plan step (unknown send / open remainder) | the platform's own paper/broker evidence | dead-submission disposition, one of `filled`/`rejected`/`cancelled`/`failed_never_submitted`/`failed_residual_abandoned` (`backend/api/routers/strategy_owner_actions.py:488,543`) | only dispositions the evidence supports are offered (`backend/api/services/owner_actions.py:3410-3450`) |

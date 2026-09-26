@@ -11,10 +11,17 @@ phase and reuses this same executor/factory.
 
 The deployment setting ``HOSTED_LIVE_ENABLED`` gates ALL live execution here and
 is false by default.
+
+``HOSTED_LIVE_LANES`` (default deny) additionally says WHICH lanes may take NEW
+exposure. A lane that is not named refuses a new plan (``LIVE_LANE_NOT_ENABLED``)
+and any later exposure-INCREASING release in that lane; reductions, exits, the
+MIS square-off, repair and flatten keep working while a lane is closed.
 """
 
 from __future__ import annotations
 
+import logging
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Mapping, Optional
 
@@ -57,6 +64,8 @@ from backend.strategies.reservations import ReservationLedger
 from backend.strategies.settlement import ExecutionBarrier
 
 LIVE_ENVIRONMENT = "live"
+
+logger = logging.getLogger(__name__)
 
 #: The exchange-local zone every platform square-off schedule is expressed in.
 #: ``mis_squareoff.squareoff_schedule()`` returns exchange-local wall-clock times
@@ -233,6 +242,17 @@ class LivePlanExecutor:
                 )
             lane = lane_for_plan(plan)
             increasing = any(self._increases_exposure(dict(leg)) for leg in legs)
+            # The C2 per-lane allowlist, checked at ADMISSION: a lane that this
+            # deployment has not opened cannot take NEW exposure. A plan whose
+            # frozen legs only reduce is still admitted, so closing a lane never
+            # blocks an exit, a repair or a flatten.
+            if increasing and not live_lane_enabled(lane, self._environ):
+                raise ExecutionRefusal(
+                    "LIVE_LANE_NOT_ENABLED",
+                    live_lane_disabled_detail(
+                        lane=lane, plan_id=plan_id, environ=self._environ
+                    ),
+                )
             if increasing or reservation is not None:
                 self._reservation_preconditions(reservation)
         except ExecutionRefusal as exc:
@@ -668,6 +688,28 @@ class LivePlanExecutor:
                             },
                         )
                         counts["blocked"] += 1
+                continue
+
+            # A lane CLOSED after this plan was admitted must not keep opening
+            # risk: an exposure-INCREASING release is refused by name, with the
+            # SAME allowlist and the SAME frozen-delta classification the
+            # admission gate uses. Reducing steps - exits, protective and staged
+            # exits, the MIS square-off, repair and flatten - never see this
+            # gate, so closing a lane cannot block risk reduction.
+            plan_lane = lane_for_plan(plan)
+            if bool(getattr(spec, "increases_exposure", False)) and not live_lane_enabled(
+                plan_lane, self._environ
+            ):
+                self.sequence.record_release_blocker(
+                    plan_id=plan_id,
+                    step_no=step_no,
+                    reason_code="LIVE_LANE_NOT_ENABLED",
+                    detail=live_lane_disabled_detail(
+                        lane=plan_lane, plan_id=plan_id, environ=self._environ
+                    )
+                    | {"step_no": step_no},
+                )
+                counts["blocked"] += 1
                 continue
 
             # The authority must re-derive from PERSISTED records on every pass:
@@ -1350,14 +1392,107 @@ _LANE_PLAN_KINDS = {
 def hosted_live_lanes() -> list:
     """The live lanes this deployment can actually execute.
 
-    Two independent gates must agree: the lane's step builder must be registered
-    (``live_sequence.hosted_live_lanes``) AND the executor must admit the plan kind
-    the lane is entered through. Anything else is not advertised.
+    Three independent gates must agree: the lane's step builder must be
+    registered (``live_sequence.hosted_live_lanes``), the executor must admit the
+    plan kind the lane is entered through, AND the deployment must have opened the
+    lane in ``HOSTED_LIVE_LANES`` (default deny). Anything else is not advertised.
     """
     from .live_sequence import hosted_live_lanes as _registered_lanes
 
+    enabled = set(enabled_live_lanes())
     return [
         lane
         for lane in _registered_lanes()
-        if all(kind in LIVE_PLAN_KINDS for kind in _LANE_PLAN_KINDS.get(lane, ()))
+        if lane in enabled
+        and all(kind in LIVE_PLAN_KINDS for kind in _LANE_PLAN_KINDS.get(lane, ()))
     ]
+
+
+#: The deployment setting that opens lanes for NEW exposure, one at a time (the
+#: C2 rollout order). A comma-separated list of PUBLIC lane names.
+ENABLED_LIVE_LANES_ENV = "HOSTED_LIVE_LANES"
+
+#: The public lane names ``HOSTED_LIVE_LANES`` may name: exactly the lanes the
+#: executor maps plan kinds for (``_LANE_PLAN_KINDS``), so the allowlist cannot
+#: drift from the admission map. Anything else is ignored.
+KNOWN_LIVE_LANES = tuple(_LANE_PLAN_KINDS)
+
+#: The public lane that owns each INTERNAL lane implementation (the value
+#: ``live_sequence.lane_for_plan`` returns). MIS is not a plan kind: that function
+#: splits it out of the single-instrument shape by frozen product, so the
+#: single-instrument implementation belongs to ``cnc`` and ``LANE_MIS`` to ``mis``.
+_LANE_PUBLIC_NAMES = {
+    "target_weights": "cnc",
+    "single_instrument": "cnc",
+    "mis": "mis",
+    "futures_roll": "futures",
+    "option_structure": "options",
+}
+
+#: Unknown lane names already reported, so the per-call read warns ONCE per
+#: process (at startup) instead of on every release pass. A restart clears it.
+_WARNED_UNKNOWN_LANES: set = set()
+
+
+def public_live_lane(lane: str) -> str:
+    """The PUBLIC lane name for a lane name or an internal lane implementation."""
+    name = str(lane or "").strip().lower()
+    return _LANE_PUBLIC_NAMES.get(name, name)
+
+
+def enabled_live_lanes(environ: Optional[Mapping[str, str]] = None) -> List[str]:
+    """The public lanes ``HOSTED_LIVE_LANES`` opens, in the order they are named.
+
+    DEFAULT DENY: unset, empty or whitespace-only means NO lane may take new
+    exposure. An unknown name is ignored - never guessed, never a wildcard - and
+    reported at startup so a typo is visible rather than silently ignored.
+
+    Read PER CALL (never cached at import), so an env change plus a restart takes
+    effect without a code change.
+    """
+    source = os.environ if environ is None else environ
+    raw = str(source.get(ENABLED_LIVE_LANES_ENV, "") or "")
+    enabled: List[str] = []
+    for part in raw.split(","):
+        name = part.strip().lower()
+        if not name:
+            continue
+        if name not in KNOWN_LIVE_LANES:
+            if name not in _WARNED_UNKNOWN_LANES:
+                _WARNED_UNKNOWN_LANES.add(name)
+                logger.warning(
+                    "%s names the unknown live lane %r; ignoring it (known lanes: %s)",
+                    ENABLED_LIVE_LANES_ENV,
+                    name,
+                    ",".join(KNOWN_LIVE_LANES),
+                )
+            continue
+        if name not in enabled:
+            enabled.append(name)
+    return enabled
+
+
+def live_lane_enabled(lane: str, environ: Optional[Mapping[str, str]] = None) -> bool:
+    """Whether ONE lane may take new exposure in this deployment.
+
+    Accepts either the public lane name (``cnc``) or the internal lane
+    implementation ``live_sequence.lane_for_plan`` returns (``target_weights``).
+    """
+    return public_live_lane(lane) in set(enabled_live_lanes(environ))
+
+
+def live_lane_disabled_detail(
+    *, lane: str, plan_id: str = "", environ: Optional[Mapping[str, str]] = None
+) -> dict:
+    """The ``LIVE_LANE_NOT_ENABLED`` detail: the lane refused, and what IS open."""
+    return {
+        "plan_id": str(plan_id or ""),
+        "lane": public_live_lane(lane),
+        "enabled_lanes": enabled_live_lanes(environ),
+        "setting": ENABLED_LIVE_LANES_ENV,
+        "message": (
+            "this live lane is not open for new exposure in this deployment; "
+            f"add it to {ENABLED_LIVE_LANES_ENV} and restart finance-app after "
+            "owner approval"
+        ),
+    }
