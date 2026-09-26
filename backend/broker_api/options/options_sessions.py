@@ -351,40 +351,60 @@ class OptionsSession:
                     inst_by_strike[inst["strike"]][inst["option_type"]] = inst
                     new_desired_tokens.add(inst["instrument_token"])
 
-                # Vectorized computation
-                # Greeks are Black-76 on the synthetic forward/sigma above.
-                greeks_ce, greeks_pe = None, None
-                if forward and T > MIN_T and sigma_expiry:
-                    try:
-                        logger.debug(f"[{self.underlying}] Running vectorized computation for {expiry_str}")
-                        k_array = np.array(sorted(window_strikes))
-                        greeks_ce = black76_greeks("CE", forward, k_array, T, sigma_expiry)
-                        greeks_pe = black76_greeks("PE", forward, k_array, T, sigma_expiry)
-                    except Exception as e:
-                        logger.error(f"[{self.underlying}] Vectorized computation failed for {expiry_str}: {e}", exc_info=True)
-                        # Do not fallback, just skip greeks for this expiry
-                        greeks_ce, greeks_pe = None, None
+                sorted_strikes = sorted(window_strikes)
+
+                # Per-strike smile: solve each strike's own IV from its OTM
+                # option price (put below forward, call above forward, ATM
+                # averaged across both sides), then compute that strike's
+                # Greeks with its own IV. Strikes whose solve fails (missing
+                # price, no convergence, or intrinsic violation) fall back to
+                # the expiry-level ATM IV and are flagged accordingly.
+                per_strike_sigma, iv_source_by_strike = self._solve_per_strike_iv(
+                    sorted_strikes, atm_strike, forward, T, sigma_expiry, inst_by_strike
+                )
 
                 rows = []
-                for i, strike in enumerate(sorted(window_strikes)):
+                for i, strike in enumerate(sorted_strikes):
                     row = {"strike": strike, "CE": None, "PE": None}
-                    for option_type, greeks_set in [("CE", greeks_ce), ("PE", greeks_pe)]:
+                    strike_sigma = per_strike_sigma[i]
+                    iv_source = iv_source_by_strike[i]
+                    for option_type in ("CE", "PE"):
                         inst = inst_by_strike.get(strike, {}).get(option_type)
                         if not inst:
                             continue
 
                         tick = self.manager.market_data.latest_ticks.get(inst["instrument_token"])
                         ltp = tick.get("last_price") if tick else None
-                        
+
                         greeks = {}
-                        if greeks_set:
-                            greeks = {
-                                "delta": greeks_set["delta"][i],
-                                "gamma": greeks_set["gamma"][i],
-                                "theta": greeks_set["theta"][i] / 365.0,
-                                "vega": greeks_set["vega"][i] / 100.0,
-                                "rho": greeks_set["rho"],
-                            }
+                        if (
+                            forward
+                            and T > MIN_T
+                            and strike_sigma is not None
+                            and not np.isnan(strike_sigma)
+                        ):
+                            try:
+                                greeks_unit = black76_greeks(
+                                    option_type, forward, strike, T, float(strike_sigma)
+                                )
+                                greeks = {
+                                    "delta": greeks_unit.get("delta"),
+                                    "gamma": greeks_unit.get("gamma"),
+                                    "theta": greeks_unit.get("theta", 0.0) / 365.0
+                                    if greeks_unit.get("theta") is not None
+                                    else None,
+                                    "vega": greeks_unit.get("vega", 0.0) / 100.0
+                                    if greeks_unit.get("vega") is not None
+                                    else None,
+                                    "rho": greeks_unit.get("rho"),
+                                }
+                            except Exception as e:
+                                logger.error(
+                                    f"[{self.underlying}] Per-strike Greeks computation failed for "
+                                    f"{expiry_str} strike={strike}: {e}",
+                                    exc_info=True,
+                                )
+                                greeks = {}
 
                         exchange_ts = tick.get("exchange_timestamp") if tick else None
                         stale_age_sec = None
@@ -398,7 +418,8 @@ class OptionsSession:
                             "tsym": inst["tradingsymbol"],
                             "lot_size": inst.get("lot_size"),
                             "ltp": ltp,
-                            "iv": sigma_expiry,
+                            "iv": strike_sigma if strike_sigma is not None and not np.isnan(strike_sigma) else None,
+                            "iv_source": iv_source,
                             "oi": tick.get("oi") if tick else None,
                             "delta": greeks.get("delta"),
                             "gamma": greeks.get("gamma"),
@@ -535,6 +556,7 @@ class OptionsSession:
                             "lot_size": inst.get("lot_size"),
                             "ltp": ltp,
                             "iv": iv,
+                            "iv_source": "expiry_fallback",
                             "oi": tick.get("oi") if tick else None,
                             "delta": greeks.get("delta"),
                             "gamma": greeks.get("gamma"),
@@ -560,6 +582,92 @@ class OptionsSession:
                 }
 
         return per_expiry_data, new_desired_tokens, spot_ltp
+
+    def _solve_per_strike_iv(
+        self,
+        sorted_strikes: List[float],
+        atm_strike: float,
+        forward: Optional[float],
+        T: float,
+        sigma_expiry: Optional[float],
+        inst_by_strike: Dict[float, Dict[str, Any]],
+    ) -> tuple[List[Optional[float]], List[str]]:
+        """
+        Solves a per-strike implied volatility "smile" instead of reusing a
+        single expiry-level sigma for every strike.
+
+        For each strike, the OTM side is used to back out the IV: puts below
+        the synthetic forward, calls above it; the ATM strike averages both
+        sides when available. A strike whose solve fails (no OTM price, no
+        convergence, or an intrinsic-value violation) falls back to the
+        expiry-level ATM IV (``sigma_expiry``) and is flagged with
+        ``iv_source: "expiry_fallback"``; a successful per-strike solve is
+        flagged ``iv_source: "per_strike"``.
+        """
+        n = len(sorted_strikes)
+        fallback_sigma = sigma_expiry if sigma_expiry is not None else None
+        per_strike_sigma: List[Optional[float]] = [fallback_sigma] * n
+        iv_source: List[str] = ["expiry_fallback"] * n
+
+        if not forward or T <= MIN_T or n == 0:
+            return per_strike_sigma, iv_source
+
+        k_array = np.array(sorted_strikes, dtype=np.float64)
+        ce_ltp_arr = np.full(n, np.nan)
+        pe_ltp_arr = np.full(n, np.nan)
+
+        for i, strike in enumerate(sorted_strikes):
+            ce_inst = inst_by_strike.get(strike, {}).get("CE")
+            if ce_inst:
+                tick = self.manager.market_data.latest_ticks.get(ce_inst["instrument_token"])
+                ltp = tick.get("last_price") if tick else None
+                if ltp is not None:
+                    ce_ltp_arr[i] = ltp
+            pe_inst = inst_by_strike.get(strike, {}).get("PE")
+            if pe_inst:
+                tick = self.manager.market_data.latest_ticks.get(pe_inst["instrument_token"])
+                ltp = tick.get("last_price") if tick else None
+                if ltp is not None:
+                    pe_ltp_arr[i] = ltp
+
+        ce_iv_arr = np.full(n, np.nan)
+        pe_iv_arr = np.full(n, np.nan)
+
+        try:
+            ce_mask = ~np.isnan(ce_ltp_arr)
+            if ce_mask.any():
+                solved = implied_vol_from_price_black76(
+                    "CE", forward, k_array[ce_mask], T, ce_ltp_arr[ce_mask]
+                )
+                ce_iv_arr[ce_mask] = solved
+            pe_mask = ~np.isnan(pe_ltp_arr)
+            if pe_mask.any():
+                solved = implied_vol_from_price_black76(
+                    "PE", forward, k_array[pe_mask], T, pe_ltp_arr[pe_mask]
+                )
+                pe_iv_arr[pe_mask] = solved
+        except Exception as e:
+            logger.error(f"[{self.underlying}] Per-strike IV solve failed: {e}", exc_info=True)
+            return per_strike_sigma, iv_source
+
+        for i, strike in enumerate(sorted_strikes):
+            if strike == atm_strike:
+                candidates = [v for v in (ce_iv_arr[i], pe_iv_arr[i]) if not np.isnan(v)]
+                if candidates:
+                    per_strike_sigma[i] = float(sum(candidates) / len(candidates))
+                    iv_source[i] = "per_strike"
+            elif strike < forward:
+                # Put wing is OTM below the forward.
+                if not np.isnan(pe_iv_arr[i]):
+                    per_strike_sigma[i] = float(pe_iv_arr[i])
+                    iv_source[i] = "per_strike"
+            else:
+                # Call wing is OTM above the forward.
+                if not np.isnan(ce_iv_arr[i]):
+                    per_strike_sigma[i] = float(ce_iv_arr[i])
+                    iv_source[i] = "per_strike"
+
+        return per_strike_sigma, iv_source
 
     def _compute_forward(
         self, expiry: date, atm_strike: float, spot_ltp: float
