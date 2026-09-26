@@ -240,8 +240,9 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
 - **After a crash or restart:** there is no reattach and no replay. Children are terminated and fenced on start
   (`supervisor.py:14-19,494-536`). Most ends go to `recovery_required`. Only a finite job that exits 0 with trade
   capability auto-continues (`continuation.py:450-472`).
-- **Stop:** SIGTERM, then SIGKILL after 10 s (`supervisor.py:1038-1043`). **Stopping does not flatten or cancel
-  orders** (`strategies.py:3202-3203`).
+- **Stop:** SIGTERM, then SIGKILL after 10 s (`supervisor.py:1038-1043`). A plain Stop **does not flatten or
+  cancel orders** (`strategies.py:3199-3203`); `POST .../jobs/{job}/stop` takes ``flatten: bool`` (default false)
+  and, when true, follows the stop with the governed strategy flatten, reporting both outcomes.
 - **Concurrency: PARTIAL.** One child at a time per runner (`supervisor.py:720,1091-1102`). The `concurrency`
   setting is validated but not used, and compose pins one container.
 - **Logs: PARTIAL.** They ship after the child terminates, are capped at 256 KiB, and are not streamed live
@@ -480,7 +481,8 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
 | Cancel pending | EXISTS | EXISTS | Reductions and protective legs cannot be cancelled |
 | Dead-submission disposition | EXISTS | EXISTS | |
 | Option owner exit | EXISTS | EXISTS | Via `option_run_repair.py:427-621` |
-| Flatten | EXISTS | **MISSING for non-option books** | Refuses `FLATTEN_LIVE_NONOPTION_UNSUPPORTED` |
+| Flatten | EXISTS | EXISTS | Live non-option books reduce through the live executor via `PlanExecutionPipeline` |
+| Kill switch (`POST /api/platform/kill-switch`) | EXISTS | EXISTS | Owner+same-origin, body `confirm: "FLATTEN ALL"`; stops every active job, flattens every exposed strategy, closes all live lanes |
 
 ---
 

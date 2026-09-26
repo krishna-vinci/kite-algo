@@ -433,6 +433,26 @@ class StopJobRequest(BaseModel):
 
     attempt: int = Field(ge=1)
     lease_epoch: Optional[int] = Field(default=None, ge=0)
+    #: When true, the strategy flatten (S3) is started AFTER the stop. Defaults
+    #: to false so a plain operator Stop keeps its existing "stop only" contract.
+    flatten: bool = False
+
+
+class StopJobFlattenView(BaseModel):
+    """The flatten outcome the stop-and-flatten request reports alongside the stop.
+
+    A named refusal is not a failed stop: the job is stopped either way, so the
+    refusal is reported here rather than replacing the stop outcome.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    started: bool
+    status: Optional[str] = None
+    operation_id: Optional[str] = None
+    evidence_digest: Optional[str] = None
+    rejection_reason: Optional[str] = None
+    detail: Dict[str, Any] = Field(default_factory=dict)
 
 
 class StopJobResponse(BaseModel):
@@ -442,6 +462,8 @@ class StopJobResponse(BaseModel):
     attempt: int
     idempotent: bool = False
     stop: JobStopView
+    #: Present only when the request asked to flatten; absent otherwise.
+    flatten: Optional[StopJobFlattenView] = None
 
 
 class DeliveryAttemptResponse(BaseModel):

@@ -247,6 +247,21 @@ def session_factory():
             )
             """
         )
+        # The broker order projection a LIVE pending-entry cancel reads to PROVE
+        # the order went terminal (``_broker_projection``); a cancel that cannot
+        # be seen as terminal is never an assumed cancellation.
+        cursor.execute(
+            """
+            CREATE TABLE public.order_state_projection (
+                account_id TEXT NOT NULL,
+                order_id TEXT NOT NULL,
+                latest_status TEXT NOT NULL DEFAULT 'OPEN',
+                last_seen_filled_quantity INTEGER NOT NULL DEFAULT 0,
+                terminal BOOLEAN NOT NULL DEFAULT 0,
+                PRIMARY KEY (account_id, order_id)
+            )
+            """
+        )
 
     Base.metadata.create_all(engine)
     yield sessionmaker(bind=engine, expire_on_commit=False)
@@ -420,6 +435,7 @@ def _seed_plan(
     phase=None,
     option_run_id=None,
     environment="paper",
+    account=ACCOUNT,
 ):
     session = session_factory()
     try:
@@ -427,7 +443,7 @@ def _seed_plan(
             StrategyProposal(
                 proposal_id=f"prop-{plan_id}",
                 strategy_id=strategy_id,
-                account_id=ACCOUNT,
+                account_id=str(account),
                 evaluation_id=f"eval-{plan_id}",
                 evaluation_kind="run_now",
                 strategy_run_id="run-1",
@@ -446,7 +462,7 @@ def _seed_plan(
                 plan_id=plan_id,
                 proposal_id=f"prop-{plan_id}",
                 strategy_id=strategy_id,
-                account_id=ACCOUNT,
+                account_id=str(account),
                 plan_kind=plan_kind,
                 plan_hash=f"hash-{plan_id}",
                 logical_plan={},
@@ -462,7 +478,7 @@ def _seed_plan(
                     option_run_id=str(option_run_id or RUN_ID),
                     worker_run_id="run-1",
                     strategy_id=strategy_id,
-                    account_id=ACCOUNT,
+                    account_id=str(account),
                     execution_environment=environment,
                     phase=phase,
                     created_at=datetime(2020, 1, 1, 10, 0, tzinfo=timezone.utc),
@@ -1353,6 +1369,7 @@ def _seed_bound_run(
     run_id="run-bound-1",
     owner_id="app:admin",
     environment="paper",
+    account=ACCOUNT,
 ):
     """The immutable run binding a flatten reduction plan is attributed to."""
     from backend.strategies.attribution_models import StrategyRunBinding
@@ -1363,13 +1380,88 @@ def _seed_bound_run(
                 strategy_run_id=str(run_id),
                 strategy_id=str(strategy_id),
                 owner_id=owner_id,
-                account_id=ACCOUNT,
+                account_id=str(account),
                 execution_environment=str(environment),
                 bound_by=owner_id,
                 binding_source="hosted_job",
             )
         )
         session.commit()
+
+
+def _seed_live_claim(
+    session_factory,
+    *,
+    strategy_id,
+    plan_id,
+    account,
+    order_id,
+    quantity=150,
+    filled=0,
+    step_no=1,
+    state="pending",
+    environment="live",
+):
+    """A durable LIVE claim still unresolved, plus its broker order projection."""
+    from backend.strategies.attribution_models import LivePlanSubmission
+
+    with session_factory() as session:
+        session.add(
+            LivePlanSubmission(
+                submission_id=f"sub-{plan_id}-{step_no}",
+                plan_id=str(plan_id),
+                step_no=int(step_no),
+                step_ref=f"{plan_id}:{step_no}",
+                strategy_id=str(strategy_id),
+                account_id=str(account),
+                execution_environment=str(environment),
+                state=str(state),
+                broker_order_ids=[str(order_id)],
+                delta_snapshot={
+                    "quantity": int(quantity),
+                    "filled_quantity": int(filled),
+                    "remaining_quantity": int(quantity) - int(filled),
+                },
+                detail={},
+            )
+        )
+        session.execute(
+            text(
+                "INSERT OR REPLACE INTO public.order_state_projection "
+                "(account_id, order_id, latest_status, last_seen_filled_quantity, "
+                " terminal) VALUES (:account, :order_id, 'OPEN', :filled, 0)"
+            ),
+            {
+                "account": str(account),
+                "order_id": str(order_id),
+                "filled": int(filled),
+            },
+        )
+        session.commit()
+
+
+class _FakeLiveCancelBoundary:
+    """The injectable broker cancel: proves the order terminal, like a real ack."""
+
+    def __init__(self, session_factory, *, events=None):
+        self.session_factory = session_factory
+        self.calls = []
+        self.events = events if events is not None else []
+
+    async def __call__(self, *, account_id, order_id):
+        self.calls.append((str(account_id), str(order_id)))
+        self.events.append(f"cancel:{order_id}")
+        with self.session_factory() as session:
+            session.execute(
+                text(
+                    "UPDATE public.order_state_projection "
+                    "SET terminal = 1, latest_status = 'CANCELLED' "
+                    "WHERE account_id = :account AND order_id = :order_id"
+                ),
+                {"account": str(account_id), "order_id": str(order_id)},
+            )
+            session.commit()
+        return {"order_id": str(order_id), "status": "cancelled"}
 
 
 def _seed_public_edge(
@@ -1435,16 +1527,21 @@ class _FakeReductionPipeline:
     production.
     """
 
-    def __init__(self, session_factory, *, zero_book=True, real_admission=False):
+    def __init__(
+        self, session_factory, *, zero_book=True, real_admission=False, events=None
+    ):
         self.session_factory = session_factory
         self.zero_book = zero_book
         self.real_admission = real_admission
         self.admit_calls = 0
         self.admitted = []
+        self.environments = []
         self.executed = []
+        self.events = events if events is not None else []
 
     def admit(self, plan, *, environment):
         self.admit_calls += 1
+        self.environments.append(str(environment))
         if not self.real_admission:
             verdict = {"admitted": True, "detail": {"source": "test_pipeline"}}
         else:
@@ -1458,6 +1555,7 @@ class _FakeReductionPipeline:
 
     async def execute(self, plan, *, actor):
         self.executed.append({"plan_id": plan.get("plan_id"), "actor": str(actor)})
+        self.events.append(f"reduce:{plan.get('plan_id')}")
         if self.zero_book:
             with self.session_factory() as session:
                 session.execute(
@@ -2098,17 +2196,37 @@ async def test_a_target_zero_plan_admits_while_an_increasing_plan_refuses_before
         assert pipeline.executed == []
 
 
+async def _create_live_strategy(client, live_account, name="live-flatten"):
+    created = await client.post(
+        BASE,
+        json={
+            "name": name,
+            "execution_mode": "live",
+            "job_kind": "finite",
+            "account_scope": live_account,
+            "max_duration_s": 21600,
+            "progress_deadline_s": 600,
+            "stale_exit_policy": "exit_on_worker_stale",
+        },
+    )
+    assert created.status_code == 200, created.text
+    return created.json()["strategy_id"]
+
+
 @pytest.mark.asyncio
-async def test_live_nonoption_flatten_refuses_by_name_while_reporting_option_work(
+async def test_live_nonoption_flatten_cancels_pending_first_then_reduces(
     session_factory, monkeypatch
 ):
-    """Section 3 step 5 (decisions): live non-option fails closed, options report."""
-    # A LIVE hosted strategy is scoped to a real broker account, so the policy has
-    # to authorize that scope as well as the paper one.
+    """Section 3.5, live: pending entry cancelled first, then a reduce-only plan.
+
+    The live book takes the SAME governed path the paper book does: the pipeline
+    dispatches the frozen target-zero plan to the live executor, and the item is
+    ``done`` only when the strategy's own attributed quantity is zero.
+    """
+    from backend.strategies.attribution_models import StrategyRunBinding  # noqa: F401
+
     live_account = "kite:liveuser"
-    monkeypatch.setenv(
-        "HOSTED_STRATEGY_ACCOUNT_SCOPES", f"{ACCOUNT},{live_account}"
-    )
+    monkeypatch.setenv("HOSTED_STRATEGY_ACCOUNT_SCOPES", f"{ACCOUNT},{live_account}")
     snapshot = _OneRunSnapshot(_one_run_row(status="exited"))
     run_store = _FakeRunStore({RUN_ID: _flat_run()})
     runner = _ScriptedExitRunner(
@@ -2124,21 +2242,117 @@ async def test_live_nonoption_flatten_refuses_by_name_while_reporting_option_wor
             }
         ]
     )
+    tcs_id, tcs = "NSE:TCS", "TCS"
     async with _client(session_factory, monkeypatch) as client:
-        created = await client.post(
-            BASE,
-            json={
-                "name": "live-flatten",
-                "execution_mode": "live",
-                "job_kind": "finite",
-                "account_scope": live_account,
-                "max_duration_s": 21600,
-                "progress_deadline_s": 600,
-                "stale_exit_policy": "exit_on_worker_stale",
-            },
-        )
-        assert created.status_code == 200, created.text
-        strategy_id = created.json()["strategy_id"]
+        strategy_id = await _create_live_strategy(client, live_account)
+    # A live attributed CNC book flatten must reduce to zero...
+    _seed_projection(
+        session_factory,
+        strategy_id=strategy_id,
+        instrument_id=EQ_ID,
+        product="CNC",
+        net_quantity=150,
+        environment="live",
+        account=live_account,
+    )
+    # ...and a still-unresolved live entry that flatten must cancel FIRST.
+    _seed_plan(
+        session_factory,
+        strategy_id=strategy_id,
+        plan_id="plan-live-entry",
+        resolved={
+            "target_kind": "single_instrument",
+            "legs": [
+                {
+                    "instrument_id": tcs_id,
+                    "tradingsymbol": tcs,
+                    "broker_symbol": tcs,
+                    "side": "BUY",
+                    "product": "CNC",
+                    "quantity": 150,
+                    "signed_quantity": 150,
+                }
+            ],
+        },
+        plan_kind="single_instrument",
+        account=live_account,
+    )
+    _seed_live_claim(
+        session_factory,
+        strategy_id=strategy_id,
+        plan_id="plan-live-entry",
+        account=live_account,
+        order_id="LIVE-ENTRY-1",
+        quantity=150,
+    )
+    _seed_catalog(session_factory)
+    _seed_catalog(
+        session_factory,
+        instrument_id=tcs_id,
+        symbol=tcs,
+        broker_token=738561,
+        generation="gen-flatten-2",
+    )
+    events: list = []
+    boundary = _FakeLiveCancelBoundary(session_factory, events=events)
+    pipeline = _FakeReductionPipeline(session_factory, events=events)
+
+    async with _client(
+        session_factory,
+        monkeypatch,
+        run_store=run_store,
+        owned_work_snapshot_service=snapshot,
+        owner_action_option_exit_runner=runner,
+        owner_action_broker_cancel=boundary,
+        owner_action_reduction_plan_builder=_canned_reduction_builder(),
+        owner_action_reduction_pipeline=pipeline,
+    ) as client:
+        response = await _post_flatten(client, strategy_id)
+        assert response.status_code == 200, response.text
+        body = response.json()
+        # A resume preserves the finished cancel and the finished reduction.
+        resumed = await _post_flatten(client, strategy_id)
+        assert resumed.status_code == 200, resumed.text
+        again = resumed.json()
+
+    # The live pending entry was cancelled through the broker boundary...
+    cancelled = _flatten_item(body, "cancel_pending", "cancel:plan-live-entry:1")
+    assert cancelled["state"] == "done", cancelled
+    assert cancelled["detail"]["outcome"] == "cancelled"
+    assert boundary.calls == [(live_account, "LIVE-ENTRY-1")]
+    # ...and the live non-option book was reduced by a target-zero plan that went
+    # through the LIVE executor path, never the ``..._UNSUPPORTED`` refusal.
+    reduction = _flatten_item(body, "nonoption_reduction")
+    assert reduction["state"] == "done", reduction
+    assert reduction["reason_code"] is None
+    assert reduction["detail"]["target_quantity"] == 0
+    assert pipeline.environments == ["live"]
+    assert len(pipeline.executed) == 1
+    # Cancel happened BEFORE the reduction.
+    assert events == ["cancel:LIVE-ENTRY-1", "reduce:plan-flatten-eq"]
+    # The broker cancel is proven, but the live claim itself is resolved only when
+    # the outcome consumer ingests it, so flatten is honestly still ``in_progress``.
+    assert body["status"] == "in_progress", body["items"]
+    assert "no_live_unresolved_submission" in body["missing"]
+    assert "books_zero" not in body["missing"]
+    # The resume did not re-run either side effect.
+    assert _flatten_item(again, "cancel_pending", "cancel:plan-live-entry:1")["state"] == (
+        "done"
+    )
+    assert _flatten_item(again, "nonoption_reduction")["state"] == "done"
+    assert len(pipeline.executed) == 1
+    assert len(boundary.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_live_flatten_refuses_an_increasing_plan_before_admission(
+    session_factory, monkeypatch
+):
+    """Live flatten may only reduce: an increasing plan never reaches admission."""
+    live_account = "kite:liveuser"
+    monkeypatch.setenv("HOSTED_STRATEGY_ACCOUNT_SCOPES", f"{ACCOUNT},{live_account}")
+    async with _client(session_factory, monkeypatch) as client:
+        strategy_id = await _create_live_strategy(client, live_account, name="live-incr")
     _seed_projection(
         session_factory,
         strategy_id=strategy_id,
@@ -2149,25 +2363,134 @@ async def test_live_nonoption_flatten_refuses_by_name_while_reporting_option_wor
         account=live_account,
     )
     _seed_catalog(session_factory)
+    pipeline = _FakeReductionPipeline(session_factory)
 
     async with _client(
         session_factory,
         monkeypatch,
-        run_store=run_store,
-        owned_work_snapshot_service=snapshot,
-        owner_action_option_exit_runner=runner,
+        owner_action_reduction_plan_builder=_canned_reduction_builder(target=300),
+        owner_action_reduction_pipeline=pipeline,
     ) as client:
         response = await _post_flatten(client, strategy_id)
         assert response.status_code == 200, response.text
         body = response.json()
 
-    # The option work that COULD be done is reported done...
-    option = _flatten_item(body, "option_exit", f"option_exit:{RUN_ID}")
-    assert option["state"] == "done", option
-    # ...and the live non-option book refuses by name instead of being liquidated.
     reduction = _flatten_item(body, "nonoption_reduction")
     assert reduction["state"] == "blocked", reduction
-    assert reduction["reason_code"] == "FLATTEN_LIVE_NONOPTION_UNSUPPORTED"
-    assert body["refusal"] == "FLATTEN_LIVE_NONOPTION_UNSUPPORTED"
-    assert body["status"] == "blocked"
-    assert "books_zero" in body["missing"]
+    assert reduction["reason_code"] == "FLATTEN_PLAN_INCREASES_EXPOSURE"
+    assert pipeline.admit_calls == 0
+    assert pipeline.executed == []
+
+
+@pytest.mark.asyncio
+async def test_job_stop_with_flatten_stops_then_flattens_and_reports_both(
+    session_factory, monkeypatch
+):
+    """Stop-and-flatten: the job stops AND the strategy is flattened, both reported."""
+    async with _client(session_factory, monkeypatch) as client:
+        strategy_id = await _create(client)
+    job_id = _seed_job(session_factory, strategy_id=strategy_id, status="queued")
+    _seed_projection(
+        session_factory,
+        strategy_id=strategy_id,
+        instrument_id=EQ_ID,
+        product="CNC",
+        net_quantity=150,
+    )
+    _seed_catalog(session_factory)
+    pipeline = _FakeReductionPipeline(session_factory)
+
+    async with _client(
+        session_factory,
+        monkeypatch,
+        owner_action_reduction_plan_builder=_canned_reduction_builder(),
+        owner_action_reduction_pipeline=pipeline,
+    ) as client:
+        response = await client.post(
+            f"{BASE}/{strategy_id}/jobs/{job_id}/stop",
+            json={"attempt": 1, "flatten": True},
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+
+    assert body["stop"]["state"] == "confirmed"
+    assert body["flatten"]["started"] is True, body["flatten"]
+    assert body["flatten"]["status"] == "complete", body["flatten"]
+    assert body["flatten"]["operation_id"]
+    assert _rows(
+        session_factory,
+        "SELECT status FROM strategy_jobs WHERE id = :id",
+        {"id": job_id},
+    )[0]["status"] == "stopped"
+    assert len(pipeline.executed) == 1
+
+
+@pytest.mark.asyncio
+async def test_job_stop_without_flatten_never_flattens(session_factory, monkeypatch):
+    """The default Stop keeps its stop-only contract."""
+    async with _client(session_factory, monkeypatch) as client:
+        strategy_id = await _create(client)
+    job_id = _seed_job(session_factory, strategy_id=strategy_id, status="queued")
+    _seed_projection(
+        session_factory,
+        strategy_id=strategy_id,
+        instrument_id=EQ_ID,
+        product="CNC",
+        net_quantity=150,
+    )
+    _seed_catalog(session_factory)
+    pipeline = _FakeReductionPipeline(session_factory)
+
+    async with _client(
+        session_factory,
+        monkeypatch,
+        owner_action_reduction_plan_builder=_canned_reduction_builder(),
+        owner_action_reduction_pipeline=pipeline,
+    ) as client:
+        response = await client.post(
+            f"{BASE}/{strategy_id}/jobs/{job_id}/stop", json={"attempt": 1}
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+
+    assert body["stop"]["state"] == "confirmed"
+    assert body.get("flatten") is None
+    assert pipeline.executed == []
+    assert _rows(
+        session_factory, "SELECT operation_id FROM strategy_flatten_operations"
+    ) == []
+
+
+@pytest.mark.asyncio
+async def test_job_stop_with_flatten_reports_a_refusal_without_hiding_the_stop(
+    session_factory, monkeypatch
+):
+    """A flatten refusal leaves the stop in place and names the refusal."""
+    async with _client(session_factory, monkeypatch) as client:
+        strategy_id = await _create(client)
+    # A LAUNCHED running job is evaluation authority whose stop is not yet
+    # PROVEN, so flatten refuses rather than racing a child that may still trade.
+    job_id = _seed_job(
+        session_factory,
+        strategy_id=strategy_id,
+        status="running",
+        handoff_at=datetime.now(timezone.utc),
+    )
+
+    async with _client(session_factory, monkeypatch) as client:
+        response = await client.post(
+            f"{BASE}/{strategy_id}/jobs/{job_id}/stop",
+            json={"attempt": 1, "flatten": True},
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+
+    # The stop WAS requested (durably) even though the flatten could not proceed.
+    assert body["stop"]["state"] == "stopping"
+    assert body["flatten"]["started"] is False
+    assert body["flatten"]["rejection_reason"] == "FLATTEN_EVALUATION_ACTIVE"
+    assert _rows(
+        session_factory,
+        "SELECT desired_state FROM strategy_jobs WHERE id = :id",
+        {"id": job_id},
+    )[0]["desired_state"] == "stopped"

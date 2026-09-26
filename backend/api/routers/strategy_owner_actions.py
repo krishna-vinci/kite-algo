@@ -96,13 +96,32 @@ def _service(
     repo: SqlAlchemyStrategyRepository = Depends(_repository),
     owner: str = Depends(require_strategy_owner),
 ) -> OwnerActionsService:
+    """The action service over the app's own durable stores (HTTP dependency)."""
+    return build_owner_actions_service(
+        request,
+        session_factory,
+        repo,
+        strategy_id=str(strategy_id),
+        owner=str(owner),
+    )
+
+
+def build_owner_actions_service(
+    request: Request,
+    session_factory: Any,
+    repo: Any,
+    *,
+    strategy_id: str,
+    owner: str,
+) -> OwnerActionsService:
     """The action service over the app's own durable stores.
 
     The paper runtime and the option-run store are whatever the app wired; a
     deployment that has none refuses by name rather than inventing a boundary.
     Flatten (S3) additionally gets the SAME S2 owner-exit it would get from the
     per-run route, and the governed execute route's own paper pipeline: one
-    implementation of each, wired from here.
+    implementation of each, wired from here. Shared by the owner-actions router
+    and the job stop-and-flatten path so both use the identical orchestration.
     """
     state = getattr(getattr(request, "app", None), "state", None)
     return OwnerActionsService(

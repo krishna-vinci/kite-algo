@@ -112,9 +112,6 @@ FLATTEN_EVALUATION_ACTIVE = "FLATTEN_EVALUATION_ACTIVE"
 #: Unanswered work the platform cannot resolve on its own must be dispositioned
 #: first (§3 step 2): flatten never guesses whether an order exists.
 DEAD_SUBMISSION_UNRESOLVED = "DEAD_SUBMISSION_UNRESOLVED"
-#: Live non-option books cannot be reduced by this lane yet (C1 owns it), so the
-#: item is refused by name while completed option work is still reported.
-FLATTEN_LIVE_NONOPTION_UNSUPPORTED = "FLATTEN_LIVE_NONOPTION_UNSUPPORTED"
 #: An item-level refusal: the derived plan would INCREASE exposure, so it is
 #: refused BEFORE admission. A flatten plan may only reduce.
 FLATTEN_PLAN_INCREASES_EXPOSURE = "FLATTEN_PLAN_INCREASES_EXPOSURE"
@@ -2871,8 +2868,9 @@ class OwnerActionsService:
         One frozen plan per ``(instrument, product)``: the frozen target is ZERO
         and the executor derives the order from the strategy's own attributed
         book, so the plan can only reduce. A plan that would increase exposure is
-        refused BEFORE admission, and live non-option flatten fails closed by name
-        until C1's governed live reduction lane can submit reductions.
+        refused BEFORE admission. Live and paper books take the SAME governed
+        path: the pipeline dispatches to the environment's own executor, and a
+        reduction is never lane/market-hours/loss gated by the live executor.
         """
         books = self._attribute_books(scope)
         if books is None:
@@ -2889,7 +2887,6 @@ class OwnerActionsService:
         types = self._instrument_types(
             [str(book.get("instrument_id") or "") for book in nonzero]
         )
-        environment = str(scope["execution_environment"])
         items: List[Dict[str, Any]] = []
         for book in nonzero:
             key = (
@@ -2926,17 +2923,6 @@ class OwnerActionsService:
                         key,
                         ITEM_STATE_BLOCKED,
                         reason_code=FLATTEN_REDUCTION_INSTRUMENT_UNKNOWN,
-                        detail=dict(book),
-                    )
-                )
-                continue
-            if environment == "live":
-                items.append(
-                    _flatten_item(
-                        FLATTEN_ITEM_REDUCTION,
-                        key,
-                        ITEM_STATE_BLOCKED,
-                        reason_code=FLATTEN_LIVE_NONOPTION_UNSUPPORTED,
                         detail=dict(book),
                     )
                 )

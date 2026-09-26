@@ -121,6 +121,7 @@ from backend.api.schemas.strategies import (
     DeliveryResponse,
     StopJobRequest,
     StopJobResponse,
+    StopJobFlattenView,
     StrategyListResponse,
     StrategyResponse,
     StrategyUpdateRequest,
@@ -3194,13 +3195,17 @@ async def stop_job(
     payload: StopJobRequest,
     owner: str = Depends(require_strategy_owner),
     repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_strategies_db),
 ):
     """Operator Stop against an immutable job/attempt.
 
     Queued work is stopped without launching it; active work receives a durable
     stop request the supervisor observes to perform bounded local cleanup.
-    Stop does **not** cancel orders or flatten positions, and it does not clear
-    the replacement block: launched work still requires reconciliation.
+    ``flatten=false`` (the default) stops only: no orders are cancelled and no
+    positions are closed, and the replacement block is untouched - launched work
+    still requires reconciliation. ``flatten=true`` stops the job and then starts
+    the strategy's governed flatten operation, so the response reports BOTH the
+    stop and the flatten outcome (a flatten refusal never hides the stop).
     """
     enforce_same_origin(request)
     job = _authorized_job(repo, owner, strategy_id, job_id)
@@ -3235,11 +3240,86 @@ async def stop_job(
         idempotent = True  # already terminal: nothing to stop
 
     refreshed = repo.get_job(owner, job.id)
+    flatten_view = None
+    if payload.flatten:
+        flatten_view = await _start_strategy_flatten(
+            request,
+            session_factory,
+            repo,
+            owner,
+            strategy_id,
+            reason=f"job_stop:{job.id}",
+            environment=str(getattr(job, "execution_mode", "") or ""),
+        )
     return StopJobResponse(
         job_id=job.id,
         attempt=int(job.attempt),
         idempotent=idempotent,
         stop=_stop_view(refreshed),
+        flatten=flatten_view,
+    )
+
+
+async def _start_strategy_flatten(
+    request: Request,
+    session_factory: Any,
+    repo: SqlAlchemyStrategyRepository,
+    owner: str,
+    strategy_id: str,
+    *,
+    reason: str,
+    environment: Optional[str] = None,
+) -> StopJobFlattenView:
+    """Start the SAME governed flatten the owner-actions route runs, or report why.
+
+    The wiring is taken from the owner-actions module so stop-and-flatten and the
+    per-strategy flatten route share one orchestration, one option-exit runner and
+    one reduction pipeline. A pre-action refusal (an unprovable stop, an ACTIVE
+    approval, unresolved dead work) is reported as ``started=false`` with its
+    named reason, because the job IS stopped regardless.
+    """
+    from backend.api.routers.strategy_owner_actions import build_owner_actions_service
+    from backend.api.services.owner_actions import OwnerActionRefusal, owner_action_scope
+
+    try:
+        # The book the stopped job was running decides the environment: a live
+        # job flattens the live book, never a paper default.
+        scope = owner_action_scope(repo, owner, strategy_id, environment)
+    except HTTPException as exc:
+        return StopJobFlattenView(
+            started=False,
+            rejection_reason=str(
+                (exc.detail or {}).get("rejection_reason")
+                if isinstance(exc.detail, dict)
+                else exc.detail
+            ),
+            detail={"status_code": exc.status_code, "message": str(exc.detail)},
+        )
+    service = build_owner_actions_service(
+        request, session_factory, repo, strategy_id=str(strategy_id), owner=str(owner)
+    )
+    try:
+        result = await service.flatten(
+            scope,
+            reason=str(reason or ""),
+            stop_evaluator=True,
+            actor=str(owner),
+        )
+    except OwnerActionRefusal as exc:
+        return StopJobFlattenView(
+            started=False,
+            rejection_reason=str(exc.reason_code),
+            detail=exc.as_detail(),
+        )
+    return StopJobFlattenView(
+        started=True,
+        status=str(result.get("status") or ""),
+        operation_id=str(result.get("operation_id") or ""),
+        evidence_digest=str(result.get("evidence_digest") or ""),
+        detail={
+            "missing": list(result.get("missing") or []),
+            "refusal": result.get("refusal"),
+        },
     )
 
 

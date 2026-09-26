@@ -31,10 +31,14 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from backend.api.routers.strategies import require_strategy_owner
 from backend.api.schemas.platform import (
+    KillSwitchJobOutcome,
+    KillSwitchRequest,
+    KillSwitchResponse,
+    KillSwitchStrategyProgress,
     PendingApprovalRow,
     PendingApprovalsResponse,
     PlatformAccountView,
@@ -49,6 +53,10 @@ from backend.api.schemas.platform import (
     PlatformStrategyRunnerStatus,
 )
 from backend.api.services.csrf import enforce_same_origin
+from backend.api.services.kill_switch import (
+    KillSwitchRefusal,
+    KillSwitchService,
+)
 from backend.platform.settings import (
     LIVE_LANE_KEYS,
     UNSET,
@@ -181,3 +189,125 @@ def list_pending_approvals(
         items=[PendingApprovalRow(**row) for row in rows],
         count=len(rows),
     )
+
+
+# ---------------------------------------------------------------------------
+# Kill switch (stop everything, flatten everything, close every lane)
+# ---------------------------------------------------------------------------
+
+
+def _kill_switch_service(
+    request: Any, session_factory: Any
+) -> KillSwitchService:
+    """The kill switch over the SAME governed owner actions the routes use.
+
+    Flatten and its status read are wired through
+    ``build_owner_actions_service`` so the kill switch, the per-strategy flatten
+    route and stop-and-flatten share ONE orchestration, one option-exit runner
+    and one reduction pipeline.
+    """
+    from backend.api.routers.strategy_owner_actions import build_owner_actions_service
+    from backend.strategies.repository import SqlAlchemyStrategyRepository
+
+    repo = SqlAlchemyStrategyRepository(session_factory)
+
+    async def flatten(scope: Any, *, reason: str, actor: str) -> dict:
+        service = build_owner_actions_service(
+            request,
+            session_factory,
+            repo,
+            strategy_id=str(scope["strategy_id"]),
+            owner=str(actor),
+        )
+        return await service.flatten(
+            scope,
+            reason=str(reason or ""),
+            stop_evaluator=True,
+            actor=str(actor),
+        )
+
+    def flatten_status(scope: Any) -> Any:
+        service = build_owner_actions_service(
+            request,
+            session_factory,
+            repo,
+            strategy_id=str(scope["strategy_id"]),
+            owner=str(scope.get("owner_id") or ""),
+        )
+        try:
+            return service.flatten_status(scope)
+        except HTTPException as exc:
+            if int(exc.status_code) == 404:
+                return None
+            raise
+
+    return KillSwitchService(
+        session_factory=session_factory,
+        repository=repo,
+        flatten=flatten,
+        flatten_status=flatten_status,
+    )
+
+
+def _kill_switch_body(result: Any) -> KillSwitchResponse:
+    return KillSwitchResponse(
+        operation_id=str(result.get("operation_id") or ""),
+        status=str(result.get("status") or ""),
+        idempotent=bool(result.get("idempotent")),
+        actor_id=result.get("actor_id"),
+        reason=str(result.get("reason") or ""),
+        created_at=result.get("created_at"),
+        strategies=[
+            KillSwitchStrategyProgress(**row)
+            for row in (result.get("strategies") or [])
+        ],
+        jobs=[KillSwitchJobOutcome(**row) for row in (result.get("jobs") or [])],
+        lanes_closed=result.get("lanes_closed"),
+    )
+
+
+@router.post("/platform/kill-switch", response_model=KillSwitchResponse)
+async def start_kill_switch(
+    request: Request,
+    payload: KillSwitchRequest,
+    owner: str = Depends(require_strategy_owner),
+    session_factory: Any = Depends(_platform_db),
+):
+    """Stop every running job, flatten every exposed book, close every live lane.
+
+    The bodied confirmation (``"FLATTEN ALL"``) is the operator's explicit
+    intent; without it nothing moves. The operation is durable before any work
+    runs, so a second POST while it is still open returns the SAME operation
+    rather than starting a parallel one.
+    """
+    enforce_same_origin(request)
+    service = _kill_switch_service(request, session_factory)
+    try:
+        result = await service.start(
+            owner=str(owner),
+            reason=str(payload.reason or ""),
+            confirm=str(payload.confirm or ""),
+        )
+    except KillSwitchRefusal as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.as_detail()) from exc
+    return _kill_switch_body(result)
+
+
+@router.get("/platform/kill-switch", response_model=KillSwitchResponse)
+def inspect_kill_switch(
+    request: Request,
+    owner: str = Depends(require_strategy_owner),
+    session_factory: Any = Depends(_platform_db),
+):
+    """The latest kill-switch operation and its per-strategy progress, or 404."""
+    service = _kill_switch_service(request, session_factory)
+    result = service.latest()
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "rejection_reason": "KILL_SWITCH_OPERATION_NONE",
+                "message": "no kill-switch operation has been run",
+            },
+        )
+    return _kill_switch_body(result)

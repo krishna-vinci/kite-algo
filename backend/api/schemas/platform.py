@@ -8,7 +8,7 @@ client from smuggling an un-modelled lane or actor through a body.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -56,6 +56,60 @@ class PlatformLiveSettingsUpdateRequest(BaseModel):
     account_daily_loss_cap_inr: Optional[float] = Field(default=None, ge=0)
     #: Recorded in the audit row. Optional, never a caller identity.
     reason: Optional[str] = Field(default=None, max_length=1000)
+
+
+class KillSwitchRequest(BaseModel):
+    """The kill-switch body. ``confirm`` must be the exact literal phrase."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(default="", max_length=1000)
+    #: The operator's explicit confirmation; anything but "FLATTEN ALL" refuses.
+    confirm: str
+
+
+class KillSwitchStrategyProgress(BaseModel):
+    """One target's progress, re-derived from its own flatten operation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    strategy_id: str
+    account_id: str
+    execution_environment: str
+    operation_id: Optional[str] = None
+    status: str
+    missing: List[str] = Field(default_factory=list)
+    refusal: Optional[str] = None
+    detail: Dict[str, Any] = Field(default_factory=dict)
+
+
+class KillSwitchJobOutcome(BaseModel):
+    """The stop outcome for one hosted job the kill switch touched."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    strategy_id: str
+    job_id: Optional[str] = None
+    attempt: Optional[int] = None
+    status: Optional[str] = None
+    outcome: str
+    error: Optional[str] = None
+
+
+class KillSwitchResponse(BaseModel):
+    """The kill-switch operation: identity, per-strategy progress, jobs and lanes."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    operation_id: str
+    status: str
+    idempotent: bool = False
+    actor_id: Optional[str] = None
+    reason: str = ""
+    created_at: Optional[str] = None
+    strategies: List[KillSwitchStrategyProgress] = Field(default_factory=list)
+    jobs: List[KillSwitchJobOutcome] = Field(default_factory=list)
+    lanes_closed: Optional[Dict[str, bool]] = None
 
 
 class PlatformBrokerStatus(BaseModel):
