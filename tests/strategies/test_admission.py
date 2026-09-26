@@ -28,6 +28,26 @@ T1 = "2026-09-01T00:00:00+00:00"
 NOW = datetime(2026, 9, 17, 12, 0, tzinfo=timezone.utc)
 
 
+#: Admission pins its verdicts to a plan and the evidence handed to it, never to
+#: wall time, so the market session is evidence the tests supply. The default
+#: says every gated exchange is open; a test that wants a shut market injects
+#: ``_closed_session(...)`` on the service instead.
+def _open_session(exchange, _now):
+    return {"exchange": exchange, "open": True, "reason": "open", "next_open": None}
+
+
+def _closed_session(reason, *, next_open=None):
+    def provider(exchange, _now):
+        return {
+            "exchange": exchange,
+            "open": False,
+            "reason": reason,
+            "next_open": next_open,
+        }
+
+    return provider
+
+
 class AdmissionTestCase(unittest.TestCase):
     def setUp(self):
         self.engine = create_engine(
@@ -163,12 +183,14 @@ class AdmissionTestCase(unittest.TestCase):
     def tearDown(self):
         self.engine.dispose()
 
-    def _service(self):
+    def _service(self, *, market_session=None):
         from backend.strategies.admission import AdmissionService
         from backend.options.execution.store import OptionRunStore
 
         return AdmissionService(
-            session_factory=self.factory, option_run_store=OptionRunStore()
+            session_factory=self.factory,
+            option_run_store=OptionRunStore(),
+            market_session_provider=market_session or _open_session,
         )
 
     # -- fixtures -----------------------------------------------------------
@@ -1200,6 +1222,55 @@ class OrderingTests(AdmissionTestCase):
         first = self.service.evaluate(self.plan(), now=NOW, margin_evidence=self.margin())
         second = self.service.evaluate(self.plan(), now=NOW, margin_evidence=self.margin())
         self.assertEqual(first.as_dict(), second.as_dict())
+
+
+class MarketSessionTests(AdmissionTestCase):
+    """A shut market refuses an INCREASE, and never refuses a REDUCTION.
+
+    The session is evidence like any other: the plan that grows the book needs
+    an open exchange, the plan that shrinks it does not, and an unreadable
+    calendar is a named refusal rather than an assumed-open session.
+    """
+
+    def test_a_live_increase_outside_the_session_refuses_market_closed(self):
+        self.policy(allocation_inr=100000.0)
+        service = self._service(
+            market_session=_closed_session(
+                "after_close", next_open="2026-09-18T09:15:00+05:30"
+            )
+        )
+        verdict = service.evaluate(self.plan(), now=NOW, margin_evidence=self.margin())
+        self.assertFalse(verdict.admitted)
+        self.assertEqual(verdict.refusal_reason, "MARKET_CLOSED")
+        self.assertEqual(verdict.detail["exchange"], "NSE")
+        self.assertEqual(verdict.detail["reason"], "after_close")
+        self.assertEqual(verdict.detail["next_open"], "2026-09-18T09:15:00+05:30")
+
+    def test_a_live_reduction_outside_the_session_is_still_admitted(self):
+        # Held 10, target flat: a pure exit needs no open market.
+        self.policy(allocation_inr=100000.0)
+        self.book(10)
+        service = self._service(market_session=_closed_session("weekend"))
+        leg = dict(self._leg(), signed_quantity=0)
+        verdict = service.evaluate(self.plan(leg=leg), now=NOW, margin_evidence=self.margin())
+        self.assertTrue(verdict.admitted, verdict.detail)
+
+    def test_an_unreadable_calendar_refuses_a_live_increase_by_name(self):
+        self.policy(allocation_inr=100000.0)
+        service = self._service(market_session=_closed_session("calendar_unavailable"))
+        verdict = service.evaluate(self.plan(), now=NOW, margin_evidence=self.margin())
+        self.assertFalse(verdict.admitted)
+        self.assertEqual(verdict.refusal_reason, "MARKET_CALENDAR_UNAVAILABLE")
+
+    def test_paper_is_unchanged_by_a_closed_session(self):
+        service = self._service(market_session=_closed_session("weekend"))
+        verdict = service.evaluate(
+            self.plan(),
+            execution_environment="paper",
+            now=NOW,
+            paper_funds={"available_funds": 100000.0},
+        )
+        self.assertTrue(verdict.admitted, verdict.detail)
 
 
 class StrategyRiskPolicyTests(AdmissionTestCase):

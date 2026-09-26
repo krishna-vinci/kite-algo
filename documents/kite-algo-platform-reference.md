@@ -265,9 +265,14 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
 - **Kinds: EXISTS.** daily, weekly, monthly and calendar, each with one `at_time` (`:59,128-133,246-338`). Misfire
   grace is 3600 s and overlap is deferred (`:64-70,109-116`).
 - **At most one run per strategy per day.** There is one schedule per strategy, and occurrences are keyed by date.
+- **Holiday-aware daily/weekly occurrences: EXISTS** (`:642-651,686-711`, helper `backend/strategies/market_session.py`).
+  A daily/weekly occurrence that lands on a weekend or an NSE holiday is still materialised, then recorded `skipped`
+  with `market_weekend` / `market_holiday` and the exchange and session date in its detail, so a schedule that did
+  not run says why. The calendar read fails OPEN here: an unreadable calendar leaves the occurrence to its ordinary
+  decision rather than skipping it on unknown evidence. Monthly and calendar kinds are untouched.
 - **MISSING:**
   - intraday or interval schedules
-  - holiday awareness (daily fires every calendar day, including weekends; `:261-333`)
+  - market-hours gating of a schedule's own `at_time` (a schedule set to 03:00 IST still fires)
   - use of `window_end` / `squareoff_at` (stored but never read; `service.py:507-508`)
   - setting a manual pause (`manual_paused_at` is only ever set to None; `repository.py:1941,1976`)
 
@@ -371,8 +376,12 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
     evidence with a cap set refuses too (fail closed), and reductions are never blocked.
   - `GET /api/platform/status` surfaces the cap state as `risk: {day_pnl_inr, cap_inr, cap_reached}`.
   - There is **no automatic flatten** here; a reached cap only refuses new exposure.
+- **Market session gate: EXISTS** (`:1025-1031,1440-1472`, helper `backend/strategies/market_session.py`). A live
+  plan that OPENS or GROWS exposure is refused `MARKET_CLOSED` outside 09:15–15:30 IST on an NSE trading day
+  (weekend / NSE holiday / before_open / after_close in `detail`), and `MARKET_CALENDAR_UNAVAILABLE` when the
+  imported calendar cannot be read (fail closed). Reductions, exits, repairs, flattens and MIS square-offs are never
+  gated, and paper is unchanged. Only NSE, BSE, NFO and BFO are gated; every other exchange is `not_gated`.
 - **MISSING:**
-  - A market-hours or holiday gate (`:1426-1430` says so).
   - A per-plan or per-day **count** cap on orders, trades or legs. The searches for `max_orders`, `max_trades` and
     `max_legs` found none. Order **rate** is limited to ≤10 Kite writes per second, with excess queued (§3).
 - **Inert inputs:**
@@ -657,7 +666,9 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
    Stopping a job does not flatten, and live non-option flatten is refused.
 5. **Intraday cadence.** Schedules fire once a day. The run-now loop is unproven. `continuous` is only a label. One
    child per runner. The 1 h CPU limit. Logs only after exit. Execution dies with the attempt.
-6. **No market-hours or holiday gate** in the pipeline or the scheduler.
+6. **Market-hours gating is admission-only.** A live plan that opens or grows exposure is refused while its
+   exchange is shut (§5.3), and daily/weekly occurrences on a weekend or NSE holiday are recorded skipped (§4.4) -
+   but a schedule's own `at_time` is still not clamped to the session, and nothing gates a live *reduction*.
 7. **Relative legs are not part of the frozen plan**, because no `chain_resolver` is injected.
 8. **Phase 0 fixed** (2026-09-26): Greeks T in IST; the one weight-sizing rule; the resolver lot size;
    owner-policy rules blocking adjusts; scheduled children reading their occurrence; read-only broker routes; and

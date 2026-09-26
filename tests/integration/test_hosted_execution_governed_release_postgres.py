@@ -43,6 +43,11 @@ from datetime import datetime, timezone
 import pytest
 from sqlalchemy import text
 
+# The suite drives its own clock in a disposable database with no imported NSE
+# calendar, so the market session is supplied as EVIDENCE through the production
+# seam rather than guessed (see tests/support/market_session_stub.py).
+from tests.support.market_session_stub import open_market_session  # noqa: F401
+
 # The disposable-database fixture, the environment switches and the fake broker
 # are shared with the Phase 2A acceptance suite rather than copied, so the two
 # cannot drift.

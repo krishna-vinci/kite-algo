@@ -34,6 +34,11 @@ from datetime import datetime, timezone
 
 import pytest
 
+# The suite drives its own clock in a disposable database with no imported NSE
+# calendar, so the market session is supplied as EVIDENCE through the production
+# seam rather than guessed (see tests/support/market_session_stub.py).
+from tests.support.market_session_stub import open_market_session  # noqa: F401
+
 from tests.integration.test_hosted_live_phase2a_routes_postgres import (
     APP_ADMIN_PASSWORD,
     APP_JWT_SECRET,

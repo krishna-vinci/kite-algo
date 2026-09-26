@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import os
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import sessionmaker
@@ -111,7 +111,7 @@ class SchedulingTestCase(unittest.TestCase):
     def tearDown(self):
         self.engine.dispose()
 
-    def _scheduler(self, *, submitter=None):
+    def _scheduler(self, *, submitter=None, trading_day_reader=None):
         from backend.strategies.scheduling import ScheduleScheduler
 
         def default_submitter(schedule, occurrence, detail):
@@ -119,7 +119,9 @@ class SchedulingTestCase(unittest.TestCase):
             return True
 
         return ScheduleScheduler(
-            session_factory=self.factory, job_submitter=submitter or default_submitter
+            session_factory=self.factory,
+            job_submitter=submitter or default_submitter,
+            trading_day_reader=trading_day_reader,
         )
 
     # -- fixtures -----------------------------------------------------------
@@ -431,6 +433,45 @@ class FiringTests(SchedulingTestCase):
         self.assertEqual(result["fired"], [])
         self.assertEqual(result["deferred"], ["sch-1:2026-10-10"])
         self.assertEqual(self.occurrences()[0]["status"], "pending")
+
+    def test_a_daily_occurrence_on_a_weekend_or_holiday_is_skipped_with_its_reason(self):
+        """A shut market is a recorded skip, not a silent gap and not a launch.
+
+        The 15th is an NSE holiday for this reader, the 11th is a Sunday (no
+        calendar needed), and the 14th is an ordinary trading day: the daily
+        schedule must skip the first two by name and fire the third.
+        """
+
+        def reader(_exchange, day):
+            return day != date(2026, 10, 15)
+
+        self.schedule(kind="daily", at_time="09:30")
+        scheduler = self._scheduler(trading_day_reader=reader)
+        result = scheduler.tick(now=NOW)
+
+        rows = {row["occurrence_key"]: row for row in self.occurrences()}
+        # Every weekend day in the lookback, plus the holiday, is skipped by
+        # name; nothing else is.
+        self.assertEqual(
+            set(result["skipped"]),
+            {
+                "sch-1:2026-09-26",
+                "sch-1:2026-09-27",
+                "sch-1:2026-10-03",
+                "sch-1:2026-10-04",
+                "sch-1:2026-10-10",
+                "sch-1:2026-10-11",
+                "sch-1:2026-10-15",
+            },
+        )
+        self.assertEqual(rows["sch-1:2026-10-15"]["status"], "skipped")
+        self.assertEqual(rows["sch-1:2026-10-15"]["skip_reason"], "market_holiday")
+        self.assertEqual(rows["sch-1:2026-10-15"]["detail"]["exchange"], "NSE")
+        self.assertEqual(rows["sch-1:2026-10-11"]["skip_reason"], "market_weekend")
+        # A trading day is decided the ordinary way (the first one fires; the
+        # default callable submitter leaves no envelope, so the rest defer).
+        self.assertEqual(rows["sch-1:2026-09-22"]["status"], "fired")
+        self.assertNotIn("sch-1:2026-09-22", result["skipped"])
 
 
 class MisfireTests(SchedulingTestCase):

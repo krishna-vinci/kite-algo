@@ -16,6 +16,11 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+# The suite drives its own clock in a disposable database with no imported NSE
+# calendar, so the market session is supplied as EVIDENCE through the production
+# seam rather than guessed (see tests/support/market_session_stub.py).
+from tests.support.market_session_stub import open_market_session  # noqa: F401
+
 PG_ADMIN = os.environ.get("RECONCILIATION_PG_ADMIN") or os.environ.get(
     "ACCEPTANCE_ADMIN_DSN", "postgresql://postgres:testonly@127.0.0.1:15433/postgres"
 )
@@ -390,7 +395,7 @@ class _LiveFixture:
         return view
 
 
-def _executor(pg, fixture, *, live_enabled: bool, broker: _FakeBroker, adapter=None):
+def _executor(pg, fixture, *, live_enabled: bool, broker: _FakeBroker, adapter=None, admission=None):
     from backend.strategies.live_service import LivePlanExecutor
 
     # This deployment's own live configuration: the master switch AND the C2
@@ -415,6 +420,7 @@ def _executor(pg, fixture, *, live_enabled: bool, broker: _FakeBroker, adapter=N
         adapter = LivePlanAdapter(
             session_factory=pg["factory"],
             intent_handler=broker,
+            admission=admission,
             barrier=ExecutionBarrier(session_factory=pg["factory"]),
             fill_reader=ingested_fill_reader(pg["factory"]),
             position_reader=attributed_position_reader(pg["factory"]),
@@ -1189,6 +1195,44 @@ def test_live_subsystem_gates_launch_admission_and_submission(pg, monkeypatch):
     with pytest.raises(ExecutionRefusal) as ctx2:
         asyncio.run(executor.execute(fixture.plan_view_from_row(), actor=OWNER))
     assert ctx2.value.reason_code == "LIVE_DISABLED"
+    assert broker.calls == []
+    assert _claim(pg["factory"], fixture.plan_id) is None
+
+
+def test_a_weekend_clock_refuses_an_increasing_live_plan(pg):
+    """The production gate, end to end: a shut market refuses an increase.
+
+    The fixture's clock is the wall clock and the disposable database carries no
+    imported calendar, so the session is supplied as EVIDENCE through the
+    production ``market_session_provider`` seam - pinned to a Saturday by the
+    REAL helper - and everything else (plan, book, reservation, approval,
+    authority, the adapter's admission call) is the production path.
+    """
+    from backend.strategies.admission import AdmissionService
+    from backend.strategies.execution import ExecutionRefusal
+    from tests.support.market_session_stub import weekend_session_provider
+
+    # No catalog seed: the market gate runs before catalog validation, and this
+    # module's shared database already carries the instrument from its sibling
+    # tests (that catalog row is keyed by ``NSE:RELIANCE``).
+    fixture = _LiveFixture(pg["factory"])
+    broker = _FakeBroker()
+    executor = _executor(
+        pg,
+        fixture,
+        live_enabled=True,
+        broker=broker,
+        admission=AdmissionService(
+            session_factory=pg["factory"],
+            market_session_provider=weekend_session_provider,
+        ),
+    )
+    with pytest.raises(ExecutionRefusal) as ctx:
+        asyncio.run(executor.execute(fixture.plan_view_from_row(), actor=OWNER))
+    assert ctx.value.reason_code == "LIVE_ADMISSION_REFUSED"
+    assert ctx.value.detail["reason_code"] == "MARKET_CLOSED"
+    assert ctx.value.detail["detail"]["reason"] == "weekend"
+    assert ctx.value.detail["detail"]["exchange"] == "NSE"
     assert broker.calls == []
     assert _claim(pg["factory"], fixture.plan_id) is None
 

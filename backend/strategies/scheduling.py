@@ -47,6 +47,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional
 from sqlalchemy import and_, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
+from backend.strategies import market_session
 from backend.strategies.attribution_models import StrategyScheduleOccurrence
 
 logger = logging.getLogger(__name__)
@@ -93,6 +94,11 @@ NO_CLAIM = "no-claim"
 #: Sentinels returned by :meth:`ScheduleScheduler._claim_decision`.
 DECISION_SETTLED = "decision-settled"
 DECISION_BUSY = "decision-busy"
+
+#: The exchange whose imported calendar decides whether a daily/weekly
+#: occurrence lands on a trading day. Hosted schedules are NSE equity schedules
+#: today, and the market-session helper maps this to the imported NSE/CM days.
+SCHEDULE_CALENDAR_EXCHANGE = "NSE"
 
 
 def _utcnow() -> datetime:
@@ -180,6 +186,7 @@ class ScheduleScheduler:
         *,
         job_submitter: Optional[Callable[[Any, Occurrence, Mapping[str, Any]], bool]] = None,
         proposal_submitter: Optional[Callable[[Any, Occurrence, Mapping[str, Any]], bool]] = None,
+        trading_day_reader: Optional[Callable[[str, date], bool]] = None,
     ) -> None:
         if session_factory is None:
             # The hosted-strategy tables live on the app database (the same
@@ -194,6 +201,9 @@ class ScheduleScheduler:
         # scheduled occurrence creates a job, never a proposal). It is accepted
         # for existing callers only; new wiring must pass ``job_submitter``.
         self._submitter = job_submitter if job_submitter is not None else proposal_submitter
+        # The imported calendar, read through the shared market-session helper.
+        # ``None`` uses that helper's own audited read; a test passes a predicate.
+        self._trading_day_reader = trading_day_reader
 
     # -- schedule reads -----------------------------------------------------
 
@@ -500,6 +510,7 @@ class ScheduleScheduler:
         deferred: List[str] = []
 
         schedule_id = str(schedule.get("id") or "")
+        kind = str(schedule.get("schedule_kind") or "")
         for occurrence in self.due_occurrences(schedule, now=moment):
             materialized = self.materialize(schedule, occurrence)
             if materialized is None:
@@ -526,6 +537,7 @@ class ScheduleScheduler:
                 resumed=resumed,
                 moment=moment,
                 grace=grace,
+                market_skip=self._market_skip(kind, occurrence),
             )
             if outcome == "fired":
                 fired.append(occurrence.occurrence_key)
@@ -547,6 +559,7 @@ class ScheduleScheduler:
         resumed: bool,
         moment: datetime,
         grace: int,
+        market_skip: Optional[Mapping[str, Any]] = None,
     ) -> str:
         """Decide one occurrence: ``fired`` / ``skipped`` / ``expired`` / ``deferred``.
 
@@ -578,6 +591,7 @@ class ScheduleScheduler:
                 moment=moment,
                 grace=grace,
                 claim=claim,
+                market_skip=market_skip,
             )
         except Exception as exc:  # noqa: BLE001 - unknown state is retried, never guessed
             return self._defer(
@@ -594,6 +608,7 @@ class ScheduleScheduler:
         moment: datetime,
         grace: int,
         claim: Any,
+        market_skip: Optional[Mapping[str, Any]] = None,
     ) -> str:
         """The claimed decision itself. Every write below carries ``claim``."""
         schedule_id = str(schedule.get("id") or "")
@@ -623,6 +638,19 @@ class ScheduleScheduler:
                     detail={"occurrence_key": occurrence.occurrence_key},
                 )
                 return "skipped" if settled else self._settled_outcome(occurrence_id)
+
+        if market_skip is not None:
+            # A weekend or an NSE holiday: recorded, never silently dropped. The
+            # reason outranks the misfire window because the occurrence never had
+            # a decision to miss - the market was shut for its whole due day.
+            settled = self._settle(
+                occurrence_id,
+                status="skipped",
+                claim=claim,
+                skip_reason=f"market_{market_skip.get('reason')}",
+                detail=dict(market_skip),
+            )
+            return "skipped" if settled else self._settled_outcome(occurrence_id)
 
         lateness = (moment - occurrence.due_at).total_seconds()
         if lateness > grace:
@@ -654,6 +682,33 @@ class ScheduleScheduler:
             return "deferred"
 
         return self._fire(schedule, occurrence, occurrence_id, claim=claim)
+
+    def _market_skip(
+        self, kind: str, occurrence: Occurrence
+    ) -> Optional[Dict[str, Any]]:
+        """Why a daily/weekly occurrence lands on a shut market, if it does.
+
+        A weekend or an NSE holiday is SKIPPED WITH A REASON: the occurrence is
+        still materialised and then recorded ``skipped``, so a schedule that did
+        not run says why, instead of leaving a silent gap. Monthly and calendar
+        kinds are untouched - an explicitly listed date is an explicit
+        instruction. An UNREADABLE calendar is never treated as a holiday: the
+        occurrence keeps its ordinary decision rather than being skipped on
+        unknown evidence.
+        """
+        if kind not in ("daily", "weekly"):
+            return None
+        day = occurrence.due_at.astimezone(market_session.IST).date()
+        state = market_session.day_state(
+            SCHEDULE_CALENDAR_EXCHANGE, day, trading_day_reader=self._trading_day_reader
+        )
+        if state not in ("weekend", "holiday"):
+            return None
+        return {
+            "exchange": SCHEDULE_CALENDAR_EXCHANGE,
+            "reason": state,
+            "session_date": day.isoformat(),
+        }
 
     def _resolve_existing_launch(
         self, schedule: Mapping[str, Any], occurrence: Occurrence

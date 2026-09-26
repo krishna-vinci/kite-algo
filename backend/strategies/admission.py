@@ -28,6 +28,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, 
 from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 
+from backend.strategies import market_session
 from backend.strategies.attribution_models import (
     AccountReconciliationVersion,
     StrategyAdmissionPolicy,
@@ -42,6 +43,8 @@ from backend.strategies.attribution_models import (
 #: the honest behaviour, and inventing the name is better than under-enforcing.
 ADMISSION_REFUSALS = (
     "ADMISSION_POLICY_MISSING",
+    "MARKET_CLOSED",
+    "MARKET_CALENDAR_UNAVAILABLE",
     "ALLOCATION_EXCEEDED",
     "REFERENCE_PRICE_UNAVAILABLE",
     "POSITION_VALUATION_UNAVAILABLE",
@@ -153,6 +156,7 @@ class AdmissionService:
         *,
         margin_engine: Any = None,
         option_run_store: Any = None,
+        market_session_provider: Optional[Callable[[str, datetime], Mapping[str, Any]]] = None,
     ) -> None:
         if session_factory is None:
             from backend.app.database import SessionLocal
@@ -161,6 +165,12 @@ class AdmissionService:
         self.session_factory = session_factory
         self._margin_engine = margin_engine
         self._option_run_store = option_run_store
+        # Evidence is passed in, not fetched: the same plan and the same session
+        # state must always produce the same verdict. The default is the real
+        # imported-calendar read, which fails CLOSED when the calendar is
+        # unreadable - a test (or a caller that already read the clock) injects
+        # its own provider instead.
+        self._market_session_provider = market_session_provider or market_session.session_state
 
     # -- policy -------------------------------------------------------------
 
@@ -1022,6 +1032,15 @@ class AdmissionService:
 
         notional = self.plan_notional(plan)
         exposure = self.plan_exposure(plan, execution_environment=environment)
+        # The market clock is the FIRST environmental precondition: a live plan
+        # that OPENS or GROWS a position is refused while its exchange is shut,
+        # before any limit or margin work is done on a decision that cannot run.
+        # Reductions, exits, repairs, flattens and MIS square-offs are never
+        # gated: closing a position is exactly what a closed market still needs.
+        if is_live:
+            market_refusal = self._market_session_refusal(plan, exposure, moment=moment)
+            if market_refusal is not None:
+                return market_refusal
         # The enforced requirement is the INCREMENTAL funding the plan needs, not
         # the whole target book: re-applying an unchanged target costs nothing,
         # and a sell leg funds nothing until it actually fills.
@@ -1470,6 +1489,40 @@ class AdmissionService:
         except Exception:  # noqa: BLE001 - an unreadable catalog is not "valid"
             return {"state": "invalidated", "reason": "CATALOG_STATE_UNAVAILABLE"}
 
+    def _market_session_refusal(
+        self,
+        plan: Mapping[str, Any],
+        exposure: Mapping[str, Any],
+        *,
+        moment: datetime,
+    ) -> Optional[AdmissionVerdict]:
+        """Refuse a live exposure-INCREASING plan while its exchange is shut.
+
+        Only a plan that OPENS or GROWS exposure needs an open session, and the
+        executor's own D-6 rule (``increases_exposure`` on every post-plan
+        coordinate) is what decides that - so a reduction, exit, repair, flatten
+        or MIS square-off is never gated. The exchange is the plan's own, and
+        the calendar is read through the imported, verified service; an
+        unreadable calendar fails closed by NAME rather than reading as open.
+        """
+        if not _increases_exposure(exposure):
+            return None
+        gated = [key for key in _plan_exchanges(plan) if market_session.is_gated_exchange(key)]
+        for exchange in gated:
+            state = dict(self._market_session_provider(exchange, moment) or {})
+            if bool(state.get("open")):
+                continue
+            detail = {
+                "exchange": exchange,
+                "reason": str(state.get("reason") or "calendar_unavailable"),
+                "session_date": state.get("session_date"),
+                "next_open": state.get("next_open"),
+            }
+            if str(state.get("reason") or "") == "calendar_unavailable":
+                return AdmissionVerdict(False, "MARKET_CALENDAR_UNAVAILABLE", detail)
+            return AdmissionVerdict(False, "MARKET_CLOSED", detail)
+        return None
+
     def _product_refusal(
         self, plan: Mapping[str, Any], *, environment: str
     ) -> Optional[Dict[str, Any]]:
@@ -1508,6 +1561,28 @@ class AdmissionService:
                 )
             ).scalars().all()
         return len(set(rows))
+
+
+def _plan_exchanges(plan: Mapping[str, Any]) -> List[str]:
+    """The distinct exchanges this plan trades on, in first-seen order."""
+    exchanges: List[str] = []
+    for leg in (plan.get("resolved_plan") or {}).get("legs") or []:
+        key = str(leg.get("exchange") or leg.get("broker_exchange") or "").strip().upper()
+        if key and key not in exchanges:
+            exchanges.append(key)
+    return exchanges
+
+
+def _increases_exposure(exposure: Mapping[str, Any]) -> bool:
+    """Whether the post-plan book OPENS or GROWS a coordinate.
+
+    ``financing.plan_exposure`` already carries the executor's own D-6 verdict on
+    every coordinate, so admission reuses that rather than re-deriving whether a
+    buy reduces a short or grows a long.
+    """
+    return any(
+        bool(row.get("increases_exposure")) for row in (exposure.get("per_instrument") or [])
+    )
 
 
 def _coerce_datetime(value: Any) -> datetime:
