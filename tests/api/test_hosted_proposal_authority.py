@@ -496,6 +496,56 @@ async def test_a_trade_capable_child_opens_proposal_authority_for_its_own_evalua
     assert stored["strategy_id"] == child.strategy_id
 
 
+@pytest.mark.asyncio
+async def test_a_proposal_built_from_the_child_occurrence_is_accepted(harness, monkeypatch):
+    """The id the child reads at attach is exactly the id the route accepts.
+
+    This closes the scheduled-occurrence loop: the run detail (real DB) is fed
+    through the real SDK ``attach_run``, the payload is built from the resulting
+    ``config.hosted_occurrence`` rather than from a hardcoded id, and the real
+    bound-evaluation check accepts it.
+    """
+    child = harness.mint("occurrence", TRADE_CAPS)
+    run_detail = harness.worker._get_run_sync(child.run_id)
+
+    from kite_algo_worker import AlgoWorkerConfig, KiteAlgoWorkerClient, RunConfig
+
+    client = KiteAlgoWorkerClient(
+        AlgoWorkerConfig(base_url="http://hosted.test", token=child.raw_token)
+    )
+    monkeypatch.setattr(client, "get_run", lambda run_id: run_detail)
+    managed = client.attach_run(
+        child.run_id,
+        session_nonce=child.nonce,
+        config=RunConfig(
+            template_id=run_detail["template_id"],
+            account_scope=run_detail["account_scope"],
+            execution_mode=run_detail["execution_mode"],
+        ),
+    )
+
+    occurrence = managed.config.hosted_occurrence
+    assert occurrence is not None
+    assert occurrence["job_id"] == child.job_id
+    assert occurrence["evaluation_id"] == child.evaluation_id
+    assert occurrence["evaluation_kind"] == "scheduled_occurrence"
+
+    response = await _submit(
+        harness,
+        child,
+        _payload(
+            child,
+            job_id=occurrence["job_id"],
+            evaluation_id=occurrence["evaluation_id"],
+            evaluation_kind=occurrence["evaluation_kind"],
+        ),
+    )
+    assert response.status == "validated"
+    stored = ProposalStore(session_factory=harness.factory).get_proposal(response.proposal_id)
+    assert stored["evaluation_id"] == child.evaluation_id
+    assert stored["job_id"] == child.job_id
+
+
 def test_the_real_run_creation_entry_point_binds_a_proposal_capable_child(harness):
     """The production run-creation path accepts a proposal-capable child.
 

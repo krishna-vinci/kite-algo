@@ -189,3 +189,91 @@ def test_build_context_pins_live_mode_from_the_child_environment(tmp_path, monke
     assert captured["session_nonce"] == "wsn_1"
     assert captured["config"].execution_mode == "live"
     assert captured["config"].account_scope == "kite:live"
+
+
+_RUN_DETAIL = {
+    "strategy_run_id": "run-1",
+    "token_id": "worker_child",
+    "template_id": "hosted:hs_1",
+    "account_scope": "kite:paper",
+    "execution_mode": "paper",
+    "status": "open",
+    "worker_session_nonce": "wsn_server_side",
+}
+
+
+def _set_child_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("KITE_ALGO_BASE_URL", "http://localhost:8000")
+    monkeypatch.setenv("KITE_ALGO_WORKER_TOKEN", "kwa_test")
+    monkeypatch.setenv("KITE_ALGO_RUN_ID", "run-1")
+    monkeypatch.setenv("KITE_ALGO_SESSION_NONCE", "wsn_1")
+    monkeypatch.setenv("KITE_ALGO_TEMPLATE_ID", "hosted:hs_1")
+    monkeypatch.setenv("KITE_ALGO_ACCOUNT_SCOPE", "kite:paper")
+    monkeypatch.setenv("KITE_ALGO_MODE", "paper")
+    monkeypatch.setenv("KITE_ALGO_PARAMS", "{}")
+    monkeypatch.setenv("KITE_ALGO_SCRATCH", str(tmp_path))
+
+
+def _stub_run_detail(monkeypatch, runtime_state):
+    detail = {**_RUN_DETAIL, "runtime_state": runtime_state}
+    monkeypatch.setattr(
+        "kite_algo_worker.client.KiteAlgoWorkerClient.get_run",
+        lambda self, run_id: detail,
+    )
+
+
+def test_build_context_exposes_the_bound_occurrence_for_a_scheduled_child(tmp_path, monkeypatch):
+    """A scheduled child reads the platform binding, not an id it invented.
+
+    The lifecycle persists ``runtime_state["hosted"]``; the attach merges that
+    into the config, so ``ctx.occurrence`` / ``ctx.run.config.hosted_occurrence``
+    carry exactly the evaluation the proposal route will accept.
+    """
+    occurrence = {
+        "job_id": "job-1",
+        "strategy_id": "stg-1",
+        "attempt": 1,
+        "version_id": "ver-1",
+        "occurrence_key": "sch-1:2026-10-10",
+        "evaluation_id": "sched:sch-1:2026-10-10",
+        "evaluation_kind": "scheduled_occurrence",
+        "due_at": "2026-10-10T03:45:00+05:30",
+    }
+    _set_child_env(monkeypatch, tmp_path)
+    _stub_run_detail(monkeypatch, {"hosted": occurrence})
+
+    ctx = hosted_bootstrap.build_context()
+
+    expected = {
+        "job_id": "job-1",
+        "occurrence_key": "sch-1:2026-10-10",
+        "evaluation_id": "sched:sch-1:2026-10-10",
+        "evaluation_kind": "scheduled_occurrence",
+        "due_at": "2026-10-10T03:45:00+05:30",
+    }
+    assert ctx.run.config.hosted_occurrence == expected
+    assert ctx.occurrence == expected
+
+
+def test_build_context_occurrence_is_none_for_a_run_now_child(tmp_path, monkeypatch):
+    """A run-now child's hosted block carries no occurrence, so both reads are None."""
+    _set_child_env(monkeypatch, tmp_path)
+    _stub_run_detail(
+        monkeypatch,
+        {
+            "hosted": {
+                "job_id": "job-2",
+                "strategy_id": "stg-1",
+                "attempt": 1,
+                "occurrence_key": None,
+                "evaluation_id": None,
+                "evaluation_kind": None,
+                "due_at": None,
+            }
+        },
+    )
+
+    ctx = hosted_bootstrap.build_context()
+
+    assert ctx.run.config.hosted_occurrence is None
+    assert ctx.occurrence is None

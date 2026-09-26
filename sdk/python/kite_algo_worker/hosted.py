@@ -45,6 +45,15 @@ class ChildContext:
     execution_mode: str
     run_id: str
 
+    @property
+    def occurrence(self) -> Optional[Dict[str, Any]]:
+        """The occurrence this child was launched for, or ``None`` for run-now.
+
+        Read from the platform binding the attach fetched (never chosen here).
+        """
+        config = getattr(self.run, "config", None)
+        return config.hosted_occurrence if config is not None else None
+
     def progress(self, note: Optional[str] = None) -> Dict[str, Any]:
         """Report progress to the hosted attempt (the child's own liveness)."""
         return self.run.progress(note)

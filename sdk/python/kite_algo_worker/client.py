@@ -193,6 +193,16 @@ class KiteAlgoWorkerClient:
                 status_code=409,
             )
 
+        # The run detail is the authority for platform-bound state: a scheduled
+        # occurrence is recorded on the job and persisted on the run as
+        # ``runtime_state["hosted"]``. Merge it into the attach config so a child
+        # can read its bound occurrence (``config.hosted_occurrence``) instead of
+        # inventing an evaluation id. The server wins on any key it defines; the
+        # child's own extras are kept.
+        server_state = existing.get("runtime_state")
+        if isinstance(server_state, Mapping) and server_state:
+            config = config._replace(runtime_state={**config.runtime_state, **dict(server_state)})
+
         from .managed_run import ManagedRun
 
         return ManagedRun(
