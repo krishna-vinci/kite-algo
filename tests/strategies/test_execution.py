@@ -3791,6 +3791,70 @@ class ExecutorOptionRunBindingTests(ExecutorTestCase, unittest.IsolatedAsyncioTe
         self.assertEqual(owner["state"], "active")
         self.assertEqual(int(owner["owner_epoch"]), 2)
 
+    async def test_generic_owner_rules_do_not_block_a_resize(self):
+        """Backend position SL/target rows are not option protection rules."""
+        executor, option_run_id = await self._enter_two_units()
+        self._seed_run_protection(option_run_id, {})
+        self._seed_owner_policy(
+            option_run_id,
+            {
+                "structure_digest": "digest-iron-condor",
+                "rules": [
+                    {
+                        "symbol": "TCS26OCT2500CE",
+                        "instrument_token": 123456,
+                        "exchange": "NFO",
+                        "tradingsymbol": "TCS26OCT2500CE",
+                        "product": "NRML",
+                        "side": "SELL",
+                        "quantity": 75,
+                        "entry_price": 100.0,
+                        "stoploss_pct": 20.0,
+                    }
+                ],
+            },
+        )
+        self._seed_adjust_plan(
+            "plan-adjust", reference=option_run_id, legs=self._adjust_legs(units=3)
+        )
+        self.claim_reservation(plan_id="plan-adjust")
+
+        result = await executor.execute(_plan_view_for(self.factory, "plan-adjust"), actor=OWNER)
+
+        self.assertEqual(result["status"], "filled")
+        self.assertEqual(
+            json.loads(self._run_row(option_run_id)["metadata"])["structure_generation"], 2
+        )
+
+    async def test_an_unsupported_owner_option_metric_still_blocks_a_resize(self):
+        """Only rules without a metric are generic; a bad option rule is unknown."""
+        executor, option_run_id = await self._enter_two_units()
+        self._seed_run_protection(option_run_id, {})
+        self._seed_owner_policy(
+            option_run_id,
+            {
+                "structure_digest": "digest-iron-condor",
+                "rules": [
+                    {
+                        "key": "bad-stop",
+                        "metric": "spread_pct",
+                        "operator": "gte",
+                        "threshold": 1,
+                    }
+                ],
+            },
+        )
+        self._seed_adjust_plan(
+            "plan-adjust", reference=option_run_id, legs=self._adjust_legs(units=3)
+        )
+        self.claim_reservation(plan_id="plan-adjust")
+
+        with self.assertRaises(self._refusal) as ctx:
+            await executor.execute(_plan_view_for(self.factory, "plan-adjust"), actor=OWNER)
+
+        self.assertEqual(ctx.exception.reason_code, "OPTION_ADJUSTMENT_PROTECTION_ACTIVE")
+        self.assertTrue(ctx.exception.detail["unreadable"])
+
     async def test_a_reduce_only_adjust_is_admitted_while_the_owner_row_is_unknown(self):
         """Risk reduction is never blocked by an unknown owner, exactly like the
         triggered-policy split: the reduction converges toward flat."""

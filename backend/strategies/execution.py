@@ -1245,7 +1245,18 @@ class PaperPlanExecutor:
         blocks: List[tuple[str, Any]] = [("run_block", None)]
         owner_row, owner_read_error = self._option_protection_owner_row(run)
         if owner_row is not None and isinstance(owner_row.get("policy"), Mapping):
-            blocks.append(("owner_policy", dict(owner_row["policy"])))
+            owner_policy = dict(owner_row["policy"])
+            raw_rules = owner_policy.get("rules")
+            if isinstance(raw_rules, list):
+                # Backend protection stores per-position SL/target rows in the
+                # same owner policy. Only rules declaring an option metric belong
+                # to this evaluator; an explicit unknown metric still fails closed.
+                owner_policy["rules"] = [
+                    rule
+                    for rule in raw_rules
+                    if not (isinstance(rule, Mapping) and "metric" not in rule)
+                ]
+            blocks.append(("owner_policy", owner_policy))
         triggered_source: Optional[str] = None
         triggered_rule: Any = None
         try:

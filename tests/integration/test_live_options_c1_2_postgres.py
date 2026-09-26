@@ -1719,7 +1719,7 @@ async def test_live_roll_partial_acquisition_holds_old_generation_then_releases_
     pg, live_env, monkeypatch
 ):
     _seed_roll_catalog(pg["factory"])
-    monkeypatch.setattr(phase2b_routes, "_FakeOptionsManager", _RollOptionsManager)
+    _fresh_options_manager(monkeypatch, base=_RollOptionsManager)
     clock = _clock()
     broker_calls = []
 
@@ -1856,8 +1856,9 @@ async def test_live_roll_partial_acquisition_holds_old_generation_then_releases_
 
 
 @pytest.mark.asyncio
-async def test_live_option_resize_rejected_hedge_releases_nothing(pg, live_env):
+async def test_live_option_resize_rejected_hedge_releases_nothing(pg, live_env, monkeypatch):
     """A REJECTED hedge increase is not a position: the dependent short waits."""
+    _fresh_options_manager(monkeypatch)
     _seed_catalog(pg["factory"])
     clock = _clock()
     broker_calls = []
@@ -2048,7 +2049,7 @@ async def test_live_roll_ledger_divergence_holds_the_old_generation(
 ):
     """A run ledger that lost the new generation never releases the old one."""
     _seed_roll_catalog(pg["factory"])
-    monkeypatch.setattr(phase2b_routes, "_FakeOptionsManager", _RollOptionsManager)
+    _fresh_options_manager(monkeypatch, base=_RollOptionsManager)
     clock = _clock()
     broker_calls = []
 
