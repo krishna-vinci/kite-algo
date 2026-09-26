@@ -596,6 +596,26 @@ export type ReservationRow = {
   release_reason: string | null;
 };
 
+// ---------------------------------------------------------------------------
+// P2-UX: cross-strategy approvals inbox
+// ---------------------------------------------------------------------------
+
+export type PendingApprovalItem = {
+  strategy_id: string;
+  strategy_name: string;
+  request_id: string;
+  plan_id: string;
+  environment: string;
+  summary: string;
+  created_at: string | null;
+  expires_at: string | null;
+};
+
+export type PendingApprovalList = {
+  items: PendingApprovalItem[];
+  count: number;
+};
+
 export type ApprovalRow = {
   approval_id: string;
   plan_id: string;

@@ -3,6 +3,7 @@
 import { useRef, useState } from "react";
 import { AlgoWorkerAccessPanel } from "@/components/settings/algo-worker-access-panel";
 import { IndexBaselinesPanel } from "@/components/settings/index-baselines-panel";
+import { LiveTradingPanel } from "@/components/settings/live-trading-panel";
 import { WorkspaceContextPanel } from "@/components/settings/workspace-context-panel";
 import { Panel } from "@/components/operator/panel";
 
@@ -10,7 +11,7 @@ import { Panel } from "@/components/operator/panel";
 // Tab definitions
 // ---------------------------------------------------------------------------
 
-type TabId = "reference-data" | "worker-access" | "workspace" | "apis";
+type TabId = "reference-data" | "worker-access" | "live-trading" | "workspace" | "apis";
 
 const TABS: { id: TabId; label: string; description: string }[] = [
   {
@@ -22,6 +23,11 @@ const TABS: { id: TabId; label: string; description: string }[] = [
     id: "worker-access",
     label: "Worker access",
     description: "Token issuance, scope controls, and run permissions.",
+  },
+  {
+    id: "live-trading",
+    label: "Live trading",
+    description: "Master switch status, account scope, and lane controls.",
   },
   {
     id: "workspace",
@@ -44,6 +50,7 @@ export default function SettingsPage() {
   const tabRefs = useRef<Record<TabId, HTMLButtonElement | null>>({
     "reference-data": null,
     "worker-access": null,
+    "live-trading": null,
     workspace: null,
     apis: null,
   });
@@ -148,6 +155,16 @@ export default function SettingsPage() {
             aria-labelledby="tab-worker-access"
           >
             <AlgoWorkerAccessPanel />
+          </div>
+        )}
+
+        {activeTab === "live-trading" && (
+          <div
+            id="tabpanel-live-trading"
+            role="tabpanel"
+            aria-labelledby="tab-live-trading"
+          >
+            <LiveTradingPanel />
           </div>
         )}
 

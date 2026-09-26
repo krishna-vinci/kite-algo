@@ -32,6 +32,7 @@ import {
   fetchOptionRun,
   fetchOptionRunRepair,
   fetchOptionRuns,
+  fetchPendingApprovals,
   fetchPendingWork,
   fetchPlan,
   inspectHostedReconciliation,
@@ -253,6 +254,18 @@ export function useExecutionRequests(strategyId: string | null) {
       );
       return moving ? 5_000 : false;
     },
+  });
+}
+
+/**
+ * The cross-strategy approvals inbox. Polled so the nav badge and the inbox
+ * page both stay current as requests arrive or expire.
+ */
+export function usePendingApprovals() {
+  return useQuery({
+    queryKey: hostedKeys.pendingApprovals(),
+    queryFn: fetchPendingApprovals,
+    refetchInterval: 20_000,
   });
 }
 

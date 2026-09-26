@@ -33,6 +33,7 @@ import {
   useCreateHostedStrategy,
   useHostedOptions,
   useHostedStrategies,
+  usePendingApprovals,
   useUpdateHostedStrategy,
 } from "@/features/strategies/hooks/use-hosted-strategies-queries";
 import { hostedErrorMessage } from "@/features/strategies/lib/format";
@@ -281,7 +282,9 @@ function StrategyRow({
 export function HostedStrategiesListPage() {
   const optionsQuery = useHostedOptions();
   const strategiesQuery = useHostedStrategies();
+  const pendingApprovalsQuery = usePendingApprovals();
   const strategies = strategiesQuery.data?.strategies ?? [];
+  const pendingApprovalsCount = pendingApprovalsQuery.data?.count ?? 0;
 
   return (
     <div className="flex flex-col gap-6">
@@ -290,6 +293,21 @@ export function HostedStrategiesListPage() {
         title="Strategies"
         description="Paste or drop a Python file on one page, choose what it may do and where it runs, then supervise the attempts."
       />
+
+      {pendingApprovalsCount > 0 ? (
+        <Alert data-testid="pending-approvals-banner">
+          <AlertTitle>
+            {pendingApprovalsCount === 1
+              ? "One execution request is waiting for your approval"
+              : `${pendingApprovalsCount} execution requests are waiting for your approval`}
+          </AlertTitle>
+          <AlertDescription>
+            <Link href="/strategies/approvals" className="font-medium underline underline-offset-2">
+              Review approvals
+            </Link>
+          </AlertDescription>
+        </Alert>
+      ) : null}
 
       <div>
         <Button asChild>

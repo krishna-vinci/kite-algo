@@ -26,6 +26,7 @@ import type {
   ExecutionRequestDecisionResponse,
   ExecutionRequestList,
   ExecutionRequestRow,
+  PendingApprovalList,
   FlattenActionPayload,
   FlattenOperationResult,
   HostedPositionList,
@@ -260,6 +261,15 @@ export async function rejectExecutionRequest(
     `${BASE}/${encodeURIComponent(strategyId)}/execution-requests/${encodeURIComponent(requestId)}/reject`,
     { method: "POST", json: payload },
   );
+}
+
+/**
+ * Every execution request in `awaiting_approval` across the owner's
+ * strategies, source `hosted_execution_requests`. Approve/reject reuse the
+ * per-strategy execution-request decision routes below.
+ */
+export async function fetchPendingApprovals(): Promise<PendingApprovalList> {
+  return apiFetch<PendingApprovalList>(`${BASE}/approvals/pending`);
 }
 
 export async function fetchExecutionRequest(

@@ -15,6 +15,7 @@ from backend.api.routers.alerts_operator_platform import (
     router as alerts_operator_platform_router,
 )
 from backend.api.routers.alerts_market_ws import router as alerts_market_ws_router
+from backend.api.routers.platform import router as platform_router
 from backend.api.routers.strategies import router as strategies_router
 from backend.api.routers.strategy_option_runs import router as strategy_option_runs_router
 from backend.api.routers.strategy_owner_actions import router as strategy_owner_actions_router
@@ -59,6 +60,10 @@ ALL_ROUTERS = [
     (alerts_operator_router, "/api"),
     (alerts_operator_platform_router, "/api"),
     (alerts_market_ws_router, "/api"),
+    # Registered BEFORE the hosted-strategy router: the platform router owns the
+    # literal path ``/strategies/approvals/pending``, which must never be
+    # considered after (or shadowed by) a ``/strategies/{strategy_id}`` pattern.
+    (platform_router, "/api"),
     (strategies_router, "/api"),
     (strategy_option_runs_router, "/api"),
     (strategy_owner_actions_router, "/api"),

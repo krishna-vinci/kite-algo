@@ -1412,6 +1412,10 @@ def hosted_live_lanes() -> list:
 #: C2 rollout order). A comma-separated list of PUBLIC lane names.
 ENABLED_LIVE_LANES_ENV = "HOSTED_LIVE_LANES"
 
+#: The name of the PERSISTED setting (``platform_live_settings``) reported in a
+#: refusal when the owner's stored row, not the env, is what closed the lane.
+PERSISTED_LIVE_LANES_SETTING = "platform_live_settings"
+
 #: The public lane names ``HOSTED_LIVE_LANES`` may name: exactly the lanes the
 #: executor maps plan kinds for (``_LANE_PLAN_KINDS``), so the allowlist cannot
 #: drift from the admission map. Anything else is ignored.
@@ -1440,17 +1444,34 @@ def public_live_lane(lane: str) -> str:
     return _LANE_PUBLIC_NAMES.get(name, name)
 
 
-def enabled_live_lanes(environ: Optional[Mapping[str, str]] = None) -> List[str]:
-    """The public lanes ``HOSTED_LIVE_LANES`` opens, in the order they are named.
+def _persisted_lane_settings() -> Optional[Any]:
+    """The owner's persisted lane row, or ``None`` when the env is authoritative.
 
-    DEFAULT DENY: unset, empty or whitespace-only means NO lane may take new
-    exposure. An unknown name is ignored - never guessed, never a wildcard - and
-    reported at startup so a typo is visible rather than silently ignored.
-
-    Read PER CALL (never cached at import), so an env change plus a restart takes
-    effect without a code change.
+    An import/read failure is "no row" rather than an error: the deployment's own
+    env allowlist is then still the answer, and that can only be narrower than
+    "open", so a database outage never widens live exposure.
     """
-    source = os.environ if environ is None else environ
+    try:
+        from backend.platform.settings import read_live_settings
+
+        return read_live_settings()
+    except Exception:  # noqa: BLE001 - an unreadable row is not an open lane
+        logger.warning(
+            "platform live settings unavailable; falling back to %s",
+            ENABLED_LIVE_LANES_ENV,
+        )
+        return None
+
+
+def live_lane_gate_source(environ: Optional[Mapping[str, str]] = None) -> str:
+    """``db`` when the persisted row decides a lane's answer, else ``env``."""
+    if environ is not None:
+        return "env"
+    return "db" if _persisted_lane_settings() is not None else "env"
+
+
+def _env_live_lanes(source: Mapping[str, str]) -> List[str]:
+    """``HOSTED_LIVE_LANES`` parsed into public lane names, in the named order."""
     raw = str(source.get(ENABLED_LIVE_LANES_ENV, "") or "")
     enabled: List[str] = []
     for part in raw.split(","):
@@ -1472,6 +1493,32 @@ def enabled_live_lanes(environ: Optional[Mapping[str, str]] = None) -> List[str]
     return enabled
 
 
+def enabled_live_lanes(environ: Optional[Mapping[str, str]] = None) -> List[str]:
+    """The public lanes open for NEW exposure, in the order the gate names them.
+
+    Two sources, in precedence order:
+
+    1. the persisted ``platform_live_settings`` row, when one exists - so an owner
+       change takes effect without a redeploy. Read PER CALL (never cached at
+       import), so the very next release pass sees it.
+    2. otherwise the deployment env allowlist ``HOSTED_LIVE_LANES``, unchanged:
+       DEFAULT DENY - unset, empty or whitespace-only means NO lane may take new
+       exposure, and an unknown name is ignored rather than guessed.
+
+    An EXPLICIT ``environ`` mapping asks for the deployment-settings answer (the
+    contract this function always had, and what a unit test passes), so the
+    database is consulted only when the caller passes none - i.e. in the running
+    process. A lane closed here never blocks a reduction, an exit, the MIS
+    square-off, repair or flatten.
+    """
+    if environ is None:
+        persisted = _persisted_lane_settings()
+        if persisted is not None:
+            lanes = dict(persisted.lanes or {})
+            return [lane for lane in KNOWN_LIVE_LANES if lanes.get(lane) is True]
+    return _env_live_lanes(os.environ if environ is None else environ)
+
+
 def live_lane_enabled(lane: str, environ: Optional[Mapping[str, str]] = None) -> bool:
     """Whether ONE lane may take new exposure in this deployment.
 
@@ -1485,14 +1532,23 @@ def live_lane_disabled_detail(
     *, lane: str, plan_id: str = "", environ: Optional[Mapping[str, str]] = None
 ) -> dict:
     """The ``LIVE_LANE_NOT_ENABLED`` detail: the lane refused, and what IS open."""
+    from_db = live_lane_gate_source(environ) == "db"
+    setting = PERSISTED_LIVE_LANES_SETTING if from_db else ENABLED_LIVE_LANES_ENV
+    if from_db:
+        message = (
+            "this live lane is not open for new exposure in this deployment; "
+            "the owner has not opened it in platform live settings"
+        )
+    else:
+        message = (
+            "this live lane is not open for new exposure in this deployment; "
+            f"add it to {ENABLED_LIVE_LANES_ENV} and restart finance-app after "
+            "owner approval"
+        )
     return {
         "plan_id": str(plan_id or ""),
         "lane": public_live_lane(lane),
         "enabled_lanes": enabled_live_lanes(environ),
-        "setting": ENABLED_LIVE_LANES_ENV,
-        "message": (
-            "this live lane is not open for new exposure in this deployment; "
-            f"add it to {ENABLED_LIVE_LANES_ENV} and restart finance-app after "
-            "owner approval"
-        ),
+        "setting": setting,
+        "message": message,
     }

@@ -3892,3 +3892,45 @@ DROP TRIGGER IF EXISTS trg_hosted_execution_audit_immutable
 CREATE TRIGGER trg_hosted_execution_audit_immutable
     BEFORE UPDATE OR DELETE ON public.hosted_execution_audit
     FOR EACH ROW EXECUTE FUNCTION forbid_hosted_execution_audit_mutation();
+
+-- =========================================
+-- Platform live-lane settings (Phase 2 UX)
+-- =========================================
+-- The owner's per-lane answer for NEW live exposure, previously expressible only
+-- as the deployment setting ``HOSTED_LIVE_LANES``. A SINGLE row (settings_id = 1)
+-- is what makes "one platform lane policy" a database fact; an ABSENT row means
+-- the deployment env allowlist still decides, which is default-deny. This row
+-- never arms live trading: ``HOSTED_LIVE_ENABLED`` still gates all live
+-- execution, and reductions, exits, the MIS square-off, repair and flatten are
+-- never gated by it.
+CREATE TABLE IF NOT EXISTS public.platform_live_settings (
+    settings_id INTEGER PRIMARY KEY,
+    lanes JSONB NOT NULL DEFAULT '{}'::jsonb,
+    updated_by TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT ck_platform_live_settings_singleton CHECK (settings_id = 1)
+);
+
+CREATE TABLE IF NOT EXISTS public.platform_live_settings_audit (
+    audit_id BIGSERIAL PRIMARY KEY,
+    actor_id TEXT NOT NULL,
+    reason TEXT,
+    previous_lanes JSONB NOT NULL DEFAULT '{}'::jsonb,
+    lanes JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_platform_live_settings_audit_created
+    ON public.platform_live_settings_audit (created_at DESC);
+
+CREATE OR REPLACE FUNCTION forbid_platform_live_settings_audit_mutation()
+RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'platform_live_settings_audit is append-only (insert-only)';
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_platform_live_settings_audit_immutable
+    ON public.platform_live_settings_audit;
+CREATE TRIGGER trg_platform_live_settings_audit_immutable
+    BEFORE UPDATE OR DELETE ON public.platform_live_settings_audit
+    FOR EACH ROW EXECUTE FUNCTION forbid_platform_live_settings_audit_mutation();

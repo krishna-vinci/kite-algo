@@ -14,6 +14,7 @@ export const hostedKeys = {
   grants: (strategyId: string) => ["hosted", "grants", strategyId] as const,
   executionRequests: (strategyId: string) =>
     ["hosted", "execution-requests", strategyId] as const,
+  pendingApprovals: () => ["hosted", "pending-approvals"] as const,
   admissionPolicy: (strategyId: string) => ["hosted", "admission-policy", strategyId] as const,
   schedule: (strategyId: string) => ["hosted", "schedule", strategyId] as const,
   scheduleOccurrences: (strategyId: string) =>

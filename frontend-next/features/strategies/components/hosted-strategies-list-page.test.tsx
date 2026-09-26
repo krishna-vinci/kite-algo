@@ -27,6 +27,7 @@ vi.mock("@/lib/hosted-strategies/api", () => ({
   fetchHostedJobNotifications: vi.fn(),
   inspectHostedReconciliation: vi.fn(),
   reconcileHostedJob: vi.fn(),
+  fetchPendingApprovals: vi.fn().mockResolvedValue({ count: 0, items: [] }),
 }));
 
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));

@@ -34,6 +34,7 @@ from typing import Any, Callable, Dict, Mapping, Optional
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
+from backend.strategies.attribution_models import StrategyPlan, StrategyReservation
 from backend.strategies.execution_authorization import (
     ExecutionAuthorizationService,
     sha256_json,
@@ -125,6 +126,22 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, (list, tuple, set)):
         return [_json_safe(item) for item in value]
     return value
+
+
+def _plan_summary(plan_kind: Any, logical_plan: Any, resolved_plan: Any) -> str:
+    """A short, honest summary of a FROZEN plan for the approvals inbox.
+
+    Built only from what the stored plan actually says - its kind and, when the
+    frozen legs are present, how many of them there are. Nothing is re-derived
+    from live market data or from the strategy's current configuration, so what
+    the owner reads is what was frozen at request time.
+    """
+    kind = str(plan_kind or "").strip() or "plan"
+    for candidate in (resolved_plan, logical_plan):
+        legs = (candidate or {}).get("legs") if isinstance(candidate, Mapping) else None
+        if isinstance(legs, list):
+            return f"{kind} ({len(legs)} leg{'s' if len(legs) != 1 else ''})"
+    return kind
 
 
 class ExecutionRequestError(Exception):
@@ -295,6 +312,67 @@ class ExecutionRequestService:
                 .all()
             )
             return [self._view(row) for row in rows]
+
+    def list_pending_for_owner(self, owner_id: str, *, limit: int = 100) -> list:
+        """Every execution request awaiting THIS owner's decision, newest first.
+
+        The approvals inbox is owner-scoped across strategies (an owner does not
+        approve per strategy), so the filter is ``owner_id`` and the ONLY status
+        is ``awaiting_approval``: a request already decided, refused, dispatching
+        or executed is not pending and never appears here. Each row carries the
+        strategy's name and a short frozen-plan summary so the owner can decide
+        without a second round of reads, and the expiry of the reservation the
+        request holds when it has one (``None`` until one exists - unknown is
+        reported as unknown, never guessed).
+        """
+        owner = str(owner_id or "").strip()
+        if not owner:
+            return []
+        with self.session_factory() as session:
+            rows = session.execute(
+                select(
+                    HostedExecutionRequest,
+                    HostedStrategy.name,
+                    StrategyPlan.plan_kind,
+                    StrategyPlan.logical_plan,
+                    StrategyPlan.resolved_plan,
+                    StrategyReservation.valid_until,
+                )
+                .join(
+                    HostedStrategy,
+                    HostedStrategy.id == HostedExecutionRequest.strategy_id,
+                )
+                .join(
+                    StrategyPlan, StrategyPlan.plan_id == HostedExecutionRequest.plan_id
+                )
+                .outerjoin(
+                    StrategyReservation,
+                    StrategyReservation.reservation_id
+                    == HostedExecutionRequest.reservation_id,
+                )
+                .where(
+                    HostedExecutionRequest.owner_id == owner,
+                    HostedExecutionRequest.status == "awaiting_approval",
+                )
+                .order_by(
+                    HostedExecutionRequest.created_at.desc(),
+                    HostedExecutionRequest.request_id,
+                )
+                .limit(int(limit))
+            ).all()
+        return [
+            {
+                "strategy_id": str(row.strategy_id),
+                "strategy_name": str(strategy_name or ""),
+                "request_id": str(row.request_id),
+                "plan_id": str(row.plan_id),
+                "environment": str(row.execution_environment),
+                "summary": _plan_summary(plan_kind, logical_plan, resolved_plan),
+                "created_at": row.created_at,
+                "expires_at": valid_until,
+            }
+            for row, strategy_name, plan_kind, logical_plan, resolved_plan, valid_until in rows
+        ]
 
     # -- creation -----------------------------------------------------------
 

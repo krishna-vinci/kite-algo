@@ -82,6 +82,80 @@ def test_hosted_live_lanes_reports_only_the_admitted_and_enabled_lanes(monkeypat
     assert hosted_live_lanes() == ["cnc", "mis"]
 
 
+# -- the persisted row (``platform_live_settings``) ---------------------------
+
+
+def test_an_explicit_environ_asks_the_env_and_never_touches_the_database(monkeypatch):
+    """The deployment-settings contract is preserved exactly.
+
+    Callers that pass an explicit mapping (every existing unit test, and any
+    caller reasoning about a *hypothetical* deployment config) get the env
+    answer, so the database is not consulted at all.
+    """
+    from backend.platform import settings as platform_settings
+
+    def _explode():
+        raise AssertionError("the lane gate must not read the database here")
+
+    monkeypatch.setattr(platform_settings, "_session_factory_override", _explode)
+
+    assert enabled_live_lanes({"HOSTED_LIVE_LANES": "cnc"}) == ["cnc"]
+    assert enabled_live_lanes({}) == []
+    assert enabled_live_lanes({"HOSTED_LIVE_LANES": "options"}) == ["options"]
+
+
+def test_an_unreadable_persisted_row_keeps_the_env_answer_and_default_deny(monkeypatch):
+    """A database that cannot be read is NOT an open lane.
+
+    The live path falls back to the deployment env allowlist - the documented,
+    default-deny source - so an outage can only ever preserve what the deployment
+    already declared, never widen it.
+    """
+    from backend.platform import settings as platform_settings
+
+    monkeypatch.setattr(
+        platform_settings,
+        "_session_factory_override",
+        lambda: _unreadable_session_factory,
+    )
+
+    monkeypatch.setenv("HOSTED_LIVE_LANES", "cnc")
+    assert enabled_live_lanes() == ["cnc"]
+    assert live_lane_enabled("cnc") is True
+    assert live_lane_enabled("options") is False
+
+    monkeypatch.delenv("HOSTED_LIVE_LANES", raising=False)
+    assert enabled_live_lanes() == []
+    assert live_lane_enabled("cnc") is False
+
+
+def _unreadable_session_factory():
+    raise RuntimeError("no database here")
+
+
+def test_a_refusal_names_the_persisted_setting_when_the_owner_row_gates(monkeypatch):
+    """The operator is told the knob that is ACTUALLY closed, not the env one."""
+    from backend.platform import settings as platform_settings
+    from backend.strategies.live_service import live_lane_disabled_detail
+
+    monkeypatch.setattr(
+        platform_settings,
+        "read_live_settings",
+        lambda session_factory=None: platform_settings.PersistedLaneSettings(
+            lanes={"cnc": True, "mis": False, "futures": False, "options": False},
+            updated_at=None,
+            updated_by="app:admin",
+        ),
+    )
+
+    detail = live_lane_disabled_detail(lane="options")
+
+    assert detail["lane"] == "options"
+    assert detail["enabled_lanes"] == ["cnc"]
+    assert detail["setting"] == "platform_live_settings"
+    assert "platform live settings" in detail["message"]
+
+
 # -- fakes -------------------------------------------------------------------
 
 

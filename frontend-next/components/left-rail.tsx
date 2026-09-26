@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { NavigationItem } from "@/lib/navigation";
+import { usePendingApprovals } from "@/features/strategies/hooks/use-hosted-strategies-queries";
 
 type LeftRailProps = Readonly<{
   navigation: NavigationItem[];
@@ -25,6 +26,9 @@ const iconByHref: Record<string, LucideIcon> = {
 };
 
 export function LeftRail({ navigation, activeHref }: LeftRailProps) {
+  const pendingApprovalsQuery = usePendingApprovals();
+  const pendingApprovalsCount = pendingApprovalsQuery.data?.count ?? 0;
+
   return (
     <aside className="row-span-3 flex h-screen w-[68px] flex-col items-center border-r border-[var(--border)] bg-[#0b0d13] px-2 py-3">
       <div className="mb-4 flex h-10 w-10 items-center justify-center rounded-xl bg-[var(--accent)] text-sm font-extrabold text-white shadow-[0_12px_24px_rgba(249,115,22,0.24)]">
@@ -52,6 +56,14 @@ export function LeftRail({ navigation, activeHref }: LeftRailProps) {
             >
               <Icon className="h-[17px] w-[17px]" strokeWidth={2} />
               {item.tag ? <span className="absolute right-1.5 top-1.5 h-1.5 w-1.5 rounded-full bg-[var(--accent)]" /> : null}
+              {item.href === "/strategies" && pendingApprovalsCount > 0 ? (
+                <span
+                  aria-label={`${pendingApprovalsCount} approvals pending`}
+                  className="absolute -right-1 -top-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-rose-500 px-1 text-[9px] font-bold leading-none text-white"
+                >
+                  {pendingApprovalsCount > 99 ? "99+" : pendingApprovalsCount}
+                </span>
+              ) : null}
               <span className="sr-only">{item.label}</span>
             </Link>
           );
