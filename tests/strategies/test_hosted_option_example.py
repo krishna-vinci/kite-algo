@@ -876,3 +876,90 @@ def test_the_exit_closes_every_held_leg_in_the_opposite_direction(dynamic):
         ("CE", "SELL", 2),
         ("PE", "SELL", 2),
     ]
+
+
+# -- the market-session loop --------------------------------------------------
+
+
+class _FakeSession:
+    """A bound market session that stays open for a fixed number of iterations."""
+
+    def __init__(self, open_iterations: int):
+        self.schedule_id = "sched-1"
+        self.date = "2026-09-26"
+        self._remaining = open_iterations
+        self._next_seq = 0
+
+    def market_open(self, *, now=None):  # noqa: ANN001, ARG002
+        if self._remaining <= 0:
+            return False
+        self._remaining -= 1
+        return True
+
+    def next_evaluation_id(self) -> str:
+        evaluation_id = f"session:{self.schedule_id}:{self.date}:{self._next_seq}"
+        self._next_seq += 1
+        return evaluation_id
+
+
+class _SessionCtx(_Ctx):
+    def __init__(self, *, client, run, session, params=None):
+        super().__init__(client, run, params)
+        self.session = session
+
+
+def test_a_bound_session_makes_one_fresh_decision_per_iteration_then_stops(dynamic, monkeypatch):
+    """Three open iterations decide against three distinct session ids, then stop."""
+    calls = []
+
+    def _spy(ctx, params, *, evaluation_id=None, evaluation_kind="run_now"):  # noqa: ANN001, ARG001
+        calls.append((evaluation_id, evaluation_kind))
+        return 0
+
+    monkeypatch.setattr(dynamic, "_evaluate_once", _spy)
+    session = _FakeSession(open_iterations=3)
+    ctx = _SessionCtx(
+        client=None, run=None, session=session, params={"session_loop_seconds": 0}
+    )
+
+    assert dynamic.main(ctx) == 0
+    assert len(calls) == 3
+    ids = [evaluation_id for evaluation_id, _ in calls]
+    assert len(set(ids)) == 3  # a fresh id every iteration, never reused
+    assert all(kind == "session_occurrence" for _, kind in calls)
+    # The loop stopped because the session closed, not because of a call budget.
+    assert session.market_open() is False
+
+
+def test_no_session_binding_makes_exactly_one_run_now_decision(dynamic, monkeypatch):
+    """Without ``ctx.session`` the example is unchanged: one decision, ``run_now``."""
+    calls = []
+
+    def _spy(ctx, params, *, evaluation_id=None, evaluation_kind="run_now"):  # noqa: ANN001, ARG001
+        calls.append((evaluation_id, evaluation_kind))
+        return 0
+
+    monkeypatch.setattr(dynamic, "_evaluate_once", _spy)
+    ctx = _Ctx(client=None, run=None, params={})
+
+    assert dynamic.main(ctx) == 0
+    assert calls == [(None, "run_now")]
+
+
+def test_outstanding_work_skips_proposing_in_an_evaluation(dynamic):
+    """A held run still mid-transition blocks a fresh proposal, session or not."""
+    held = _held_run(generation=2, units=1, status="adjusting")
+    run = _Run(
+        statuses=[],
+        owned_work={
+            "option_runs": [held],
+            "option_runs_coverage": {"coverage": "known"},
+        },
+    )
+    ctx = _Ctx(client=_Client(_DynamicOptionsApi()), run=run, params={})
+
+    result = dynamic._evaluate_once(ctx, dict(ctx.params))
+
+    assert result == 0
+    assert not hasattr(run, "last_payload")
+    assert any("outstanding work" in text for text in ctx.said)

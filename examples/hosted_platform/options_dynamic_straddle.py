@@ -37,6 +37,21 @@ harness, and none changes what the strategy is allowed to do:
 Stale or missing quotes/Greeks, an unpublished book, an unreadable option-run
 snapshot and a missing lot or delta are named no-action states: the example says
 why it did nothing instead of guessing a strike, a price or a size.
+
+Two run modes share the SAME decision rule:
+
+* run-now (or any job without a bound market session) makes exactly ONE
+  decision and returns;
+* a ``market_session`` schedule binds ``ctx.session``, and this example then
+  loops, one decision per evaluation, until the session closes
+  (``ctx.session.market_open()`` turns false). Each iteration mints its OWN
+  evaluation id from ``ctx.session.next_evaluation_id()`` - never reused across
+  iterations - and proposes with ``evaluation_kind="session_occurrence"``, the
+  platform's binding for that schedule. ``session_loop_seconds`` (default 60)
+  is the pause between iterations. An iteration with outstanding work already
+  in flight (the held run not yet back to a settled ``entered`` state) reports
+  it and proposes nothing, rather than racing a decision the platform has not
+  finished landing yet.
 """
 
 from __future__ import annotations
@@ -197,6 +212,19 @@ def _held_run(runs: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         if _run_state(row) != "closed":
             return row
     return None
+
+
+def _outstanding(run: Optional[Dict[str, Any]]) -> bool:
+    """Whether the held run is mid-transition rather than settled ``entered``.
+
+    ``entered`` is the only steady state this example proposes an adjustment
+    against; every other open status means the platform has not finished
+    landing the last thing this strategy asked for, so a fresh evaluation
+    would be racing it rather than reading a settled generation.
+    """
+    if run is None:
+        return False
+    return _run_state(run) == "open" and str(run.get("status") or "") != "entered"
 
 
 def _run_generation(run: Dict[str, Any]) -> int:
@@ -564,6 +592,8 @@ def _proposal(
     option_run_id: Optional[str] = None,
     based_on_generation: Optional[int] = None,
     suffix: str = "",
+    evaluation_id: Optional[str] = None,
+    evaluation_kind: str = "run_now",
 ) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "underlying": underlying,
@@ -592,8 +622,8 @@ def _proposal(
     if based_on_generation is not None:
         payload["based_on_generation"] = int(based_on_generation)
     return {
-        "evaluation_id": f"dynamic-straddle-{phase}{suffix}-{ctx.run_id}",
-        "evaluation_kind": "run_now",
+        "evaluation_id": evaluation_id or f"dynamic-straddle-{phase}{suffix}-{ctx.run_id}",
+        "evaluation_kind": evaluation_kind,
         "strategy_id": identity["strategy_id"],
         "strategy_run_id": ctx.run_id,
         "account_scope": identity["account_scope"],
@@ -726,8 +756,21 @@ def _verify_landed(
     return True, run
 
 
-def main(ctx) -> int:  # noqa: ANN001 - the hosted contract is main(ctx)
-    params: Dict[str, Any] = dict(ctx.params or {})
+def _evaluate_once(
+    ctx,  # noqa: ANN001
+    params: Dict[str, Any],
+    *,
+    evaluation_id: Optional[str] = None,
+    evaluation_kind: str = "run_now",
+) -> int:
+    """ONE decision: entry, exit, a resize or a roll - or a named no-action.
+
+    This is the whole example's rule, run-now or from inside the session loop
+    alike; ``evaluation_id``/``evaluation_kind`` are the only things a caller
+    varies, since a session evaluation is bound to the platform's own
+    ``session_occurrence`` identity rather than a run-now id this example makes
+    up.
+    """
     underlying = str(params.get("underlying") or "NIFTY").strip().upper()
     product = str(params.get("product") or "NRML").strip().upper()
     expiry_policy = str(params.get("expiry_policy") or "exit_before_cutoff")
@@ -738,6 +781,13 @@ def main(ctx) -> int:  # noqa: ANN001 - the hosted contract is main(ctx)
     if runs is None:
         return 0
     run = _held_run(runs)
+    if _outstanding(run):
+        _say(
+            ctx,
+            "no action: outstanding work in flight "
+            f"(status={run.get('status')!r}); not proposing over it",
+        )
+        return 0
     held_expiry = _run_expiry(run) if run is not None else ""
     held_units = _run_units(run) if run is not None else 0
 
@@ -801,6 +851,8 @@ def main(ctx) -> int:  # noqa: ANN001 - the hosted contract is main(ctx)
             structure_id=structure_id,
             legs=legs,
             units=unit_size,
+            evaluation_id=evaluation_id,
+            evaluation_kind=evaluation_kind,
         )
         row = _submit(ctx, proposal, deadline_seconds=deadline_seconds, what="entry")
         _say(ctx, f"entry answer {_describe(row)}")
@@ -825,6 +877,8 @@ def main(ctx) -> int:  # noqa: ANN001 - the hosted contract is main(ctx)
             structure_id=structure_id,
             legs=closing,
             option_run_id=str(run.get("option_run_id") or ""),
+            evaluation_id=evaluation_id,
+            evaluation_kind=evaluation_kind,
         )
         row = _submit(ctx, proposal, deadline_seconds=deadline_seconds, what="exit")
         _say(ctx, f"exit answer {_describe(row)}")
@@ -870,6 +924,8 @@ def main(ctx) -> int:  # noqa: ANN001 - the hosted contract is main(ctx)
         units=unit_size,
         option_run_id=str(run.get("option_run_id") or ""),
         based_on_generation=int(decision["based_on_generation"]),
+        evaluation_id=evaluation_id,
+        evaluation_kind=evaluation_kind,
     )
     _say(ctx, f"{decision['action']} decided: {decision['reason']}")
     row = _submit(
@@ -893,6 +949,37 @@ def main(ctx) -> int:  # noqa: ANN001 - the hosted contract is main(ctx)
             ),
         )
     return _finish_held(ctx, underlying, decision["action"])
+
+
+def _run_session_loop(ctx, params: Dict[str, Any]) -> int:  # noqa: ANN001
+    """One decision per evaluation, looped until ``ctx.session`` closes.
+
+    Every pass mints a fresh ``ctx.session.next_evaluation_id()`` - never
+    reused - and proposes with ``evaluation_kind="session_occurrence"``, the
+    platform's own binding for this scheduled job. The loop adds nothing to the
+    decision rule itself: ``_evaluate_once`` is exactly what run-now calls.
+    """
+    session = ctx.session
+    interval = _number(params.get("session_loop_seconds"), 60.0) or 60.0
+    last_result = 0
+    while session.market_open():
+        evaluation_id = session.next_evaluation_id()
+        _say(ctx, f"session evaluation {evaluation_id}")
+        last_result = _evaluate_once(
+            ctx, params, evaluation_id=evaluation_id, evaluation_kind="session_occurrence"
+        )
+        time.sleep(interval)
+    _say(ctx, "session closed: loop finished")
+    return last_result
+
+
+def main(ctx) -> int:  # noqa: ANN001 - the hosted contract is main(ctx)
+    """Run-now makes ONE decision; a bound market session loops until it closes."""
+    params: Dict[str, Any] = dict(ctx.params or {})
+    session = getattr(ctx, "session", None)
+    if session is not None:
+        return _run_session_loop(ctx, params)
+    return _evaluate_once(ctx, params)
 
 
 def _duplicate_entry_probe(  # noqa: ANN001
