@@ -149,6 +149,10 @@ class HostedStrategySchedule(Base):
     progress_deadline_s = Column(Integer, nullable=False)
     schedule_kind = Column(Text, nullable=False)
     at_time = Column(Text, nullable=False)
+    #: Market-session kind: minutes after open when the job starts and before
+    #: close when the platform asks its one session-long job to stop.
+    start_offset_min = Column(Integer, nullable=True)
+    stop_offset_min = Column(Integer, nullable=True)
     weekday = Column(Integer, nullable=True)
     #: Monthly kind: the day of month the occurrence falls on.
     day_of_month = Column(Integer, nullable=True)
@@ -185,8 +189,26 @@ class HostedStrategySchedule(Base):
             name="ck_hosted_strategy_schedules_job_kind",
         ),
         CheckConstraint(
-            "schedule_kind IN ('daily', 'weekly', 'monthly', 'calendar')",
+            "schedule_kind IN ('daily', 'weekly', 'monthly', 'calendar', 'market_session')",
             name="ck_hosted_strategy_schedules_kind",
+        ),
+        CheckConstraint(
+            "start_offset_min IS NULL OR (start_offset_min >= 0 AND start_offset_min < 1440)",
+            name="ck_hosted_strategy_schedules_start_offset",
+        ),
+        CheckConstraint(
+            "stop_offset_min IS NULL OR (stop_offset_min >= 0 AND stop_offset_min < 1440)",
+            name="ck_hosted_strategy_schedules_stop_offset",
+        ),
+        CheckConstraint(
+            "schedule_kind <> 'market_session' OR (start_offset_min IS NOT NULL "
+            "AND stop_offset_min IS NOT NULL)",
+            name="ck_hosted_strategy_schedules_session_offsets",
+        ),
+        CheckConstraint(
+            "schedule_kind = 'market_session' OR "
+            "(start_offset_min IS NULL AND stop_offset_min IS NULL)",
+            name="ck_hosted_strategy_schedules_non_session_offsets",
         ),
         CheckConstraint(
             "day_of_month IS NULL OR (day_of_month >= 1 AND day_of_month <= 31)",

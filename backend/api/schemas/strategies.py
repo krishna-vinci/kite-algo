@@ -556,14 +556,16 @@ class HostedScheduleRequest(BaseModel):
     execution_mode: Literal["paper", "dry_run", "live"]
     job_kind: str = Field(default="finite", max_length=32)
     params: Dict[str, Any] = Field(default_factory=dict)
-    schedule_kind: Literal["daily", "weekly", "monthly", "calendar"]
-    at_time: str = Field(max_length=5)
+    schedule_kind: Literal["daily", "weekly", "monthly", "calendar", "market_session"]
+    at_time: Optional[str] = Field(default=None, max_length=5)
     weekday: Optional[int] = Field(default=None, ge=0, le=6)
     day_of_month: Optional[int] = Field(default=None, ge=1, le=31)
     calendar_dates: Optional[List[str]] = None
     timezone: str = Field(default="Asia/Kolkata", max_length=64)
     window_end: Optional[str] = Field(default=None, max_length=5)
     squareoff_at: Optional[str] = Field(default=None, max_length=5)
+    start_offset_min: Optional[int] = Field(default=None, ge=0, lt=1440)
+    stop_offset_min: Optional[int] = Field(default=None, ge=0, lt=1440)
     enabled: bool = True
 
 
@@ -603,6 +605,8 @@ class HostedScheduleResponse(BaseModel):
     timezone: str
     window_end: Optional[str] = None
     squareoff_at: Optional[str] = None
+    start_offset_min: Optional[int] = None
+    stop_offset_min: Optional[int] = None
     enabled: bool
     #: The stored manual pause, if one was set outside this surface.
     manually_paused: bool = False

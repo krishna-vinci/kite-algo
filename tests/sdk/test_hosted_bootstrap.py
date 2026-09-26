@@ -277,3 +277,50 @@ def test_build_context_occurrence_is_none_for_a_run_now_child(tmp_path, monkeypa
 
     assert ctx.run.config.hosted_occurrence is None
     assert ctx.occurrence is None
+
+
+def test_build_context_exposes_a_session_and_mints_valid_ids(tmp_path, monkeypatch):
+    """Session children get the clock and an id helper for this exact job/day."""
+    from datetime import datetime
+
+    occurrence = {
+        "job_id": "job-3",
+        "strategy_id": "stg-1",
+        "attempt": 1,
+        "version_id": "ver-1",
+        "occurrence_key": "sch-1:2026-10-09",
+        "schedule_id": "sch-1",
+        "evaluation_id": "session:sch-1:2026-10-09:0",
+        "evaluation_kind": "session_occurrence",
+        "session_date": "2026-10-09",
+        "opens_at": "2026-10-09T03:45:00+00:00",
+        "closes_at": "2026-10-09T10:00:00+00:00",
+    }
+    _set_child_env(monkeypatch, tmp_path)
+    _stub_run_detail(monkeypatch, {"hosted": occurrence})
+
+    ctx = hosted_bootstrap.build_context()
+
+    assert ctx.session is not None
+    assert ctx.session.date == "2026-10-09"
+    assert ctx.session.next_evaluation_id() == "session:sch-1:2026-10-09:0"
+    assert ctx.session.next_evaluation_id() == "session:sch-1:2026-10-09:1"
+    assert ctx.session.market_open(now=datetime.fromisoformat("2026-10-09T05:00:00+00:00"))
+    assert not ctx.session.market_open(now=datetime.fromisoformat("2026-10-09T10:01:00+00:00"))
+
+
+def test_session_context_is_none_for_a_scheduled_occurrence(tmp_path, monkeypatch):
+    """Only session jobs receive the session helper."""
+    occurrence = {
+        "job_id": "job-4",
+        "occurrence_key": "sch-1:2026-10-09",
+        "evaluation_id": "sched:sch-1:2026-10-09",
+        "evaluation_kind": "scheduled_occurrence",
+    }
+    _set_child_env(monkeypatch, tmp_path)
+    _stub_run_detail(monkeypatch, {"hosted": occurrence})
+
+    ctx = hosted_bootstrap.build_context()
+
+    assert ctx.occurrence is not None
+    assert ctx.session is None

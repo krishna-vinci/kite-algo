@@ -531,6 +531,10 @@ async def prepare_launch(
             "evaluation_id": bound_evaluation_id,
             "evaluation_kind": bound.get("evaluation_kind"),
             "due_at": bound.get("due_at"),
+            "schedule_id": bound.get("schedule_id"),
+            "session_date": bound.get("session_date"),
+            "opens_at": bound.get("opens_at"),
+            "closes_at": bound.get("closes_at"),
         }
     }
     protection = _protection_runtime_state(stale_exit_policy, job.progress_deadline_s)

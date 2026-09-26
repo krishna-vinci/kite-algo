@@ -16,11 +16,38 @@ import importlib.util
 import json
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 __all__ = ["ChildContext", "build_context", "load_strategy_main", "run_child"]
+
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+
+@dataclass
+class SessionContext:
+    """The one market session a scheduled child may propose within."""
+
+    schedule_id: str
+    date: str
+    opens_at: str
+    closes_at: str
+    _next_seq: int = 0
+
+    def next_evaluation_id(self) -> str:
+        evaluation_id = f"session:{self.schedule_id}:{self.date}:{self._next_seq}"
+        self._next_seq += 1
+        return evaluation_id
+
+    def market_open(self, *, now: Optional[datetime] = None) -> bool:
+        moment = (now or datetime.now(_IST)).astimezone(_IST)
+        if moment.date().isoformat() != self.date:
+            return False
+        opens = datetime.fromisoformat(self.opens_at).astimezone(_IST).time()
+        closes = datetime.fromisoformat(self.closes_at).astimezone(_IST).time()
+        return opens <= moment.time() < closes
 
 ENV_BASE_URL = "KITE_ALGO_BASE_URL"
 ENV_WORKER_TOKEN = "KITE_ALGO_WORKER_TOKEN"
@@ -44,6 +71,8 @@ class ChildContext:
     template_id: str
     execution_mode: str
     run_id: str
+    _session_cache: Optional[SessionContext] = field(default=None, init=False, repr=False, compare=False)
+    _session_cache_built: bool = field(default=False, init=False, repr=False, compare=False)
 
     @property
     def occurrence(self) -> Optional[Dict[str, Any]]:
@@ -53,6 +82,33 @@ class ChildContext:
         """
         config = getattr(self.run, "config", None)
         return config.hosted_occurrence if config is not None else None
+
+    @property
+    def session(self) -> Optional[SessionContext]:
+        """The bound market session, or ``None`` for every other job kind.
+
+        Built once and cached: ``next_evaluation_id()`` mints a fresh id each
+        call, so re-reading this property must return the same instance
+        rather than resetting the sequence to zero.
+        """
+        if self._session_cache_built:
+            return self._session_cache
+        self._session_cache_built = True
+        occurrence = self.occurrence
+        if not occurrence or occurrence.get("evaluation_kind") != "session_occurrence":
+            self._session_cache = None
+            return None
+        schedule_id = occurrence.get("schedule_id")
+        if not occurrence.get("session_date") or not occurrence.get("opens_at") or not occurrence.get("closes_at"):
+            self._session_cache = None
+            return None
+        self._session_cache = SessionContext(
+            schedule_id=str(schedule_id or ""),
+            date=str(occurrence["session_date"]),
+            opens_at=str(occurrence["opens_at"]),
+            closes_at=str(occurrence["closes_at"]),
+        )
+        return self._session_cache
 
     def progress(self, note: Optional[str] = None) -> Dict[str, Any]:
         """Report progress to the hosted attempt (the child's own liveness)."""

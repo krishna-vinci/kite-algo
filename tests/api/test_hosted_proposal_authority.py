@@ -121,6 +121,8 @@ class Child:
     occurrence_key: str
     evaluation_id: str
     actions: tuple
+    schedule_id: str
+    session_date: str | None = None
 
 
 def _now() -> datetime:
@@ -208,7 +210,15 @@ class Harness:
         self.factory = factory
         self._counter = [0]
 
-    def mint(self, label, capabilities, *, validated_run_create=False):
+    def mint(
+        self,
+        label,
+        capabilities,
+        *,
+        validated_run_create=False,
+        evaluation_kind="scheduled_occurrence",
+        session_date=None,
+    ):
         self._counter[0] += 1
         label = f"{label}{self._counter[0]}"
         strategy = self.strategies.create_strategy(
@@ -230,8 +240,29 @@ class Harness:
             capabilities_snapshot={"schema_version": 2, "capabilities": dict(capabilities)},
             created_by=OWNER,
         )
+        session_kind = evaluation_kind == "session_occurrence"
         occurrence_key = f"sch-{label}:2026-10-10"
-        evaluation_id = f"sched:sch-{label}:2026-10-10"
+        evaluation_id = (
+            f"session:sch-{label}:2026-10-10:0"
+            if session_kind
+            else f"sched:sch-{label}:2026-10-10"
+        )
+        identity = {
+            "source": "schedule_occurrence",
+            "schedule_id": f"sch-{label}",
+            "occurrence_key": occurrence_key,
+            "evaluation_id": evaluation_id,
+            "evaluation_kind": evaluation_kind,
+        }
+        if session_kind:
+            identity.update(
+                {
+                    "session_date": "2026-10-10",
+                    "opens_at": "2026-10-10T03:45:00+00:00",
+                    "closes_at": "2026-10-10T10:00:00+00:00",
+                    "stop_at": "2026-10-10T09:55:00+00:00",
+                }
+            )
         job = self.strategies.create_job(
             strategy_id=strategy.id,
             version_id=version.id,
@@ -240,13 +271,7 @@ class Harness:
             execution_mode="paper",
             params={},
             occurrence_key=occurrence_key,
-            identity={
-                "source": "schedule_occurrence",
-                "schedule_id": f"sch-{label}",
-                "occurrence_key": occurrence_key,
-                "evaluation_id": evaluation_id,
-                "evaluation_kind": "scheduled_occurrence",
-            },
+            identity=identity,
         )
         template = f"hosted:{strategy.id}"
         token_id = f"worker-{label}"
@@ -274,8 +299,18 @@ class Harness:
                     "capabilities": dict(capabilities),
                     "occurrence_key": occurrence_key,
                     "evaluation_id": evaluation_id,
-                    "evaluation_kind": "scheduled_occurrence",
-                }
+                    "evaluation_kind": evaluation_kind,
+                    **(
+                        {
+                            "schedule_id": f"sch-{label}",
+                            "session_date": "2026-10-10",
+                            "opens_at": "2026-10-10T03:45:00+00:00",
+                            "closes_at": "2026-10-10T10:00:00+00:00",
+                        }
+                        if session_kind
+                        else {}
+                    ),
+                },
             },
         )
         binding = RunBindingInput(
@@ -344,6 +379,8 @@ class Harness:
             nonce=str(claimed["worker_session_nonce"]),
             occurrence_key=occurrence_key,
             evaluation_id=evaluation_id,
+            schedule_id=f"sch-{label}",
+            session_date=session_date,
             actions=tuple(actions),
         )
 
@@ -544,6 +581,74 @@ async def test_a_proposal_built_from_the_child_occurrence_is_accepted(harness, m
     stored = ProposalStore(session_factory=harness.factory).get_proposal(response.proposal_id)
     assert stored["evaluation_id"] == child.evaluation_id
     assert stored["job_id"] == child.job_id
+
+
+@pytest.mark.asyncio
+async def test_a_session_child_may_submit_many_valid_session_evaluations(harness):
+    child = harness.mint(
+        "session",
+        TRADE_CAPS,
+        evaluation_kind="session_occurrence",
+        session_date="2026-10-10",
+    )
+    first_id = child.evaluation_id
+    second_id = f"session:{child.schedule_id}:2026-10-10:1"
+
+    first = await _submit(
+        harness, child, _payload(child, evaluation_id=first_id, evaluation_kind="session_occurrence")
+    )
+    second = await _submit(
+        harness,
+        child,
+        _payload(
+            child,
+            evaluation_id=second_id,
+            evaluation_kind="session_occurrence",
+            payload={**_payload(child).payload, "target_quantity": 6},
+        ),
+    )
+
+    assert first.status == "validated"
+    assert second.status == "validated"
+    assert _proposals_for(harness, child) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_session_child_cannot_submit_another_session_or_date(harness):
+    from fastapi import HTTPException
+
+    child = harness.mint(
+        "session-boundary",
+        TRADE_CAPS,
+        evaluation_kind="session_occurrence",
+        session_date="2026-10-10",
+    )
+    with pytest.raises(HTTPException) as other_date:
+        await _submit(
+            harness,
+            child,
+            _payload(
+                child,
+                evaluation_id=f"session:{child.schedule_id}:2026-10-11:0",
+                evaluation_kind="session_occurrence",
+            ),
+        )
+    with pytest.raises(HTTPException) as other_schedule:
+        await _submit(
+            harness,
+            child,
+            _payload(
+                child,
+                evaluation_id="session:sch-other:2026-10-10:0",
+                evaluation_kind="session_occurrence",
+            ),
+        )
+
+    assert other_date.value.status_code == 409
+    assert _detail(other_date)["rejection_reason"] == "EVALUATION_IDENTITY_MISMATCH"
+    assert other_schedule.value.status_code == 409
+    assert _detail(other_schedule)["rejection_reason"] == "EVALUATION_IDENTITY_MISMATCH"
+    assert _proposals_for(harness, child) == 0
 
 
 def test_the_real_run_creation_entry_point_binds_a_proposal_capable_child(harness):

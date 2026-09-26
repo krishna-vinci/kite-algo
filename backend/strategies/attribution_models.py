@@ -476,7 +476,7 @@ class StrategyProposal(Base):
     __table_args__ = (
         UniqueConstraint("strategy_id", "evaluation_id", name="uq_proposals_strategy_evaluation"),
         CheckConstraint(
-            "evaluation_kind IN ('scheduled_occurrence', 'run_now')",
+            "evaluation_kind IN ('scheduled_occurrence', 'session_occurrence', 'run_now')",
             name="ck_proposals_evaluation_kind",
         ),
         CheckConstraint(
@@ -489,7 +489,8 @@ class StrategyProposal(Base):
         ),
         CheckConstraint("status IN ('received', 'validated', 'refused')", name="ck_proposals_status"),
         CheckConstraint(
-            "evaluation_kind <> 'scheduled_occurrence' OR job_id IS NOT NULL",
+            "(evaluation_kind NOT IN ('scheduled_occurrence', 'session_occurrence') "
+            "OR job_id IS NOT NULL)",
             name="ck_proposals_scheduled_requires_job",
         ),
         ForeignKeyConstraint(

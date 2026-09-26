@@ -614,6 +614,8 @@ def _schedule_mapping(row: Any) -> Dict[str, Any]:
         "strategy_id": str(row.strategy_id),
         "schedule_kind": str(row.schedule_kind),
         "at_time": str(row.at_time),
+        "start_offset_min": row.start_offset_min,
+        "stop_offset_min": row.stop_offset_min,
         "timezone": str(row.timezone),
         "day_of_month": row.day_of_month,
         "weekday": row.weekday,
@@ -656,6 +658,8 @@ def _schedule_out(row: Any, *, repo: SqlAlchemyStrategyRepository) -> HostedSche
         timezone=str(row.timezone),
         window_end=row.window_end,
         squareoff_at=row.squareoff_at,
+        start_offset_min=row.start_offset_min,
+        stop_offset_min=row.stop_offset_min,
         enabled=bool(row.enabled),
         manually_paused=row.manual_paused_at is not None,
         max_duration_s=int(row.max_duration_s),
@@ -761,6 +765,8 @@ async def put_hosted_schedule(
             timezone=payload.timezone,
             window_end=payload.window_end,
             squareoff_at=payload.squareoff_at,
+            start_offset_min=payload.start_offset_min,
+            stop_offset_min=payload.stop_offset_min,
             enabled=payload.enabled,
         )
     except service.StrategyValidationError as exc:

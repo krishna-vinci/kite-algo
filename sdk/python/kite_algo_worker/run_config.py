@@ -69,13 +69,19 @@ class RunConfig(ModelMixin):
         evaluation_id = hosted.get("evaluation_id")
         if not occurrence_key and not evaluation_id:
             return None
-        return {
+        occurrence = {
             "job_id": hosted.get("job_id"),
             "occurrence_key": occurrence_key,
             "evaluation_id": evaluation_id,
             "evaluation_kind": hosted.get("evaluation_kind"),
             "due_at": hosted.get("due_at"),
         }
+        for key in ("session_date", "opens_at", "closes_at"):
+            if hosted.get(key) is not None:
+                occurrence[key] = hosted[key]
+        if hosted.get("evaluation_kind") == "session_occurrence":
+            occurrence["schedule_id"] = hosted.get("schedule_id")
+        return occurrence
 
     def with_metadata(self, **kwargs: Any) -> "RunConfig":
         return self._replace(metadata={**self.metadata, **kwargs})

@@ -524,6 +524,7 @@ class SqlAlchemyStrategyRepository:
         owner_id: str,
         job_kind: str,
         execution_mode: str,
+        max_duration_s: Optional[int] = None,
         params: Optional[Dict[str, Any]] = None,
         occurrence_key: Optional[str] = None,
         identity: Optional[Dict[str, Any]] = None,
@@ -635,7 +636,9 @@ class SqlAlchemyStrategyRepository:
             params_snapshot = service.validate_parameters(version.parameters_schema, params)
             policy_snapshot = service.build_policy_snapshot(
                 stale_exit_policy=strategy.stale_exit_policy,
-                max_duration_s=strategy.max_duration_s,
+                max_duration_s=(
+                    strategy.max_duration_s if max_duration_s is None else max_duration_s
+                ),
                 progress_deadline_s=strategy.progress_deadline_s,
             )
             row = StrategyJob(
@@ -653,7 +656,9 @@ class SqlAlchemyStrategyRepository:
                 params_snapshot=copy.deepcopy(params_snapshot),
                 capabilities_snapshot=copy.deepcopy(dict(version.capabilities_snapshot or {})),
                 policy_snapshot=copy.deepcopy(policy_snapshot),
-                max_duration_s=strategy.max_duration_s,
+                max_duration_s=(
+                    strategy.max_duration_s if max_duration_s is None else max_duration_s
+                ),
                 progress_deadline_s=strategy.progress_deadline_s,
                 identity_json=copy.deepcopy(dict(identity or {})),
             )
@@ -1742,6 +1747,8 @@ class SqlAlchemyStrategyRepository:
         timezone: str = "Asia/Kolkata",
         window_end: Optional[str] = None,
         squareoff_at: Optional[str] = None,
+        start_offset_min: Optional[int] = None,
+        stop_offset_min: Optional[int] = None,
         enabled: bool = True,
     ) -> HostedStrategySchedule:
         """Store a schedule, validating identity and deriving snapshots.
@@ -1759,6 +1766,8 @@ class SqlAlchemyStrategyRepository:
             timezone=timezone,
             window_end=window_end,
             squareoff_at=squareoff_at,
+            start_offset_min=start_offset_min,
+            stop_offset_min=stop_offset_min,
         )
         if job_kind not in service.ALLOWED_JOB_KINDS:
             raise service.StrategyValidationError("unsupported job_kind")
@@ -1784,7 +1793,11 @@ class SqlAlchemyStrategyRepository:
             params_snapshot = service.validate_parameters(version.parameters_schema, params)
             policy_snapshot = service.build_policy_snapshot(
                 stale_exit_policy=strategy.stale_exit_policy,
-                max_duration_s=strategy.max_duration_s,
+                max_duration_s=(
+                    22800
+                    if schedule["schedule_kind"] == "market_session"
+                    else strategy.max_duration_s
+                ),
                 progress_deadline_s=strategy.progress_deadline_s,
             )
             row = HostedStrategySchedule(
@@ -1812,6 +1825,8 @@ class SqlAlchemyStrategyRepository:
                 timezone=schedule["timezone"],
                 window_end=schedule["window_end"],
                 squareoff_at=schedule["squareoff_at"],
+                start_offset_min=schedule["start_offset_min"],
+                stop_offset_min=schedule["stop_offset_min"],
                 enabled=bool(enabled),
             )
             session.add(row)
@@ -1854,6 +1869,8 @@ class SqlAlchemyStrategyRepository:
         timezone: str = "Asia/Kolkata",
         window_end: Optional[str] = None,
         squareoff_at: Optional[str] = None,
+        start_offset_min: Optional[int] = None,
+        stop_offset_min: Optional[int] = None,
         enabled: bool = True,
     ) -> "HostedStrategySchedule":
         """Create or edit this strategy's single stored schedule.
@@ -1875,6 +1892,8 @@ class SqlAlchemyStrategyRepository:
             timezone=timezone,
             window_end=window_end,
             squareoff_at=squareoff_at,
+            start_offset_min=start_offset_min,
+            stop_offset_min=stop_offset_min,
         )
         if job_kind not in service.ALLOWED_JOB_KINDS:
             raise service.StrategyValidationError("unsupported job_kind")
@@ -1922,7 +1941,11 @@ class SqlAlchemyStrategyRepository:
             row.job_kind = job_kind
             row.policy_snapshot = copy.deepcopy(policy_snapshot)
             row.capabilities_snapshot = copy.deepcopy(dict(version.capabilities_snapshot or {}))
-            row.max_duration_s = int(strategy.max_duration_s)
+            row.max_duration_s = (
+                22800
+                if schedule["schedule_kind"] == "market_session"
+                else strategy.max_duration_s
+            )
             row.progress_deadline_s = int(strategy.progress_deadline_s)
             row.schedule_kind = schedule["schedule_kind"]
             row.at_time = schedule["at_time"]
@@ -1936,6 +1959,8 @@ class SqlAlchemyStrategyRepository:
             row.timezone = schedule["timezone"]
             row.window_end = schedule["window_end"]
             row.squareoff_at = schedule["squareoff_at"]
+            row.start_offset_min = schedule["start_offset_min"]
+            row.stop_offset_min = schedule["stop_offset_min"]
             row.enabled = bool(enabled)
             if row.enabled:
                 row.manual_paused_at = None

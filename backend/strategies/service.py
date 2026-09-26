@@ -90,7 +90,7 @@ ALLOWED_STALE_EXIT_POLICIES = ("none", "exit_on_worker_stale")
 #: ``monthly`` a day of month, ``calendar`` explicit ISO dates; ``daily`` is a
 #: plain clock time. ``session_close`` was deliberately deferred (ambiguous
 #: completion window), so it is still absent.
-ALLOWED_SCHEDULE_KINDS = ("daily", "weekly", "monthly", "calendar")
+ALLOWED_SCHEDULE_KINDS = ("daily", "weekly", "monthly", "calendar", "market_session")
 
 #: Actions a CHILD run token may hold. ``heartbeat`` is absent on purpose.
 #: ``runs:progress`` is the child-authenticated liveness/progress marker.
@@ -430,29 +430,53 @@ def _validate_clock(label: str, value: Optional[str]) -> Optional[str]:
 def validate_schedule(
     *,
     schedule_kind: str,
-    at_time: str,
+    at_time: Optional[str],
     weekday: Optional[int] = None,
     day_of_month: Optional[int] = None,
     calendar_dates: Optional[Iterable[str]] = None,
     timezone: str = "Asia/Kolkata",
     window_end: Optional[str] = None,
     squareoff_at: Optional[str] = None,
+    start_offset_min: Optional[int] = None,
+    stop_offset_min: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Validate the bounded schedule shape for every supported kind.
 
     ``daily`` is a clock time, ``weekly`` adds a weekday, ``monthly`` a day of
     month (clamped to the month's length at materialisation), and ``calendar``
-    the explicit ISO dates. ``session_close`` remains rejected (ambiguous
-    completion window). A field that belongs to another kind is rejected rather
-    than stored, so a schedule can never carry a silent second meaning.
+    the explicit ISO dates. A market-session schedule derives both edges from
+    the NSE clock; its offsets are configuration, not wall-clock times.
+    ``session_close`` remains rejected for the explicit clock kinds. A field
+    that belongs to another kind is rejected rather than stored, so a schedule
+    can never carry a silent second meaning.
     """
     if schedule_kind not in ALLOWED_SCHEDULE_KINDS:
         raise StrategyValidationError(
             f"schedule_kind must be one of {', '.join(ALLOWED_SCHEDULE_KINDS)}"
         )
-    at = _validate_clock("at_time", at_time)
-    if at is None:
-        raise StrategyValidationError("at_time is required")
+    if schedule_kind == "market_session":
+        at = "09:15"
+    else:
+        at = _validate_clock("at_time", at_time)
+        if at is None:
+            raise StrategyValidationError("at_time is required")
+
+    def _offset(value: Optional[int], label: str) -> Optional[int]:
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise StrategyValidationError(f"{label} must be an integer")
+        if not 0 <= value < 1440:
+            raise StrategyValidationError(f"{label} must be between 0 and 1439")
+        return value
+
+    session_start_offset = _offset(start_offset_min, "start_offset_min")
+    session_stop_offset = _offset(stop_offset_min, "stop_offset_min")
+    if schedule_kind == "market_session":
+        session_start_offset = 0 if session_start_offset is None else session_start_offset
+        session_stop_offset = 5 if session_stop_offset is None else session_stop_offset
+    elif session_start_offset is not None or session_stop_offset is not None:
+        raise StrategyValidationError("offsets belong only to a market-session schedule")
 
     if schedule_kind == "daily":
         if weekday is not None or day_of_month is not None or calendar_dates is not None:
@@ -484,6 +508,12 @@ def validate_schedule(
             raise StrategyValidationError("a monthly schedule takes no weekday/calendar dates")
         weekday = None
         calendar_dates = None
+    elif schedule_kind == "market_session":
+        if weekday is not None or day_of_month is not None or calendar_dates is not None:
+            raise StrategyValidationError("a market-session schedule takes no weekday/day_of_month/dates")
+        weekday = None
+        day_of_month = None
+        calendar_dates = None
     else:  # calendar
         dates = _validate_calendar_dates(calendar_dates)
         if not dates:
@@ -506,6 +536,8 @@ def validate_schedule(
         "timezone": tz,
         "window_end": _validate_clock("window_end", window_end),
         "squareoff_at": _validate_clock("squareoff_at", squareoff_at),
+        "start_offset_min": session_start_offset,
+        "stop_offset_min": session_stop_offset,
     }
 
 

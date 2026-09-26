@@ -55,7 +55,7 @@ from backend.options.market.freshness import (
 )
 
 #: Evaluation kinds a client may assert (mirrors ``ck_proposals_evaluation_kind``).
-EVALUATION_KINDS = ("scheduled_occurrence", "run_now")
+EVALUATION_KINDS = ("scheduled_occurrence", "session_occurrence", "run_now")
 
 
 class ProposalStoreError(Exception):
@@ -294,9 +294,11 @@ class ProposalStore:
             raise ProposalStoreError("account_id is required")
         if not str(submission.strategy_run_id or "").strip():
             raise ProposalStoreError("strategy_run_id is required provenance")
-        if submission.evaluation_kind == "scheduled_occurrence" and not submission.job_id:
-            # Mirrors ck_proposals_scheduled_requires_job: a scheduled occurrence
-            # always names the job that produced it.
+        if submission.evaluation_kind in ("scheduled_occurrence", "session_occurrence") and (
+            not submission.job_id
+        ):
+            # Mirrors ck_proposals_scheduled_requires_job: a scheduled or
+            # session occurrence always names the job that produced it.
             raise ProposalStoreError("a scheduled occurrence requires job_id")
 
     def _pinned_read(self, submission: ProposalSubmission) -> PinnedCatalogRead:

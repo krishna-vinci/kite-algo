@@ -127,7 +127,8 @@ class SchedulingTestCase(unittest.TestCase):
     # -- fixtures -----------------------------------------------------------
 
     def schedule(self, *, kind="monthly", at_time="09:30", day_of_month=None,
-                 calendar_dates=None, enabled=True, schedule_id="sch-1", weekday=None):
+                 calendar_dates=None, enabled=True, schedule_id="sch-1", weekday=None,
+                 start_offset_min=None, stop_offset_min=None):
         hosted_id = f"hs-{schedule_id}"
         version_id = f"v-{schedule_id}"
         with self.factory() as session:
@@ -156,10 +157,12 @@ class SchedulingTestCase(unittest.TestCase):
                     "INSERT INTO hosted_strategy_schedules "
                     "(id, strategy_id, version_id, owner_id, account_scope, execution_mode, "
                     " job_kind, max_duration_s, progress_deadline_s, schedule_kind, at_time, "
-                    " timezone, weekday, day_of_month, calendar_dates, enabled, params_snapshot, "
-                    " policy_snapshot, capabilities_snapshot) "
+                    " start_offset_min, stop_offset_min, timezone, weekday, day_of_month, "
+                    " calendar_dates, enabled, params_snapshot, policy_snapshot, "
+                    " capabilities_snapshot) "
                     "VALUES (:id, :sid, :vid, 'app:o', 'kite:paper', 'paper', 'finite', 3600, 600, "
-                    " :kind, :at_time, 'Asia/Kolkata', :wd, :dom, :dates, :enabled, '{}', '{}', '{}')"
+                    " :kind, :at_time, :start_offset, :stop_offset, 'Asia/Kolkata', :wd, :dom, "
+                    " :dates, :enabled, '{}', '{}', '{}')"
                 ),
                 {
                     "id": schedule_id,
@@ -167,6 +170,8 @@ class SchedulingTestCase(unittest.TestCase):
                     "vid": version_id,
                     "kind": kind,
                     "at_time": at_time,
+                    "start_offset": start_offset_min,
+                    "stop_offset": stop_offset_min,
                     "wd": weekday,
                     "dom": day_of_month,
                     "dates": json.dumps(calendar_dates) if calendar_dates is not None else None,
@@ -291,7 +296,7 @@ class OccurrenceComputationTests(SchedulingTestCase):
 
         self.assertEqual(
             set(scheduling_module.SCHEDULE_KINDS),
-            {"daily", "weekly", "monthly", "calendar"},
+            {"daily", "weekly", "monthly", "calendar", "market_session"},
         )
         self.schedule(kind="monthly", day_of_month=1)
         self.assertIn("sch-1", {row["id"] for row in self.scheduler.enabled_schedules()})
@@ -472,6 +477,102 @@ class FiringTests(SchedulingTestCase):
         # default callable submitter leaves no envelope, so the rest defer).
         self.assertEqual(rows["sch-1:2026-09-22"]["status"], "fired")
         self.assertNotIn("sch-1:2026-09-22", result["skipped"])
+
+
+class MarketSessionTests(SchedulingTestCase):
+    def test_a_trading_day_starts_one_session_job_at_open(self):
+        opened = datetime(2026, 10, 1, 3, 46, tzinfo=timezone.utc)  # 09:16 IST
+        self.schedule(
+            kind="market_session",
+            at_time="09:15",
+            start_offset_min=0,
+            stop_offset_min=5,
+        )
+        result = self.scheduler.tick(now=opened)
+
+        self.assertEqual(result["fired"], ["sch-1:2026-10-01"])
+        occurrence_key, evaluation_id = self.fired[0]
+        self.assertEqual(occurrence_key, "sch-1:2026-10-01")
+        self.assertEqual(evaluation_id, "session:sch-1:2026-10-01:0")
+
+    def test_a_holiday_session_is_skipped_with_the_market_reason(self):
+        opened = datetime(2026, 10, 2, 3, 46, tzinfo=timezone.utc)  # 09:16 IST
+
+        def reader(_exchange, day):
+            return day != date(2026, 10, 2)
+
+        self.schedule(
+            kind="market_session",
+            at_time="09:15",
+            start_offset_min=0,
+            stop_offset_min=5,
+        )
+        scheduler = self._scheduler(trading_day_reader=reader)
+        result = scheduler.tick(now=opened)
+
+        self.assertIn("sch-1:2026-10-02", result["skipped"])
+        row = next(row for row in self.occurrences() if row["occurrence_key"] == "sch-1:2026-10-02")
+        self.assertEqual(row["status"], "skipped")
+        self.assertEqual(row["skip_reason"], "market_holiday")
+
+    def test_a_session_job_is_stop_requested_at_its_close_offset(self):
+        from datetime import timedelta
+
+        from backend.strategies.repository import SqlAlchemyStrategyRepository
+
+        self.schedule(
+            kind="market_session",
+            at_time="09:15",
+            start_offset_min=0,
+            stop_offset_min=5,
+            enabled=False,
+        )
+        repository = SqlAlchemyStrategyRepository(self.factory)
+        stop_at = datetime(2026, 10, 1, 9, 55, tzinfo=timezone.utc)
+        identity = {
+            "source": "schedule_occurrence",
+            "schedule_id": "sch-1",
+            "occurrence_key": "sch-1:2026-10-01",
+            "evaluation_id": "session:sch-1:2026-10-01:0",
+            "evaluation_kind": "session_occurrence",
+            "session_date": "2026-10-01",
+            "opens_at": "2026-10-01T03:45:00+00:00",
+            "closes_at": "2026-10-01T10:00:00+00:00",
+            "stop_at": stop_at.isoformat(),
+        }
+        job = repository.create_job(
+            strategy_id="hs-sch-1",
+            version_id="v-sch-1",
+            owner_id="app:o",
+            job_kind="finite",
+            execution_mode="paper",
+            max_duration_s=22800,
+            params={},
+            occurrence_key="sch-1:2026-10-01",
+            identity=identity,
+        )
+        self.assertEqual(job.max_duration_s, 22800)
+        repository.claim_job(
+            job.id,
+            lease_owner="sup-1",
+            expected_lease_epoch=0,
+            expected_attempt=1,
+            lease_until=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+
+        def submitter(_schedule, _occurrence, _detail):
+            return True
+
+        submitter.repository = repository
+        scheduler = self._scheduler(submitter=submitter)
+        result = scheduler.tick(now=stop_at + timedelta(seconds=1))
+
+        self.assertEqual(result["stopped_session_jobs"], [job.id])
+        stopped = repository.get_job("app:o", job.id)
+        assert stopped is not None
+        self.assertEqual(stopped.desired_state, "stopped")
+        self.assertEqual(stopped.status, "starting")
+        self.assertIsNotNone(stopped.stop_requested_at)
 
 
 class MisfireTests(SchedulingTestCase):

@@ -2797,14 +2797,14 @@ CREATE TABLE IF NOT EXISTS public.strategy_proposals (
     -- hold many evaluations, so nothing limits evaluations per job.
     CONSTRAINT uq_proposals_strategy_evaluation UNIQUE (strategy_id, evaluation_id),
     CONSTRAINT ck_proposals_evaluation_kind
-        CHECK (evaluation_kind IN ('scheduled_occurrence', 'run_now')),
+        CHECK (evaluation_kind IN ('scheduled_occurrence', 'session_occurrence', 'run_now')),
     CONSTRAINT ck_proposals_target_kind
         CHECK (target_kind IN ('single_instrument', 'target_weights', 'intent_bundle',
                                'target_futures', 'option_structure')),
     CONSTRAINT ck_proposals_status CHECK (status IN ('received', 'validated', 'refused')),
     -- A scheduled occurrence always names the job that produced it.
     CONSTRAINT ck_proposals_scheduled_requires_job
-        CHECK (evaluation_kind <> 'scheduled_occurrence' OR job_id IS NOT NULL),
+        CHECK (evaluation_kind NOT IN ('scheduled_occurrence', 'session_occurrence') OR job_id IS NOT NULL),
     CONSTRAINT fk_proposals_strategy_canonical
         FOREIGN KEY (strategy_id, account_id)
         REFERENCES public.strategies (id, account_scope) ON DELETE RESTRICT
@@ -3414,6 +3414,31 @@ ALTER TABLE public.hosted_strategy_schedules DROP CONSTRAINT IF EXISTS ck_hosted
 ALTER TABLE public.hosted_strategy_schedules
     ADD CONSTRAINT ck_hosted_strategy_schedules_calendar_dates
     CHECK (schedule_kind <> 'calendar' OR calendar_dates IS NOT NULL);
+
+-- Market-session run style: one job per NSE trading day, started/stopped by
+-- offsets from the session open/close instead of a fixed clock time.
+ALTER TABLE public.hosted_strategy_schedules ADD COLUMN IF NOT EXISTS start_offset_min INTEGER;
+ALTER TABLE public.hosted_strategy_schedules ADD COLUMN IF NOT EXISTS stop_offset_min INTEGER;
+ALTER TABLE public.hosted_strategy_schedules DROP CONSTRAINT IF EXISTS ck_hosted_strategy_schedules_kind;
+ALTER TABLE public.hosted_strategy_schedules
+    ADD CONSTRAINT ck_hosted_strategy_schedules_kind
+    CHECK (schedule_kind IN ('daily', 'weekly', 'monthly', 'calendar', 'market_session'));
+ALTER TABLE public.hosted_strategy_schedules DROP CONSTRAINT IF EXISTS ck_hosted_strategy_schedules_start_offset;
+ALTER TABLE public.hosted_strategy_schedules
+    ADD CONSTRAINT ck_hosted_strategy_schedules_start_offset
+    CHECK (start_offset_min IS NULL OR (start_offset_min >= 0 AND start_offset_min < 1440));
+ALTER TABLE public.hosted_strategy_schedules DROP CONSTRAINT IF EXISTS ck_hosted_strategy_schedules_stop_offset;
+ALTER TABLE public.hosted_strategy_schedules
+    ADD CONSTRAINT ck_hosted_strategy_schedules_stop_offset
+    CHECK (stop_offset_min IS NULL OR (stop_offset_min >= 0 AND stop_offset_min < 1440));
+ALTER TABLE public.hosted_strategy_schedules DROP CONSTRAINT IF EXISTS ck_hosted_strategy_schedules_session_offsets;
+ALTER TABLE public.hosted_strategy_schedules
+    ADD CONSTRAINT ck_hosted_strategy_schedules_session_offsets
+    CHECK (schedule_kind <> 'market_session' OR (start_offset_min IS NOT NULL AND stop_offset_min IS NOT NULL));
+ALTER TABLE public.hosted_strategy_schedules DROP CONSTRAINT IF EXISTS ck_hosted_strategy_schedules_non_session_offsets;
+ALTER TABLE public.hosted_strategy_schedules
+    ADD CONSTRAINT ck_hosted_strategy_schedules_non_session_offsets
+    CHECK (schedule_kind = 'market_session' OR (start_offset_min IS NULL AND stop_offset_min IS NULL));
 
 CREATE TABLE IF NOT EXISTS public.strategy_schedule_occurrences (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

@@ -41,6 +41,8 @@ the plan back for trading.
 
 from __future__ import annotations
 
+import re
+from datetime import date
 from typing import Any, Dict
 
 from fastapi import APIRouter, HTTPException, Request
@@ -230,11 +232,61 @@ def _bound_evaluation_id(hosted_job: Any) -> Any:
     return value or None
 
 
-def _require_bound_evaluation(payload: ProposalSubmitRequest, bound_evaluation_id: str) -> None:
-    """An occurrence-driven job may only be answered by its own evaluation."""
+def _require_bound_evaluation(payload: ProposalSubmitRequest, hosted_job: Any) -> None:
+    """A scheduled job answers one evaluation; a session job owns many."""
+    identity = dict(getattr(hosted_job, "identity_json", None) or {})
+    bound_evaluation_id = str(identity.get("evaluation_id") or "").strip()
+    submitted_id = str(payload.evaluation_id)
+    submitted_kind = str(payload.evaluation_kind)
+
+    if submitted_kind == "session_occurrence":
+        if str(identity.get("evaluation_kind") or "") != "session_occurrence":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "rejection_reason": "EVALUATION_IDENTITY_MISMATCH",
+                    "message": "This run is not bound to a market session",
+                    "strategy_run_id": payload.strategy_run_id,
+                    "submitted_evaluation_id": submitted_id,
+                },
+            )
+        match = re.fullmatch(
+            r"session:(?P<schedule_id>[^:]+):(?P<session_date>\d{4}-\d{2}-\d{2}):"
+            r"(?P<seq>\d+)",
+            submitted_id,
+        )
+        session_date = str(identity.get("session_date") or "")
+        if (
+            match is None
+            or match.group("schedule_id") != str(identity.get("schedule_id") or "")
+            or match.group("session_date") != session_date
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "rejection_reason": "EVALUATION_IDENTITY_MISMATCH",
+                    "message": "This evaluation does not belong to the job's session",
+                    "strategy_run_id": payload.strategy_run_id,
+                    "bound_session_date": session_date,
+                    "submitted_evaluation_id": submitted_id,
+                },
+            )
+        try:
+            date.fromisoformat(match.group("session_date"))
+        except ValueError:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "rejection_reason": "EVALUATION_IDENTITY_MISMATCH",
+                    "message": "This evaluation does not belong to the job's session",
+                    "submitted_evaluation_id": submitted_id,
+                },
+            )
+        return
+
     if (
-        str(payload.evaluation_id) != bound_evaluation_id
-        or str(payload.evaluation_kind) != "scheduled_occurrence"
+        submitted_id != bound_evaluation_id
+        or submitted_kind != "scheduled_occurrence"
     ):
         raise HTTPException(
             status_code=409,
@@ -277,7 +329,7 @@ async def submit_proposal(request: Request, payload: ProposalSubmitRequest) -> P
     job_id = _bound_job_id(payload, hosted_job)
     bound_evaluation_id = _bound_evaluation_id(hosted_job)
     if bound_evaluation_id is not None:
-        _require_bound_evaluation(payload, bound_evaluation_id)
+        _require_bound_evaluation(payload, hosted_job)
 
     try:
         result = _store(request, with_option_market=option_market).submit(

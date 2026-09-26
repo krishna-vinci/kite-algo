@@ -57,7 +57,7 @@ logger = logging.getLogger(__name__)
 #: There is no other driver for ``hosted_strategy_schedules`` — the pre-existing
 #: worker-job runner drains *queued jobs*, not schedules — so a kind this runtime
 #: skips is a kind that never runs at all.
-SCHEDULE_KINDS = ("daily", "weekly", "monthly", "calendar")
+SCHEDULE_KINDS = ("daily", "weekly", "monthly", "calendar", "market_session")
 
 #: How far back a daily/weekly schedule looks for occurrences that were due
 #: during an outage. Bounded so a long outage still yields every occurrence the
@@ -100,6 +100,10 @@ DECISION_BUSY = "decision-busy"
 #: today, and the market-session helper maps this to the imported NSE/CM days.
 SCHEDULE_CALENDAR_EXCHANGE = "NSE"
 
+# A session job is allowed to outlive the clock by a short fence margin; the
+# close-time stop request remains the normal termination path.
+SESSION_JOB_GRACE_SECONDS = 300
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -139,11 +143,25 @@ def _parse_hhmm(value: str) -> time:
         return time(9, 30)
 
 
+def _integer_setting(value: Any, default: int) -> int:
+    """Read a bounded integer setting defensively when a stored row is odd."""
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        return default
+    return result if result >= 0 else default
+
+
 @dataclass(frozen=True)
 class Occurrence:
     occurrence_key: str
     due_at: datetime
     evaluation_id: str
+    evaluation_kind: str = "scheduled_occurrence"
+    session_date: Optional[date] = None
+    opens_at: Optional[datetime] = None
+    closes_at: Optional[datetime] = None
+    stop_at: Optional[datetime] = None
 
 
 class ScheduleRefusal(Exception):
@@ -244,6 +262,19 @@ class ScheduleScheduler:
                 "job_kind": str(row.job_kind),
                 "max_duration_s": int(row.max_duration_s),
                 "progress_deadline_s": int(row.progress_deadline_s),
+                "start_offset_min": _integer_setting(row.start_offset_min, 0)
+                if row.schedule_kind == "market_session"
+                else None,
+                "stop_offset_min": _integer_setting(row.stop_offset_min, 5)
+                if row.schedule_kind == "market_session"
+                else None,
+                "session_job_duration_s": (
+                    int((market_session.SESSION_CLOSE.hour * 60 + market_session.SESSION_CLOSE.minute) * 60)
+                    - int((market_session.SESSION_OPEN.hour * 60 + market_session.SESSION_OPEN.minute) * 60)
+                    + SESSION_JOB_GRACE_SECONDS
+                )
+                if row.schedule_kind == "market_session"
+                else None,
                 "params_snapshot": dict(row.params_snapshot or {}),
                 "capabilities_snapshot": dict(row.capabilities_snapshot or {}),
                 "policy_snapshot": dict(row.policy_snapshot or {}),
@@ -341,6 +372,35 @@ class ScheduleScheduler:
                                 evaluation_id=f"sched:{schedule_id}:{day.isoformat()}",
                             )
                         )
+
+        elif kind == "market_session":
+            today = moment.date()
+            for offset in range(LOOKBACK_DAYS):
+                day = today - timedelta(days=offset)
+                opens_at = datetime.combine(
+                    day, market_session.SESSION_OPEN, tzinfo=market_session.IST
+                )
+                closes_at = datetime.combine(
+                    day, market_session.SESSION_CLOSE, tzinfo=market_session.IST
+                )
+                start_offset = _integer_setting(schedule.get("start_offset_min"), 0)
+                stop_offset = _integer_setting(schedule.get("stop_offset_min"), 5)
+                due_local = opens_at + timedelta(minutes=start_offset)
+                if due_local <= moment:
+                    occurrences.append(
+                        Occurrence(
+                            occurrence_key=f"{schedule_id}:{day.isoformat()}",
+                            due_at=due_local.astimezone(timezone.utc),
+                            evaluation_id=f"session:{schedule_id}:{day.isoformat()}:0",
+                            evaluation_kind="session_occurrence",
+                            session_date=day,
+                            opens_at=opens_at.astimezone(timezone.utc),
+                            closes_at=closes_at.astimezone(timezone.utc),
+                            stop_at=(
+                                closes_at - timedelta(minutes=stop_offset)
+                            ).astimezone(timezone.utc),
+                        )
+                    )
         # Ascending, so a long outage replays oldest-first. Deterministic for a
         # given (schedule, instant), which is what lets the unique index be the
         # only deduplication needed.
@@ -481,6 +541,7 @@ class ScheduleScheduler:
         expired: List[str] = []
         deferred: List[str] = []
         errors: List[Dict[str, str]] = []
+        stopped_session_jobs: List[str] = []
 
         for schedule in self.enabled_schedules():
             try:
@@ -493,13 +554,64 @@ class ScheduleScheduler:
             expired.extend(result["expired"])
             deferred.extend(result["deferred"])
 
+        try:
+            stopped_session_jobs = self._stop_due_session_jobs(moment)
+        except Exception as exc:  # noqa: BLE001 - session stopping must not stall ticks
+            errors.append({"schedule_id": "market_session", "error": repr(exc)})
+
         return {
             "fired": fired,
             "skipped": skipped,
             "expired": expired,
             "deferred": deferred,
+            "stopped_session_jobs": stopped_session_jobs,
             "errors": errors,
         }
+
+    def _stop_due_session_jobs(self, moment: datetime) -> List[str]:
+        """Ask every expired session job to stop through the operator path.
+
+        Session jobs are deliberately long-lived, so their one close edge is a
+        durable ``desired_state=stopped`` request. The supervisor observes it by
+        the same contract as an operator Stop: no flatten and no order action.
+        """
+        from backend.strategies.models import StrategyJob
+
+        submitter_repository = getattr(self._submitter, "repository", None)
+        if submitter_repository is None:
+            return []
+        stopped: List[str] = []
+        with self.session_factory() as session:
+            rows = session.execute(
+                select(StrategyJob).where(
+                    StrategyJob.status.in_(("queued", "starting", "running")),
+                    StrategyJob.desired_state != "stopped",
+                )
+            ).scalars().all()
+
+        for job in rows:
+            identity = dict(getattr(job, "identity_json", None) or {})
+            if str(identity.get("evaluation_kind") or "") != "session_occurrence":
+                continue
+            try:
+                stop_at = datetime.fromisoformat(str(identity.get("stop_at")))
+            except (TypeError, ValueError):
+                continue
+            if moment < _as_utc(stop_at):
+                continue
+            kwargs = {
+                "job_id": str(job.id),
+                "owner_id": str(job.owner_id),
+                "expected_attempt": int(job.attempt),
+                "actor": "host:scheduler",
+            }
+            if str(job.status) == "queued":
+                requested = submitter_repository.stop_queued_job(**kwargs)
+            else:
+                requested = submitter_repository.request_stop_active(**kwargs)
+            if requested:
+                stopped.append(str(job.id))
+        return stopped
 
     def _tick_schedule(
         self, schedule: Mapping[str, Any], *, moment: datetime, grace: int
@@ -696,7 +808,7 @@ class ScheduleScheduler:
         occurrence keeps its ordinary decision rather than being skipped on
         unknown evidence.
         """
-        if kind not in ("daily", "weekly"):
+        if kind not in ("daily", "weekly", "market_session"):
             return None
         day = occurrence.due_at.astimezone(market_session.IST).date()
         state = market_session.day_state(
@@ -1173,6 +1285,28 @@ def next_occurrence(schedule: Mapping[str, Any], *, now: datetime) -> Optional[O
     schedule_id = str(schedule.get("id") or "")
 
     def occurrence_for(day: date) -> Optional[Occurrence]:
+        if kind == "market_session":
+            opens_at = datetime.combine(
+                day, market_session.SESSION_OPEN, tzinfo=market_session.IST
+            )
+            closes_at = datetime.combine(
+                day, market_session.SESSION_CLOSE, tzinfo=market_session.IST
+            )
+            start_offset = _integer_setting(schedule.get("start_offset_min"), 0)
+            stop_offset = _integer_setting(schedule.get("stop_offset_min"), 5)
+            due_local = opens_at + timedelta(minutes=start_offset)
+            if due_local <= moment:
+                return None
+            return Occurrence(
+                occurrence_key=f"{schedule_id}:{day.isoformat()}",
+                due_at=due_local.astimezone(timezone.utc),
+                evaluation_id=f"session:{schedule_id}:{day.isoformat()}:0",
+                evaluation_kind="session_occurrence",
+                session_date=day,
+                opens_at=opens_at.astimezone(timezone.utc),
+                closes_at=closes_at.astimezone(timezone.utc),
+                stop_at=(closes_at - timedelta(minutes=stop_offset)).astimezone(timezone.utc),
+            )
         due_local = datetime.combine(day, at_time, tzinfo=zone)
         if due_local <= moment:
             return None
@@ -1220,6 +1354,13 @@ def next_occurrence(schedule: Mapping[str, Any], *, now: datetime) -> Optional[O
             if candidate is not None:
                 return candidate
         return None
+    if kind == "market_session":
+        today = moment.date()
+        for offset in range(LOOKBACK_DAYS):
+            candidate = occurrence_for(today + timedelta(days=offset))
+            if candidate is not None:
+                return candidate
+        return None
     if kind == "weekly":
         weekday = schedule.get("weekday")
         if not isinstance(weekday, int) or isinstance(weekday, bool) or not 0 <= weekday <= 6:
@@ -1245,14 +1386,28 @@ def pinned_launch_identity(
     found under the same occurrence key can be compared against it rather than
     trusted because the key matched.
     """
-    return {
+    identity = {
         "source": "schedule_occurrence",
         "schedule_id": str(schedule.get("id") or ""),
         "occurrence_key": occurrence.occurrence_key,
         "evaluation_id": occurrence.evaluation_id,
-        "evaluation_kind": "scheduled_occurrence",
         "due_at": occurrence.due_at.astimezone(timezone.utc).isoformat(),
     }
+    if occurrence.evaluation_kind == "session_occurrence":
+        identity.update(
+            {
+                "evaluation_kind": "session_occurrence",
+                "session_date": (
+                    occurrence.session_date or occurrence.due_at.astimezone(market_session.IST).date()
+                ).isoformat(),
+                "opens_at": occurrence.opens_at.astimezone(timezone.utc).isoformat(),
+                "closes_at": occurrence.closes_at.astimezone(timezone.utc).isoformat(),
+                "stop_at": occurrence.stop_at.astimezone(timezone.utc).isoformat(),
+            }
+        )
+    else:
+        identity["evaluation_kind"] = "scheduled_occurrence"
+    return identity
 
 
 def matches_pinned_launch(
@@ -1428,6 +1583,11 @@ class HostedJobSubmitter:
                 owner_id=owner_id,
                 job_kind=str(schedule.get("job_kind") or "finite"),
                 execution_mode=str(schedule.get("execution_mode") or "paper"),
+                max_duration_s=(
+                    int(schedule.get("session_job_duration_s") or 22800)
+                    if str(schedule.get("schedule_kind") or "") == "market_session"
+                    else None
+                ),
                 params=dict(schedule.get("params_snapshot") or {}),
                 occurrence_key=occurrence.occurrence_key,
                 identity=pinned_launch_identity(schedule, occurrence),
