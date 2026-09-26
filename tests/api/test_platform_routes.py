@@ -35,7 +35,7 @@ install_dependency_stubs()
 
 import httpx  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
-from sqlalchemy import create_engine, delete, select  # noqa: E402
+from sqlalchemy import create_engine, delete, event, select, text  # noqa: E402
 from sqlalchemy.orm import sessionmaker  # noqa: E402
 from sqlalchemy.pool import StaticPool  # noqa: E402
 
@@ -70,6 +70,22 @@ def session_factory():
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
+
+    @event.listens_for(engine, "connect")
+    def _attach_public(dbapi_connection, connection_record):
+        _ = connection_record
+        cursor = dbapi_connection.cursor()
+        cursor.execute("ATTACH DATABASE ':memory:' AS public")
+        # The reconciled broker book the account day-P&L reader sums. It lives on
+        # the ``public.``-qualified Core schema, so it is created explicitly.
+        cursor.execute(
+            "CREATE TABLE public.account_positions ("
+            " account_id TEXT, instrument_token INTEGER, product TEXT, exchange TEXT,"
+            " tradingsymbol TEXT, net_quantity INTEGER DEFAULT 0, realized_pnl REAL DEFAULT 0,"
+            " last_price REAL, average_price REAL)"
+        )
+        dbapi_connection.commit()
+
     Base.metadata.create_all(engine)
     # The broker session store lives on a DIFFERENT declarative base
     # (``backend.app.database.Base``), so its table is created explicitly.
@@ -241,6 +257,64 @@ async def test_put_persists_the_row_audits_it_and_overrides_the_env(
 
 
 @pytest.mark.asyncio
+async def test_the_account_daily_loss_cap_round_trips_and_is_audited(
+    client, session_factory, gate_session
+):
+    lanes = {"cnc": False, "mis": True, "futures": False, "options": False}
+    opened = await client.put(
+        f"{BASE}/live-settings",
+        json={
+            "lanes": lanes,
+            "account_daily_loss_cap_inr": 5000.0,
+            "reason": "owner set a 5k account-wide cap",
+        },
+    )
+    assert opened.status_code == 200, opened.text
+    assert opened.json()["account_daily_loss_cap_inr"] == 5000.0
+
+    # GET reads the cap back, and the write is legible with its author.
+    assert (await client.get(f"{BASE}/live-settings")).json()[
+        "account_daily_loss_cap_inr"
+    ] == 5000.0
+    row = _session_row(session_factory)
+    assert float(row.account_daily_loss_cap_inr) == 5000.0
+    first = _audit_rows(session_factory)[0]
+    assert first.previous_account_daily_loss_cap_inr is None
+    assert float(first.account_daily_loss_cap_inr) == 5000.0
+
+    # A lanes-only PUT must not silently clear a configured cap...
+    preserved = await client.put(
+        f"{BASE}/live-settings",
+        json={"lanes": {"cnc": True, "mis": False, "futures": False, "options": False}},
+    )
+    assert preserved.json()["account_daily_loss_cap_inr"] == 5000.0
+    second = _audit_rows(session_factory)[1]
+    assert float(second.previous_account_daily_loss_cap_inr) == 5000.0
+    assert float(second.account_daily_loss_cap_inr) == 5000.0
+
+    # ...while an explicit null clears it.
+    cleared = await client.put(
+        f"{BASE}/live-settings",
+        json={
+            "lanes": {"cnc": True, "mis": False, "futures": False, "options": False},
+            "account_daily_loss_cap_inr": None,
+        },
+    )
+    assert cleared.json()["account_daily_loss_cap_inr"] is None
+    third = _audit_rows(session_factory)[2]
+    assert float(third.previous_account_daily_loss_cap_inr) == 5000.0
+    assert third.account_daily_loss_cap_inr is None
+
+    # A negative cap is refused before it can be stored.
+    negative = await client.put(
+        f"{BASE}/live-settings",
+        json={"lanes": lanes, "account_daily_loss_cap_inr": -1.0},
+    )
+    assert negative.status_code == 422, negative.text
+    assert len(_audit_rows(session_factory)) == 3
+
+
+@pytest.mark.asyncio
 async def test_a_lane_outside_the_contract_and_a_cross_origin_put_are_refused(
     client, session_factory, gate_session
 ):
@@ -329,6 +403,9 @@ async def test_status_says_unknown_rather_than_guessing(
     assert body["market_data"] == {"state": "down", "last_tick_age_s": None}
     assert body["strategy_runner"] == {"state": "unknown", "last_seen_age_s": None}
     assert body["live"] == {"enabled": True, "lanes_open": []}
+    # No cap is configured (the settings store is unreadable), so the risk axis
+    # is inert rather than invented.
+    assert body["risk"] == {"day_pnl_inr": None, "cap_inr": None, "cap_reached": False}
 
 
 def _leased_job(session, *, lease_until, updated_at) -> None:
@@ -395,6 +472,7 @@ async def test_status_reports_the_evidence_it_actually_has(
     assert body["strategy_runner"]["state"] == "ok"
     assert 10 <= body["strategy_runner"]["last_seen_age_s"] <= 20
     assert body["live"] == {"enabled": True, "lanes_open": ["mis"]}
+    assert body["risk"] == {"day_pnl_inr": None, "cap_inr": None, "cap_reached": False}
 
     # With the session gone the broker is EXPIRED (a fresh login is required),
     # which is a different answer from "unknown".
@@ -404,6 +482,45 @@ async def test_status_reports_the_evidence_it_actually_has(
     expired = (await client.get(f"{BASE}/status")).json()
     assert expired["broker"]["state"] == "expired"
     assert expired["broker"]["detail"] is not None
+
+
+@pytest.mark.asyncio
+async def test_status_reports_the_account_day_pnl_and_the_cap_it_is_tested_against(
+    client, session_factory, gate_session
+):
+    platform_settings.update_live_settings(
+        {"cnc": False, "mis": True, "futures": False, "options": False},
+        actor_id=OWNER,
+        account_daily_loss_cap_inr=5000.0,
+        session_factory=session_factory,
+    )
+    with session_factory() as session:
+        session.execute(
+            text(
+                "INSERT INTO public.account_positions "
+                "(account_id, instrument_token, product, exchange, tradingsymbol, "
+                " net_quantity, realized_pnl, last_price, average_price) "
+                "VALUES ('kite:XJJ12345', 100, 'CNC', 'NSE', 'RELIANCE', 0, -4500.0, 0, 0)"
+            )
+        )
+        session.commit()
+
+    body = (await client.get(f"{BASE}/status")).json()
+    assert body["risk"] == {
+        "day_pnl_inr": -4500.0,
+        "cap_inr": 5000.0,
+        "cap_reached": False,
+    }
+
+    # The day's loss reaching the cap flips it, without any flatten.
+    with session_factory() as session:
+        session.execute(
+            text("UPDATE public.account_positions SET realized_pnl = -5000.0")
+        )
+        session.commit()
+    reached = (await client.get(f"{BASE}/status")).json()
+    assert reached["risk"]["cap_reached"] is True
+    assert reached["risk"]["day_pnl_inr"] == -5000.0
 
 
 @pytest.mark.asyncio

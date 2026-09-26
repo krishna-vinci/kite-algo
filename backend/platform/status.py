@@ -139,6 +139,26 @@ def broker_account_view(
     is default-deny), so the UI can show "this account is not authorised for
     hosted strategies" without inventing a scope.
     """
+    scopes, candidate = _resolve_platform_account(
+        session_factory, account_scopes=account_scopes
+    )
+    return {
+        "scope": mask_account_scope(candidate),
+        "allowed": bool(candidate) and candidate in scopes,
+    }
+
+
+def _resolve_platform_account(
+    session_factory: Optional[Callable[[], Any]],
+    *,
+    account_scopes: Optional[Sequence[str]] = None,
+) -> tuple:
+    """The platform account scope and the allowlist it is judged against.
+
+    The recorded broker session's account wins; with no session recorded, a
+    single allowlisted scope is used. Anything else is the empty string - the
+    platform cannot name one account, so it does not invent one.
+    """
     if account_scopes is None:
         from backend.api.services.hosted_strategy_authz import authorized_account_scopes
 
@@ -148,14 +168,44 @@ def broker_account_view(
 
     recorded = _system_kite_session(session_factory)["account"]
     if recorded:
-        candidate = str(recorded)
-    elif len(scopes) == 1:
-        candidate = str(scopes[0])
-    else:
-        candidate = ""
+        return scopes, str(recorded)
+    if len(scopes) == 1:
+        return scopes, str(scopes[0])
+    return scopes, ""
+
+
+def platform_account_scope(
+    session_factory: Optional[Callable[[], Any]] = None,
+) -> str:
+    """The unmasked platform account scope, or ``""`` when there is not exactly one."""
+    return _resolve_platform_account(session_factory)[1]
+
+
+def account_risk_view(
+    session_factory: Optional[Callable[[], Any]] = None,
+) -> Dict[str, Any]:
+    """The account-wide day-loss cap and the broker day P&L it is tested against.
+
+    No cap configured is an inert, honest ``cap_inr=None``. A cap that IS set
+    with an unreadable (or unnamed) account fails closed - ``cap_reached=True`` -
+    exactly as admission refuses an exposure-increasing plan in that state.
+    """
+    from backend.strategies.daily_loss import (
+        account_daily_loss_cap_inr,
+        account_day_pnl_inr,
+    )
+
+    cap = account_daily_loss_cap_inr(session_factory=session_factory)
+    if cap is None:
+        return {"day_pnl_inr": None, "cap_inr": None, "cap_reached": False}
+    account = platform_account_scope(session_factory)
+    if not account:
+        return {"day_pnl_inr": None, "cap_inr": cap, "cap_reached": True}
+    day_pnl = account_day_pnl_inr(account_id=account, session_factory=session_factory)
     return {
-        "scope": mask_account_scope(candidate),
-        "allowed": bool(candidate) and candidate in scopes,
+        "day_pnl_inr": day_pnl,
+        "cap_inr": cap,
+        "cap_reached": day_pnl is None or day_pnl <= -float(cap),
     }
 
 
@@ -267,16 +317,19 @@ async def platform_status_view(
         "market_data": await market_data_view(reader=market_reader, now=moment),
         "strategy_runner": strategy_runner_view(session_factory, now=moment),
         "live": {"enabled": live_enabled, "lanes_open": list(lanes_open)},
+        "risk": account_risk_view(session_factory),
     }
 
 
 __all__ = [
     "MARKET_STATUS_KEY",
     "MARKET_TICK_STALE_SECONDS",
+    "account_risk_view",
     "broker_account_view",
     "broker_status_view",
     "market_data_view",
     "mask_account_scope",
+    "platform_account_scope",
     "platform_status_view",
     "redis_market_status",
     "strategy_runner_view",

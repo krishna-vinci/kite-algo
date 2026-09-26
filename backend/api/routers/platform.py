@@ -44,12 +44,14 @@ from backend.api.schemas.platform import (
     PlatformLiveSettingsUpdateRequest,
     PlatformLiveStatus,
     PlatformMarketDataStatus,
+    PlatformRiskStatus,
     PlatformStatusResponse,
     PlatformStrategyRunnerStatus,
 )
 from backend.api.services.csrf import enforce_same_origin
 from backend.platform.settings import (
     LIVE_LANE_KEYS,
+    UNSET,
     read_live_settings,
     update_live_settings,
 )
@@ -100,6 +102,9 @@ def _settings_response(*, session_factory: Any) -> PlatformLiveSettingsResponse:
         live_enabled=hosted_live_enabled(source),
         lanes=lanes,
         lanes_source=lanes_source,
+        account_daily_loss_cap_inr=(
+            persisted.account_daily_loss_cap_inr if persisted is not None else None
+        ),
         account=PlatformAccountView(**broker_account_view(session_factory)),
         updated_at=updated_at,
         updated_by=updated_by,
@@ -129,10 +134,18 @@ def update_live_settings_route(
     to be on for any live execution to happen.
     """
     enforce_same_origin(request)
+    # A lanes-only PUT must not silently clear a configured cap: the cap moves
+    # only when the caller names it (an explicit ``null`` clears it).
+    cap_update: Any = (
+        payload.account_daily_loss_cap_inr
+        if "account_daily_loss_cap_inr" in payload.model_fields_set
+        else UNSET
+    )
     update_live_settings(
         payload.lanes.model_dump(),
         actor_id=owner,
         reason=payload.reason,
+        account_daily_loss_cap_inr=cap_update,
         session_factory=session_factory,
     )
     return _settings_response(session_factory=session_factory)
@@ -151,6 +164,7 @@ async def get_platform_status(
         market_data=PlatformMarketDataStatus(**body["market_data"]),
         strategy_runner=PlatformStrategyRunnerStatus(**body["strategy_runner"]),
         live=PlatformLiveStatus(**body["live"]),
+        risk=PlatformRiskStatus(**body["risk"]),
     )
 
 

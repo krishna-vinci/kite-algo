@@ -358,10 +358,19 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
   - Reducing exits and adjusts skip this gate.
 - **Live margin and funds.** Evidence must be no older than `ADMISSION_MARGIN_MAX_AGE_SECONDS` (60 s). The basket
   margin is `required_margin_inr`. Cash below the requirement is refused, except for a staged CNC plan (`:1332-1385`).
-- **PARTIAL: `daily_loss_budget_inr`.**
-  - Live: once set, **every live plan is refused** with `DAILY_LOSS_BUDGET_UNAVAILABLE`, because no caller passes
-    `realized_loss_inr` (`:1228-1257`).
-  - Paper: the daily check is never enforced.
+- **EXISTS: `daily_loss_budget_inr` and the account-wide `account_daily_loss_cap_inr`.**
+  - Strategy budget: admission is handed today's realized P&L for the strategy/environment, computed from its
+    attributed confirmed fills with an average-cost fold (`backend/strategies/daily_loss.py`; the fill's own IST
+    calendar day decides what is "today"), minus order-level charge estimates when the fill source records them. An
+    exposure-INCREASING plan is refused with `DAILY_LOSS_BUDGET_EXCEEDED` once the realized loss reaches the budget;
+    reductions are never blocked. Unreadable evidence still refuses with `DAILY_LOSS_BUDGET_UNAVAILABLE`.
+  - Account cap: the optional `account_daily_loss_cap_inr` (platform live settings, migration `20260926_000053`)
+    is tested against the broker's own day P&L, summed from the reconciled `account_positions` book
+    (`realized_pnl` + unrealised, the same `pnl` the realtime positions service publishes). An exposure-increasing
+    LIVE plan is refused with `ACCOUNT_DAILY_LOSS_CAP_REACHED` once the account loss reaches the cap; unreadable
+    evidence with a cap set refuses too (fail closed), and reductions are never blocked.
+  - `GET /api/platform/status` surfaces the cap state as `risk: {day_pnl_inr, cap_inr, cap_reached}`.
+  - There is **no automatic flatten** here; a reached cap only refuses new exposure.
 - **MISSING:**
   - A market-hours or holiday gate (`:1426-1430` says so).
   - A per-plan or per-day **count** cap on orders, trades or legs. The searches for `max_orders`, `max_trades` and
@@ -450,6 +459,9 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
   (`attribution_models.py:211-226`). It is **not per run** and carries **no P&L**.
 - **Account truth.** Broker = Σ attributed + manual (`account_truth.py:1-40`).
 - **Per-run P&L** exists only for paper display (`paper_runtime/run_state.py`).
+- **Strategy realized P&L** is derived on demand for the daily-loss controls
+  (`backend/strategies/daily_loss.py`): today's attributed fills folded at average cost. It is not stored on the
+  projection.
 - **Owner actions** (`backend/api/services/owner_actions.py`):
 
 | Action | Paper | Live | Notes |

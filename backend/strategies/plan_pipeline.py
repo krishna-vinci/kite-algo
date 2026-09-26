@@ -485,10 +485,22 @@ class PlanExecutionPipeline:
 
     def admit(self, plan: Mapping[str, Any], *, environment: str) -> Dict[str, Any]:
         self._assert_option_structure_admissible(plan, environment=environment)
+        from backend.strategies import daily_loss
+
+        # The two daily-loss controls read their own evidence (today's attributed
+        # realized P&L for this strategy, and the account-wide day P&L behind the
+        # optional cap); admission itself stays a pure function of that evidence.
+        evidence = daily_loss.admission_daily_loss_evidence(
+            plan=plan,
+            environment=environment,
+            session_factory=self.session_factory,
+            now=self._clock(),
+        )
         verdict = self.admission.evaluate(
             plan,
             execution_environment=environment,
             margin_evidence=self.margin(plan, environment),
+            **evidence,
         )
         return verdict.as_dict() if hasattr(verdict, "as_dict") else dict(verdict)
 

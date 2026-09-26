@@ -1,8 +1,9 @@
 """ORM tables for the platform live-lane setting and its audit trail.
 
-Migration ``20260926_000052_platform_live_settings`` mirrors these tables
-exactly. The ORM uses ``JSON`` (portable to the SQLite test database) while the
-migration and ``schema.sql`` use ``JSONB`` - the established pattern in this
+Migration ``20260926_000052_platform_live_settings`` creates these tables and
+``20260926_000053_account_daily_loss_cap`` adds the account-wide day-loss cap
+columns. The ORM uses ``JSON`` (portable to the SQLite test database) while the
+migrations and ``schema.sql`` use ``JSONB`` - the established pattern in this
 repo.
 
 ``platform_live_settings`` is a SINGLE row: ``settings_id`` is a check-enforced
@@ -19,6 +20,7 @@ from sqlalchemy import (
     Index,
     Integer,
     JSON,
+    Numeric,
     Text,
     func,
 )
@@ -42,6 +44,9 @@ class PlatformLiveSetting(Base):
     settings_id = Column(Integer, primary_key=True, default=LIVE_SETTINGS_SINGLETON_ID)
     #: ``{"cnc": bool, "mis": bool, "futures": bool, "options": bool}``.
     lanes = Column(JSON, nullable=False, default=dict)
+    #: The account-wide day-loss cap in INR, or NULL for "no cap configured".
+    #: Enforced at admission against the broker's own day P&L, never here.
+    account_daily_loss_cap_inr = Column(Numeric(18, 2), nullable=True)
     #: The server-derived actor (``app:<username>``) of the last change.
     updated_by = Column(Text, nullable=False)
     updated_at = Column(
@@ -71,6 +76,8 @@ class PlatformLiveSettingAudit(Base):
     reason = Column(Text, nullable=True)
     previous_lanes = Column(JSON, nullable=False, default=dict)
     lanes = Column(JSON, nullable=False, default=dict)
+    previous_account_daily_loss_cap_inr = Column(Numeric(18, 2), nullable=True)
+    account_daily_loss_cap_inr = Column(Numeric(18, 2), nullable=True)
     created_at = Column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

@@ -8,10 +8,10 @@ properties matter more than any individual control:
   the same plan and the same evidence always produce the same verdict and the
   same reason. An operator debugging a refusal never has to guess which control
   fired first.
-* **Fail-closed honesty (D-9).** Where V1 cannot prove something — a live
-  daily-loss source, a margin quote, a reference price — admission refuses with a
-  named reason instead of silently treating the axis as satisfied. An
-  unenforced control that looks enforced is worse than a refusal.
+* **Fail-closed honesty (D-9).** Where the platform cannot prove something — an
+  unreadable daily-loss source, a missing margin quote, a reference price —
+  admission refuses with a named reason instead of silently treating the axis as
+  satisfied. An unenforced control that looks enforced is worse than a refusal.
 
 A NULL limit means "not enforced" and is deliberately distinguishable from a
 limit of zero. Nothing here places orders or sizes anything: deterministic
@@ -50,6 +50,8 @@ ADMISSION_REFUSALS = (
     "MAX_OPEN_INSTRUMENTS_EXCEEDED",
     "ORDER_RATE_EXCEEDED",
     "DAILY_LOSS_BUDGET_UNAVAILABLE",
+    "DAILY_LOSS_BUDGET_EXCEEDED",
+    "ACCOUNT_DAILY_LOSS_CAP_REACHED",
     "STRATEGY_RISK_POLICY_MISSING",
     "OPTION_STRUCTURE_FAMILY_NOT_ALLOWED",
     "OPTION_EXPIRY_POLICY_NOT_ALLOWED",
@@ -974,6 +976,8 @@ class AdmissionService:
         paper_funds: Optional[Mapping[str, Any]] = None,
         peak_capacity_inr: Optional[float] = None,
         realized_loss_inr: Optional[float] = None,
+        account_day_pnl_inr: Optional[float] = None,
+        account_daily_loss_cap_inr: Optional[float] = None,
         catalog_state: Optional[Mapping[str, Any]] = None,
     ) -> AdmissionVerdict:
         """Evaluate every control in order; the first refusal wins (D-2).
@@ -982,6 +986,12 @@ class AdmissionService:
         evidence must always produce the same verdict, and a caller that cannot
         obtain evidence passes ``None`` (which fails closed where it matters)
         rather than having admission reach for the network.
+
+        ``realized_loss_inr`` is today's realized LOSS for this strategy as a
+        non-negative magnitude (0 when flat or in profit), and
+        ``account_daily_loss_cap_inr``/``account_day_pnl_inr`` are the
+        account-wide cap and the broker's own day P&L. Both controls refuse only
+        an exposure-INCREASING plan; a reduction is never blocked by a loss.
         """
         moment = now or _utcnow()
         environment = str(execution_environment or "live").lower()
@@ -1225,34 +1235,76 @@ class AdmissionService:
             if recent >= limit:
                 return AdmissionVerdict(False, "ORDER_RATE_EXCEEDED", detail)
 
+        # The plan's OWN direction decides whether a loss control applies: a
+        # reduction or an exit is never blocked by a realized loss, only exposure
+        # that GROWS the book.
+        increases_exposure = any(
+            row.get("increases_exposure") for row in exposure["per_instrument"]
+        )
+
         if policy is not None and policy.get("daily_loss_budget_inr") is not None:
-            if is_live and realized_loss_inr is None:
-                # V1 has no attributed live realized-loss source. Treating the
-                # budget as satisfied would silently disable a configured limit,
-                # so admission refuses until that evidence exists (Project 5+).
+            budget = float(policy["daily_loss_budget_inr"])
+            detail.update(
+                {
+                    "daily_loss_budget_inr": budget,
+                    "realized_loss_inr": realized_loss_inr,
+                }
+            )
+            if realized_loss_inr is None:
+                # An unreadable attributed realized-loss source must not read as
+                # "the budget is satisfied". The caller passes None only when it
+                # could not obtain today's realized P&L for this strategy.
                 return AdmissionVerdict(
                     False,
                     "DAILY_LOSS_BUDGET_UNAVAILABLE",
                     {
                         **detail,
-                        "daily_loss_budget_inr": policy["daily_loss_budget_inr"],
                         "message": (
-                            "A live daily-loss budget is configured but no attributed "
-                            "realized-loss evidence exists yet; refusing rather than "
+                            "A daily-loss budget is configured but today's attributed "
+                            "realized P&L could not be read; refusing rather than "
                             "silently not enforcing it."
                         ),
                     },
                 )
-            if realized_loss_inr is not None and abs(float(realized_loss_inr)) > float(
-                policy["daily_loss_budget_inr"]
-            ):
+            if increases_exposure and float(realized_loss_inr) >= budget:
                 return AdmissionVerdict(
                     False,
-                    "DAILY_LOSS_BUDGET_UNAVAILABLE",
+                    "DAILY_LOSS_BUDGET_EXCEEDED",
                     {
                         **detail,
-                        "daily_loss_budget_inr": policy["daily_loss_budget_inr"],
-                        "realized_loss_inr": float(realized_loss_inr),
+                        "message": (
+                            "Today's realized loss for this strategy has reached its "
+                            "daily_loss_budget_inr; only risk-reducing plans are allowed."
+                        ),
+                    },
+                )
+
+        if is_live and account_daily_loss_cap_inr is not None:
+            cap = float(account_daily_loss_cap_inr)
+            detail.update(
+                {
+                    "account_daily_loss_cap_inr": cap,
+                    "account_day_pnl_inr": account_day_pnl_inr,
+                }
+            )
+            # Unknown evidence fails closed: with a cap configured, a broker day
+            # P&L that cannot be read refuses new exposure like a reached cap.
+            evidence_unavailable = account_day_pnl_inr is None
+            cap_reached = evidence_unavailable or float(account_day_pnl_inr) <= -cap
+            if cap_reached and increases_exposure:
+                return AdmissionVerdict(
+                    False,
+                    "ACCOUNT_DAILY_LOSS_CAP_REACHED",
+                    {
+                        **detail,
+                        "evidence": (
+                            "unavailable" if evidence_unavailable else "read"
+                        ),
+                        "message": (
+                            "The account-wide daily loss cap is configured and the "
+                            "broker's day P&L is at or below it (or could not be read); "
+                            "only risk-reducing plans are allowed."
+                        ),
                     },
                 )
 

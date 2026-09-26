@@ -1227,12 +1227,24 @@ class LivePlanAdapter:
                     raise
                 raise LiveRefusal(exc.reason_code, exc.detail) from exc
         self._check_option_structure_admissibility(plan)
+        from backend.strategies import daily_loss
+
+        # The same two daily-loss controls the paper/live pipeline applies, with
+        # LIVE evidence: the strategy's attributed realized P&L today, and the
+        # account-wide day P&L behind the optional cap. Admission stays pure.
+        evidence = daily_loss.admission_daily_loss_evidence(
+            plan=plan,
+            environment="live",
+            session_factory=self.session_factory,
+            now=self._clock(),
+        )
         verdict = self.admission.evaluate(
             plan,
             execution_environment="live",
             now=self._clock(),
             margin_evidence=margin_evidence,
             catalog_state=catalog_state,
+            **evidence,
         )
         if not bool(verdict.admitted):
             raise LiveRefusal(

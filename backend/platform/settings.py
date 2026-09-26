@@ -6,6 +6,11 @@ gates nothing else: reductions, exits, the MIS square-off, repair and flatten
 keep working while a lane is closed, exactly as they did when
 ``HOSTED_LIVE_LANES`` was the only source.
 
+The same row also carries the account-wide ``account_daily_loss_cap_inr``. It is
+**stored, never enforced, here**: admission reads it and refuses an
+exposure-increasing live plan once the broker's own day P&L is at or below the
+cap (``backend.strategies.daily_loss``).
+
 Two properties this module owes the live path:
 
 * **Default deny, never a widened fail-open.** An absent row, an absent lane key,
@@ -83,11 +88,31 @@ def normalise_lanes(raw: Optional[Mapping[str, Any]]) -> Dict[str, bool]:
 
 @dataclass(frozen=True)
 class PersistedLaneSettings:
-    """The stored lane map plus who last wrote it."""
+    """The stored lane map (and account day-loss cap) plus who last wrote it."""
 
     lanes: Dict[str, bool]
     updated_at: Optional[datetime]
     updated_by: Optional[str]
+    account_daily_loss_cap_inr: Optional[float] = None
+
+
+class _Unset:
+    """Sentinel type: "the caller did not name this field, so preserve the stored one"."""
+
+
+#: Passed as ``account_daily_loss_cap_inr`` when a caller wants the stored value
+#: left untouched (a lanes-only PUT must not silently clear a configured cap).
+UNSET = _Unset()
+
+
+def _as_cap(value: Any) -> Optional[float]:
+    """The cap as a float, or ``None``. A non-numeric value is not a cap."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def read_live_settings(
@@ -99,8 +124,8 @@ def read_live_settings(
     raised at the caller: it reports ``None`` so the caller keeps the deployment
     env allowlist it already had, which can only be narrower than "open".
     """
-    factory = platform_session_factory(session_factory)
     try:
+        factory = platform_session_factory(session_factory)
         with factory() as session:
             row = session.execute(
                 select(PlatformLiveSetting).where(
@@ -123,6 +148,7 @@ def read_live_settings(
         lanes=normalise_lanes(row.lanes),
         updated_at=row.updated_at,
         updated_by=row.updated_by,
+        account_daily_loss_cap_inr=_as_cap(getattr(row, "account_daily_loss_cap_inr", None)),
     )
 
 
@@ -130,27 +156,39 @@ def _write_once(
     session: Any,
     lanes: Dict[str, bool],
     *,
+    account_daily_loss_cap_inr: Any,
     actor_id: str,
     reason: Optional[str],
     moment: datetime,
-) -> Dict[str, bool]:
+) -> tuple:
+    """Write the row and its audit row. Returns ``(previous_cap, stored_cap)``."""
     row = session.execute(
         select(PlatformLiveSetting).where(
             PlatformLiveSetting.settings_id == LIVE_SETTINGS_SINGLETON_ID
         )
     ).scalar_one_or_none()
     previous = normalise_lanes(row.lanes) if row is not None else {}
+    previous_cap = (
+        _as_cap(getattr(row, "account_daily_loss_cap_inr", None)) if row is not None else None
+    )
+    cap = (
+        previous_cap
+        if account_daily_loss_cap_inr is UNSET
+        else _as_cap(account_daily_loss_cap_inr)
+    )
     if row is None:
         session.add(
             PlatformLiveSetting(
                 settings_id=LIVE_SETTINGS_SINGLETON_ID,
                 lanes=lanes,
+                account_daily_loss_cap_inr=cap,
                 updated_by=actor_id,
                 updated_at=moment,
             )
         )
     else:
         row.lanes = lanes
+        row.account_daily_loss_cap_inr = cap
         row.updated_by = actor_id
         row.updated_at = moment
     session.add(
@@ -159,11 +197,13 @@ def _write_once(
             reason=(str(reason).strip() or None) if reason is not None else None,
             previous_lanes=previous,
             lanes=lanes,
+            previous_account_daily_loss_cap_inr=previous_cap,
+            account_daily_loss_cap_inr=cap,
             created_at=moment,
         )
     )
     session.commit()
-    return previous
+    return previous_cap, cap
 
 
 def update_live_settings(
@@ -171,6 +211,7 @@ def update_live_settings(
     *,
     actor_id: str,
     reason: Optional[str] = None,
+    account_daily_loss_cap_inr: Any = UNSET,
     session_factory: Optional[Callable[[], Any]] = None,
     now: Optional[datetime] = None,
 ) -> PersistedLaneSettings:
@@ -187,13 +228,15 @@ def update_live_settings(
         raise ValueError("actor_id is required to change live lane settings")
     moment = now or datetime.now(timezone.utc)
     factory = platform_session_factory(session_factory)
+    stored_cap: Optional[float] = _as_cap(account_daily_loss_cap_inr)
 
     for attempt in (1, 2):
         try:
             with factory() as session:
-                _write_once(
+                _previous_cap, stored_cap = _write_once(
                     session,
                     settings,
+                    account_daily_loss_cap_inr=account_daily_loss_cap_inr,
                     actor_id=actor,
                     reason=reason,
                     moment=moment,
@@ -206,11 +249,17 @@ def update_live_settings(
                 "platform live settings insert lost a race; retrying as an update"
             )
 
-    return PersistedLaneSettings(lanes=settings, updated_at=moment, updated_by=actor)
+    return PersistedLaneSettings(
+        lanes=settings,
+        updated_at=moment,
+        updated_by=actor,
+        account_daily_loss_cap_inr=stored_cap,
+    )
 
 
 __all__ = [
     "LIVE_LANE_KEYS",
+    "UNSET",
     "PersistedLaneSettings",
     "normalise_lanes",
     "platform_session_factory",

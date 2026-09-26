@@ -3906,6 +3906,7 @@ CREATE TRIGGER trg_hosted_execution_audit_immutable
 CREATE TABLE IF NOT EXISTS public.platform_live_settings (
     settings_id INTEGER PRIMARY KEY,
     lanes JSONB NOT NULL DEFAULT '{}'::jsonb,
+    account_daily_loss_cap_inr NUMERIC(18,2),
     updated_by TEXT NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT ck_platform_live_settings_singleton CHECK (settings_id = 1)
@@ -3917,6 +3918,8 @@ CREATE TABLE IF NOT EXISTS public.platform_live_settings_audit (
     reason TEXT,
     previous_lanes JSONB NOT NULL DEFAULT '{}'::jsonb,
     lanes JSONB NOT NULL DEFAULT '{}'::jsonb,
+    previous_account_daily_loss_cap_inr NUMERIC(18,2),
+    account_daily_loss_cap_inr NUMERIC(18,2),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_platform_live_settings_audit_created

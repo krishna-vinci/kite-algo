@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest import mock
 
 from sqlalchemy import create_engine, event, text
@@ -1038,8 +1038,8 @@ class OptionalAxisTests(AdmissionTestCase):
 
 class FailClosedTests(AdmissionTestCase):
     def test_live_daily_loss_budget_refuses_as_unavailable(self):
-        # The honest V1 behaviour: there is no attributed live realized-loss
-        # source, so a configured budget refuses rather than silently not applying.
+        # A caller that could not read today's realized P&L passes None, and a
+        # configured budget then refuses rather than silently not applying.
         self.policy(allocation_inr=100000.0, daily_loss_budget_inr=5000.0)
         verdict = self.service.evaluate(self.plan(), now=NOW, margin_evidence=self.margin())
         self.assertEqual(verdict.refusal_reason, "DAILY_LOSS_BUDGET_UNAVAILABLE")
@@ -1055,7 +1055,7 @@ class FailClosedTests(AdmissionTestCase):
             self.plan(), execution_environment="paper", now=NOW,
             paper_funds={"available_funds": 100000.0}, realized_loss_inr=900.0,
         )
-        self.assertEqual(over.refusal_reason, "DAILY_LOSS_BUDGET_UNAVAILABLE")
+        self.assertEqual(over.refusal_reason, "DAILY_LOSS_BUDGET_EXCEEDED")
 
     def test_missing_margin_evidence_refuses(self):
         self.policy(allocation_inr=100000.0)
@@ -2019,6 +2019,373 @@ class LiveOptionMarginReaderTests(unittest.TestCase):
         for funds in cases:
             with self.subTest(funds=funds):
                 self.assertIsNone(_cnc_available_cash(_Kite(funds), "kite:A"))
+
+
+class DailyLossBudgetTests(AdmissionTestCase):
+    """The strategy daily-loss budget and the account-wide cap, at admission.
+
+    Both controls read EVIDENCE (today's realized loss / the broker day P&L); the
+    reader that produces that evidence is exercised separately. What matters here
+    is the verdict shape: an increase is refused by name, a reduction never is,
+    and unreadable cap evidence fails closed.
+    """
+
+    def test_a_live_increase_reaching_the_budget_is_refused_by_name(self):
+        self.policy(allocation_inr=1000.0, daily_loss_budget_inr=500.0)
+
+        under = self.service.evaluate(
+            self.plan(), now=NOW, margin_evidence=self.margin(), realized_loss_inr=499.0
+        )
+        self.assertTrue(under.admitted, under.detail)
+
+        reached = self.service.evaluate(
+            self.plan(), now=NOW, margin_evidence=self.margin(), realized_loss_inr=500.0
+        )
+        self.assertEqual(reached.refusal_reason, "DAILY_LOSS_BUDGET_EXCEEDED")
+        self.assertEqual(reached.detail["realized_loss_inr"], 500.0)
+
+    def test_a_reduction_is_never_blocked_by_a_realized_loss(self):
+        # The strategy already holds 20; a target of 10 REDUCES exposure.
+        self.policy(allocation_inr=1000.0, daily_loss_budget_inr=500.0)
+        self.book(20)
+        self.publish_state()
+        plan = self.plan()
+        exposure = self.service.plan_exposure(plan, execution_environment="live")
+        self.assertFalse(
+            any(row["increases_exposure"] for row in exposure["per_instrument"]),
+            exposure["per_instrument"],
+        )
+
+        # A budget of 500 with a 9000 loss must still let a reduction through.
+        verdict = self.service.evaluate(
+            plan, now=NOW, margin_evidence=self.margin(), realized_loss_inr=9000.0
+        )
+        self.assertTrue(verdict.admitted, verdict.detail)
+
+    def test_the_account_cap_refuses_a_live_increase(self):
+        self.policy(allocation_inr=1000.0)
+        under = self.service.evaluate(
+            self.plan(),
+            now=NOW,
+            margin_evidence=self.margin(),
+            account_daily_loss_cap_inr=5000.0,
+            account_day_pnl_inr=-4999.0,
+        )
+        self.assertTrue(under.admitted, under.detail)
+
+        reached = self.service.evaluate(
+            self.plan(),
+            now=NOW,
+            margin_evidence=self.margin(),
+            account_daily_loss_cap_inr=5000.0,
+            account_day_pnl_inr=-5000.0,
+        )
+        self.assertEqual(reached.refusal_reason, "ACCOUNT_DAILY_LOSS_CAP_REACHED")
+        self.assertEqual(reached.detail["evidence"], "read")
+
+    def test_the_account_cap_with_unreadable_evidence_fails_closed(self):
+        self.policy(allocation_inr=1000.0)
+        verdict = self.service.evaluate(
+            self.plan(),
+            now=NOW,
+            margin_evidence=self.margin(),
+            account_daily_loss_cap_inr=5000.0,
+            account_day_pnl_inr=None,
+        )
+        self.assertEqual(verdict.refusal_reason, "ACCOUNT_DAILY_LOSS_CAP_REACHED")
+        self.assertEqual(verdict.detail["evidence"], "unavailable")
+
+    def test_the_account_cap_never_blocks_a_reduction(self):
+        self.policy(allocation_inr=1000.0)
+        self.book(20)
+        self.publish_state()
+        verdict = self.service.evaluate(
+            self.plan(),
+            now=NOW,
+            margin_evidence=self.margin(),
+            account_daily_loss_cap_inr=5000.0,
+            account_day_pnl_inr=-90000.0,
+        )
+        self.assertTrue(verdict.admitted, verdict.detail)
+
+    def test_the_account_cap_never_applies_to_paper(self):
+        self.policy(allocation_inr=None)
+        verdict = self.service.evaluate(
+            self.plan(),
+            execution_environment="paper",
+            now=NOW,
+            paper_funds={"available_funds": 100000.0},
+            account_daily_loss_cap_inr=1.0,
+            account_day_pnl_inr=-100000.0,
+        )
+        self.assertTrue(verdict.admitted, verdict.detail)
+
+
+def _fill_fact(order_id, instrument_token, product, signed_quantity, price, moment):
+    from backend.strategies.daily_loss import FillFact
+
+    return FillFact(
+        order_id=order_id,
+        instrument_token=instrument_token,
+        product=product,
+        signed_quantity=signed_quantity,
+        price=price,
+        effective_at=moment,
+    )
+
+
+class RealizedPnlCalcTests(unittest.TestCase):
+    """The average-cost fold behind ``daily_loss_budget_inr`` (pure arithmetic)."""
+
+    DAY = date(2026, 9, 17)
+
+    def _at(self, hour, minute=0):
+        from backend.strategies.daily_loss import IST
+
+        return datetime(2026, 9, 17, hour, minute, tzinfo=IST)
+
+    def test_a_buy_then_sell_round_trip_realizes_the_gain(self):
+        from backend.strategies.daily_loss import realized_pnl_for_session
+
+        result = realized_pnl_for_session(
+            [
+                _fill_fact("o1", 100, "CNC", 10, 100.0, self._at(9, 20)),
+                _fill_fact("o2", 100, "CNC", -10, 110.0, self._at(14, 0)),
+            ],
+            session_day=self.DAY,
+        )
+
+        self.assertAlmostEqual(result.gross_pnl_inr, 100.0)
+        self.assertAlmostEqual(result.charges_inr, 0.0)
+        self.assertEqual(result.loss_inr, 0.0)
+        self.assertEqual(result.fill_count, 2)
+
+    def test_a_partial_close_realizes_only_the_closed_slice(self):
+        from backend.strategies.daily_loss import realized_pnl_for_session
+
+        result = realized_pnl_for_session(
+            [
+                _fill_fact("o1", 100, "CNC", 10, 100.0, self._at(9, 20)),
+                _fill_fact("o2", 100, "CNC", -4, 90.0, self._at(11, 0)),
+            ],
+            session_day=self.DAY,
+        )
+
+        self.assertAlmostEqual(result.gross_pnl_inr, -40.0)
+        self.assertAlmostEqual(result.loss_inr, 40.0)
+
+    def test_charges_are_subtracted_for_orders_that_filled_today(self):
+        from backend.strategies.daily_loss import realized_pnl_for_session
+
+        result = realized_pnl_for_session(
+            [
+                _fill_fact("o1", 100, "CNC", 10, 100.0, self._at(9, 20)),
+                _fill_fact("o2", 100, "CNC", -10, 90.0, self._at(11, 0)),
+            ],
+            session_day=self.DAY,
+            charges_by_order={"o1": 5.0, "o2": 7.5},
+        )
+
+        self.assertAlmostEqual(result.gross_pnl_inr, -100.0)
+        self.assertAlmostEqual(result.charges_inr, 12.5)
+        self.assertAlmostEqual(result.net_pnl_inr, -112.5)
+        self.assertAlmostEqual(result.loss_inr, 112.5)
+
+    def test_an_earlier_days_position_realizes_only_when_it_closes_today(self):
+        from backend.strategies.daily_loss import IST, realized_pnl_for_session
+
+        yesterday = datetime(2026, 9, 16, 10, 0, tzinfo=IST)
+        result = realized_pnl_for_session(
+            [
+                _fill_fact("o0", 100, "CNC", 10, 100.0, yesterday),
+                _fill_fact("o1", 100, "CNC", -10, 90.0, self._at(11, 0)),
+            ],
+            session_day=self.DAY,
+        )
+
+        # Only the closing fill's realized -100 is today's loss; yesterday's open
+        # is not a fill of today.
+        self.assertAlmostEqual(result.gross_pnl_inr, -100.0)
+        self.assertEqual(result.fill_count, 1)
+
+    def test_the_session_day_is_the_ist_calendar_day(self):
+        from backend.strategies.daily_loss import session_date
+
+        # 19:00 UTC on the 16th is 00:30 IST on the 17th.
+        self.assertEqual(
+            session_date(datetime(2026, 9, 16, 19, 0, tzinfo=timezone.utc)),
+            date(2026, 9, 17),
+        )
+
+
+class StrategyDailyLossReaderTests(unittest.TestCase):
+    """The DB reader wiring: attributed live fills and their order-level charges."""
+
+    NOW = datetime(2026, 9, 17, 12, 0, tzinfo=timezone.utc)
+
+    def setUp(self):
+        self.engine = create_engine(
+            "sqlite+pysqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+
+        @event.listens_for(self.engine, "connect")
+        def _attach_public(dbapi_connection, connection_record):
+            _ = connection_record
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.execute("ATTACH DATABASE ':memory:' AS public")
+            cursor.execute(
+                "CREATE TABLE public.order_trade_fills ("
+                " account_id TEXT, trade_id TEXT, order_id TEXT, instrument_token INTEGER,"
+                " product TEXT, transaction_type TEXT, quantity INTEGER, price REAL,"
+                " fill_timestamp TEXT)"
+            )
+            cursor.execute(
+                "CREATE TABLE public.worker_live_execution_links ("
+                " account_id TEXT, broker_order_id TEXT, strategy_run_id TEXT, trade_id TEXT)"
+            )
+            cursor.execute(
+                "CREATE TABLE public.live_order_intents ("
+                " account_id TEXT, broker_order_id TEXT, strategy_run_id TEXT,"
+                " cost_contract_json TEXT)"
+            )
+            dbapi_connection.commit()
+
+        from backend.strategies.attribution_models import Strategy, StrategyRunBinding
+
+        _Base.metadata.create_all(
+            self.engine,
+            tables=[Strategy.__table__, StrategyRunBinding.__table__],
+        )
+        self.factory = sessionmaker(bind=self.engine)
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT INTO strategies (id, owner_id, name, account_scope, status) "
+                    "VALUES ('stg-A', 'app:o', 'A', 'kite:A', 'active')"
+                )
+            )
+            session.execute(
+                text(
+                    "INSERT INTO strategy_run_bindings "
+                    "(strategy_run_id, strategy_id, owner_id, account_id, "
+                    " execution_environment, bound_by, binding_source) "
+                    "VALUES ('run-1', 'stg-A', 'app:o', 'kite:A', 'live', 'app:o', 'hosted_job')"
+                )
+            )
+            session.commit()
+
+    def tearDown(self):
+        self.engine.dispose()
+
+    def _link(self, order_id, *, run_id="run-1"):
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT INTO public.worker_live_execution_links "
+                    "(account_id, broker_order_id, strategy_run_id, trade_id) "
+                    "VALUES ('kite:A', :order_id, :run_id, NULL)"
+                ),
+                {"order_id": order_id, "run_id": run_id},
+            )
+            session.commit()
+
+    def _fill(self, *, trade_id, order_id, transaction_type, quantity, price, at):
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT INTO public.order_trade_fills "
+                    "(account_id, trade_id, order_id, instrument_token, product, "
+                    " transaction_type, quantity, price, fill_timestamp) "
+                    "VALUES ('kite:A', :trade_id, :order_id, 100, 'CNC', "
+                    " :transaction_type, :quantity, :price, :at)"
+                ),
+                {
+                    "trade_id": trade_id,
+                    "order_id": order_id,
+                    "transaction_type": transaction_type,
+                    "quantity": quantity,
+                    "price": price,
+                    "at": at,
+                },
+            )
+            session.commit()
+
+    def test_a_round_trip_reads_back_as_a_loss_net_of_recorded_charges(self):
+        from backend.strategies import daily_loss
+
+        self._link("o1")
+        self._link("o2")
+        self._fill(
+            trade_id="t1", order_id="o1", transaction_type="BUY",
+            quantity=10, price=100.0, at="2026-09-17T04:00:00+00:00",
+        )
+        self._fill(
+            trade_id="t2", order_id="o2", transaction_type="SELL",
+            quantity=10, price=90.0, at="2026-09-17T06:00:00+00:00",
+        )
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT INTO public.live_order_intents "
+                    "(account_id, broker_order_id, strategy_run_id, cost_contract_json) "
+                    "VALUES ('kite:A', 'o2', 'run-1', :payload)"
+                ),
+                {"payload": json.dumps({"total_charges": 12.5})},
+            )
+            session.commit()
+
+        loss = daily_loss.strategy_daily_realized_loss_inr(
+            account_id="kite:A",
+            strategy_id="stg-A",
+            execution_environment="live",
+            session_factory=self.factory,
+            now=self.NOW,
+        )
+
+        self.assertAlmostEqual(loss, 112.5)
+
+    def test_another_strategys_fills_are_not_this_strategys_loss(self):
+        from backend.strategies import daily_loss
+
+        self._link("o1", run_id="run-other")
+        self._fill(
+            trade_id="t1", order_id="o1", transaction_type="BUY",
+            quantity=10, price=100.0, at="2026-09-17T04:00:00+00:00",
+        )
+
+        loss = daily_loss.strategy_daily_realized_loss_inr(
+            account_id="kite:A",
+            strategy_id="stg-A",
+            execution_environment="live",
+            session_factory=self.factory,
+            now=self.NOW,
+        )
+
+        self.assertEqual(loss, 0.0)
+
+    def test_an_unreadable_source_is_none_never_a_zero(self):
+        from backend.strategies import daily_loss
+
+        bare = create_engine(
+            "sqlite+pysqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        try:
+            bare_factory = sessionmaker(bind=bare)
+            loss = daily_loss.strategy_daily_realized_loss_inr(
+                account_id="kite:A",
+                strategy_id="stg-A",
+                execution_environment="live",
+                session_factory=bare_factory,
+                now=self.NOW,
+            )
+            self.assertIsNone(loss)
+        finally:
+            bare.dispose()
 
 
 if __name__ == "__main__":
