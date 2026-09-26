@@ -23,7 +23,8 @@ visible to whoever reads the plan rather than invisible.
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Any, Dict, Mapping
+import math
+from typing import Any, Dict, Mapping, Optional
 
 from backend.strategies.compiler.base import (
     PinnedCatalogRead,
@@ -104,7 +105,157 @@ class FuturesCompiler(TargetCompiler):
         roll_id = raw.get("roll_id")
         if roll_id is not None and not str(roll_id).strip():
             raise ValidationRefusal("PAYLOAD_INVALID", {"roll_id": str(roll_id)})
-        return {"roll_id": None if roll_id is None else str(roll_id), "role": role}
+        peer = raw.get("peer")
+        if peer is None:
+            raise ValidationRefusal(
+                "PAYLOAD_INVALID",
+                {
+                    "roll_role": role,
+                    "message": (
+                        "A roll half must freeze the held peer contract so admission "
+                        "can value the concurrent futures book"
+                    ),
+                },
+            )
+        if not isinstance(peer, Mapping):
+            raise ValidationRefusal("PAYLOAD_INVALID", {"reason": "roll.peer must be an object"})
+        peer = dict(peer)
+        peer_side = str(peer.get("side") or "").upper()
+        if peer_side not in ("BUY", "SELL"):
+            raise ValidationRefusal(
+                "PAYLOAD_INVALID",
+                {
+                    "field": "roll.peer.side",
+                    "value": peer.get("side"),
+                    "message": "A roll peer requires an explicit BUY or SELL holding side",
+                },
+            )
+        peer["side"] = peer_side
+        return {
+            "roll_id": None if roll_id is None else str(roll_id),
+            "role": role,
+            "peer": peer,
+        }
+
+    @staticmethod
+    def _peer_reference_price(peer: Mapping[str, Any]) -> float:
+        """The peer's fresh quote is required evidence, never a guessed mark."""
+        try:
+            price = float(peer.get("reference_price"))
+        except (TypeError, ValueError) as exc:
+            raise ValidationRefusal(
+                "REFERENCE_PRICE_UNAVAILABLE",
+                {
+                    "field": "roll.peer.reference_price",
+                    "value": peer.get("reference_price"),
+                    "message": "A futures roll peer requires a finite reference price",
+                },
+            ) from exc
+        if not math.isfinite(price) or price <= 0:
+            raise ValidationRefusal(
+                "REFERENCE_PRICE_UNAVAILABLE",
+                {
+                    "field": "roll.peer.reference_price",
+                    "value": peer.get("reference_price"),
+                    "message": "A futures roll peer reference price must be finite and positive",
+                },
+            )
+        return price
+
+    def _old_roll_leg(
+        self,
+        peer: Mapping[str, Any],
+        pinned: PinnedCatalogRead,
+        *,
+        product: str,
+    ) -> Dict[str, Any]:
+        required = ("instrument_token", "exchange", "tradingsymbol", "lots")
+        missing = [field for field in required if peer.get(field) is None]
+        if missing:
+            raise ValidationRefusal(
+                "PAYLOAD_INVALID", {"missing_fields": sorted(missing), "field": "roll.peer"}
+            )
+        peer_lots = _as_lots(peer.get("lots"))
+        try:
+            peer_token = int(peer["instrument_token"])
+        except (TypeError, ValueError) as exc:
+            raise ValidationRefusal("PAYLOAD_INVALID", {"reason": str(exc)}) from exc
+        peer_exchange = str(peer["exchange"]).upper()
+        peer_symbol = str(peer["tradingsymbol"]).upper()
+        mapping = pinned.resolve_token(
+            peer_token, exchange=peer_exchange, symbol=peer_symbol
+        )
+        if mapping is None:
+            raise ValidationRefusal(
+                "CONTRACT_UNRESOLVED",
+                {
+                    "instrument_token": peer_token,
+                    "exchange": peer_exchange,
+                    "tradingsymbol": peer_symbol,
+                    "catalog_generation": pinned.pin(),
+                },
+            )
+        if str(mapping.get("lifecycle_status") or "") != "active":
+            raise ValidationRefusal(
+                "CONTRACT_UNRESOLVED",
+                {
+                    "tradingsymbol": peer_symbol,
+                    "lifecycle_status": mapping.get("lifecycle_status"),
+                    "catalog_generation": pinned.pin(),
+                },
+            )
+        if str(mapping.get("instrument_type") or "").upper() != FUTURES_INSTRUMENT_TYPE:
+            raise ValidationRefusal(
+                "CONTRACT_UNRESOLVED",
+                {
+                    "tradingsymbol": peer_symbol,
+                    "instrument_type": mapping.get("instrument_type"),
+                    "expected_instrument_type": FUTURES_INSTRUMENT_TYPE,
+                    "message": "The roll peer is not a futures contract",
+                },
+            )
+        peer_expiry = _expiry_iso(mapping.get("expiry"))
+        if not peer_expiry:
+            raise ValidationRefusal(
+                "EXPIRY_UNAVAILABLE",
+                {
+                    "instrument_id": mapping["instrument_id"],
+                    "tradingsymbol": peer_symbol,
+                    "message": "A futures roll peer requires an expiry",
+                },
+            )
+        peer_lot_size = _as_optional_int(mapping.get("lot_size"))
+        if not peer_lot_size or peer_lot_size <= 0:
+            raise ValidationRefusal(
+                "CONTRACT_UNRESOLVED",
+                {
+                    "tradingsymbol": peer_symbol,
+                    "lot_size": mapping.get("lot_size"),
+                    "message": "The catalog provides no roll-peer lot size",
+                },
+            )
+        peer_quantity = peer_lots * peer_lot_size
+        peer_signed_quantity = (
+            -peer_quantity if str(peer.get("side")) == "SELL" else peer_quantity
+        )
+        return {
+            "instrument_id": mapping["instrument_id"],
+            "exchange": mapping["exchange"],
+            "tradingsymbol": mapping["tradingsymbol"],
+            "broker_exchange": mapping["broker_exchange"],
+            "broker_symbol": mapping["broker_symbol"],
+            "broker_token": mapping["broker_token"],
+            "product": product,
+            "instrument_type": FUTURES_INSTRUMENT_TYPE,
+            "underlying": mapping.get("underlying") or "",
+            "lots": peer_lots,
+            "lot_size": peer_lot_size,
+            "quantity": peer_quantity,
+            "signed_quantity": peer_signed_quantity,
+            "tick_size": mapping.get("tick_size"),
+            "expiry": peer_expiry,
+            "reference_price": self._peer_reference_price(peer),
+        }
 
     def compile(self, payload: Mapping[str, Any], pinned: PinnedCatalogRead) -> ResolvedPlan:
         required = ("instrument_token", "exchange", "tradingsymbol", "lots")
@@ -265,4 +416,7 @@ class FuturesCompiler(TargetCompiler):
                 }
             ],
         }
+        peer = roll_binding.get("peer") if roll_binding is not None else None
+        if peer is not None:
+            resolved["old_legs"] = [self._old_roll_leg(peer, pinned, product=product)]
         return ResolvedPlan(target_kind=self.target_kind, logical=logical, resolved=resolved)

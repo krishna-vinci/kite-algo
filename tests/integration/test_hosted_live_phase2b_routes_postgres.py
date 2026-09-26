@@ -636,7 +636,10 @@ class _Env:
         )
 
 
-def _futures_payload(*, symbol: str, token: int, side: str, roll: dict | None = None) -> dict:
+def _futures_payload(
+    *, symbol: str, token: int, side: str, roll: dict | None = None,
+    peer: dict | None = None,
+) -> dict:
     payload = {
         "target_kind": "target_futures",
         "payload": {
@@ -646,11 +649,17 @@ def _futures_payload(*, symbol: str, token: int, side: str, roll: dict | None = 
             "lots": 1,
             "product": "NRML",
             "side": side,
-            "reference_price": 20000.0,
+            "reference_price": 1500.0,
         },
     }
     if roll is not None:
-        payload["payload"]["roll"] = roll
+        payload["payload"]["roll"] = {
+            **roll,
+            "peer": {
+                **peer,
+                "reference_price": 1500.0,
+            },
+        }
     return payload
 
 
@@ -744,6 +753,13 @@ def test_futures_roll_releases_the_close_only_after_the_full_replacement(pg, liv
                     token=FUT_NEW_TOKEN,
                     side="BUY",
                     roll={"role": "open_new"},
+                    peer={
+                        "instrument_token": FUT_OLD_TOKEN,
+                        "exchange": "NFO",
+                        "tradingsymbol": FUT_OLD,
+                        "lots": 1,
+                        "side": "BUY",
+                    },
                 ),
                 account_scope=env.account_scope,
             )
@@ -791,6 +807,13 @@ def test_futures_roll_releases_the_close_only_after_the_full_replacement(pg, liv
                     token=FUT_OLD_TOKEN,
                     side="SELL",
                     roll={"role": "close_old", "roll_id": roll_id},
+                    peer={
+                        "instrument_token": FUT_NEW_TOKEN,
+                        "exchange": "NFO",
+                        "tradingsymbol": FUT_NEW,
+                        "lots": 1,
+                        "side": "BUY",
+                    },
                 ),
                 account_scope=env.account_scope,
             )

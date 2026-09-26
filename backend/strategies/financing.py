@@ -192,10 +192,20 @@ def plan_exposure(
     to run the same arithmetic under its own lock: a detached admission verdict is
     not authoritative by the time capacity is claimed.
     """
-    legs = list((plan.get("resolved_plan") or {}).get("legs") or [])
+    resolved = dict(plan.get("resolved_plan") or {})
+    legs = list(resolved.get("legs") or [])
+    # A futures roll is one strategy, one position, two contracts for a moment.
+    # Its roll-peer is deliberately NOT an order leg (executor sequencing forbids
+    # one plan to move both contracts), but it IS part of the post-plan book.
+    # The compiler freezes that peer with its own reference price exactly so the
+    # unvalued-coordinate gate below can remain strict for every other plan.
+    if (
+        str(resolved.get("target_kind") or "") == "target_futures"
+        and resolved.get("roll")
+    ):
+        legs = legs + list(resolved.get("old_legs") or [])
     account_id = str(plan.get("account_id") or "")
     strategy_id = str(plan.get("strategy_id") or "")
-    resolved = dict(plan.get("resolved_plan") or {})
     logical = dict(plan.get("logical_plan") or {})
     try:
         basis_raw = resolved.get("capital_basis_inr", logical.get("capital_basis_inr"))

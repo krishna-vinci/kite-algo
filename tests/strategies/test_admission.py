@@ -653,6 +653,42 @@ class OptionalAxisTests(AdmissionTestCase):
         verdict = self.service.evaluate(two_legs, now=NOW, margin_evidence=self.margin())
         self.assertEqual(verdict.refusal_reason, "MAX_OPEN_INSTRUMENTS_EXCEEDED")
 
+    def test_a_futures_roll_peer_is_valued_while_an_unrelated_gap_still_refuses(self):
+        self.policy(allocation_inr=100000.0)
+        self.book(10, canonical_id="inst-OLD", token=700)
+        plan = self.plan(
+            resolved_plan={
+                "target_kind": "target_futures",
+                "roll": {"role": "open_new"},
+                "legs": [self._leg()],
+                "old_legs": [
+                    {
+                        "instrument_id": "inst-OLD",
+                        "product": "CNC",
+                        "instrument_type": "FUT",
+                        "signed_quantity": 10,
+                        "reference_price": 100.0,
+                        "lot_size": 1,
+                    }
+                ],
+            }
+        )
+
+        exposure = self.service.plan_exposure(plan, execution_environment="live")
+        self.assertEqual(exposure["unvalued"], [])
+        self.assertEqual(exposure["post_instruments"], 2)
+        admitted = self.service.evaluate(plan, now=NOW, margin_evidence=self.margin())
+        self.assertTrue(admitted.admitted, admitted.detail)
+
+        # The exception is only for the frozen peer. Any OTHER post-plan
+        # coordinate without a price remains unknown evidence and refuses.
+        self.book(5, canonical_id="inst-OTHER", token=999)
+        refused = self.service.evaluate(plan, now=NOW, margin_evidence=self.margin())
+        self.assertEqual(refused.refusal_reason, "POSITION_VALUATION_UNAVAILABLE")
+        self.assertEqual(
+            refused.detail["unvalued"][0]["coordinate"], ["inst-OTHER", "CNC"]
+        )
+
     def test_an_unpriced_held_coordinate_refuses_instead_of_reading_as_zero(self):
         # A configured notional limit with a held coordinate the plan does not
         # price is unknown evidence: refusing by name is honest, and valuing it as

@@ -201,6 +201,54 @@ class ExpiryTests(FuturesCompilerTestCase):
         self.assertEqual(leg["expiry"], "2026-11-26")
 
 
+class RollPeerTests(FuturesCompilerTestCase):
+    def test_a_roll_freezes_its_peer_as_an_old_leg(self):
+        self.contract()
+        self.contract("NIFTY26SEPFUT", token=501)
+        plan = self.compile(
+            roll={
+                "role": "open_new",
+                "peer": {
+                    "instrument_token": 501,
+                    "exchange": "NFO",
+                    "tradingsymbol": "NIFTY26SEPFUT",
+                    "lots": 2,
+                    "side": "BUY",
+                    "reference_price": 24800.0,
+                },
+            }
+        )
+
+        old_leg = plan.resolved["old_legs"][0]
+        self.assertEqual(old_leg["instrument_id"], "inst-NIFTY26SEPFUT")
+        self.assertEqual(old_leg["lots"], 2)
+        self.assertEqual(old_leg["lot_size"], 75)
+        self.assertEqual(old_leg["signed_quantity"], 150)
+        self.assertEqual(old_leg["reference_price"], 24800.0)
+
+    def test_a_roll_peer_without_a_fresh_price_refuses(self):
+        from backend.strategies.compiler.base import ValidationRefusal
+
+        self.contract()
+        self.contract("NIFTY26SEPFUT", token=501)
+        with self.assertRaises(ValidationRefusal) as ctx:
+            self.compile(
+                roll={
+                    "role": "open_new",
+                    "peer": {
+                        "instrument_token": 501,
+                        "exchange": "NFO",
+                        "tradingsymbol": "NIFTY26SEPFUT",
+                        "lots": 1,
+                        "side": "BUY",
+                        "reference_price": None,
+                    },
+                }
+            )
+
+        self.assertEqual(ctx.exception.reason_code, "REFERENCE_PRICE_UNAVAILABLE")
+
+
 class LotSizeTests(FuturesCompilerTestCase):
     def test_a_contract_without_a_lot_size_refuses(self):
         from backend.strategies.compiler.base import ValidationRefusal
