@@ -189,6 +189,20 @@ class RollStateMachine:
             ).scalar_one_or_none()
             return self._view(row) if row is not None else None
 
+    def list_open(self) -> List[Dict[str, Any]]:
+        """Every roll still in flight, across every strategy and account.
+
+        This is the expiry watch's enumeration: an unrolled contract needs a
+        periodic check regardless of which strategy owns it, so this carries no
+        ``strategy_id``/``account_id`` predicate the way ``list_for_strategy`` and
+        ``open_for`` do.
+        """
+        with self.session_factory() as session:
+            rows = session.execute(
+                select(StrategyRoll).where(StrategyRoll.state.in_(OPEN_ROLL_STATES))
+            ).scalars().all()
+            return [self._view(row) for row in rows]
+
     def list_for_strategy(self, *, strategy_id: str, limit: int = 50) -> List[Dict[str, Any]]:
         with self.session_factory() as session:
             rows = session.execute(
@@ -316,7 +330,14 @@ class RollStateMachine:
                 .where(StrategyRollEvent.roll_id == str(roll_id))
                 .order_by(StrategyRollEvent.created_at, StrategyRollEvent.event)
             ).scalars().all()
-            return [{"event": str(row.event), "detail": dict(row.detail or {})} for row in rows]
+            return [
+                {
+                    "event": str(row.event),
+                    "detail": dict(row.detail or {}),
+                    "created_at": row.created_at,
+                }
+                for row in rows
+            ]
 
     # -- lifecycle ----------------------------------------------------------
 

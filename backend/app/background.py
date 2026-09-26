@@ -163,6 +163,104 @@ async def _worker_protection_loop(app: FastAPI):
             set_component_status("worker_protection", "degraded", detail=str(exc))
         await asyncio.sleep(interval)
 
+async def _notify_option_run_owner(request: Any, *, run: Dict[str, Any], text: str, subject: str, idempotency_key: str) -> bool:
+    """Notify a hosted option run's app OWNER, on its own enabled channels.
+
+    Mirrors the existing account-truth reconciliation notifier
+    (``backend.strategies.account_truth._owner_channels`` +
+    ``enqueue_run_notification``): the owner is resolved from the run's
+    persisted hosted job (never the account scope), and an owner with no
+    enabled channel is a silent no-op rather than a raised error, exactly like
+    that path - a notification outcome never blocks or fails the watch.
+    """
+    from backend.api.services.hosted_attempt import hosted_job_for_run
+    from backend.notifications.repository import SqlAlchemyNotificationRepository
+    from backend.strategies.account_truth import _owner_channels
+
+    job = await hosted_job_for_run(request, run)
+    owner_id = str(getattr(job, "owner_id", "") or "")
+    if not owner_id:
+        return False
+    repository = getattr(request.app.state, "notification_repository", None)
+    if repository is None:
+        repository = SqlAlchemyNotificationRepository()
+    channels = await asyncio.to_thread(_owner_channels, repository, owner_id)
+    if not channels:
+        return False
+    try:
+        await asyncio.to_thread(
+            repository.enqueue_run_notification,
+            owner_id=owner_id,
+            run_id=str(run.get("strategy_run_id") or ""),
+            channel_names=channels,
+            text=text,
+            subject=subject,
+            idempotency_key=idempotency_key,
+        )
+        return True
+    except Exception:  # noqa: BLE001 - notification delivery is never load-bearing
+        return False
+
+
+async def _expiry_watch_loop(app: FastAPI):
+    """Warn on approaching expiry and escalate a reached option cutoff (P4).
+
+    No platform scheduler previously watched a held position's own expiry
+    after entry: ``OptionExpiryPolicy.check`` only ran at entry time, and
+    futures' ``check_expiry_cutoff`` had no production caller at all. This is
+    that scheduler. It never rolls anything (rolling stays the strategy's own
+    decision) and it never blocks a reduction; the only actions it can take are
+    a warning and - options only, on expiry day, past cutoff, and only for a
+    structure frozen ``exit_before_cutoff`` - submitting that structure's own
+    already-defined staged exit.
+    """
+    from types import SimpleNamespace
+
+    from backend.api.repositories.algo_worker_repo import SqlAlchemyAlgoWorkerRepository
+    from backend.api.services.expiry_watch import ExpiryWatchService, build_roll_escalator
+    from backend.api.services.protection_runtime import submit_worker_protection_structure_exit
+    from backend.broker_api.core.redis_events import publish_event
+    from backend.strategies.rolls import RollStateMachine
+
+    interval = max(30.0, float(os.getenv("EXPIRY_WATCH_INTERVAL_SECONDS", "300")))
+    request = SimpleNamespace(headers={}, app=app, is_disconnected=lambda: False)
+    repo = getattr(app.state, "algo_worker_repository", None)
+    if repo is None:
+        repo = SqlAlchemyAlgoWorkerRepository()
+        app.state.algo_worker_repository = repo
+    roll_machine = RollStateMachine()
+
+    async def _publish_timeline(row: Dict[str, Any]) -> None:
+        strategy_run_id = str(row.get("strategy_run_id") or "")
+        if not strategy_run_id:
+            return
+        await publish_event(f"worker.execution.events:{strategy_run_id}", dict(row))
+
+    service = ExpiryWatchService(
+        repo=repo,
+        roll_lister=lambda: asyncio.to_thread(roll_machine.list_open),
+        roll_escalator=build_roll_escalator(roll_machine),
+        structure_exit_submitter=lambda run, state: submit_worker_protection_structure_exit(
+            request, run, state
+        ),
+        notify_option_run=lambda run, text, subject, idempotency_key: _notify_option_run_owner(
+            request, run=run, text=text, subject=subject, idempotency_key=idempotency_key
+        ),
+        publish_timeline=_publish_timeline,
+    )
+    set_component_status("expiry_watch", "healthy", detail="Expiry watch runtime started")
+    while True:
+        try:
+            result = await service.evaluate_once()
+            heartbeat("expiry_watch", detail="Evaluated expiry warnings and cutoffs", meta={**result, "interval_seconds": interval})
+        except asyncio.CancelledError:
+            set_component_status("expiry_watch", "stopped", detail="Expiry watch runtime cancelled")
+            break
+        except Exception as exc:
+            logging.warning("Expiry watch loop failed: %s", exc, exc_info=True)
+            set_component_status("expiry_watch", "degraded", detail=str(exc))
+        await asyncio.sleep(interval)
+
 async def _worker_runtime_recovery_runs_loop(app: FastAPI):
     interval = max(1.0, float(os.getenv("WORKER_RUNTIME_STALE_RECOVERY_INTERVAL_SECONDS", "30")))
     service = build_worker_runtime_recovery_service(

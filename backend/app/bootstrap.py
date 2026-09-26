@@ -18,6 +18,7 @@ from backend.app.background import (
     _account_ingest_loop,
     _strategy_schedule_loop,
     _bracket_executor_loop,
+    _expiry_watch_loop,
     _worker_protection_loop,
     _worker_runtime_recovery_exit_loop,
     _worker_runtime_recovery_runs_loop,
@@ -296,6 +297,7 @@ async def combined_lifespan(app: FastAPI):
     order_runtime_task = None
     positions_runtime_task = None
     worker_protection_task = None
+    expiry_watch_task = None
     worker_runtime_stale_recovery_task = None
     worker_runtime_exiting_recovery_task = None
     bracket_executor_task = None
@@ -733,6 +735,11 @@ async def combined_lifespan(app: FastAPI):
         else:
             set_component_status("worker_protection", "disabled", detail="Worker protection runtime disabled by WORKER_PROTECTION_ENABLED")
 
+        if os.getenv("EXPIRY_WATCH_ENABLED", "true").lower() in {"1", "true", "yes"}:
+            expiry_watch_task = asyncio.create_task(_expiry_watch_loop(app))
+        else:
+            set_component_status("expiry_watch", "disabled", detail="Expiry watch runtime disabled by EXPIRY_WATCH_ENABLED")
+
         worker_runtime_stale_recovery_task = asyncio.create_task(_worker_runtime_recovery_runs_loop(app))
         worker_runtime_exiting_recovery_task = asyncio.create_task(_worker_runtime_recovery_exit_loop(app))
         bracket_executor_task = asyncio.create_task(_bracket_executor_loop(app))
@@ -876,6 +883,16 @@ async def combined_lifespan(app: FastAPI):
             worker_protection_task.cancel()
             try:
                 await worker_protection_task
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Cancel expiry watch runtime
+    try:
+        if 'expiry_watch_task' in locals() and expiry_watch_task:
+            expiry_watch_task.cancel()
+            try:
+                await expiry_watch_task
             except Exception:
                 pass
     except Exception:
