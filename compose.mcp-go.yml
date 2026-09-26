@@ -22,7 +22,7 @@ services:
       KITE_MCP_HTTP_TOKEN: ${KITE_MCP_HTTP_TOKEN:-}
       KITE_MCP_ALLOW_DATA_REFRESH: ${KITE_MCP_ALLOW_DATA_REFRESH:-false}
     ports:
-      - "${KITE_MCP_BIND_ADDRESS:-0.0.0.0}:${KITE_MCP_HOST_PORT:-18789}:8788"
+      - "${KITE_MCP_BIND_ADDRESS:-127.0.0.1}:${KITE_MCP_HOST_PORT:-18789}:8788"
     depends_on:
       finance-app:
         condition: service_healthy

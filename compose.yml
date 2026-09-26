@@ -16,7 +16,7 @@ services:
       -c wal_buffers=1MB
       -c effective_cache_size=512MB
     ports:
-      - "15432:5432"
+      - "127.0.0.1:15432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -35,7 +35,7 @@ services:
     restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes"]
     ports:
-      - "16379:6379"
+      - "127.0.0.1:16379:6379"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -64,7 +64,7 @@ services:
       MARKET_RUNTIME_HTTP_URL: http://market-runtime:8780
       MARKET_RUNTIME_ENABLED: "true"
     ports:
-      - "18780:8780"
+      - "127.0.0.1:18780:8780"
     depends_on:
       postgres:
         condition: service_healthy
