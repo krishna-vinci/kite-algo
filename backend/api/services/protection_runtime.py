@@ -2,12 +2,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+import asyncio
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 from backend.api.services.protection import evaluate_backend_protection, validate_backend_protection_payload
 from backend.broker_api.core.redis_events import publish_event
+from backend.options.protection.live_metrics import (
+    derive_live_option_protection_metrics,
+    open_option_positions,
+)
+from backend.options.protection.runtime import (
+    evaluate_option_protection_state,
+    normalize_protection_config as normalize_option_protection_config,
+)
 
 
 def _utcnow() -> datetime:
@@ -38,6 +47,11 @@ class WorkerProtectionRuntime:
             Callable[[Dict[str, Any], Dict[str, Any]], Awaitable[Dict[str, Any]]]
         ] = None,
         owner_store: Any = None,
+        option_run_store: Any = None,
+        index_tick_loader: Optional[Callable[[int], Awaitable[Dict[str, Any] | None]]] = None,
+        option_tick_loader: Optional[Callable[[int], Awaitable[Dict[str, Any] | None]]] = None,
+        index_token_resolver: Optional[Callable[[str, str], Awaitable[int | None]]] = None,
+        option_token_resolver: Optional[Callable[[str, str], Awaitable[int | None]]] = None,
     ) -> None:
         self.repo = repo
         self.pnl_loader = pnl_loader
@@ -54,6 +68,14 @@ class WorkerProtectionRuntime:
         #: cannot disagree about an exit that is in flight (B2.4 S2a). Injected in
         #: tests; the production default is the durable owner store.
         self.owner_store = owner_store
+        #: Durable option-run evidence and market reads. They are lazy in
+        #: production so tests and non-option deployments never construct the
+        #: options machinery merely to evaluate a flat equity run.
+        self.option_run_store = option_run_store
+        self.index_tick_loader = index_tick_loader
+        self.option_tick_loader = option_tick_loader
+        self.index_token_resolver = index_token_resolver
+        self.option_token_resolver = option_token_resolver
 
     async def evaluate_once(self) -> Dict[str, int]:
         # OPTION STRUCTURES are enumerated by OWNER ROW, not by the worker run's
@@ -73,7 +95,7 @@ class WorkerProtectionRuntime:
             # to fire and no structure identity to exit, so evaluating it would
             # only write state every pass. Those runs stay on exactly the path
             # they had before this slice.
-            if not self._protection_enabled(run):
+            if not self._protection_enabled(run) and not self._has_option_metric_rules(run):
                 continue
             pending.append(dict(run))
         for run in list(runs or []):
@@ -125,6 +147,34 @@ class WorkerProtectionRuntime:
         except Exception:  # noqa: BLE001 - let the evaluation report the error
             return True
         return bool(config.enabled)
+
+    @staticmethod
+    def _has_option_metric_rules(run: Dict[str, Any]) -> bool:
+        owner = run.get("protection_owner")
+        if not isinstance(owner, dict):
+            return False
+        policies: list[Any] = []
+        policy = owner.get("policy")
+        if isinstance(policy, dict):
+            nested = policy.get("protection_policy")
+            if isinstance(nested, dict):
+                policies.append(nested)
+            policies.append(policy)
+        option_metrics = {
+            "index_ltp",
+            "combined_premium",
+            "combined_premium_change_pct",
+            "strategy_mtm",
+            "open_quantity",
+        }
+        for source in policies:
+            rules = source.get("rules")
+            if isinstance(rules, list) and any(
+                isinstance(rule, dict) and str(rule.get("metric") or "") in option_metrics
+                for rule in rules
+            ):
+                return True
+        return False
 
     def _protection_owner_store(self) -> Any:
         if self.owner_store is None:
@@ -213,6 +263,13 @@ class WorkerProtectionRuntime:
         now = self.now_fn()
         if self._has_recent_exit_claim(state, now):
             return False
+        owner = self._protection_owner_context(run)
+        if owner is not None and self._has_option_metric_rules(run):
+            option_result = await self._evaluate_option_owner_run(
+                run, runtime_state, state, owner, now=now
+            )
+            if option_result is not None:
+                return option_result
         pnl = await self.pnl_loader(run)
         positions = list(pnl.get("legs") or pnl.get("positions") or [])
         next_state = evaluate_backend_protection(
@@ -386,6 +443,400 @@ class WorkerProtectionRuntime:
             await self._publish_timeline_rows(persisted_non_trigger.get("timeline_events") or [])
         return did_trigger
 
+    async def _evaluate_option_owner_run(
+        self,
+        run: Dict[str, Any],
+        runtime_state: Dict[str, Any],
+        state: Dict[str, Any],
+        owner: Dict[str, Any],
+        *,
+        now: datetime,
+    ) -> Optional[bool]:
+        """Evaluate fresh option metrics, then reuse the generic trigger path.
+
+        ``None`` means the owner row has no option-metric rules and belongs to
+        the generic evaluation it always used. A claimed option trigger never
+        bypasses the staged-exit adapter or owner-row CAS.
+        """
+
+        option_run = await asyncio.to_thread(self._option_run_store().get_run, str(owner.get("option_run_id") or ""))
+        protection = self._option_rule_config(option_run, owner)
+        if protection is None:
+            return None
+        if state.get("exit_submitted"):
+            return False
+        metrics, metric_errors = await derive_live_option_protection_metrics(
+            option_run,
+            index_token_resolver=self._index_token_resolver(),
+            index_tick_loader=self._index_tick_loader(),
+            option_tick_loader=self._option_tick_loader(),
+            option_token_resolver=self._option_token_resolver(),
+            now=now,
+        )
+        persisted_metrics = {**metrics, "as_of": now.isoformat()}
+        await asyncio.to_thread(
+            self._option_run_store().update_protection_metrics,
+            str(option_run.strategy_run_id),
+            persisted_metrics,
+            errors=metric_errors,
+        )
+        await self._record_option_metric_availability(
+            run,
+            runtime_state,
+            state,
+            metric_errors,
+            now=now,
+        )
+        verdict = evaluate_option_protection_state(
+            run=option_run,
+            protection=protection,
+            metric_snapshot=metrics,
+        )
+        try:
+            has_open_quantity = float(metrics.get("open_quantity") or 0) > 0
+        except (TypeError, ValueError):
+            has_open_quantity = False
+        if not has_open_quantity:
+            return False
+        if not verdict.get("triggered"):
+            return False
+
+        rule = dict(verdict.get("matched_rule") or {})
+        next_state = {
+            **state,
+            "status": "triggered",
+            "action": "exit_strategy",
+            "triggered_rule": f"option:{rule.get('key') or rule.get('metric') or 'unknown'}",
+            "details": {
+                "option_rule": rule,
+                "option_metrics": dict(verdict.get("metrics") or {}),
+                "option_run_id": str(owner.get("option_run_id") or ""),
+            },
+            "generation": int(state.get("generation") or 0) + 1,
+        }
+        claim_id = str(uuid.uuid4())
+        claimed_state = {
+            **next_state,
+            "exit_claim_id": claim_id,
+            "exit_claimed_at": now.isoformat(),
+            "exit_idempotency_key": self._idempotency_key(run, next_state),
+        }
+        claimed_result = await self._persist_state(
+            run,
+            runtime_state,
+            state,
+            claimed_state,
+            expected_generation=state.get("generation"),
+            expected_triggered_rule=state.get("triggered_rule") or "",
+        )
+        if claimed_result is None:
+            return False
+        await self._publish_timeline_rows(claimed_result.get("timeline_events") or [])
+
+        structure = self._option_structure_identity(option_run, owner)
+        if structure is None:
+            raise RuntimeError(
+                "OPTION_PROTECTION_STRUCTURE_UNKNOWN: active option-metric owner "
+                "does not name a structure"
+            )
+        self._mirror_protection_owner_action(owner, "claimed")
+        structure_exit = await self._submit_structure_exit(
+            run, claimed_state, structure, claim_id=claim_id
+        )
+        self._mirror_protection_owner_action(
+            owner,
+            self._owner_action_state(structure_exit),
+            stage_digest=(structure_exit or {}).get("stage_digest"),
+        )
+        structure_state = {
+            **claimed_state,
+            "exit_submitted": bool(
+                structure_exit.get("submitted")
+                and structure_exit.get("complete", True)
+            ),
+            "structure_exit_complete": bool(structure_exit.get("complete", True)),
+            "exit_submission_status": (
+                "submitted" if structure_exit.get("submitted")
+                else str(structure_exit.get("reason") or "not_submitted")
+            ),
+            "structure_exit": structure_exit,
+        }
+        persisted_structure = await self._persist_state(
+            run,
+            runtime_state,
+            claimed_state,
+            structure_state,
+            expected_generation=structure_state.get("generation"),
+            expected_exit_claim_id=claim_id,
+        )
+        if persisted_structure is None:
+            persisted_structure = await self._persist_state(
+                run, runtime_state, claimed_state, structure_state
+            )
+        if persisted_structure is not None:
+            await self._publish_timeline_rows(
+                persisted_structure.get("timeline_events") or []
+            )
+        return bool(structure_exit.get("submitted"))
+
+    async def _record_option_metric_availability(
+        self,
+        run: Dict[str, Any],
+        runtime_state: Dict[str, Any],
+        state: Dict[str, Any],
+        errors: Dict[str, str],
+        *,
+        now: datetime,
+    ) -> None:
+        """Persist one metric-unavailable event per continuous outage.
+
+        The first stale tick anchors the outage. Timeline visibility is delayed
+        until ~30 seconds so a one-tick market-data gap does not create alert
+        noise; the event is then written once and the marker prevents repeats.
+        """
+
+        unavailable = state.get("option_metric_unavailable")
+        unavailable = dict(unavailable) if isinstance(unavailable, dict) else {}
+        if not errors:
+            if not unavailable:
+                return
+            next_state = {
+                **state,
+                "option_metric_unavailable": None,
+            }
+            await self._persist_state(
+                run,
+                runtime_state,
+                state,
+                next_state,
+                expected_generation=state.get("generation"),
+                expected_triggered_rule=state.get("triggered_rule") or "",
+                expected_exit_claim_id=state.get("exit_claim_id") or "",
+            )
+            return
+
+        missing_metrics = [
+            {"metric": str(metric), "reason": str(reason)}
+            for metric, reason in sorted(errors.items())
+        ]
+        first_seen_at = str(unavailable.get("first_seen_at") or "")
+        if not first_seen_at:
+            next_state = {
+                **state,
+                "option_metric_unavailable": {
+                    "first_seen_at": now.isoformat(),
+                    "metrics": missing_metrics,
+                },
+            }
+            await self._persist_state(
+                run,
+                runtime_state,
+                state,
+                next_state,
+                expected_generation=state.get("generation"),
+                expected_triggered_rule=state.get("triggered_rule") or "",
+                expected_exit_claim_id=state.get("exit_claim_id") or "",
+            )
+            return
+
+        try:
+            first_seen = datetime.fromisoformat(first_seen_at.replace("Z", "+00:00"))
+        except ValueError:
+            first_seen = now
+        if first_seen.tzinfo is None:
+            first_seen = first_seen.replace(tzinfo=timezone.utc)
+        elapsed = (now.astimezone(timezone.utc) - first_seen.astimezone(timezone.utc)).total_seconds()
+        event_emitted_at = str(unavailable.get("event_emitted_at") or "")
+        if elapsed < 30 or event_emitted_at:
+            return
+
+        strategy_run_id = str(run.get("strategy_run_id") or "")
+        event = {
+            "event_kind": "protection",
+            "event_source": "backend_protection",
+            "event_type": "OPTION_PROTECTION_METRIC_UNAVAILABLE",
+            "related_resource_type": "strategy_run",
+            "related_resource_id": strategy_run_id,
+            "summary": "Option protection metric unavailable",
+            "payload": {
+                "emission_mode": "mutation_driven",
+                "first_seen_at": first_seen_at,
+                "missing_metrics": missing_metrics,
+            },
+        }
+        next_state = {
+            **state,
+            "option_metric_unavailable": {
+                **unavailable,
+                "metrics": missing_metrics,
+                "event_emitted_at": now.isoformat(),
+            },
+        }
+        await self._persist_state(
+            run,
+            runtime_state,
+            state,
+            next_state,
+            expected_generation=state.get("generation"),
+            expected_triggered_rule=state.get("triggered_rule") or "",
+            expected_exit_claim_id=state.get("exit_claim_id") or "",
+            timeline_events=[event],
+        )
+
+    async def collect_option_metric_subscription_tokens(self) -> set[int]:
+        """Tokens needed by every active owner run with option-metric rules.
+
+        This is enumeration only: it reuses the same resolvers as metric reads
+        and never contacts Redis or creates a market-runtime owner.
+        """
+
+        tokens: set[int] = set()
+        for candidate in await self._protection_owner_runs():
+            run = dict(candidate)
+            owner = self._protection_owner_context(run)
+            if owner is None or not self._has_option_metric_rules(run):
+                continue
+            try:
+                option_run = await asyncio.to_thread(
+                    self._option_run_store().get_run,
+                    str(owner.get("option_run_id") or ""),
+                )
+                if self._option_rule_config(option_run, owner) is None:
+                    continue
+                protection = getattr(option_run, "protection", None)
+                underlying = str(protection.get("underlying") or "") if isinstance(protection, dict) else ""
+                if underlying:
+                    index_token = await self._index_token_resolver()(underlying, "NSE")
+                    if index_token is not None:
+                        tokens.add(int(index_token))
+                for position in open_option_positions(option_run):
+                    try:
+                        token = int(position.get("instrument_token"))
+                    except (TypeError, ValueError):
+                        token = await self._option_token_resolver()(
+                            str(position.get("exchange") or "NFO"),
+                            str(position.get("symbol") or ""),
+                        )
+                    if token is not None:
+                        tokens.add(int(token))
+            except Exception:  # noqa: BLE001 - one unreadable run cannot starve others
+                continue
+        return tokens
+
+    @staticmethod
+    def _option_rule_config(option_run: Any, owner: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Normalize owner policy rules first, with the run's own rules as fallback."""
+
+        sources: list[Any] = []
+        policy = owner.get("policy")
+        if isinstance(policy, dict):
+            nested = policy.get("protection_policy")
+            if isinstance(nested, dict):
+                sources.append(nested)
+            sources.append(policy)
+        if getattr(option_run, "protection", None):
+            sources.append(option_run.protection)
+
+        rules: list[dict[str, Any]] = []
+        precedence: list[str] = []
+        option_metrics = {"index_ltp", "combined_premium", "combined_premium_change_pct", "strategy_mtm", "open_quantity"}
+        for source in sources:
+            raw_rules = source.get("rules") if isinstance(source, dict) else None
+            if not isinstance(raw_rules, list):
+                continue
+            relevant = [
+                rule
+                for rule in raw_rules
+                if isinstance(rule, dict) and str(rule.get("metric") or "") in option_metrics
+            ]
+            if not relevant:
+                continue
+            normalized = normalize_option_protection_config({"rules": relevant})
+            for rule in normalized["rules"]:
+                if rule not in rules:
+                    rules.append(rule)
+            for role in normalized["precedence"]:
+                if role not in precedence:
+                    precedence.append(role)
+        if not rules:
+            return None
+        return {"rules": rules, "precedence": precedence}
+
+    @staticmethod
+    def _option_structure_identity(option_run: Any, owner: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        policy = owner.get("policy")
+        digest = str((policy or {}).get("structure_digest") or "")
+        if not digest:
+            protection = getattr(option_run, "protection", None)
+            digest = str((protection or {}).get("structure_digest") or "")
+        return {"structure_digest": digest} if digest else None
+
+    def _option_run_store(self) -> Any:
+        if self.option_run_store is None:
+            from backend.options.execution.durable_store import DurableOptionRunStore
+
+            session_factory = getattr(self.repo, "session_factory", None)
+            self.option_run_store = (
+                DurableOptionRunStore(session_factory=session_factory)
+                if session_factory is not None
+                else DurableOptionRunStore()
+            )
+        return self.option_run_store
+
+    def _index_tick_loader(self) -> Callable[[int], Awaitable[Dict[str, Any] | None]]:
+        if self.index_tick_loader is not None:
+            return self.index_tick_loader
+
+        async def read_tick(token: int) -> Dict[str, Any] | None:
+            from backend.broker_api.core.redis_events import get_redis
+
+            redis = get_redis()
+            raw = await redis.get(f"market:tick:{int(token)}")
+            return json.loads(raw) if raw else None
+
+        self.index_tick_loader = read_tick
+        return self.index_tick_loader
+
+    def _option_tick_loader(self) -> Callable[[int], Awaitable[Dict[str, Any] | None]]:
+        if self.option_tick_loader is not None:
+            return self.option_tick_loader
+        self.option_tick_loader = self._index_tick_loader()
+        return self.option_tick_loader
+
+    def _index_token_resolver(self) -> Callable[[str, str], Awaitable[int | None]]:
+        if self.index_token_resolver is not None:
+            return self.index_token_resolver
+
+        async def resolve(underlying: str, exchange: str) -> int | None:
+            _ = exchange
+            from backend.broker_api.instruments.instruments_repository import InstrumentsRepository
+
+            def lookup() -> int | None:
+                return InstrumentsRepository().get_spot_token(underlying)
+
+            return await asyncio.to_thread(lookup)
+
+        self.index_token_resolver = resolve
+        return self.index_token_resolver
+
+    def _option_token_resolver(self) -> Callable[[str, str], Awaitable[int | None]]:
+        if self.option_token_resolver is not None:
+            return self.option_token_resolver
+
+        async def resolve(exchange: str, tradingsymbol: str) -> int | None:
+            from backend.broker_api.instruments.instruments_repository import InstrumentsRepository
+
+            def lookup() -> int | None:
+                instrument = InstrumentsRepository().get_instrument_by_exchange_symbol(
+                    exchange, tradingsymbol
+                )
+                return int(instrument.get("instrument_token")) if instrument else None
+
+            return await asyncio.to_thread(lookup)
+
+        self.option_token_resolver = resolve
+        return self.option_token_resolver
+
     def _has_recent_exit_claim(self, state: Dict[str, Any], now: datetime) -> bool:
         if state.get("exit_submitted") or not state.get("exit_claim_id"):
             return False
@@ -414,14 +865,16 @@ class WorkerProtectionRuntime:
         expected_generation: Any = None,
         expected_triggered_rule: Optional[str] = None,
         expected_exit_claim_id: Optional[str] = None,
+        timeline_events: Optional[list[Dict[str, Any]]] = None,
     ) -> Optional[Dict[str, Any]]:
         strategy_run_id = str(run["strategy_run_id"])
         expected = int(expected_generation) if expected_generation is not None else None
-        timeline_events = self._build_timeline_events(
-            run,
-            previous_state=previous_protection_state,
-            next_state=protection_state,
-        )
+        if timeline_events is None:
+            timeline_events = self._build_timeline_events(
+                run,
+                previous_state=previous_protection_state,
+                next_state=protection_state,
+            )
         if hasattr(self.repo, "update_run_backend_protection_state_with_events"):
             return await self.repo.update_run_backend_protection_state_with_events(
                 strategy_run_id,
@@ -622,6 +1075,31 @@ class WorkerProtectionRuntime:
         rule = str(state.get("triggered_rule") or "unknown")
         digest = hashlib.sha1(json.dumps(state.get("details") or {}, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:10]
         return f"backend-protection:{run['strategy_run_id']}:g{generation}:{rule}:{digest}"
+
+
+async def collect_worker_option_protection_subscription_tokens(
+    repo: Any = None,
+) -> set[int]:
+    """Read the option-metric token set for the positions subscription worker."""
+
+    from backend.api.repositories.algo_worker_repo import SqlAlchemyAlgoWorkerRepository
+
+    if repo is None:
+        repo = SqlAlchemyAlgoWorkerRepository()
+    runtime = WorkerProtectionRuntime(
+        repo=repo,
+        pnl_loader=lambda _run: _empty_pnl(),
+        exit_submitter=lambda _run, _state: _unused_exit(),
+    )
+    return await runtime.collect_option_metric_subscription_tokens()
+
+
+async def _empty_pnl() -> Dict[str, Any]:
+    return {"legs": []}
+
+
+async def _unused_exit() -> Dict[str, Any]:
+    raise RuntimeError("option subscription enumeration must never submit an exit")
 
 
 async def load_worker_run_pnl_for_protection(request: Any, run: Dict[str, Any]) -> Dict[str, Any]:

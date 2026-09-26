@@ -492,6 +492,17 @@ async def combined_lifespan(app: FastAPI):
                         db.close()
 
                     subscriptions = {int(row[0]): "ltp" for row in rows if row and row[0] is not None}
+                    try:
+                        from backend.api.services.protection_runtime import (
+                            collect_worker_option_protection_subscription_tokens,
+                        )
+
+                        option_tokens = await collect_worker_option_protection_subscription_tokens(
+                            getattr(app.state, "algo_worker_repository", None)
+                        )
+                        subscriptions.update({int(token): "ltp" for token in option_tokens})
+                    except Exception:
+                        logging.exception("Failed to enumerate option protection runtime subscriptions")
                     if subscriptions:
                         await market_data_runtime.set_owner_subscriptions(owner_id, subscriptions)
                     else:

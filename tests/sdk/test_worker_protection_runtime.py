@@ -90,6 +90,7 @@ class _OwnerRowRepo(_StructureRepo):
         self.owner_policy = dict(owner_policy) if owner_policy is not None else {
             "structure_digest": "digest-owned"
         }
+        self.timeline_events = []
 
     async def list_protection_enabled_runs(self):
         if not self.also_in_run_list:
@@ -113,8 +114,29 @@ class _OwnerRowRepo(_StructureRepo):
                     "policy": dict(self.owner_policy),
                     "option_run_status": "entered",
                 },
-            }
-        ]
+                    }
+                ]
+
+    async def update_run_backend_protection_state_with_events(
+        self,
+        strategy_run_id,
+        protection_state,
+        *,
+        expected_generation=None,
+        expected_triggered_rule=None,
+        expected_exit_claim_id=None,
+        timeline_events=None,
+    ):
+        result = await self.update_run_backend_protection_state(
+            strategy_run_id,
+            protection_state,
+            expected_generation=expected_generation,
+            expected_triggered_rule=expected_triggered_rule,
+            expected_exit_claim_id=expected_exit_claim_id,
+        )
+        if result is not None:
+            self.timeline_events.extend(list(timeline_events or []))
+        return result
 
 
 class _OwnerMirrorStore:
@@ -125,6 +147,22 @@ class _OwnerMirrorStore:
 
     def record_action(self, option_run_id, action_state, stage_digest, observed_epoch):
         self.calls.append((option_run_id, action_state, stage_digest, observed_epoch))
+
+
+class _OptionRunStore:
+    def __init__(self, run):
+        self.run = run
+
+    def get_run(self, _option_run_id):
+        return self.run
+
+    def update_protection_metrics(self, _option_run_id, metrics, *, errors=None):
+        self.run.metadata = {
+            **(self.run.metadata or {}),
+            "protection_metrics": dict(metrics),
+            "protection_metric_errors": dict(errors or {}),
+        }
+        return self.run
 
 
 class _Clock:
@@ -668,6 +706,185 @@ class WorkerProtectionRuntimeTests(unittest.IsolatedAsyncioTestCase):
         await runtime.evaluate_once()
         self.assertEqual(owner_store.calls[-1][1], "unresolved")
         self.assertEqual(owner_store.calls[-1][2], "stage-3")
+
+    async def _evaluate_option_metrics(self, *, index_tick, clock):
+        from backend.options.execution.models import OptionRunState
+
+        option_run = OptionRunState(
+            strategy_run_id="opt_run_abc123",
+            strategy_name="index_guard",
+            product="NRML",
+            status="entered",
+            legs=[
+                {
+                    "leg_id": "plan:1",
+                    "transaction_type": "SELL",
+                    "tradingsymbol": "NIFTY22500CE",
+                    "quantity": 75,
+                    "instrument_token": 101,
+                    "price": 100.0,
+                }
+            ],
+            trades=[
+                {
+                    "leg_id": "plan:1",
+                    "transaction_type": "SELL",
+                    "quantity": 75,
+                    "price": 100.0,
+                    "phase": "entry",
+                }
+            ],
+            protection={
+                "underlying": "NIFTY",
+                "structure_digest": "digest-owned",
+                "rules": [
+                    {
+                        "key": "index-stop",
+                        "metric": "index_ltp",
+                        "operator": "lte",
+                        "threshold": 22000.0,
+                        "action": "exit",
+                    }
+                ],
+            },
+            metadata={},
+        )
+        repo = _OwnerRowRepo(
+            owner_policy={
+                "structure_digest": "digest-owned",
+                "rules": [
+                    {
+                        "key": "index-stop",
+                        "metric": "index_ltp",
+                        "operator": "lte",
+                        "threshold": 22000.0,
+                        "action": "exit",
+                    }
+                ],
+            }
+        )
+        repo.runs[0]["runtime_state"]["backend_protection"] = {"enabled": False}
+        option_store = _OptionRunStore(option_run)
+
+        async def index_token(_underlying, _exchange):
+            return 1
+
+        async def read_tick(token):
+            if token == 1:
+                return index_tick
+            return {"last_price": 100.0, "received_at": clock.now.isoformat()}
+
+        structure_exit = AsyncMock(
+            return_value={"submitted": True, "complete": True, "reason": "submitted"}
+        )
+        generic_exit = AsyncMock()
+        owner_store = _OwnerMirrorStore()
+        runtime = WorkerProtectionRuntime(
+            repo=repo,
+            pnl_loader=AsyncMock(),
+            exit_submitter=generic_exit,
+            structure_exit_submitter=structure_exit,
+            owner_store=owner_store,
+            option_run_store=option_store,
+            index_tick_loader=read_tick,
+            option_tick_loader=read_tick,
+            index_token_resolver=index_token,
+            now_fn=clock,
+            squareoff_schedule={},
+        )
+        return runtime, repo, option_store, structure_exit, generic_exit, owner_store
+
+    async def test_a_fresh_option_index_stop_claims_one_staged_exit(self):
+        clock = _Clock(datetime(2026, 4, 25, 12, 1, tzinfo=timezone.utc))
+        runtime, repo, option_store, structure_exit, generic_exit, owner_store = (
+            await self._evaluate_option_metrics(
+                index_tick={
+                    "last_price": 21900.0,
+                    "received_at": clock.now.isoformat(),
+                },
+                clock=clock,
+            )
+        )
+
+        result = await runtime.evaluate_once()
+
+        self.assertEqual(result, {"evaluated": 1, "triggered": 1, "errors": 0})
+        self.assertEqual(option_store.run.metadata["protection_metrics"]["index_ltp"], 21900.0)
+        structure_exit.assert_awaited_once()
+        generic_exit.assert_not_awaited()
+        self.assertEqual(owner_store.calls[-1][1], "none")
+        state = repo.saved[-1][1]["backend_protection_state"]
+        self.assertTrue(state["exit_submitted"])
+        self.assertEqual(state["triggered_rule"], "option:index-stop")
+
+        clock.advance(10)
+        await runtime.evaluate_once()
+        structure_exit.assert_awaited_once()
+        generic_exit.assert_not_awaited()
+
+    async def test_option_metric_tokens_join_the_positions_subscription_set(self):
+        clock = _Clock(datetime(2026, 4, 25, 12, 1, tzinfo=timezone.utc))
+        runtime, _repo, _option_store, _structure_exit, _generic_exit, _owner_store = (
+            await self._evaluate_option_metrics(
+                index_tick={
+                    "last_price": 21900.0,
+                    "received_at": clock.now.isoformat(),
+                },
+                clock=clock,
+            )
+        )
+
+        tokens = await runtime.collect_option_metric_subscription_tokens()
+
+        # The index plus the open short leg; both are required to evaluate every
+        # rule on this run without a silent missing-metric fallback.
+        self.assertEqual(tokens, {1, 101})
+
+    async def test_a_stale_option_index_tick_is_omitted_and_never_exits(self):
+        clock = _Clock(datetime(2026, 4, 25, 12, 1, tzinfo=timezone.utc))
+        runtime, repo, option_store, structure_exit, generic_exit, _owner_store = (
+            await self._evaluate_option_metrics(
+                index_tick={
+                    "last_price": 21900.0,
+                    "received_at": "2026-04-25T12:00:40+00:00",
+                },
+                clock=clock,
+            )
+        )
+
+        result = await runtime.evaluate_once()
+
+        self.assertEqual(result, {"evaluated": 1, "triggered": 0, "errors": 0})
+        self.assertNotIn("index_ltp", option_store.run.metadata["protection_metrics"])
+        self.assertIn("index_ltp", option_store.run.metadata["protection_metric_errors"])
+        structure_exit.assert_not_awaited()
+        generic_exit.assert_not_awaited()
+
+        # The first stale observation anchors the outage only.
+        self.assertEqual(repo.timeline_events, [])
+        self.assertIn("first_seen_at", repo.runs[0]["runtime_state"]["backend_protection_state"]["option_metric_unavailable"])
+
+        # Two later ticks span the 30-second visibility threshold; the event is
+        # written on the second, then the outage marker suppresses repetition.
+        clock.advance(15)
+        await runtime.evaluate_once()
+        clock.advance(15)
+        await runtime.evaluate_once()
+        unavailable_events = [
+            event
+            for event in repo.timeline_events
+            if event["event_type"] == "OPTION_PROTECTION_METRIC_UNAVAILABLE"
+        ]
+        self.assertEqual(len(unavailable_events), 1)
+        self.assertEqual(
+            unavailable_events[0]["payload"]["missing_metrics"],
+            [
+                {
+                    "metric": "index_ltp",
+                    "reason": "underlying index LTP is missing or older than 10 seconds",
+                }
+            ],
+        )
 
 
 if __name__ == "__main__":

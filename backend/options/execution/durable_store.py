@@ -564,6 +564,32 @@ class DurableOptionRunStore:
         finally:
             session.close()
 
+    def update_protection_metrics(
+        self, strategy_run_id: str, metrics: dict[str, Any], *, errors: dict[str, str] | None = None
+    ) -> OptionRunState:
+        """Merge a fresh metric snapshot into the run's existing metadata."""
+
+        self._require_id(strategy_run_id)
+        session = self._session_factory()
+        try:
+            run = self._get_run_in_session(session, strategy_run_id, for_update=True)
+            metadata = dict(run.metadata or {})
+            previous = metadata.get("protection_metrics")
+            merged = dict(previous) if isinstance(previous, dict) else {}
+            merged.update(dict(metrics or {}))
+            metadata["protection_metrics"] = merged
+            if errors is not None:
+                metadata["protection_metric_errors"] = dict(errors)
+            run.metadata = metadata
+            self._update_run_in_session(session, run)
+            session.commit()
+            return run
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
     def record_trades_once(
         self, strategy_run_id: str, trades: list[dict], *, dedupe_key: str
     ) -> tuple[list[dict], list[dict]]:
