@@ -903,6 +903,254 @@ class ProposalStoreTests(ProposalTestCase):
         )
 
 
+class _FakeRelativeOptionMarket:
+    """A minimal ``OptionsMarketService`` double for RELATIVE-leg resolution.
+
+    Supports exactly the calls the production chain resolver makes:
+    ``get_session`` (expiry selector resolution), ``resolve_selection`` (per-leg
+    strike/delta resolution), and ``get_chain``/``get_greeks`` (the existing
+    freeze-evidence check, unchanged by this feature).
+    """
+
+    def __init__(self, *, expiry, expiries, updated_at, contracts):
+        self.expiry = expiry
+        self.expiries = expiries
+        self.updated_at = updated_at
+        # contracts: {"CE_OTM2": {...}, "PE_DELTA": {...}}
+        self.contracts = contracts
+
+    def get_session(self, _underlying):
+        return {"expiries": self.expiries}
+
+    def resolve_selection(self, underlying, payload):
+        assert payload["expiry"] == self.expiry, "expiry must already be a concrete date"
+        leg = payload["legs"][0]
+        option_type = leg["option_type"]
+        if "delta_target" in leg:
+            meta = self.contracts[f"{option_type}_DELTA"]
+        else:
+            meta = self.contracts[f"{option_type}_{leg['offset']}"]
+        return {
+            "underlying": underlying,
+            "expiry": self.expiry,
+            "resolved": [
+                {
+                    "underlying": underlying,
+                    "expiry": self.expiry,
+                    "strike": meta["strike"],
+                    "option_type": option_type,
+                    "tradingsymbol": meta["tsym"],
+                    "instrument_token": meta["token"],
+                    "lot_size": meta["lot_size"],
+                    "tick_size": 0.05,
+                    "ltp": meta["ltp"],
+                    "resolver": "test",
+                    "resolution_meta": {},
+                }
+            ],
+            "count": 1,
+        }
+
+    def _packet(self, meta):
+        return {
+            "token": meta["token"], "tsym": meta["tsym"], "ltp": meta["ltp"],
+            "iv": 0.15, "delta": meta.get("delta", 0.0), "updated_at": self.updated_at,
+        }
+
+    def get_chain(self, _underlying, _expiry):
+        chain = []
+        for key, meta in self.contracts.items():
+            option_type = key.split("_", 1)[0]
+            row = {"strike": meta["strike"], "ce": None, "pe": None}
+            row[option_type.lower()] = self._packet(meta)
+            chain.append(row)
+        return {"underlying": "NIFTY", "expiry": self.expiry, "chain": chain,
+                "updated_at": self.updated_at}
+
+    def get_greeks(self, _underlying, _expiry):
+        return {
+            "contracts": [self._packet(meta) for meta in self.contracts.values()],
+            "updated_at": self.updated_at,
+        }
+
+
+class OptionStructureRelativeLegsTests(ProposalTestCase):
+    """RELATIVE legs (offset/delta_target) resolve against the live chain and
+    freeze exactly like concrete legs; a stale or missing chain refuses."""
+
+    def setUp(self):
+        super().setUp()
+        from datetime import date, timedelta
+
+        self.seed_generation(G2, "published", T2)
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT INTO strategies (id, owner_id, name, account_scope, status) "
+                    "VALUES ('stg-A', 'app:o', 'Strategy A', 'kite:A', 'active')"
+                )
+            )
+            session.commit()
+
+        today = date.today()
+        week_end = today + timedelta(days=6 - today.weekday())
+        self.current_week_expiry = today.isoformat()
+        self.contracts = {
+            "CE_OTM2": {"strike": 25200, "token": 601, "tsym": "NIFTY-25200-CE",
+                        "lot_size": 75, "ltp": 40.0, "delta": 0.3},
+            "PE_DELTA": {"strike": 24800, "token": 602, "tsym": "NIFTY-24800-PE",
+                         "lot_size": 75, "ltp": 35.0, "delta": -0.2},
+        }
+        for key, meta in self.contracts.items():
+            option_type = key.split("_", 1)[0]
+            instrument_id = f"opt-{meta['strike']}-{option_type}"
+            self._seed_option(
+                instrument_id, symbol=meta["tsym"], token=meta["token"],
+                option_type=option_type, strike=meta["strike"],
+                lot_size=meta["lot_size"], expiry=self.current_week_expiry,
+            )
+
+    def _seed_option(self, instrument_id, *, symbol, token, option_type, strike, lot_size, expiry):
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT INTO public.instrument_catalog_records "
+                    "(instrument_id, exchange, tradingsymbol, lifecycle_status, "
+                    " current_generation_id, instrument_type, expiry, lot_size, tick_size, "
+                    " underlying, strike, option_type) "
+                    "VALUES (:id, 'NFO', :symbol, 'active', :gen, :option_type, :expiry, "
+                    " :lot_size, 0.05, 'NIFTY', :strike, :option_type)"
+                ),
+                {"id": instrument_id, "symbol": symbol, "gen": G2, "option_type": option_type,
+                 "expiry": expiry, "lot_size": lot_size, "strike": strike},
+            )
+            session.execute(
+                text(
+                    "INSERT INTO public.instrument_broker_mappings "
+                    "(mapping_id, instrument_id, broker, broker_exchange, broker_symbol, "
+                    " broker_token, valid_from_generation, is_current) "
+                    "VALUES (:mid, :id, 'kite', 'NFO', :symbol, :token, :gen, 1)"
+                ),
+                {"mid": f"map-{instrument_id}", "id": instrument_id, "symbol": symbol,
+                 "token": token, "gen": G2},
+            )
+            session.commit()
+
+    def _store(self, market):
+        from backend.strategies.proposals import ProposalStore
+
+        return ProposalStore(session_factory=self.factory, option_market_reader=lambda: market)
+
+    def _journal(self):
+        with self.factory() as session:
+            return [
+                (str(row[0]), str(row[1] or ""))
+                for row in session.execute(
+                    text(
+                        "SELECT event, reason_code FROM strategy_proposal_journal "
+                        "WHERE strategy_id = 'stg-A' ORDER BY created_at, event"
+                    )
+                ).fetchall()
+            ]
+
+    def _submission(self, **overrides):
+        from backend.strategies.proposals import ProposalSubmission
+
+        values = {
+            "strategy_id": "stg-A",
+            "account_id": "kite:A",
+            "evaluation_id": "eval-opt-1",
+            "evaluation_kind": "run_now",
+            "job_id": None,
+            "strategy_run_id": "run-1",
+            "target_kind": "option_structure",
+            "payload": {
+                "underlying": "NIFTY",
+                "expiry": "current_week",
+                "product": "NRML",
+                "legs": [
+                    {"selection": {"option_type": "CE", "moneyness": "OTM", "offset": 2},
+                     "side": "SELL", "ratio": 1, "reference_price": 40.0},
+                    {"selection": {"option_type": "PE", "delta_target": 0.2},
+                     "side": "SELL", "ratio": 1, "reference_price": 35.0},
+                ],
+            },
+        }
+        values.update(overrides)
+        return ProposalSubmission(**values)
+
+    def _fresh_market(self):
+        from datetime import datetime, timezone
+
+        return _FakeRelativeOptionMarket(
+            expiry=self.current_week_expiry,
+            expiries=[self.current_week_expiry],
+            updated_at=datetime.now(timezone.utc),
+            contracts=self.contracts,
+        )
+
+    def test_relative_legs_resolve_and_freeze(self):
+        market = self._fresh_market()
+        result = self._store(market).submit(self._submission())
+        self.assertEqual(result["status"], "validated", result)
+        legs = result["plan"]["resolved_plan"]["legs"]
+        self.assertEqual({leg["strike"] for leg in legs}, {25200.0, 24800.0})
+        self.assertEqual({leg["lot_size"] for leg in legs}, {75})
+        # The selector resolved to a concrete date, not the selector text.
+        self.assertEqual(result["plan"]["resolved_plan"]["expiry"], self.current_week_expiry)
+        # The selection policy is frozen for audit, alongside the resolved leg.
+        selections = {leg["option_type"]: leg["selection"] for leg in legs}
+        self.assertEqual(selections["CE"], {"option_type": "CE", "moneyness": "OTM", "offset": 2})
+        self.assertEqual(selections["PE"], {"option_type": "PE", "delta_target": 0.2})
+        self.assertIn("option_chain_evidence", result["plan"]["resolved_plan"])
+
+    def test_a_stale_chain_refuses(self):
+        from datetime import datetime, timedelta, timezone
+
+        market = self._fresh_market()
+        market.updated_at = datetime.now(timezone.utc) - timedelta(seconds=30)
+        result = self._store(market).submit(self._submission())
+        self.assertEqual(result["status"], "refused")
+        self.assertIsNone(result["plan"])
+        refusals = [row for row in self._journal() if row[0] == "validation_refused"]
+        self.assertEqual(refusals, [("validation_refused", "OPTION_CHAIN_SNAPSHOT_STALE")])
+
+    def test_no_active_session_refuses_by_name(self):
+        class _NoSession:
+            def get_session(self, _underlying):
+                raise RuntimeError("no active option session")
+
+        result = self._store(_NoSession()).submit(self._submission())
+        self.assertEqual(result["status"], "refused")
+        refusals = [row for row in self._journal() if row[0] == "validation_refused"]
+        self.assertEqual(refusals, [("validation_refused", "OPTION_CHAIN_SNAPSHOT_UNAVAILABLE")])
+
+    def test_concrete_legs_unchanged(self):
+        """A structure with only concrete legs never touches the chain resolver,
+        and freezes exactly as it did before RELATIVE legs existed."""
+        market = self._fresh_market()
+        submission = self._submission(
+            evaluation_id="eval-opt-concrete",
+            payload={
+                "underlying": "NIFTY",
+                "expiry": self.current_week_expiry,
+                "product": "NRML",
+                "legs": [
+                    {"instrument_token": 601, "exchange": "NFO", "tradingsymbol": "NIFTY-25200-CE",
+                     "side": "SELL", "ratio": 1, "reference_price": 40.0},
+                    {"instrument_token": 602, "exchange": "NFO", "tradingsymbol": "NIFTY-24800-PE",
+                     "side": "SELL", "ratio": 1, "reference_price": 35.0},
+                ],
+            },
+        )
+        result = self._store(market).submit(submission)
+        self.assertEqual(result["status"], "validated", result)
+        legs = result["plan"]["resolved_plan"]["legs"]
+        self.assertEqual({leg["strike"] for leg in legs}, {25200.0, 24800.0})
+        self.assertTrue(all(leg["selection"] is None for leg in legs))
+        self.assertIn("option_chain_evidence", result["plan"]["resolved_plan"])
+
+
 class TargetWeightsPlanTests(ProposalTestCase):
     """D-6 end to end: a weights plan persists its scope and stays valid."""
 

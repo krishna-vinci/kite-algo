@@ -277,6 +277,35 @@ class SelectionPolicyTests(OptionStructureTestCase):
             )
         self.assertEqual(ctx.exception.reason_code, "SELECTION_POLICY_UNRESOLVABLE")
 
+    def test_a_delta_target_selection_resolves_by_delta_not_offset(self):
+        """A ``delta_target`` leg names the contract by Greek, so the resolver
+        is asked for a delta and never an offset."""
+        instrument_id = self.option(strike=24800, option_type="PE", token=502)
+        seen = {}
+
+        def resolver(*, underlying, expiry, option_type, moneyness, **kwargs):
+            seen.update(kwargs)
+            return {
+                "instrument_token": 502,
+                "instrument_id": instrument_id,
+                "strike": 24800,
+                "option_type": option_type,
+                "expiry": "2026-10-29",
+            }
+
+        plan = self.compile(
+            self.payload([
+                {"selection": {"option_type": "PE", "delta_target": 0.2},
+                 "side": "SELL", "ratio": 1, "reference_price": 100.0}
+            ]),
+            chain_resolver=resolver,
+        )
+        self.assertEqual(plan.resolved["legs"][0]["instrument_id"], instrument_id)
+        self.assertEqual(seen, {"delta_target": 0.2})
+        self.assertEqual(
+            plan.resolved["legs"][0]["selection"], {"option_type": "PE", "delta_target": 0.2}
+        )
+
 
 class ExpiryPolicyTests(OptionStructureTestCase):
     def _short_structure(self):

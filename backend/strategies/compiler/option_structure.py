@@ -506,14 +506,24 @@ class OptionStructureCompiler(TargetCompiler):
                     "message": "No chain resolver is available to satisfy this selection",
                 },
             )
+        delta_target = selection.get("delta_target")
+        if delta_target is None:
+            delta_target = selection.get("target_delta")
+        resolver_kwargs: Dict[str, Any] = {
+            "underlying": underlying,
+            "expiry": structure_expiry,
+            "option_type": option_type,
+            "moneyness": str(selection.get("moneyness") or "ATM").upper(),
+        }
+        if delta_target is not None:
+            # A delta target names the contract by its Greek, not by strike
+            # distance, so the offset the moneyness/offset pair would otherwise
+            # carry is not sent -- the resolver picks one or the other.
+            resolver_kwargs["delta_target"] = _as_optional_float(delta_target)
+        else:
+            resolver_kwargs["offset"] = int(selection.get("offset") or 0)
         try:
-            chosen = chain_resolver(
-                underlying=underlying,
-                expiry=structure_expiry,
-                option_type=option_type,
-                moneyness=str(selection.get("moneyness") or "ATM").upper(),
-                offset=int(selection.get("offset") or 0),
-            )
+            chosen = chain_resolver(**resolver_kwargs)
         except Exception:  # noqa: BLE001 - a failing chain is an unresolvable policy
             chosen = None
         if not chosen:

@@ -49,6 +49,10 @@ from backend.strategies.compiler import (
     compute_plan_hash,
     plan_pin,
 )
+from backend.strategies.compiler.chain_resolver import (
+    build_production_chain_resolver,
+    resolve_structure_expiry,
+)
 from backend.options.market.freshness import (
     OptionChainEvidenceRefusal,
     option_chain_freeze_evidence,
@@ -232,21 +236,50 @@ class ProposalStore:
         refusal: Optional[ValidationRefusal] = None
         resolved_plan = None
         compiled = None
+        market_service: Any = None
+        is_option_structure = submission.target_kind == "option_structure"
         try:
             pinned = self._pinned_read(submission)
             compile_payload = self._compile_payload(submission)
+            chain_resolver = None
+            if is_option_structure and self._option_market_reader is not None:
+                market_service = self._option_market_reader()
+                if market_service is None:
+                    raise ValidationRefusal(
+                        "OPTION_CHAIN_SNAPSHOT_UNAVAILABLE",
+                        {"message": "no active option market session source is configured"},
+                    )
+                # RELATIVE legs (ATM+N/ITMn/OTMn, delta_target) resolve against
+                # the live chain, never a guess; the structure's own expiry may
+                # itself be a selector, so it is pinned to one concrete date
+                # here, before any leg is asked to match against it.
+                # Only a SELECTOR is resolved here. A payload without an expiry
+                # (an exit or adjust that names its run) or with a plain date
+                # compiles exactly as before - never refuse risk reduction.
+                raw_expiry = str(compile_payload.get("expiry") or "").strip()
+                if raw_expiry:
+                    compile_payload["expiry"] = resolve_structure_expiry(
+                        market_service,
+                        underlying=str(compile_payload.get("underlying") or "").upper(),
+                        expiry=raw_expiry,
+                    )
+                chain_resolver = build_production_chain_resolver(market_service)
             if self._compiler is not None:
                 compiled = self._compiler.compile(compile_payload, pinned)
             else:
                 compiled = compile_resolved_plan(
-                    submission.target_kind, compile_payload, pinned
+                    submission.target_kind,
+                    compile_payload,
+                    pinned,
+                    chain_resolver=chain_resolver,
                 )
         except ValidationRefusal as exc:
             refusal = exc
 
-        if refusal is None and submission.target_kind == "option_structure" and self._option_market_reader is not None:
+        if refusal is None and is_option_structure and self._option_market_reader is not None:
             try:
-                market_service = self._option_market_reader()
+                if market_service is None:
+                    market_service = self._option_market_reader()
                 if market_service is None:
                     raise ValidationRefusal(
                         "OPTION_CHAIN_SNAPSHOT_UNAVAILABLE",
