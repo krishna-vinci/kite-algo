@@ -388,7 +388,11 @@ class MigrationTests(_PgTestCase):
         cfg = Config("backend/alembic.ini")
         cfg.set_main_option("script_location", "backend/alembic")
         heads = ScriptDirectory.from_config(cfg).get_heads()
-        self.assertEqual(list(heads), ["20260923_000042"])
+        # The chain must resolve to exactly ONE head - a second, divergent head
+        # would make "upgrade head" ambiguous. The revision itself is the
+        # chain's own value: hardcoding it here only rots when a later
+        # migration lands.
+        self.assertEqual(len(heads), 1, f"alembic has more than one head: {list(heads)}")
 
         sf = self.make_db("head")
         self._assert_governed_objects(sf)

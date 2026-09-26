@@ -163,7 +163,11 @@ def _funds_boundary(monkeypatch):
         strategies_module,
         "_live_margin_evidence",
         lambda _scope, _plan: {
-            "usable": 5_000_000.0,
+            # The strategy is allocated 50M and the account can fund it: this
+            # fake is the ACCOUNT's capacity, so it must cover the plans a test
+            # materializes (the releasing-window test holds four 1.5M plans at
+            # once), not just one of them.
+            "usable": 50_000_000.0,
             "as_of": datetime.now(timezone.utc).isoformat(),
         },
     )

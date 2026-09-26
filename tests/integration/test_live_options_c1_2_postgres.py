@@ -1632,7 +1632,10 @@ async def test_margin_limit_enforces_required_margin_inr_on_live_option_entry(pg
 
 
 @pytest.mark.asyncio
-async def test_live_option_resize_partial_hedge_releases_nothing_full_hedge_releases_short(pg, live_env):
+async def test_live_option_resize_partial_hedge_releases_nothing_full_hedge_releases_short(
+    pg, live_env, monkeypatch
+):
+    _fresh_options_manager(monkeypatch)
     _seed_catalog(pg["factory"])
     clock = _clock()
     broker_calls = []
@@ -1930,8 +1933,11 @@ async def test_live_option_resize_rejected_hedge_releases_nothing(pg, live_env, 
 
 
 @pytest.mark.asyncio
-async def test_live_adjust_with_a_stale_generation_is_refused_at_admission(pg, live_env):
+async def test_live_adjust_with_a_stale_generation_is_refused_at_admission(
+    pg, live_env, monkeypatch
+):
     """A stale-based adjust refuses by name before any reservation is taken."""
+    _fresh_options_manager(monkeypatch)
     _seed_catalog(pg["factory"])
     clock = _clock()
     broker_calls = []
