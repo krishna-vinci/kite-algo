@@ -39,7 +39,7 @@ from backend.api.routers import strategies as strategies_router  # noqa: E402
 from backend.api.routers import strategy_owner_actions as owner_actions_router  # noqa: E402
 from backend.app.auth import AppUser  # noqa: E402
 from backend.api.services.kill_switch import strategy_exposure_targets  # noqa: E402
-from backend.strategies.attribution_models import StrategyPositionProjection  # noqa: E402
+from backend.strategies.attribution_models import LivePlanSubmission, StrategyPositionProjection  # noqa: E402
 from backend.platform.models import (  # noqa: E402
     PlatformLiveSetting,
     PlatformLiveSettingAudit,
@@ -358,6 +358,7 @@ async def test_kill_switch_spans_a_strategy_owned_by_another_operator(
 def test_exposure_targets_keep_each_leg_when_a_hedge_nets_to_zero():
     engine = create_engine("sqlite+pysqlite:///:memory:")
     StrategyPositionProjection.__table__.create(engine)
+    LivePlanSubmission.__table__.create(engine)
     factory = sessionmaker(bind=engine)
 
     with factory() as session:
@@ -389,5 +390,31 @@ def test_exposure_targets_keep_each_leg_when_a_hedge_nets_to_zero():
             "account_id": "kite:A",
             "execution_environment": "live",
         }
+    ]
+    engine.dispose()
+
+
+def test_a_flat_strategy_with_a_working_live_order_is_a_target():
+    """An approved order still working at the broker can fill after the switch."""
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    StrategyPositionProjection.__table__.create(engine)
+    LivePlanSubmission.__table__.create(engine)
+    factory = sessionmaker(bind=engine)
+    with factory() as session:
+        for submission_id, strategy_id, state in (
+            ("sub-1", "stg-working", "pending"),
+            ("sub-2", "stg-done", "filled"),
+        ):
+            session.add(
+                LivePlanSubmission(
+                    submission_id=submission_id, plan_id=f"plan-{submission_id}", step_no=1,
+                    step_ref=f"plan-{submission_id}:1", strategy_id=strategy_id,
+                    account_id="kite:A", execution_environment="live", state=state,
+                )
+            )
+        session.commit()
+
+    assert strategy_exposure_targets(factory, ["stg-working", "stg-done"]) == [
+        {"strategy_id": "stg-working", "account_id": "kite:A", "execution_environment": "live"}
     ]
     engine.dispose()

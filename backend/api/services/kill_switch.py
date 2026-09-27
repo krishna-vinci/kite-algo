@@ -34,9 +34,14 @@ from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Sequ
 from fastapi import HTTPException
 from sqlalchemy import select
 
-from backend.api.services.owner_actions import OwnerActionRefusal, owner_action_scope
+from backend.api.services.owner_actions import (
+    LIVE_UNRESOLVED_STATES,
+    OwnerActionRefusal,
+    owner_action_scope,
+)
 from backend.platform.settings import LIVE_LANE_KEYS, update_live_settings
 from backend.strategies.attribution_models import (
+    LivePlanSubmission,
     StrategyPositionProjection,
     StrategyProposalJournal,
 )
@@ -119,7 +124,8 @@ class KillSwitchRefusal(RuntimeError):
 def strategy_exposure_targets(
     session_factory: Any, strategy_ids: Sequence[str]
 ) -> List[Dict[str, Any]]:
-    """Every ``(strategy, account, environment)`` with a NON-ZERO attributed book.
+    """Every ``(strategy, account, environment)`` with a NON-ZERO attributed book
+    or an unresolved (possibly working) live order.
 
     The projection is the platform's own attributed truth, so a strategy with no
     live or paper exposure is simply not a flatten target. A read that fails
@@ -146,10 +152,29 @@ def strategy_exposure_targets(
                 ),
             )
         ).all()
+        # A live order can be working at the broker before anything has filled:
+        # the book is still flat, but the order can fill after the switch. Those
+        # strategies are targets too, so the governed flatten cancels the
+        # unfilled remainder (it already handles unresolved live claims).
+        working = session.execute(
+            select(
+                LivePlanSubmission.strategy_id,
+                LivePlanSubmission.account_id,
+                LivePlanSubmission.execution_environment,
+            )
+            .where(
+                LivePlanSubmission.strategy_id.in_(wanted),
+                LivePlanSubmission.execution_environment == "live",
+                LivePlanSubmission.state.in_(sorted(LIVE_UNRESOLVED_STATES)),
+            )
+            .distinct()
+        ).all()
     exposed: set[tuple] = set()
     for strategy_id, account_id, environment, _kind, _key, _product, quantity in rows:
         if int(quantity or 0) != 0:
             exposed.add((str(strategy_id), str(account_id), str(environment)))
+    for strategy_id, account_id, environment in working:
+        exposed.add((str(strategy_id), str(account_id), str(environment)))
     return [
         {
             "strategy_id": strategy_id,
