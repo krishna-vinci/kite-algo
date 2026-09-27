@@ -172,6 +172,12 @@ def resolve_delta_contract(
     for strike, payload in contracts_by_strike.items():
         if not isinstance(payload, Mapping):
             continue
+        # A strike whose own IV did not solve carries the ATM IV, so its delta
+        # is borrowed, not observed; an unpriced contract is not tradable.
+        if str(payload.get("iv_source") or "") == "expiry_fallback":
+            continue
+        if payload.get("ltp") is not None and float(payload.get("ltp") or 0.0) <= 0.0:
+            continue
         raw_delta = payload.get("delta")
         if raw_delta is None:
             continue

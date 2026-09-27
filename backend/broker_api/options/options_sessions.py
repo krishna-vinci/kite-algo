@@ -1,9 +1,10 @@
 import asyncio
 import logging
+import math
 import os
 from datetime import date, datetime, timezone, timedelta
 from math import floor
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set
 from zoneinfo import ZoneInfo
 import numpy as np
 
@@ -54,6 +55,11 @@ def autostart_underlyings() -> List[str]:
 
 # Constants
 TOKEN_CAP = 2500
+#: Far expiries widen their strike window to reach roughly this |delta| on both
+#: sides (z of the normal CDF: N(-1.2816) ~= 0.10), so a delta-picked short on a
+#: monthly is inside the tracked window.
+FAR_WINDOW_DELTA_Z = 1.2816
+FAR_WINDOW_MAX = 30
 YEAR_IN_DAYS = 365.0
 MIN_T = 1e-6  # Min time to expiry to avoid zero division
 # NSE/NFO options expire at 15:30 IST (Asia/Kolkata), so time-to-expiry must be
@@ -61,6 +67,16 @@ MIN_T = 1e-6  # Min time to expiry to avoid zero division
 IST = ZoneInfo("Asia/Kolkata")
 EXPIRY_CLOSE_HOUR_IST = 15
 EXPIRY_CLOSE_MINUTE_IST = 30
+
+
+def rank_tokens(ranks: Mapping[int, tuple], cap: int) -> tuple[List[int], List[int]]:
+    """Keep the ``cap`` most important tokens: spot, then ATM outwards, near first.
+
+    Deterministic (rank, then token) so a cap never drops spot or the ATM pair
+    while a far wing survives.
+    """
+    ordered = [token for token, _rank in sorted(ranks.items(), key=lambda item: (item[1], item[0]))]
+    return ordered[:cap], ordered[cap:]
 
 
 class OptionsSession:
@@ -88,8 +104,11 @@ class OptionsSession:
         self.strikes_by_expiry: Dict[date, List[float]] = {}
         self.sigma_by_expiry: Dict[date, float] = {}
         self.desired_tokens: Set[int] = set()
+        self.token_ranks: Dict[int, tuple] = {}
         self.snapshot: Dict[str, Any] = {}
         self.last_spot_ltp: Optional[float] = None
+        self.last_spot_live: bool = False
+        self.last_spot_age_sec: Optional[float] = None
         self.last_expiry_refresh_ts: Optional[datetime] = None
         
         # Instrument cache
@@ -278,11 +297,12 @@ class OptionsSession:
         blocking the asyncio event loop.
         """
         # The actual computation is now done in a separate thread
-        per_expiry_data, new_desired_tokens, spot_ltp = await asyncio.to_thread(
+        per_expiry_data, new_desired_tokens, spot_ltp, token_ranks = await asyncio.to_thread(
             self._run_computation
         )
 
         self.desired_tokens = new_desired_tokens
+        self.token_ranks = token_ranks
 
         # 3. Assemble and publish snapshot
         snapshot = {
@@ -293,6 +313,13 @@ class OptionsSession:
             "expiries": [e.isoformat() for e in self.expiries],
             "per_expiry": per_expiry_data,
             "desired_token_count": len(self.desired_tokens),
+            "health": {
+                "spot_live": bool(self.last_spot_live),
+                "spot_age_sec": self.last_spot_age_sec,
+                "dropped_tokens": int(
+                    getattr(self.manager, "dropped_tokens", {}).get(self.underlying, 0)
+                ),
+            },
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         self.snapshot = snapshot
@@ -300,7 +327,7 @@ class OptionsSession:
         # 4. Notify manager to update subscriptions and publish
         await self.manager.on_session_update(self)
 
-    def _run_computation(self) -> tuple[Dict[str, Any], Set[int], Optional[float]]:
+    def _run_computation(self) -> tuple[Dict[str, Any], Set[int], Optional[float], Dict[int, tuple]]:
         """
         The synchronous, CPU-bound part of the computation. This method is
         executed in a separate thread pool to avoid blocking the event loop.
@@ -320,11 +347,20 @@ class OptionsSession:
             if spot_tick and "last_price" in spot_tick
             else None
         )
+        self.last_spot_age_sec = None
         if spot_ltp:
             self.last_spot_ltp = spot_ltp
+            self.last_spot_live = True
+            stamp = spot_tick.get("exchange_timestamp") if spot_tick else None
+            if isinstance(stamp, datetime):
+                if stamp.tzinfo is None:
+                    stamp = stamp.replace(tzinfo=timezone.utc)
+                self.last_spot_age_sec = (datetime.now(timezone.utc) - stamp).total_seconds()
         else:
-            # Use last known good value if current is missing, but don't block processing
+            # Keep computing from the last good value, but say so in health:
+            # a reused spot is not a live spot.
             spot_ltp = self.last_spot_ltp
+            self.last_spot_live = False
             logger.warning(
                 f"No live spot LTP for {self.underlying}; using last known value: {spot_ltp}"
             )
@@ -332,10 +368,11 @@ class OptionsSession:
         # 2. Iterate through expiries
         per_expiry_data = {}
         new_desired_tokens = {self.spot_token} if self.spot_token else set()
+        token_ranks: Dict[int, tuple] = {int(self.spot_token): (0, 0, 0)} if self.spot_token else {}
 
         if OPTIONS_SESSIONS_USE_VECTORIZED:
             # --- Vectorized Path ---
-            for expiry in self.expiries:
+            for expiry_index, expiry in enumerate(self.expiries):
                 expiry_str = expiry.isoformat()
                 strikes = self.strikes_by_expiry.get(expiry, [])
                 if not strikes or not spot_ltp:
@@ -347,16 +384,22 @@ class OptionsSession:
                     continue
 
                 T = self._time_to_expiry(expiry)
-                # NOTE: Synthetic forward (F = S + C_atm - P_atm) computed here
+                # NOTE: Synthetic forward from multi-strike put-call parity
                 # remains the session-level source feeding canonical market
                 # snapshots and worker options views.
-                forward, ce_atm_ltp, pe_atm_ltp = self._compute_forward(expiry, atm_strike, spot_ltp)
+                forward, ce_atm_ltp, pe_atm_ltp = self._compute_forward(expiry, atm_strike, spot_ltp, strikes=strikes)
                 sigma_expiry = self._compute_sigma(expiry, atm_strike, forward, T, ce_atm_ltp, pe_atm_ltp)
 
                 window_strikes = build_bounded_strike_window(
                     strikes=strikes,
                     atm_strike=atm_strike,
-                    window=self.window_size,
+                    window=self._expiry_window(
+                        expiry_index=expiry_index,
+                        strikes=strikes,
+                        center=float(forward or spot_ltp),
+                        sigma=sigma_expiry,
+                        T=T,
+                    ),
                 )
                 
                 strikes_key = tuple(sorted(window_strikes))
@@ -367,9 +410,17 @@ class OptionsSession:
                 )
 
                 inst_by_strike = {s: {} for s in window_strikes}
+                ordered_window = sorted(window_strikes)
+                atm_index = min(
+                    range(len(ordered_window)),
+                    key=lambda idx: abs(ordered_window[idx] - float(atm_strike)),
+                ) if ordered_window else 0
+                distance = {strike: abs(idx - atm_index) for idx, strike in enumerate(ordered_window)}
                 for inst in option_instruments:
                     inst_by_strike[inst["strike"]][inst["option_type"]] = inst
-                    new_desired_tokens.add(inst["instrument_token"])
+                    token = int(inst["instrument_token"])
+                    new_desired_tokens.add(token)
+                    token_ranks[token] = (1, distance.get(inst["strike"], FAR_WINDOW_MAX), expiry_index)
 
                 sorted_strikes = sorted(window_strikes)
 
@@ -601,7 +652,37 @@ class OptionsSession:
                     "max_pain": max_pain,
                 }
 
-        return per_expiry_data, new_desired_tokens, spot_ltp
+        if not OPTIONS_SESSIONS_USE_VECTORIZED:
+            token_ranks = {int(t): (1, 0, 0) for t in new_desired_tokens}
+
+        return per_expiry_data, new_desired_tokens, spot_ltp, token_ranks
+
+    def _expiry_window(
+        self,
+        *,
+        expiry_index: int,
+        strikes: Sequence[float],
+        center: float,
+        sigma: Optional[float],
+        T: float,
+    ) -> int:
+        """Strikes each side of ATM to track for one expiry.
+
+        The nearest expiry keeps ``window_size``. Later expiries widen until the
+        window reaches roughly 10-delta on both sides (a monthly short picked by
+        delta must be inside the tracked window), capped at ``FAR_WINDOW_MAX``.
+        """
+        base = int(self.window_size)
+        if expiry_index == 0 or not sigma or sigma <= 0 or T <= MIN_T or not center:
+            return base
+        ordered = sorted({float(s) for s in strikes})
+        steps = [b - a for a, b in zip(ordered, ordered[1:]) if b > a]
+        if not steps:
+            return base
+        step = float(np.median(steps))
+        half_range = float(center) * (math.exp(FAR_WINDOW_DELTA_Z * float(sigma) * math.sqrt(T)) - 1.0)
+        needed = int(math.ceil(half_range / step))
+        return max(base, min(needed, FAR_WINDOW_MAX))
 
     def _solve_per_strike_iv(
         self,
@@ -690,37 +771,45 @@ class OptionsSession:
         return per_strike_sigma, iv_source
 
     def _compute_forward(
-        self, expiry: date, atm_strike: float, spot_ltp: float
+        self,
+        expiry: date,
+        atm_strike: float,
+        spot_ltp: float,
+        strikes: Optional[Sequence[float]] = None,
     ) -> tuple[Optional[float], Optional[float], Optional[float]]:
-        """
-        Computes the synthetic forward price: F = Spot + Call_ATM - Put_ATM.
-        Returns None for the forward if either ATM option LTP is missing.
+        """Synthetic forward from put-call parity: F = K + C_K - P_K (r = 0).
 
-        Important:
-        - This synthetic-forward computation is intentionally retained in
-          `broker_api/options_sessions.py` as the active backend computation
-          source for options market snapshots consumed by canonical routes/SDK.
+        Median over the (up to) three strikes nearest spot that have a positive
+        CE and PE price, so one stale or zero quote cannot move the forward.
+        This module's Black-76 is undiscounted, so parity is used undiscounted
+        too (r = 0). Returns (forward, ATM CE ltp, ATM PE ltp); forward is None
+        when no strike has both prices.
         """
         repo = self.manager.instrument_repo
-        atm_insts = repo.get_option_instruments_for_strikes(
-            self.underlying, expiry, [atm_strike]
-        )
-        ce_inst = next((i for i in atm_insts if i["option_type"] == "CE"), None)
-        pe_inst = next((i for i in atm_insts if i["option_type"] == "PE"), None)
+        ticks = self.manager.market_data.latest_ticks
+        candidates = sorted(
+            {float(s) for s in (strikes or [atm_strike])},
+            key=lambda s: (abs(s - float(spot_ltp or atm_strike)), s),
+        )[:3]
+        if float(atm_strike) not in candidates:
+            candidates.append(float(atm_strike))
+        instruments = repo.get_option_instruments_for_strikes(self.underlying, expiry, candidates)
+        prices: Dict[float, Dict[str, Optional[float]]] = {}
+        for inst in instruments:
+            tick = ticks.get(inst["instrument_token"])
+            price = tick.get("last_price") if tick else None
+            prices.setdefault(float(inst["strike"]), {})[inst["option_type"]] = price
 
-        ce_ltp, pe_ltp = None, None
-        if ce_inst:
-            tick = self.manager.market_data.latest_ticks.get(ce_inst["instrument_token"])
-            if tick:
-                ce_ltp = tick.get("last_price")
-        if pe_inst:
-            tick = self.manager.market_data.latest_ticks.get(pe_inst["instrument_token"])
-            if tick:
-                pe_ltp = tick.get("last_price")
-
-        if spot_ltp is not None and ce_ltp is not None and pe_ltp is not None:
-            return spot_ltp + ce_ltp - pe_ltp, ce_ltp, pe_ltp
-        return None, ce_ltp, pe_ltp
+        atm = prices.get(float(atm_strike), {})
+        ce_ltp, pe_ltp = atm.get("CE"), atm.get("PE")
+        estimates = []
+        for strike in candidates[:3]:
+            call, put = prices.get(strike, {}).get("CE"), prices.get(strike, {}).get("PE")
+            if call and put and call > 0 and put > 0:
+                estimates.append(strike + float(call) - float(put))
+        if not estimates:
+            return None, ce_ltp, pe_ltp
+        return float(np.median(estimates)), ce_ltp, pe_ltp
 
     def _time_to_expiry(self, expiry: date) -> float:
         """
@@ -787,6 +876,7 @@ class OptionsSessionManager:
         self.sessions: Dict[str, OptionsSession] = {}
         self.client_queues: Dict[str, List[asyncio.Queue]] = {}
         self.owner_id = "backend:options-sessions"
+        self.dropped_tokens: Dict[str, int] = {}
 
     async def start_sessions(
         self, items: List[Dict[str, Any]], replace: bool = False
@@ -898,14 +988,12 @@ class OptionsSessionManager:
             redis_client = get_redis()
             v1_snapshot_key = option_snapshot_v1_key(session.underlying)
             v1_pub_channel = option_snapshot_v1_updates_channel(session.underlying)
-            snapshot_key = f"options:snapshot:{session.underlying}"
             pub_channel = f"options:updates:{session.underlying}"
 
             v1_payload_json = serialize_option_snapshot_v1(session.snapshot, session.underlying)
             await redis_client.set(v1_snapshot_key, v1_payload_json, ex=OPTION_SNAPSHOT_TTL_SECONDS)
             await redis_client.publish(v1_pub_channel, v1_payload_json)
 
-            await redis_client.set(snapshot_key, str(session.snapshot), ex=OPTION_SNAPSHOT_TTL_SECONDS)
             await publish_event(pub_channel, session.snapshot)
         except Exception as e:
             logger.warning(f"Redis operation failed: {e}")
@@ -919,27 +1007,30 @@ class OptionsSessionManager:
         await self._converge_subscriptions()
 
     async def _converge_subscriptions(self):
-        """
-        Computes the union of all desired tokens and updates the market runtime.
-        """
-        global_union: Set[int] = set()
-        for session in self.sessions.values():
-            global_union.update(session.desired_tokens)
-
-        # Enforce token cap
-        if len(global_union) > TOKEN_CAP:
-            # TODO: Implement degradation logic
+        """Subscribe the union of desired tokens, truncating by rank at TOKEN_CAP."""
+        ranks: Dict[int, tuple] = {}
+        owner_of: Dict[int, str] = {}
+        for underlying, session in self.sessions.items():
+            session_ranks = dict(getattr(session, "token_ranks", {}) or {})
+            for token in session.desired_tokens:
+                rank = session_ranks.get(int(token), (1, FAR_WINDOW_MAX, 99))
+                if int(token) not in ranks or rank < ranks[int(token)]:
+                    ranks[int(token)] = rank
+                    owner_of[int(token)] = underlying
+        kept, dropped = rank_tokens(ranks, TOKEN_CAP)
+        self.dropped_tokens = {underlying: 0 for underlying in self.sessions}
+        for token in dropped:
+            self.dropped_tokens[owner_of[token]] = self.dropped_tokens.get(owner_of[token], 0) + 1
+        if dropped:
             logger.warning(
-                f"Token cap exceeded: {len(global_union)} > {TOKEN_CAP}. "
-                "Degradation not yet implemented."
+                "options token cap reached: kept %s, dropped %s (far wings first)",
+                len(kept),
+                len(dropped),
             )
-            # For now, just truncate
-            global_union = set(list(global_union)[:TOKEN_CAP])
-
-        if global_union:
+        if kept:
             await self.market_data.set_owner_subscriptions(
                 self.owner_id,
-                {int(token): "full" for token in global_union},
+                {int(token): "full" for token in kept},
             )
         else:
             await self.market_data.delete_owner(self.owner_id)

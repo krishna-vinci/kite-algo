@@ -176,6 +176,18 @@ def test_start_sessions_route_delegates_to_manager():
     ], False)]
 
 
+def test_start_sessions_route_rejects_window_over_30():
+    snapshot = _build_snapshot()
+    manager = _FakeManager(snapshot)
+    app = FastAPI()
+    app.include_router(market_router)
+    app.dependency_overrides[get_options_session_manager] = lambda: manager
+    client = TestClient(app)
+
+    response = client.post("/api/options/sessions", json={"items": [{"underlying": "NIFTY", "window": 31}]})
+    assert response.status_code == 422
+
+
 def test_market_routes_return_option_session_not_found_when_missing():
     response = _client(None).get("/api/options/underlyings/NIFTY/session")
     assert response.status_code == 404

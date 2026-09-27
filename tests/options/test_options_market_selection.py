@@ -112,3 +112,21 @@ def test_resolve_delta_contract_treats_positive_put_target_as_magnitude():
 
     assert contract.strike == 24950.0
     assert contract.resolution_meta["delta_comparison"] == "magnitude"
+
+
+def test_delta_selection_ignores_fallback_iv_and_unpriced_contracts():
+    from datetime import date
+
+    from backend.options.market.selection import resolve_delta_contract
+
+    contracts = {
+        20000.0: {"tsym": "A", "token": 1, "ltp": 100.0, "delta": 0.50, "iv_source": "per_strike"},
+        20300.0: {"tsym": "B", "token": 2, "ltp": 20.0, "delta": 0.16, "iv_source": "per_strike"},
+        20350.0: {"tsym": "C", "token": 3, "ltp": 12.0, "delta": 0.15, "iv_source": "expiry_fallback"},
+        20400.0: {"tsym": "D", "token": 4, "ltp": 0.0, "delta": 0.15, "iv_source": "per_strike"},
+    }
+    resolved = resolve_delta_contract(
+        underlying="NIFTY", expiry=date(2026, 10, 6), option_type="CE",
+        delta_target=0.15, contracts_by_strike=contracts,
+    )
+    assert resolved.tradingsymbol == "B"

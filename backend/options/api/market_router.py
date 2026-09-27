@@ -20,7 +20,8 @@ logger = logging.getLogger(__name__)
 
 class OptionsSessionItemPayload(BaseModel):
     underlying: str = Field(min_length=1)
-    window: int = Field(default=12, ge=1, le=100)
+    # ATM±window per expiry; far expiries widen up to FAR_WINDOW_MAX (30).
+    window: int = Field(default=12, ge=1, le=30)
     cadence_sec: int = Field(default=5, ge=1, le=3600)
 
 

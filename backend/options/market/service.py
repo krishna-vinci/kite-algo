@@ -398,6 +398,8 @@ class OptionsMarketService:
             "lot_size": payload.get("lot_size"),
             "ltp": payload.get("ltp"),
             "iv": payload.get("iv"),
+            "iv_source": payload.get("iv_source"),
+            "stale_age_sec": payload.get("stale_age_sec"),
             "oi": payload.get("oi"),
             "delta": payload.get("delta"),
             "gamma": payload.get("gamma"),

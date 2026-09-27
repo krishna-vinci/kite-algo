@@ -98,7 +98,7 @@ def test_serialize_payload_is_valid_json_with_schema_v1_and_json_safe_dates():
     assert payload["expiries"] == ["2026-05-07"]
 
 
-def test_session_update_writes_v1_json_and_legacy_key(monkeypatch):
+def test_session_update_writes_v1_json_and_no_legacy_snapshot_key(monkeypatch):
     fake_redis = _FakeRedis()
     published_legacy: list[tuple[str, dict]] = []
 
@@ -132,7 +132,8 @@ def test_session_update_writes_v1_json_and_legacy_key(monkeypatch):
     v1_key = "options:chain:v1:NIFTY"
     legacy_key = "options:snapshot:nifty"
     assert any(call[0] == v1_key and call[2] == OPTION_SNAPSHOT_TTL_SECONDS for call in fake_redis.set_calls)
-    assert any(call[0] == legacy_key and call[2] == OPTION_SNAPSHOT_TTL_SECONDS for call in fake_redis.set_calls)
+    # Nothing reads the str(dict) legacy key; it is no longer written.
+    assert not any(call[0] == legacy_key for call in fake_redis.set_calls)
 
     stored_v1 = fake_redis.values[v1_key]
     assert isinstance(stored_v1, str)
