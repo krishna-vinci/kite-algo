@@ -18,6 +18,14 @@ freeze-quantity column, so the limit can only come from the intent's own
 declaration. When it is declared, exceeding it refuses; when it is absent, the
 resolved leg records ``freeze_source: unavailable`` so the unchecked axis is
 visible to whoever reads the plan rather than invisible.
+
+A plan may also name the contract *relative* to the pin — ``{"underlying":
+"GOLD", "exchange": "MCX", "expiry": "near"}`` — instead of reciting a broker
+token. The selector is resolved once, against the pinned generation, at compile
+time: the same rule as a token, so "near" is the nearest expiry the pin carried
+and not whatever the catalog offers on the day the plan executes. A selector that
+cannot be answered (unknown underlying, or fewer listed expiries than the rank
+needs) refuses rather than silently trading a different month.
 """
 
 from __future__ import annotations
@@ -37,9 +45,20 @@ from backend.broker_api.orders.autoslice import should_autoslice
 #: The catalog instrument type that means "futures contract".
 FUTURES_INSTRUMENT_TYPE = "FUT"
 
+#: The relative expiries a selector may name: the nearest listed contract, the
+#: one after it, and the furthest listed one.
+EXPIRY_SELECTORS = ("near", "next", "far")
 
-def _as_lots(value: Any) -> int:
-    """Lots must be a positive whole number: half a contract is not a contract."""
+
+def _as_lots(value: Any, *, allow_flat: bool = False) -> int:
+    """Lots must be a whole number: half a contract is not a contract.
+
+    ``allow_flat`` admits exactly ``0``, and only for a roll's ``close_old``
+    half. A close is an ABSOLUTE FLAT of the strategy's attributed book, not a
+    (target - current) delta, so declaring a negative target would size the close
+    twice (the executor keeps the same rule). The flat target is what the
+    executor and the live lane already read as "close whatever is held".
+    """
     try:
         numeric = float(value)
     except (TypeError, ValueError) as exc:
@@ -50,6 +69,8 @@ def _as_lots(value: Any) -> int:
             {"lots": value, "message": "Lots must be a whole number of contracts"},
         )
     lots = int(numeric)
+    if lots == 0 and allow_flat:
+        return 0
     if lots <= 0:
         raise ValidationRefusal(
             "PAYLOAD_INVALID",
@@ -77,8 +98,112 @@ def _expiry_iso(value: Any) -> Any:
     return str(value)
 
 
+def _expiry_rank(value: Any) -> str:
+    """The relative expiry a selector named: ``near`` / ``next`` / ``far``."""
+    rank = str(value or "near").strip().lower()
+    if rank not in EXPIRY_SELECTORS:
+        raise ValidationRefusal(
+            "PAYLOAD_INVALID",
+            {
+                "field": "expiry",
+                "value": value,
+                "allowed": list(EXPIRY_SELECTORS),
+                "message": "A contract selector names near, next or far",
+            },
+        )
+    return rank
+
+
 class FuturesCompiler(TargetCompiler):
     target_kind = "target_futures"
+
+    @staticmethod
+    def _contract_selector(payload: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+        """The relative contract this payload names, or ``None`` for a token.
+
+        A payload either recites a contract (``instrument_token`` +
+        ``tradingsymbol``) or selects one (``underlying`` + ``exchange`` +
+        ``expiry``). Both together is not a preference to be resolved: whichever
+        won, the other would be a silently ignored instruction, so it refuses.
+        """
+        if payload.get("underlying") is None:
+            if payload.get("expiry") is not None and payload.get("instrument_token") is not None:
+                raise ValidationRefusal(
+                    "PAYLOAD_INVALID",
+                    {
+                        "field": "expiry",
+                        "value": payload.get("expiry"),
+                        "message": (
+                            "An expiry selector belongs to a contract selector "
+                            "(underlying + exchange), not to a named contract"
+                        ),
+                    },
+                )
+            return None
+        if payload.get("instrument_token") is not None or payload.get("tradingsymbol") is not None:
+            raise ValidationRefusal(
+                "PAYLOAD_INVALID",
+                {
+                    "underlying": payload.get("underlying"),
+                    "instrument_token": payload.get("instrument_token"),
+                    "tradingsymbol": payload.get("tradingsymbol"),
+                    "message": (
+                        "A payload names a contract or selects one, never both: "
+                        "drop the token to select by underlying and expiry"
+                    ),
+                },
+            )
+        return {
+            "underlying": str(payload["underlying"]).strip().upper(),
+            "exchange": str(payload["exchange"]).strip().upper(),
+            "expiry": _expiry_rank(payload.get("expiry")),
+        }
+
+    @staticmethod
+    def _select_contract(
+        selector: Mapping[str, Any], pinned: PinnedCatalogRead
+    ) -> Dict[str, Any]:
+        """The contract this selector names in the PINNED generation, or a refusal."""
+        underlying = str(selector["underlying"])
+        exchange = str(selector["exchange"])
+        rank = str(selector["expiry"])
+        contracts = pinned.futures_contracts(underlying=underlying, exchange=exchange)
+        if not contracts:
+            raise ValidationRefusal(
+                "CONTRACT_UNRESOLVED",
+                {
+                    "underlying": underlying,
+                    "exchange": exchange,
+                    "expiry": rank,
+                    "catalog_generation": pinned.pin(),
+                    "message": (
+                        "The pinned catalog lists no active dated futures contract "
+                        "for this underlying on this exchange"
+                    ),
+                },
+            )
+        # Near is the first listed expiry, next the second, far the last - so an
+        # underlying with a single listed contract cannot answer "next" with a
+        # contract the strategy did not ask for.
+        index = {"near": 0, "next": 1, "far": len(contracts) - 1}[rank]
+        if index >= len(contracts):
+            raise ValidationRefusal(
+                "CONTRACT_UNRESOLVED",
+                {
+                    "underlying": underlying,
+                    "exchange": exchange,
+                    "expiry": rank,
+                    "listed_expiries": [
+                        _expiry_iso(contract.get("expiry")) for contract in contracts
+                    ],
+                    "catalog_generation": pinned.pin(),
+                    "message": (
+                        "The pinned catalog lists fewer futures expiries than this "
+                        "selector needs"
+                    ),
+                },
+            )
+        return dict(contracts[index])
 
     @staticmethod
     def _roll_binding(payload: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
@@ -258,36 +383,55 @@ class FuturesCompiler(TargetCompiler):
         }
 
     def compile(self, payload: Mapping[str, Any], pinned: PinnedCatalogRead) -> ResolvedPlan:
-        required = ("instrument_token", "exchange", "tradingsymbol", "lots")
+        selector = self._contract_selector(payload)
+        # A named contract still requires its own four fields; a selector requires
+        # the underlying, the exchange and the size, and nothing else.
+        required = (
+            ("exchange", "lots")
+            if selector is not None
+            else ("instrument_token", "exchange", "tradingsymbol", "lots")
+        )
         missing = [field for field in required if payload.get(field) is None]
         if missing:
             raise ValidationRefusal("PAYLOAD_INVALID", {"missing_fields": sorted(missing)})
 
         roll_binding = self._roll_binding(payload)
 
-        try:
-            broker_token = int(payload["instrument_token"])
-        except (TypeError, ValueError) as exc:
-            raise ValidationRefusal("PAYLOAD_INVALID", {"reason": str(exc)}) from exc
-
-        exchange = str(payload["exchange"]).upper()
-        tradingsymbol = str(payload["tradingsymbol"]).upper()
         product = str(payload.get("product") or "NRML").upper()
-        lots = _as_lots(payload.get("lots"))
-
-        mapping = pinned.resolve_token(
-            broker_token, exchange=exchange, symbol=tradingsymbol
+        # Only a roll's close half may declare a flat target: it closes whatever
+        # the strategy is attributed to hold, so naming its own lot count would be
+        # a second, competing size for the same close.
+        flat_close = (
+            roll_binding is not None and str(roll_binding.get("role")) == "close_old"
         )
-        if mapping is None:
-            raise ValidationRefusal(
-                "CONTRACT_UNRESOLVED",
-                {
-                    "instrument_token": broker_token,
-                    "exchange": exchange,
-                    "tradingsymbol": tradingsymbol,
-                    "catalog_generation": pinned.pin(),
-                },
+        lots = _as_lots(payload.get("lots"), allow_flat=flat_close)
+
+        if selector is not None:
+            mapping = self._select_contract(selector, pinned)
+            broker_token = int(mapping["broker_token"])
+            exchange = str(mapping["exchange"] or selector["exchange"]).upper()
+            tradingsymbol = str(mapping["tradingsymbol"] or "").upper()
+        else:
+            try:
+                broker_token = int(payload["instrument_token"])
+            except (TypeError, ValueError) as exc:
+                raise ValidationRefusal("PAYLOAD_INVALID", {"reason": str(exc)}) from exc
+
+            exchange = str(payload["exchange"]).upper()
+            tradingsymbol = str(payload["tradingsymbol"]).upper()
+            mapping = pinned.resolve_token(
+                broker_token, exchange=exchange, symbol=tradingsymbol
             )
+            if mapping is None:
+                raise ValidationRefusal(
+                    "CONTRACT_UNRESOLVED",
+                    {
+                        "instrument_token": broker_token,
+                        "exchange": exchange,
+                        "tradingsymbol": tradingsymbol,
+                        "catalog_generation": pinned.pin(),
+                    },
+                )
 
         lifecycle = str(mapping.get("lifecycle_status") or "")
         if lifecycle != "active":
@@ -382,6 +526,20 @@ class FuturesCompiler(TargetCompiler):
             "side": side,
             "roll": roll_binding,
         }
+        # A selected contract records BOTH what the strategy named and what it
+        # resolved to, so a plan can be read back as "the near GOLD contract" and
+        # still prove which month that was.
+        contract_selector = (
+            None
+            if selector is None
+            else {
+                "underlying": selector["underlying"],
+                "exchange": selector["exchange"],
+                "expiry": selector["expiry"],
+            }
+        )
+        if contract_selector is not None:
+            logical["contract_selector"] = contract_selector
         resolved: Dict[str, Any] = {
             "target_kind": self.target_kind,
             "catalog_generation": pinned.pin(),
@@ -419,4 +577,8 @@ class FuturesCompiler(TargetCompiler):
         peer = roll_binding.get("peer") if roll_binding is not None else None
         if peer is not None:
             resolved["old_legs"] = [self._old_roll_leg(peer, pinned, product=product)]
+        if contract_selector is not None:
+            # Present only for a selected contract, so a plan that recited a token
+            # keeps the artifact shape it has always had.
+            resolved["contract_selector"] = contract_selector
         return ResolvedPlan(target_kind=self.target_kind, logical=logical, resolved=resolved)

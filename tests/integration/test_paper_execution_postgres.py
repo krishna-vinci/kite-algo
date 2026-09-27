@@ -198,15 +198,15 @@ def paper_env():
         yield
 
 
-def _paper_service(sf):
+def _paper_service(sf, *, catalog=None, price=PRICE, starting_balance="100000"):
     from backend.paper_runtime.repository import SqlAlchemyPaperRepository
     from backend.paper_runtime.service import PaperTradingService
 
     return PaperTradingService(
         repository=SqlAlchemyPaperRepository(session_factory=sf),
-        instruments_repository=_CatalogInstrument(),
-        market_data_runtime=_TickRuntime(PRICE),
-        default_starting_balance=Decimal("100000"),
+        instruments_repository=catalog or _CatalogInstrument(),
+        market_data_runtime=_TickRuntime(price),
+        default_starting_balance=Decimal(starting_balance),
     )
 
 
@@ -350,7 +350,8 @@ def submit_plan(sf, *, target_quantity=10, sid=STRATEGY, account=ACCOUNT, run_id
     )
 
 
-def admit_and_reserve(sf, plan, *, environment="paper", valid_seconds=3600, allocation=None):
+def admit_and_reserve(sf, plan, *, environment="paper", valid_seconds=3600, allocation=None,
+                      evaluation_id="eval-1"):
     """Paper admission (P4) and the durable capacity claim it produces."""
     service = AdmissionService(session_factory=sf)
     if allocation is not None:
@@ -374,7 +375,7 @@ def admit_and_reserve(sf, plan, *, environment="paper", valid_seconds=3600, allo
             plan_id=str(plan["plan_id"]),
             strategy_id=str(plan["strategy_id"]),
             account_id=str(plan["account_id"]),
-            evaluation_id="eval-1",
+            evaluation_id=str(evaluation_id),
             execution_environment=environment,
             requirement_inr=float(verdict.detail.get("plan_requirement_inr") or 0.0),
             valid_until=datetime.now(timezone.utc) + timedelta(seconds=valid_seconds),
@@ -756,3 +757,309 @@ def test_concurrent_execute_yields_exactly_one_submission(disposable_db, paper_e
         "SELECT COUNT(*) FROM public.strategy_reservation_events WHERE reservation_id = :rid AND event = 'consumed'",
         {"rid": reservation["reservation_id"]},
     ) == 1
+
+
+# ---------------------------------------------------------------------------
+# 4. MCX commodity futures: a selector entry, then the existing roll flow
+# ---------------------------------------------------------------------------
+
+#: A fake MCX GOLD complex: two listed months, one lot each.
+GOLD_LOT = 100
+GOLD_PRICE = 7250.0
+GOLD_NEAR_TOKEN = 640001
+GOLD_NEXT_TOKEN = 640002
+GOLD_NEAR_SYMBOL = "GOLD26OCTFUT"
+GOLD_NEXT_SYMBOL = "GOLD26NOVFUT"
+
+
+class _GoldCatalog:
+    """The paper runtime's instrument lookup for the two fake MCX contracts."""
+
+    SYMBOLS = {
+        GOLD_NEAR_SYMBOL: GOLD_NEAR_TOKEN,
+        GOLD_NEXT_SYMBOL: GOLD_NEXT_TOKEN,
+    }
+
+    def get_instrument_by_exchange_symbol(self, exchange, tradingsymbol):
+        token = self.SYMBOLS.get(str(tradingsymbol or "").upper())
+        if token is None:
+            return None
+        return {
+            "instrument_token": token,
+            "exchange": exchange,
+            "tradingsymbol": tradingsymbol,
+            "lot_size": GOLD_LOT,
+            "instrument_type": "FUT",
+            "last_price": GOLD_PRICE,
+        }
+
+
+def seed_gold_catalog(sf):
+    """One published generation with two active MCX GOLD futures months.
+
+    The fake equivalent of what the instrument catalog publishes for MCX, so the
+    selector resolves through the same pinned read a real deployment would use.
+    Returns ``{tradingsymbol: instrument_id}`` (ids are real UUIDs).
+    """
+    gen = str(uuid.uuid4())
+    instruments = {}
+    _exec(
+        sf,
+        "INSERT INTO public.instrument_catalog_generations (id, status, published_at) "
+        "VALUES (:gen, 'published', '2024-01-01T00:00:00+00:00')",
+        {"gen": gen},
+    )
+    for symbol, token, expiry in (
+        (GOLD_NEAR_SYMBOL, GOLD_NEAR_TOKEN, "2026-10-05"),
+        (GOLD_NEXT_SYMBOL, GOLD_NEXT_TOKEN, "2026-11-05"),
+    ):
+        instrument = str(uuid.uuid4())
+        instruments[symbol] = instrument
+        _exec(
+            sf,
+            "INSERT INTO public.instrument_catalog_records "
+            "(instrument_id, identity_key, public_key, exchange, tradingsymbol, instrument_type, "
+            " underlying, expiry, lot_size, lifecycle_status, current_generation_id) "
+            "VALUES (:iid, :ikey, :pkey, 'MCX', :symbol, 'FUT', 'GOLD', :expiry, :lot, "
+            " 'active', :gen)",
+            {
+                "iid": instrument,
+                "ikey": f"MCX:{symbol}:{instrument}",
+                "pkey": f"MCX:{symbol}",
+                "symbol": symbol,
+                "expiry": expiry,
+                "lot": GOLD_LOT,
+                "gen": gen,
+            },
+        )
+        _exec(
+            sf,
+            "INSERT INTO public.instrument_broker_mappings "
+            "(instrument_id, broker, broker_exchange, broker_symbol, broker_token, "
+            " valid_from_generation, is_current) "
+            "VALUES (:iid, 'kite', 'MCX', :symbol, :token, :gen, true)",
+            {"iid": instrument, "symbol": symbol, "token": token, "gen": gen},
+        )
+    return instruments
+
+
+def submit_gold_futures(
+    sf,
+    *,
+    evaluation_id,
+    selector=None,
+    instrument_token=None,
+    tradingsymbol=None,
+    lots=1,
+    side="BUY",
+    roll=None,
+    reference_price=GOLD_PRICE,
+):
+    """One real hosted submission for a GOLD futures plan, by selector or token."""
+    payload = {
+        "catalog_generation": PinnedCatalogRead(sf).pin(),
+        "product": "NRML",
+        "lots": lots,
+        "side": side,
+        "reference_price": reference_price,
+        "exchange": "MCX",
+    }
+    if selector is not None:
+        payload.update({"underlying": "GOLD", "expiry": selector})
+    else:
+        payload.update({"instrument_token": instrument_token, "tradingsymbol": tradingsymbol})
+    if roll is not None:
+        payload["roll"] = roll
+    store = ProposalStore(session_factory=sf)
+    return store, store.submit(
+        ProposalSubmission(
+            strategy_id=STRATEGY,
+            account_id=ACCOUNT,
+            evaluation_id=evaluation_id,
+            evaluation_kind="run_now",
+            strategy_run_id=RUN_ID,
+            target_kind="target_futures",
+            payload=payload,
+        )
+    )
+
+
+def test_gold_mcx_selector_entry_then_the_roll_flow_moves_to_the_next_month(
+    disposable_db, paper_env
+):
+    """The commodity end to end: selector entry, then the existing roll flow.
+
+    Nothing here is MCX-specific beyond the fake catalog rows and the selector:
+    the entry freezes the near month, the roll acquires the next month before it
+    releases the old contract's close, and completion is proven flat rather than
+    assumed.
+    """
+    from backend.strategies.attribution import (
+        SqlAttributionStore,
+        StrategyAttributionService,
+    )
+    from backend.strategies.rolls import RollStateMachine
+
+    seed_strategy(disposable_db)
+    instruments = seed_gold_catalog(disposable_db)
+    near_id = instruments[GOLD_NEAR_SYMBOL]
+    next_id = instruments[GOLD_NEXT_SYMBOL]
+    seed_run_binding(disposable_db)
+    machine = RollStateMachine(session_factory=disposable_db)
+
+    def attributed(instrument_id):
+        return machine.attributed_quantity(
+            strategy_id=STRATEGY, account_id=ACCOUNT, instrument_id=instrument_id
+        )
+
+    def fold():
+        run(
+            StrategyAttributionService(
+                SqlAttributionStore(session_factory=disposable_db)
+            ).publish(
+                account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment="paper"
+            )
+        )
+
+    store, submitted = submit_gold_futures(
+        disposable_db, evaluation_id="eval-gold-entry", selector="near"
+    )
+    assert submitted["status"] == "validated", submitted
+    entry = store.get_plan(submitted["plan"]["plan_id"])
+    entry_leg = entry["resolved_plan"]["legs"][0]
+    assert entry_leg["instrument_id"] == near_id
+    assert entry_leg["tradingsymbol"] == GOLD_NEAR_SYMBOL
+    assert entry_leg["expiry"] == "2026-10-05"
+    assert entry_leg["lot_size"] == GOLD_LOT
+    assert entry_leg["quantity"] == GOLD_LOT
+    assert entry["resolved_plan"]["contract_selector"]["expiry"] == "near"
+
+    executor = build_executor(
+        disposable_db,
+        _paper_service(
+            disposable_db,
+            catalog=_GoldCatalog(),
+            price=GOLD_PRICE,
+            starting_balance="5000000",
+        ),
+    )
+    admit_and_reserve(
+        disposable_db, entry, allocation=5_000_000.0, evaluation_id="eval-gold-entry"
+    )
+    assert run(executor.execute(entry, actor=OWNER))["status"] == "filled"
+    fold()
+    assert attributed(near_id) == GOLD_LOT
+    assert attributed(next_id) == 0
+
+    # 2. The replacement is ACQUIRED first, and its plan names the held peer.
+    store, submitted = submit_gold_futures(
+        disposable_db,
+        evaluation_id="eval-gold-roll-open",
+        selector="next",
+        roll={
+            "role": "open_new",
+            "peer": {
+                "instrument_token": GOLD_NEAR_TOKEN,
+                "exchange": "MCX",
+                "tradingsymbol": GOLD_NEAR_SYMBOL,
+                "lots": 1,
+                "side": "BUY",
+                "reference_price": GOLD_PRICE,
+            },
+        },
+    )
+    assert submitted["status"] == "validated", submitted
+    acquisition = store.get_plan(submitted["plan"]["plan_id"])
+    assert acquisition["resolved_plan"]["legs"][0]["instrument_id"] == next_id
+    assert acquisition["resolved_plan"]["old_legs"][0]["instrument_id"] == near_id
+
+    roll = machine.create(
+        strategy_id=STRATEGY,
+        account_id=ACCOUNT,
+        old_instrument_id=near_id,
+        new_instrument_id=next_id,
+        required_replacement_quantity=GOLD_LOT,
+        old_coordinate={"product": "NRML"},
+        new_coordinate={"product": "NRML"},
+        plan_id=acquisition["plan_id"],
+    )
+    roll_id = roll["roll_id"]
+    admit_and_reserve(
+        disposable_db, acquisition, allocation=5_000_000.0,
+        evaluation_id="eval-gold-roll-open",
+    )
+    assert run(executor.execute(acquisition, actor=OWNER))["status"] == "filled"
+
+    # The executor recorded the roll's own replacement fill from the real paper
+    # order, so the proof is this roll's evidence rather than a caller's number.
+    assert machine.replacement_filled_quantity(roll_id) == GOLD_LOT
+    assert machine.prove_filled(roll_id)["state"] == "releasing_old"
+
+    # 3. Only now may the old contract's close be released - and executed.
+    assert machine.release_close(roll_id)["state"] == "releasing_old"
+    store, submitted = submit_gold_futures(
+        disposable_db,
+        evaluation_id="eval-gold-roll-close",
+        instrument_token=GOLD_NEAR_TOKEN,
+        tradingsymbol=GOLD_NEAR_SYMBOL,
+        side="SELL",
+        # A close is an ABSOLUTE FLAT: the flat target is what sizes the close
+        # from the attributed book, so it names no lot count of its own.
+        lots=0,
+        roll={
+            "role": "close_old",
+            "roll_id": roll_id,
+            "peer": {
+                "instrument_token": GOLD_NEXT_TOKEN,
+                "exchange": "MCX",
+                "tradingsymbol": GOLD_NEXT_SYMBOL,
+                "lots": 1,
+                "side": "BUY",
+                "reference_price": GOLD_PRICE,
+            },
+        },
+    )
+    assert submitted["status"] == "validated", submitted
+    close = store.get_plan(submitted["plan"]["plan_id"])
+    close_leg = close["resolved_plan"]["legs"][0]
+    assert (close_leg["instrument_id"], close_leg["signed_quantity"]) == (
+        near_id,
+        0,
+    )
+
+    admit_and_reserve(
+        disposable_db, close, allocation=5_000_000.0, evaluation_id="eval-gold-roll-close"
+    )
+    assert run(executor.execute(close, actor=OWNER))["status"] == "filled"
+    fold()
+
+    # The strategy now holds the NEXT month and nothing on the old one, which is
+    # what lets the roll complete on proven flatness.
+    assert attributed(near_id) == 0
+    assert attributed(next_id) == GOLD_LOT
+    assert machine.mark_old_flat(roll_id)["state"] == "completed"
+    # The ordered trail: the close is released only after the replacement fill is
+    # proven, and the roll completes only on a proven-flat old book.
+    events = [row["event"] for row in machine.events(roll_id)]
+    for expected in (
+        "created",
+        "replacement_filled",
+        "fill_proven",
+        "close_released",
+        "old_flat",
+        "completed",
+    ):
+        assert expected in events, events
+    assert events.index("replacement_filled") < events.index("fill_proven")
+    assert events.index("fill_proven") < events.index("close_released")
+    assert events.index("close_released") < events.index("old_flat")
+    assert events[-1] == "completed"
+    # Two paper orders on the old month (entry, close), one on the new one.
+    assert (
+        _scalar(
+            disposable_db,
+            "SELECT COUNT(*) FROM public.paper_orders WHERE account_scope = :account",
+            {"account": ACCOUNT},
+        )
+        == 3
+    )

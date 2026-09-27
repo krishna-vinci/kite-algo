@@ -128,7 +128,7 @@ class SchedulingTestCase(unittest.TestCase):
 
     def schedule(self, *, kind="monthly", at_time="09:30", day_of_month=None,
                  calendar_dates=None, enabled=True, schedule_id="sch-1", weekday=None,
-                 start_offset_min=None, stop_offset_min=None):
+                 start_offset_min=None, stop_offset_min=None, exchange=None):
         hosted_id = f"hs-{schedule_id}"
         version_id = f"v-{schedule_id}"
         with self.factory() as session:
@@ -157,12 +157,12 @@ class SchedulingTestCase(unittest.TestCase):
                     "INSERT INTO hosted_strategy_schedules "
                     "(id, strategy_id, version_id, owner_id, account_scope, execution_mode, "
                     " job_kind, max_duration_s, progress_deadline_s, schedule_kind, at_time, "
-                    " start_offset_min, stop_offset_min, timezone, weekday, day_of_month, "
-                    " calendar_dates, enabled, params_snapshot, policy_snapshot, "
+                    " start_offset_min, stop_offset_min, exchange, timezone, weekday, "
+                    " day_of_month, calendar_dates, enabled, params_snapshot, policy_snapshot, "
                     " capabilities_snapshot) "
                     "VALUES (:id, :sid, :vid, 'app:o', 'kite:paper', 'paper', 'finite', 3600, 600, "
-                    " :kind, :at_time, :start_offset, :stop_offset, 'Asia/Kolkata', :wd, :dom, "
-                    " :dates, :enabled, '{}', '{}', '{}')"
+                    " :kind, :at_time, :start_offset, :stop_offset, :exchange, 'Asia/Kolkata', "
+                    " :wd, :dom, :dates, :enabled, '{}', '{}', '{}')"
                 ),
                 {
                     "id": schedule_id,
@@ -172,6 +172,7 @@ class SchedulingTestCase(unittest.TestCase):
                     "at_time": at_time,
                     "start_offset": start_offset_min,
                     "stop_offset": stop_offset_min,
+                    "exchange": exchange,
                     "wd": weekday,
                     "dom": day_of_month,
                     "dates": json.dumps(calendar_dates) if calendar_dates is not None else None,
@@ -184,7 +185,7 @@ class SchedulingTestCase(unittest.TestCase):
             "version_id": version_id, "owner_id": "app:o",
             "execution_mode": "paper", "schedule_kind": kind, "at_time": at_time,
             "timezone": "Asia/Kolkata", "day_of_month": day_of_month,
-            "calendar_dates": calendar_dates, "weekday": weekday,
+            "calendar_dates": calendar_dates, "weekday": weekday, "exchange": exchange,
         }
 
     def occurrences(self, schedule_id="sch-1"):
@@ -573,6 +574,128 @@ class MarketSessionTests(SchedulingTestCase):
         self.assertEqual(stopped.desired_state, "stopped")
         self.assertEqual(stopped.status, "starting")
         self.assertIsNotNone(stopped.stop_requested_at)
+
+    def test_an_mcx_session_schedule_runs_on_the_commodity_clock(self):
+        # 03:31 UTC is 09:01 IST: a minute past the 09:00 commodity open.
+        opened = datetime(2026, 10, 1, 3, 31, tzinfo=timezone.utc)
+        self.schedule(
+            kind="market_session",
+            at_time="09:00",
+            exchange="MCX",
+            start_offset_min=0,
+            stop_offset_min=5,
+        )
+
+        result = self._scheduler().tick(now=opened)
+
+        self.assertEqual(result["fired"], ["sch-1:2026-10-01"])
+
+    def test_the_stored_mcx_session_keeps_its_exchange_and_session_length(self):
+        self.schedule(
+            kind="market_session",
+            at_time="09:00",
+            exchange="MCX",
+            start_offset_min=0,
+            stop_offset_min=5,
+        )
+
+        (entry,) = self.scheduler.enabled_schedules()
+
+        self.assertEqual(entry["exchange"], "MCX")
+        # 09:00 to 23:30 is 14.5 hours, plus the close fence margin.
+        self.assertEqual(entry["session_job_duration_s"], 14 * 3600 + 30 * 60 + 300)
+
+    def test_a_session_schedule_without_an_exchange_keeps_the_nse_clock(self):
+        self.schedule(
+            kind="market_session",
+            at_time="09:15",
+            start_offset_min=0,
+            stop_offset_min=5,
+        )
+
+        (entry,) = self.scheduler.enabled_schedules()
+
+        # A row that names no exchange is read as the clock it has always meant.
+        self.assertEqual(entry["exchange"], "NSE")
+        self.assertEqual(entry["session_job_duration_s"], 22800)
+        # 09:01 IST is before the equity bell, so today's occurrence is not due.
+        result = self._scheduler(trading_day_reader=lambda *_: True).tick(
+            now=datetime(2026, 10, 1, 3, 31, tzinfo=timezone.utc)
+        )
+        self.assertNotIn("sch-1:2026-10-01", result["fired"])
+
+    def test_next_occurrence_uses_the_schedules_own_exchange(self):
+        from backend.strategies.scheduling import next_occurrence
+
+        following = next_occurrence(
+            {
+                "id": "sch-1",
+                "schedule_kind": "market_session",
+                "exchange": "MCX",
+                "start_offset_min": 0,
+                "stop_offset_min": 5,
+            },
+            now=datetime(2026, 10, 1, 1, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(following.due_at.astimezone(IST).strftime("%H:%M"), "09:00")
+        self.assertEqual(following.closes_at.astimezone(IST).strftime("%H:%M"), "23:30")
+        # The stop offset is measured from the commodity close, not the equity one.
+        self.assertEqual(following.stop_at.astimezone(IST).strftime("%H:%M"), "23:25")
+
+    def test_an_nse_holiday_does_not_close_the_commodity_session(self):
+        # Every day is an NSE holiday for this reader: the equity schedule is
+        # skipped with its reason while the commodity session on that same day runs.
+        self.schedule(
+            kind="market_session",
+            at_time="09:00",
+            exchange="MCX",
+            start_offset_min=0,
+            stop_offset_min=5,
+        )
+        self.schedule(
+            kind="market_session",
+            at_time="09:15",
+            schedule_id="sch-2",
+            start_offset_min=0,
+            stop_offset_min=5,
+        )
+        scheduler = self._scheduler(trading_day_reader=lambda *_: False)
+
+        # 03:46 UTC is 09:16 IST: past both openings, so both are due today.
+        result = scheduler.tick(now=datetime(2026, 10, 1, 3, 46, tzinfo=timezone.utc))
+
+        self.assertIn("sch-1:2026-10-01", result["fired"])
+        self.assertIn("sch-2:2026-10-01", result["skipped"])
+        equity = next(
+            row
+            for row in scheduler.occurrences_for_schedule(schedule_id="sch-2")
+            if row["occurrence_key"] == "sch-2:2026-10-01"
+        )
+        self.assertEqual(equity["skip_reason"], "market_holiday")
+
+    def test_a_commodity_weekend_skip_names_the_unverified_calendar(self):
+        # 2026-10-03 is a Saturday.
+        self.schedule(
+            kind="market_session",
+            at_time="09:00",
+            exchange="MCX",
+            start_offset_min=0,
+            stop_offset_min=5,
+        )
+        scheduler = self._scheduler()
+
+        result = scheduler.tick(now=datetime(2026, 10, 3, 3, 31, tzinfo=timezone.utc))
+
+        self.assertIn("sch-1:2026-10-03", result["skipped"])
+        saturday = next(
+            row
+            for row in scheduler.occurrences_for_schedule(schedule_id="sch-1")
+            if row["occurrence_key"] == "sch-1:2026-10-03"
+        )
+        self.assertEqual(saturday["status"], "skipped")
+        self.assertEqual(saturday["skip_reason"], "market_weekend")
+        self.assertEqual(saturday["detail"]["holiday_status"], "not_verified_holiday")
 
 
 class MisfireTests(SchedulingTestCase):

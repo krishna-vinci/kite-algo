@@ -233,6 +233,21 @@ class PinnedCatalogRead:
     def resolve_symbol(self, exchange: str, symbol: str) -> Optional[Dict[str, Any]]:
         return self._resolve(exchange=exchange, symbol=symbol)
 
+    def futures_contracts(
+        self, underlying: str, exchange: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Active, dated futures contracts for an underlying, nearest expiry first.
+
+        The futures selector's read: same pin, same shape as :meth:`resolve_token`,
+        so a plan that named ``near``/``next``/``far`` freezes the exact contract
+        the pin offered rather than re-reading the catalog at execution time.
+        """
+        self.pin()
+        rows = self._catalog.futures_mappings_as_of(
+            self._published_at, underlying=underlying, exchange=exchange
+        )
+        return [self._mapping(row) for row in rows]
+
     def _resolve(
         self,
         *,
@@ -249,7 +264,10 @@ class PinnedCatalogRead:
             # Zero rows: nothing was mapped then. More than one: the pin does not
             # identify a single listing, which is not something to guess at.
             return None
-        row = rows[0]
+        return self._mapping(rows[0])
+
+    def _mapping(self, row: Mapping[str, Any]) -> Dict[str, Any]:
+        """One catalog row in the resolved-mapping shape the compilers consume."""
         return {
             "instrument_id": str(row["instrument_id"]),
             "exchange": str(row["exchange"] or ""),

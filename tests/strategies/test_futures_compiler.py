@@ -88,7 +88,8 @@ class FuturesCompilerTestCase(unittest.TestCase):
         self.engine.dispose()
 
     def contract(self, symbol="NIFTY26OCTFUT", *, token=500, kind="FUT", expiry="2026-10-29",
-                 lot=75, tick="0.05", lifecycle="active", underlying="NIFTY"):
+                 lot=75, tick="0.05", lifecycle="active", underlying="NIFTY",
+                 exchange="NFO"):
         instrument_id = f"inst-{symbol}"
         with self.factory() as session:
             session.execute(
@@ -96,22 +97,22 @@ class FuturesCompilerTestCase(unittest.TestCase):
                     "INSERT INTO public.instrument_catalog_records "
                     "(instrument_id, exchange, tradingsymbol, lifecycle_status, "
                     " current_generation_id, instrument_type, expiry, lot_size, tick_size, "
-                    " underlying) VALUES (:id, 'NFO', :symbol, :lifecycle, :gen, :kind, :expiry, "
-                    " :lot, :tick, :underlying)"
+                    " underlying) VALUES (:id, :exchange, :symbol, :lifecycle, :gen, :kind, "
+                    " :expiry, :lot, :tick, :underlying)"
                 ),
                 {"id": instrument_id, "symbol": symbol, "lifecycle": lifecycle, "gen": G1,
                  "kind": kind, "expiry": expiry, "lot": lot, "tick": tick,
-                 "underlying": underlying},
+                 "underlying": underlying, "exchange": exchange},
             )
             session.execute(
                 text(
                     "INSERT INTO public.instrument_broker_mappings "
                     "(mapping_id, instrument_id, broker, broker_exchange, broker_symbol, "
                     " broker_token, valid_from_generation, is_current) "
-                    "VALUES (:mid, :id, 'kite', 'NFO', :symbol, :token, :gen, 1)"
+                    "VALUES (:mid, :id, 'kite', :exchange, :symbol, :token, :gen, 1)"
                 ),
                 {"mid": f"map-{symbol}", "id": instrument_id, "symbol": symbol,
-                 "token": token, "gen": G1},
+                 "token": token, "gen": G1, "exchange": exchange},
             )
             session.commit()
         return instrument_id
@@ -322,6 +323,207 @@ class FreezeTests(FuturesCompilerTestCase):
         self.assertIsNone(leg["freeze_quantity"])
         # Recorded rather than assumed: a consumer can see the axis was not checked.
         self.assertEqual(leg["freeze_source"], "unavailable")
+
+
+class ContractSelectorTests(FuturesCompilerTestCase):
+    """``{underlying, exchange, expiry}`` resolved against the pinned generation."""
+
+    def golds(self):
+        """Three MCX GOLD months, plus an option and an undated listing to ignore."""
+        self.contract("GOLD26OCTFUT", token=601, expiry="2026-10-05", lot=100,
+                      underlying="GOLD", exchange="MCX")
+        self.contract("GOLD26NOVFUT", token=602, expiry="2026-11-05", lot=100,
+                      underlying="GOLD", exchange="MCX")
+        self.contract("GOLD26DECFUT", token=603, expiry="2026-12-05", lot=100,
+                      underlying="GOLD", exchange="MCX")
+
+    def selector(self, **overrides):
+        values = {"underlying": "GOLD", "exchange": "MCX", "lots": 1,
+                  "reference_price": 78000.0}
+        values.update(overrides)
+        return values
+
+    def test_the_near_selector_resolves_the_nearest_listed_month(self):
+        self.contract("GOLD26NOVFUT", token=602, expiry="2026-11-05", underlying="GOLD",
+                      exchange="MCX")
+        self.contract("GOLD26OCTFUT", token=601, expiry="2026-10-05", underlying="GOLD",
+                      exchange="MCX")
+        # Inserted newest-first: the selector orders by expiry, not by insert order.
+        leg = self.compile(self.selector(expiry="near")).resolved["legs"][0]
+        self.assertEqual(leg["tradingsymbol"], "GOLD26OCTFUT")
+        self.assertEqual(leg["broker_token"], 601)
+        self.assertEqual(leg["expiry"], "2026-10-05")
+
+    def test_the_next_and_far_selectors_walk_the_listed_expiries(self):
+        self.golds()
+        near = self.compile(self.selector(expiry="near")).resolved["legs"][0]
+        nxt = self.compile(self.selector(expiry="next")).resolved["legs"][0]
+        far = self.compile(self.selector(expiry="far")).resolved["legs"][0]
+        self.assertEqual(
+            [near["tradingsymbol"], nxt["tradingsymbol"], far["tradingsymbol"]],
+            ["GOLD26OCTFUT", "GOLD26NOVFUT", "GOLD26DECFUT"],
+        )
+        self.assertEqual([near["expiry"], nxt["expiry"], far["expiry"]],
+                         ["2026-10-05", "2026-11-05", "2026-12-05"])
+
+    def test_the_selector_is_frozen_beside_the_contract_it_resolved(self):
+        """A plan reads back as both the intent and the month it meant."""
+        self.golds()
+        plan = self.compile(self.selector(expiry="next"))
+        self.assertEqual(
+            plan.resolved["contract_selector"],
+            {"underlying": "GOLD", "exchange": "MCX", "expiry": "next"},
+        )
+        self.assertEqual(plan.logical["contract_selector"]["expiry"], "next")
+        leg = plan.resolved["legs"][0]
+        # The lot comes from the catalog, frozen on the leg like a named contract.
+        self.assertEqual(leg["lot_size"], 100)
+        self.assertEqual(leg["quantity"], 100)
+        self.assertEqual(leg["underlying"], "GOLD")
+        self.assertEqual(leg["exchange"], "MCX")
+
+    def test_an_unknown_underlying_refuses(self):
+        from backend.strategies.compiler.base import ValidationRefusal
+
+        self.golds()
+        with self.assertRaises(ValidationRefusal) as ctx:
+            self.compile(self.selector(underlying="SILVER"))
+        self.assertEqual(ctx.exception.reason_code, "CONTRACT_UNRESOLVED")
+        self.assertEqual(ctx.exception.detail["underlying"], "SILVER")
+
+    def test_a_rank_beyond_the_listed_expiries_refuses(self):
+        from backend.strategies.compiler.base import ValidationRefusal
+
+        self.contract("GOLD26OCTFUT", token=601, expiry="2026-10-05", underlying="GOLD",
+                      exchange="MCX")
+        # "next" cannot be answered by the October contract, which is "near".
+        with self.assertRaises(ValidationRefusal) as ctx:
+            self.compile(self.selector(expiry="next"))
+        self.assertEqual(ctx.exception.reason_code, "CONTRACT_UNRESOLVED")
+        self.assertEqual(ctx.exception.detail["listed_expiries"], ["2026-10-05"])
+
+    def test_a_retired_or_undated_listing_is_not_selectable(self):
+        from backend.strategies.compiler.base import ValidationRefusal
+
+        self.contract("GOLD26OCTFUT", token=601, expiry="2026-10-05", underlying="GOLD",
+                      exchange="MCX", lifecycle="retired")
+        self.contract("GOLD26NOVFUT", token=602, expiry=None, underlying="GOLD",
+                      exchange="MCX")
+        with self.assertRaises(ValidationRefusal) as ctx:
+            self.compile(self.selector())
+        self.assertEqual(ctx.exception.reason_code, "CONTRACT_UNRESOLVED")
+
+    def test_a_selector_only_sees_its_own_exchange(self):
+        """NFO NIFTY listings are not GOLD contracts, and MCX GOLD is not NFO."""
+        from backend.strategies.compiler.base import ValidationRefusal
+
+        self.contract("GOLD26OCTFUT", token=601, expiry="2026-10-05", underlying="GOLD",
+                      exchange="MCX")
+        with self.assertRaises(ValidationRefusal) as ctx:
+            self.compile(self.selector(exchange="NFO"))
+        self.assertEqual(ctx.exception.reason_code, "CONTRACT_UNRESOLVED")
+
+    def test_an_unknown_expiry_rank_refuses(self):
+        from backend.strategies.compiler.base import ValidationRefusal
+
+        self.golds()
+        with self.assertRaises(ValidationRefusal) as ctx:
+            self.compile(self.selector(expiry="nearest"))
+        self.assertEqual(ctx.exception.reason_code, "PAYLOAD_INVALID")
+        self.assertEqual(ctx.exception.detail["allowed"], ["near", "next", "far"])
+
+    def test_a_token_and_a_selector_together_refuse(self):
+        """Whichever won, the other would be a silently ignored instruction."""
+        from backend.strategies.compiler.base import ValidationRefusal
+
+        self.golds()
+        with self.assertRaises(ValidationRefusal) as ctx:
+            self.compile(self.selector(instrument_token=601, tradingsymbol="GOLD26OCTFUT"))
+        self.assertEqual(ctx.exception.reason_code, "PAYLOAD_INVALID")
+
+    def test_an_expiry_rank_without_an_underlying_refuses(self):
+        from backend.strategies.compiler.base import ValidationRefusal
+
+        self.contract()
+        with self.assertRaises(ValidationRefusal) as ctx:
+            self.compile(expiry="near")
+        self.assertEqual(ctx.exception.reason_code, "PAYLOAD_INVALID")
+
+    def test_a_named_contract_still_compiles_exactly_as_before(self):
+        """The token path keeps its artifact shape: no selector key appears."""
+        self.contract()
+        plan = self.compile()
+        self.assertNotIn("contract_selector", plan.resolved)
+        self.assertNotIn("contract_selector", plan.logical)
+        self.assertEqual(plan.resolved["legs"][0]["tradingsymbol"], "NIFTY26OCTFUT")
+
+
+class RollCloseTests(FuturesCompilerTestCase):
+    """A roll's close half declares an ABSOLUTE FLAT, not its own lot count.
+
+    The executor sizes a ``close_old`` step from the strategy's attributed book,
+    so a negative target of its own would close the position twice. The flat
+    target is the shape the executor and the live lane already read as "close
+    whatever is held", and it is the only place a zero-lot futures target is
+    allowed to compile at all.
+    """
+
+    def close_payload(self, **overrides):
+        values = self.payload(
+            lots=0,
+            side="SELL",
+            roll={
+                "role": "close_old",
+                "peer": {
+                    "instrument_token": 501,
+                    "exchange": "NFO",
+                    "tradingsymbol": "NIFTY26NOVFUT",
+                    "lots": 1,
+                    "side": "BUY",
+                    "reference_price": 25100.0,
+                },
+            },
+        )
+        values.update(overrides)
+        return values
+
+    def test_a_flat_close_is_the_shape_the_executor_reads(self):
+        self.contract()
+        self.contract("NIFTY26NOVFUT", token=501, expiry="2026-11-26")
+        plan = self.compile(self.close_payload())
+        leg = plan.resolved["legs"][0]
+        self.assertEqual(leg["lots"], 0)
+        self.assertEqual(leg["quantity"], 0)
+        self.assertEqual(leg["signed_quantity"], 0)
+        # The leg carries no direction of its own: the executor derives the
+        # closing side from which way the attributed book points.
+        self.assertNotIn("side", leg)
+        self.assertEqual(plan.logical["side"], "SELL")
+        self.assertEqual(plan.resolved["roll"]["role"], "close_old")
+
+    def test_a_zero_lot_target_still_refuses_outside_a_roll_close(self):
+        from backend.strategies.compiler.base import ValidationRefusal
+
+        self.contract()
+        with self.assertRaises(ValidationRefusal) as ctx:
+            self.compile(lots=0)
+        self.assertEqual(ctx.exception.reason_code, "PAYLOAD_INVALID")
+
+    def test_a_zero_lot_acquisition_refuses(self):
+        from backend.strategies.compiler.base import ValidationRefusal
+
+        self.contract()
+        self.contract("NIFTY26NOVFUT", token=501, expiry="2026-11-26")
+        with self.assertRaises(ValidationRefusal) as ctx:
+            self.compile(self.close_payload(roll={"role": "open_new", "peer": {
+                "instrument_token": 501,
+                "exchange": "NFO",
+                "tradingsymbol": "NIFTY26NOVFUT",
+                "lots": 1,
+                "side": "BUY",
+                "reference_price": 25100.0,
+            }}))
+        self.assertEqual(ctx.exception.reason_code, "PAYLOAD_INVALID")
 
 
 if __name__ == "__main__":

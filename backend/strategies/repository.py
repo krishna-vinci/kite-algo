@@ -49,7 +49,7 @@ from backend.strategies.models import (
     StrategyJobLog,
     StrategyJobReconciliation,
 )
-from backend.strategies import service
+from backend.strategies import market_session, service
 
 __all__ = [
     "SqlAlchemyStrategyRepository",
@@ -1749,13 +1749,16 @@ class SqlAlchemyStrategyRepository:
         squareoff_at: Optional[str] = None,
         start_offset_min: Optional[int] = None,
         stop_offset_min: Optional[int] = None,
+        exchange: Optional[str] = None,
         enabled: bool = True,
     ) -> HostedStrategySchedule:
         """Store a schedule, validating identity and deriving snapshots.
 
         Every supported kind is created here: a monthly schedule keeps its day of
         month and a calendar schedule its explicit dates, so the scheduler can
-        materialise the same occurrences the operator configured.
+        materialise the same occurrences the operator configured. A
+        market-session schedule keeps the exchange whose clock it runs on, so an
+        MCX session is never materialised on the NSE hours.
         """
         schedule = service.validate_schedule(
             schedule_kind=schedule_kind,
@@ -1768,6 +1771,7 @@ class SqlAlchemyStrategyRepository:
             squareoff_at=squareoff_at,
             start_offset_min=start_offset_min,
             stop_offset_min=stop_offset_min,
+            exchange=exchange,
         )
         if job_kind not in service.ALLOWED_JOB_KINDS:
             raise service.StrategyValidationError("unsupported job_kind")
@@ -1794,7 +1798,7 @@ class SqlAlchemyStrategyRepository:
             policy_snapshot = service.build_policy_snapshot(
                 stale_exit_policy=strategy.stale_exit_policy,
                 max_duration_s=(
-                    22800
+                    market_session.session_job_duration_s(schedule["exchange"])
                     if schedule["schedule_kind"] == "market_session"
                     else strategy.max_duration_s
                 ),
@@ -1827,6 +1831,7 @@ class SqlAlchemyStrategyRepository:
                 squareoff_at=schedule["squareoff_at"],
                 start_offset_min=schedule["start_offset_min"],
                 stop_offset_min=schedule["stop_offset_min"],
+                exchange=schedule["exchange"],
                 enabled=bool(enabled),
             )
             session.add(row)
@@ -1871,6 +1876,7 @@ class SqlAlchemyStrategyRepository:
         squareoff_at: Optional[str] = None,
         start_offset_min: Optional[int] = None,
         stop_offset_min: Optional[int] = None,
+        exchange: Optional[str] = None,
         enabled: bool = True,
     ) -> "HostedStrategySchedule":
         """Create or edit this strategy's single stored schedule.
@@ -1894,6 +1900,7 @@ class SqlAlchemyStrategyRepository:
             squareoff_at=squareoff_at,
             start_offset_min=start_offset_min,
             stop_offset_min=stop_offset_min,
+            exchange=exchange,
         )
         if job_kind not in service.ALLOWED_JOB_KINDS:
             raise service.StrategyValidationError("unsupported job_kind")
@@ -1942,7 +1949,7 @@ class SqlAlchemyStrategyRepository:
             row.policy_snapshot = copy.deepcopy(policy_snapshot)
             row.capabilities_snapshot = copy.deepcopy(dict(version.capabilities_snapshot or {}))
             row.max_duration_s = (
-                22800
+                market_session.session_job_duration_s(schedule["exchange"])
                 if schedule["schedule_kind"] == "market_session"
                 else strategy.max_duration_s
             )
@@ -1961,6 +1968,7 @@ class SqlAlchemyStrategyRepository:
             row.squareoff_at = schedule["squareoff_at"]
             row.start_offset_min = schedule["start_offset_min"]
             row.stop_offset_min = schedule["stop_offset_min"]
+            row.exchange = schedule["exchange"]
             row.enabled = bool(enabled)
             if row.enabled:
                 row.manual_paused_at = None

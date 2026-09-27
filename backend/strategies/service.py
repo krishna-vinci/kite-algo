@@ -40,6 +40,7 @@ except Exception:  # pragma: no cover - only if referencing is unavailable
     _NO_NETWORK_REGISTRY = None
 
 from backend.algo_runtime.account_scope import parse_account_scope
+from backend.strategies import market_session
 
 __all__ = [
     "ALLOWED_EXECUTION_MODES",
@@ -439,16 +440,18 @@ def validate_schedule(
     squareoff_at: Optional[str] = None,
     start_offset_min: Optional[int] = None,
     stop_offset_min: Optional[int] = None,
+    exchange: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Validate the bounded schedule shape for every supported kind.
 
     ``daily`` is a clock time, ``weekly`` adds a weekday, ``monthly`` a day of
     month (clamped to the month's length at materialisation), and ``calendar``
     the explicit ISO dates. A market-session schedule derives both edges from
-    the NSE clock; its offsets are configuration, not wall-clock times.
-    ``session_close`` remains rejected for the explicit clock kinds. A field
-    that belongs to another kind is rejected rather than stored, so a schedule
-    can never carry a silent second meaning.
+    one exchange's session clock - NSE by default, MCX when named - and its
+    offsets are configuration, not wall-clock times. ``session_close`` remains
+    rejected for the explicit clock kinds. A field that belongs to another kind
+    is rejected rather than stored, so a schedule can never carry a silent
+    second meaning.
     """
     if schedule_kind not in ALLOWED_SCHEDULE_KINDS:
         raise StrategyValidationError(
@@ -477,6 +480,20 @@ def validate_schedule(
         session_stop_offset = 5 if session_stop_offset is None else session_stop_offset
     elif session_start_offset is not None or session_stop_offset is not None:
         raise StrategyValidationError("offsets belong only to a market-session schedule")
+
+    if exchange is not None and schedule_kind != "market_session":
+        raise StrategyValidationError("exchange belongs only to a market-session schedule")
+    if schedule_kind == "market_session":
+        # The exchange picks the session clock, so an unknown one is refused
+        # rather than silently falling back to the NSE hours it did not ask for.
+        session_exchange = str(exchange or "").strip().upper() or "NSE"
+        if not market_session.is_gated_exchange(session_exchange):
+            raise StrategyValidationError(
+                "market-session exchange must be one of "
+                + ", ".join(market_session.GATED_EXCHANGES)
+            )
+    else:
+        session_exchange = None
 
     if schedule_kind == "daily":
         if weekday is not None or day_of_month is not None or calendar_dates is not None:
@@ -538,6 +555,7 @@ def validate_schedule(
         "squareoff_at": _validate_clock("squareoff_at", squareoff_at),
         "start_offset_min": session_start_offset,
         "stop_offset_min": session_stop_offset,
+        "exchange": session_exchange,
     }
 
 

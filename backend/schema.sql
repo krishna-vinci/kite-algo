@@ -3440,6 +3440,21 @@ ALTER TABLE public.hosted_strategy_schedules
     ADD CONSTRAINT ck_hosted_strategy_schedules_non_session_offsets
     CHECK (schedule_kind = 'market_session' OR (start_offset_min IS NULL AND stop_offset_min IS NULL));
 
+-- A market-session schedule names the exchange whose clock it runs on (NSE by
+-- default, MCX for the commodity session). The kind was NSE-only before MCX
+-- existed, so old rows are backfilled to the clock they could only have meant.
+ALTER TABLE public.hosted_strategy_schedules ADD COLUMN IF NOT EXISTS exchange TEXT;
+UPDATE public.hosted_strategy_schedules SET exchange = 'NSE'
+    WHERE schedule_kind = 'market_session' AND exchange IS NULL;
+ALTER TABLE public.hosted_strategy_schedules DROP CONSTRAINT IF EXISTS ck_hosted_strategy_schedules_exchange;
+ALTER TABLE public.hosted_strategy_schedules
+    ADD CONSTRAINT ck_hosted_strategy_schedules_exchange
+    CHECK (exchange IS NULL OR exchange IN ('NSE', 'BSE', 'NFO', 'BFO', 'MCX'));
+ALTER TABLE public.hosted_strategy_schedules DROP CONSTRAINT IF EXISTS ck_hosted_strategy_schedules_non_session_exchange;
+ALTER TABLE public.hosted_strategy_schedules
+    ADD CONSTRAINT ck_hosted_strategy_schedules_non_session_exchange
+    CHECK (schedule_kind = 'market_session' OR exchange IS NULL);
+
 CREATE TABLE IF NOT EXISTS public.strategy_schedule_occurrences (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     schedule_id TEXT NOT NULL,

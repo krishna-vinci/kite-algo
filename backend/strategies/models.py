@@ -153,6 +153,9 @@ class HostedStrategySchedule(Base):
     #: close when the platform asks its one session-long job to stop.
     start_offset_min = Column(Integer, nullable=True)
     stop_offset_min = Column(Integer, nullable=True)
+    #: Market-session kind: the exchange whose session clock the job runs on
+    #: (NSE by default, MCX for the commodity session).
+    exchange = Column(Text, nullable=True)
     weekday = Column(Integer, nullable=True)
     #: Monthly kind: the day of month the occurrence falls on.
     day_of_month = Column(Integer, nullable=True)
@@ -209,6 +212,14 @@ class HostedStrategySchedule(Base):
             "schedule_kind = 'market_session' OR "
             "(start_offset_min IS NULL AND stop_offset_min IS NULL)",
             name="ck_hosted_strategy_schedules_non_session_offsets",
+        ),
+        CheckConstraint(
+            "exchange IS NULL OR exchange IN ('NSE', 'BSE', 'NFO', 'BFO', 'MCX')",
+            name="ck_hosted_strategy_schedules_exchange",
+        ),
+        CheckConstraint(
+            "schedule_kind = 'market_session' OR exchange IS NULL",
+            name="ck_hosted_strategy_schedules_non_session_exchange",
         ),
         CheckConstraint(
             "day_of_month IS NULL OR (day_of_month >= 1 AND day_of_month <= 31)",

@@ -96,13 +96,14 @@ DECISION_SETTLED = "decision-settled"
 DECISION_BUSY = "decision-busy"
 
 #: The exchange whose imported calendar decides whether a daily/weekly
-#: occurrence lands on a trading day. Hosted schedules are NSE equity schedules
-#: today, and the market-session helper maps this to the imported NSE/CM days.
+#: occurrence lands on a trading day. A market-session occurrence asks its OWN
+#: exchange instead (see ``_market_skip``), so an MCX session is not closed by an
+#: NSE holiday.
 SCHEDULE_CALENDAR_EXCHANGE = "NSE"
 
 # A session job is allowed to outlive the clock by a short fence margin; the
 # close-time stop request remains the normal termination path.
-SESSION_JOB_GRACE_SECONDS = 300
+SESSION_JOB_GRACE_SECONDS = market_session.SESSION_JOB_GRACE_SECONDS
 
 
 def _utcnow() -> datetime:
@@ -150,6 +151,16 @@ def _integer_setting(value: Any, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return result if result >= 0 else default
+
+
+#: The session clock a market-session schedule runs on when it names none. A
+#: stored row from before the exchange field existed keeps the NSE equity hours.
+DEFAULT_SESSION_EXCHANGE = "NSE"
+
+
+def _session_exchange(value: Any) -> str:
+    """The exchange a market-session schedule's clock belongs to."""
+    return str(value or "").strip().upper() or DEFAULT_SESSION_EXCHANGE
 
 
 @dataclass(frozen=True)
@@ -268,10 +279,14 @@ class ScheduleScheduler:
                 "stop_offset_min": _integer_setting(row.stop_offset_min, 5)
                 if row.schedule_kind == "market_session"
                 else None,
+                # The exchange whose session clock this schedule runs on. The
+                # NSE equity clock stays the default so an edited schedule never
+                # silently moves to another venue's hours.
+                "exchange": _session_exchange(row.exchange)
+                if row.schedule_kind == "market_session"
+                else None,
                 "session_job_duration_s": (
-                    int((market_session.SESSION_CLOSE.hour * 60 + market_session.SESSION_CLOSE.minute) * 60)
-                    - int((market_session.SESSION_OPEN.hour * 60 + market_session.SESSION_OPEN.minute) * 60)
-                    + SESSION_JOB_GRACE_SECONDS
+                    market_session.session_job_duration_s(_session_exchange(row.exchange))
                 )
                 if row.schedule_kind == "market_session"
                 else None,
@@ -375,13 +390,16 @@ class ScheduleScheduler:
 
         elif kind == "market_session":
             today = moment.date()
+            opens_at_clock, closes_at_clock = market_session.session_window(
+                schedule.get("exchange")
+            )
             for offset in range(LOOKBACK_DAYS):
                 day = today - timedelta(days=offset)
                 opens_at = datetime.combine(
-                    day, market_session.SESSION_OPEN, tzinfo=market_session.IST
+                    day, opens_at_clock, tzinfo=market_session.IST
                 )
                 closes_at = datetime.combine(
-                    day, market_session.SESSION_CLOSE, tzinfo=market_session.IST
+                    day, closes_at_clock, tzinfo=market_session.IST
                 )
                 start_offset = _integer_setting(schedule.get("start_offset_min"), 0)
                 stop_offset = _integer_setting(schedule.get("stop_offset_min"), 5)
@@ -649,7 +667,9 @@ class ScheduleScheduler:
                 resumed=resumed,
                 moment=moment,
                 grace=grace,
-                market_skip=self._market_skip(kind, occurrence),
+                market_skip=self._market_skip(
+                    kind, occurrence, exchange=schedule.get("exchange")
+                ),
             )
             if outcome == "fired":
                 fired.append(occurrence.occurrence_key)
@@ -796,7 +816,7 @@ class ScheduleScheduler:
         return self._fire(schedule, occurrence, occurrence_id, claim=claim)
 
     def _market_skip(
-        self, kind: str, occurrence: Occurrence
+        self, kind: str, occurrence: Occurrence, *, exchange: Any = None
     ) -> Optional[Dict[str, Any]]:
         """Why a daily/weekly occurrence lands on a shut market, if it does.
 
@@ -806,21 +826,32 @@ class ScheduleScheduler:
         kinds are untouched - an explicitly listed date is an explicit
         instruction. An UNREADABLE calendar is never treated as a holiday: the
         occurrence keeps its ordinary decision rather than being skipped on
-        unknown evidence.
+        unknown evidence. A market-session occurrence asks its OWN exchange, so
+        an MCX session is not closed by an NSE holiday - and, because MCX has no
+        imported holiday calendar, its skip detail carries the
+        ``not_verified_holiday`` note rather than claiming a verified tick.
         """
         if kind not in ("daily", "weekly", "market_session"):
             return None
+        if kind == "market_session":
+            key = _session_exchange(exchange)
+        else:
+            # Daily/weekly occurrences still answer for the imported NSE days.
+            key = str(exchange or "").strip().upper() or SCHEDULE_CALENDAR_EXCHANGE
         day = occurrence.due_at.astimezone(market_session.IST).date()
         state = market_session.day_state(
-            SCHEDULE_CALENDAR_EXCHANGE, day, trading_day_reader=self._trading_day_reader
+            key, day, trading_day_reader=self._trading_day_reader
         )
         if state not in ("weekend", "holiday"):
             return None
-        return {
-            "exchange": SCHEDULE_CALENDAR_EXCHANGE,
+        detail: Dict[str, Any] = {
+            "exchange": key,
             "reason": state,
             "session_date": day.isoformat(),
         }
+        if not market_session.is_calendar_backed_exchange(key):
+            detail["holiday_status"] = market_session.UNVERIFIED_HOLIDAY
+        return detail
 
     def _resolve_existing_launch(
         self, schedule: Mapping[str, Any], occurrence: Occurrence
@@ -1286,11 +1317,14 @@ def next_occurrence(schedule: Mapping[str, Any], *, now: datetime) -> Optional[O
 
     def occurrence_for(day: date) -> Optional[Occurrence]:
         if kind == "market_session":
+            opens_at_clock, closes_at_clock = market_session.session_window(
+                schedule.get("exchange")
+            )
             opens_at = datetime.combine(
-                day, market_session.SESSION_OPEN, tzinfo=market_session.IST
+                day, opens_at_clock, tzinfo=market_session.IST
             )
             closes_at = datetime.combine(
-                day, market_session.SESSION_CLOSE, tzinfo=market_session.IST
+                day, closes_at_clock, tzinfo=market_session.IST
             )
             start_offset = _integer_setting(schedule.get("start_offset_min"), 0)
             stop_offset = _integer_setting(schedule.get("stop_offset_min"), 5)

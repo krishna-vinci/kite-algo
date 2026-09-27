@@ -157,6 +157,55 @@ async def test_schedule_is_null_until_configured_then_round_trips(session_factor
 
 
 @pytest.mark.asyncio
+async def test_a_market_session_schedule_round_trips_its_exchange(session_factory, monkeypatch):
+    """The stored clock is what the runtime drives, so it round-trips."""
+    async with _client(session_factory, monkeypatch) as client:
+        strategy, version = await _strategy_with_version(client)
+        sid = strategy["strategy_id"]
+
+        created = await client.put(
+            f"{BASE}/{sid}/schedule",
+            json=_schedule_body(
+                version["version_id"],
+                schedule_kind="market_session",
+                at_time=None,
+                exchange="MCX",
+                start_offset_min=0,
+                stop_offset_min=5,
+            ),
+        )
+
+        assert created.status_code == 200, created.text
+        body = created.json()
+        assert (body["schedule_kind"], body["exchange"]) == ("market_session", "MCX")
+        # 09:00 to 23:30 IST: the next run is the commodity open, not 09:15.
+        from backend.strategies.market_session import IST
+
+        assert (
+            datetime.fromisoformat(body["next_occurrence_at"])
+            .astimezone(IST)
+            .strftime("%H:%M")
+        ) == "09:00"
+        fetched = (await client.get(f"{BASE}/{sid}/schedule")).json()
+        assert fetched["exchange"] == "MCX"
+
+        # An unknown venue is refused rather than silently given the NSE hours.
+        refused = await client.put(
+            f"{BASE}/{sid}/schedule",
+            json=_schedule_body(
+                version["version_id"],
+                schedule_kind="market_session",
+                at_time=None,
+                exchange="NASDAQ",
+                start_offset_min=0,
+                stop_offset_min=5,
+            ),
+        )
+        assert refused.status_code == 422
+        assert (await client.get(f"{BASE}/{sid}/schedule")).json()["exchange"] == "MCX"
+
+
+@pytest.mark.asyncio
 async def test_schedule_edit_keeps_the_same_row_and_repins_the_version(session_factory, monkeypatch):
     async with _client(session_factory, monkeypatch) as client:
         strategy, version = await _strategy_with_version(client)

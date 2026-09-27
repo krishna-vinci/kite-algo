@@ -1050,6 +1050,66 @@ class PinnedInstrumentCatalog:
         """Mapping rows alive at ``published_at``, joined to their record."""
         return self._mapping_query(published_at, **filters)
 
+    def futures_mappings_as_of(
+        self,
+        published_at: Any,
+        *,
+        underlying: str,
+        exchange: Optional[str] = None,
+    ) -> List[Mapping[str, Any]]:
+        """Every active, dated futures contract for one underlying, nearest first.
+
+        This is the selector's read: a plan that names ``{"underlying": "GOLD",
+        "exchange": "MCX", "expiry": "near"}`` resolves against the same pinned
+        generation as a named token, so "near" means the nearest expiry the pin
+        carried rather than whatever the catalog says later. Nothing is guessed:
+        a contract without an expiry cannot be rolled and therefore is not a
+        rollable candidate, and a retired listing is not offered at all.
+        """
+        published = {
+            "broker": self.broker,
+            "published_at": published_at,
+            "underlying": str(underlying or "").strip().upper(),
+            "exchange": str(exchange or "").strip().upper() or None,
+        }
+        return self._query(
+            """
+            SELECT m.instrument_id,
+                   m.broker_exchange,
+                   m.broker_symbol,
+                   m.broker_token,
+                   m.valid_from_generation,
+                   m.valid_to_generation,
+                   r.exchange,
+                   r.tradingsymbol,
+                   r.lifecycle_status,
+                   r.instrument_type,
+                   r.expiry,
+                   r.lot_size,
+                   r.tick_size,
+                   r.underlying,
+                   r.strike,
+                   r.option_type
+            FROM public.instrument_broker_mappings m
+            JOIN public.instrument_catalog_generations g_from
+              ON g_from.id = m.valid_from_generation
+            LEFT JOIN public.instrument_catalog_generations g_to
+              ON g_to.id = m.valid_to_generation
+            JOIN public.instrument_catalog_records r
+              ON r.instrument_id = m.instrument_id
+            WHERE m.broker = :broker
+              AND g_from.published_at <= :published_at
+              AND (g_to.published_at IS NULL OR g_to.published_at > :published_at)
+              AND UPPER(r.instrument_type) = 'FUT'
+              AND r.lifecycle_status = 'active'
+              AND r.expiry IS NOT NULL
+              AND UPPER(r.underlying) = :underlying
+              AND (:exchange IS NULL OR UPPER(r.exchange) = :exchange)
+            ORDER BY r.expiry ASC, r.tradingsymbol ASC
+            """,
+            published,
+        )
+
     def _mapping_query(self, published_at: Any, **filters: Any) -> List[Mapping[str, Any]]:
         clauses = ["m.broker = :broker", "g_from.published_at <= :published_at",
                    "(g_to.published_at IS NULL OR g_to.published_at > :published_at)"]

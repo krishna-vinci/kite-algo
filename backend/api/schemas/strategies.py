@@ -566,6 +566,9 @@ class HostedScheduleRequest(BaseModel):
     squareoff_at: Optional[str] = Field(default=None, max_length=5)
     start_offset_min: Optional[int] = Field(default=None, ge=0, lt=1440)
     stop_offset_min: Optional[int] = Field(default=None, ge=0, lt=1440)
+    #: Market-session kind only: the exchange whose session clock the job runs
+    #: on. Defaults to the NSE equity hours.
+    exchange: Optional[str] = Field(default=None, max_length=16)
     enabled: bool = True
 
 
@@ -607,6 +610,8 @@ class HostedScheduleResponse(BaseModel):
     squareoff_at: Optional[str] = None
     start_offset_min: Optional[int] = None
     stop_offset_min: Optional[int] = None
+    #: The exchange a market-session schedule's clock belongs to (NSE default).
+    exchange: Optional[str] = None
     enabled: bool
     #: The stored manual pause, if one was set outside this surface.
     manually_paused: bool = False

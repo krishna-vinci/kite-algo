@@ -135,7 +135,8 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
   - **Endpoints:** expiries, chain, mini-chain, greeks, selection/resolve, PCR, max-pain, SSE stream
     (`market_router.py:78-160`). Worker mirrors are in `backend/options/api/worker_options_router.py:159-252`.
 - **Calendar: PARTIAL.** Covers NSE CM holidays only (`backend/broker_api/market/nse_calendar_source.py`,
-  `exchange_calendar.py`). There are no MCX or CDS sessions.
+  `exchange_calendar.py`). There are no imported MCX or CDS calendars; MCX is gated on its own clock instead (§5.3,
+  `backend/strategies/market_session.py`), and its holidays stay unverified.
 
 ## 3. Broker integration
 
@@ -280,6 +281,11 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
   with `market_weekend` / `market_holiday` and the exchange and session date in its detail, so a schedule that did
   not run says why. The calendar read fails OPEN here: an unreadable calendar leaves the occurrence to its ordinary
   decision rather than skipping it on unknown evidence. Monthly and calendar kinds are untouched.
+- **`market_session` kind: EXISTS** (`:376-403`, `backend/strategies/service.py` `validate_schedule`). One job per
+  session day, started and stopped by `start_offset_min` / `stop_offset_min` from that session's own open and close.
+  The schedule carries an optional `exchange` (default `NSE`, `MCX` allowed; column
+  `hosted_strategy_schedules.exchange`, migration `20260927_000055`), and a session occurrence is skipped on its OWN
+  exchange's weekend/holiday rather than on the NSE calendar's.
 - **MISSING:**
   - intraday or interval schedules
   - market-hours gating of a schedule's own `at_time` (a schedule set to 03:00 IST still fires)
@@ -342,10 +348,16 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
 - **`target_weights`.** Needs a universe revision, reference prices, a capital basis and a cash buffer.
   - The `WeightsPortfolioCompiler.compile` limits have no production caller; admission enforces the equivalents.
 - **`target_futures`.**
-  - Takes whole lots, FUT only, an expiry, and a catalog lot size.
+  - Takes whole lots, FUT only, an expiry, and a catalog lot size - or, instead of a token, a SELECTOR:
+    `{underlying, exchange, expiry: near|next|far}` resolved once against the pinned generation
+    (`PinnedCatalogRead.futures_contracts`, `backend/broker_api/instruments/catalog.py`), which freezes the token,
+    symbol, lot and expiry it chose. An unknown underlying, or a rank the pin cannot answer, refuses
+    `CONTRACT_UNRESOLVED`; a self-contradictory payload (token **and** selector) refuses `PAYLOAD_INVALID`.
   - `FREEZE_LIMIT_EXCEEDED` fires **only if the payload declares `freeze_quantity`**, because the catalog has no
     freeze column (`futures.py:177-255`).
-  - Supports a roll with `open_new`/`close_old`.
+  - Supports a roll with `open_new`/`close_old`. The close half declares an ABSOLUTE FLAT (`lots: 0`, the only place
+    a zero-lot target compiles) because the executor sizes a close from the attributed book, so a competing negative
+    target would close the position twice.
 - **`option_structure`.**
   - Legs are given as direct coordinates or through a `selection` policy.
   - Leg quantity = `lot_size × ratio × structure_units`, with no upper bound.
@@ -390,7 +402,10 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
   plan that OPENS or GROWS exposure is refused `MARKET_CLOSED` outside 09:15–15:30 IST on an NSE trading day
   (weekend / NSE holiday / before_open / after_close in `detail`), and `MARKET_CALENDAR_UNAVAILABLE` when the
   imported calendar cannot be read (fail closed). Reductions, exits, repairs, flattens and MIS square-offs are never
-  gated, and paper is unchanged. Only NSE, BSE, NFO and BFO are gated; every other exchange is `not_gated`.
+  gated, and paper is unchanged. Gated exchanges are NSE, BSE, NFO, BFO and MCX; every other exchange is `not_gated`.
+  MCX trades 09:00-23:30 IST (close configurable through `MCX_SESSION_CLOSE`, default 23:30) on its own clock, with
+  weekends the only known closure: its holiday calendar is not imported, so MCX answers carry
+  `holiday_status: not_verified_holiday` in `detail` instead of claiming a verified trading day.
 - **MISSING:**
   - A per-plan or per-day **count** cap on orders, trades or legs. The searches for `max_orders`, `max_trades` and
     `max_legs` found none. Order **rate** is limited to ≤10 Kite writes per second, with excess queued (§3).
@@ -663,7 +678,7 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
 | Portfolio / investing (equal weight, momentum) | `target_weights` / cnc | EXISTS | EXISTS (fake broker only), staged financing | Once-a-day schedule fits | Basket % rules |
 | Equity signal, delivery | `single_instrument` CNC / cnc | EXISTS | EXISTS (fake broker only), one leg | **Needs intraday.** Only a run-now loop, not proven | Position % rules |
 | Intraday equity | `single_instrument` MIS / mis | EXISTS | EXISTS (fake broker only), one leg | Needs intraday (same gap) | % rules plus MIS square-off |
-| Futures | `target_futures` / futures | EXISTS | EXISTS (fake broker only), one leg, roll state machine | Needs intraday (same gap) | % rules; freeze refused only if declared |
+| Futures (NFO, MCX) | `target_futures` / futures | EXISTS | EXISTS (fake broker only), one leg, `near`/`next`/`far` contract selector, roll state machine | `market_session` schedules cover the 09:00-23:30 MCX window; holidays unverified | % rules; freeze refused only if declared |
 | Options | `option_structure` / options | EXISTS | EXISTS (fake broker only): hedge gate, LIMIT, roll, repair | Needs intraday (same gap) | % rules, staged exit; **index, premium and MTM rules dead**; no Greeks |
 | Order bundle | `intent_bundle` | EXISTS | MISSING | — | — |
 
