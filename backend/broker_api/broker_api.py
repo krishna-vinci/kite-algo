@@ -1111,6 +1111,8 @@ async def update_all_instruments_daily():
             session=db,
             refresh_from_broker=True,
             backfill_only_nulls=True,
+            # No search index is deployed; the daily job refreshes and backfills.
+            reindex=False,
             background_tasks=None
         )
         logger.info(f"Daily instruments maintenance completed successfully. Counts: {counts}")
