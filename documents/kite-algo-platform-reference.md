@@ -621,7 +621,10 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
   There are **no inbound commands**.
 - **Journal and analytics: EXISTS.** Daily, weekly and monthly journal; episodes with notes; analytics for
   summary, strategy, equity, costs and paper-vs-live; the live journal projector (`backend/journaling`,
-  `api/routers/{journal,analytics}.py`).
+  `api/routers/{journal,analytics}.py`). Hosted strategies: paper and live fills land on a journal run keyed by
+  the strategy run; execution-request decisions (raised, auto-queued/refused, owner approve/reject) and
+  protection exits are appended as decision events on that run (`backend/strategies/journal_bridge.py`). Journal
+  rules are not enforced by admission (they carry no machine-checkable condition).
 - **Paper runtime: EXISTS.** Fills, margin and charge heuristics, and account reset/upsert
   (`/api/system/paper/accounts/...`).
 - **Algo runtime: PARTIAL.** `backend/algo_runtime` is an in-process, tick- and candle-driven kernel with a

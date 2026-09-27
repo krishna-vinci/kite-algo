@@ -34,6 +34,7 @@ from typing import Any, Callable, Dict, Mapping, Optional
 from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
+from backend.strategies import journal_bridge
 from backend.strategies.attribution_models import StrategyPlan, StrategyReservation
 from backend.strategies.execution_authorization import (
     ExecutionAuthorizationService,
@@ -626,7 +627,9 @@ class ExecutionRequestService:
                 )
             )
             session.commit()
-            return {"idempotent": False, "request": self._view(row)}
+            view = self._view(row)
+            journal_bridge.record_request_decision(view)
+            return {"idempotent": False, "request": view}
         except ExecutionRequestError:
             session.rollback()
             raise
@@ -731,7 +734,9 @@ class ExecutionRequestService:
                 row.updated_at = moment
                 session.add(self._audit(row, "refused", actor, "owner", moment))
                 session.commit()
-                return {"request": self._view(row), "approved": False}
+                view = self._view(row)
+                journal_bridge.record_request_decision(view, actor=str(actor))
+                return {"request": view, "approved": False}
             refusal = self._attempt_refusal(session, row, moment)
             if refusal is not None:
                 row.status = "refused"
@@ -740,7 +745,9 @@ class ExecutionRequestService:
                 row.updated_at = moment
                 session.add(self._audit(row, "refused", actor, "owner", moment))
                 session.commit()
-                return {"request": self._view(row), "approved": False}
+                view = self._view(row)
+                journal_bridge.record_request_decision(view, actor=str(actor))
+                return {"request": view, "approved": False}
             row.status = "queued"
             row.decision_kind = "manual"
             row.decision_actor = str(actor)
@@ -759,7 +766,9 @@ class ExecutionRequestService:
             row.updated_at = moment
             session.add(self._audit(row, "approved", actor, "owner", moment))
             session.commit()
-            return {"request": self._view(row), "approved": True}
+            view = self._view(row)
+            journal_bridge.record_request_decision(view, actor=str(actor))
+            return {"request": view, "approved": True}
         except ExecutionRequestError:
             session.rollback()
             raise
@@ -802,7 +811,9 @@ class ExecutionRequestService:
             row.updated_at = moment
             session.add(self._audit(row, "rejected", actor, "owner", moment))
             session.commit()
-            return {"request": self._view(row), "rejected": True}
+            view = self._view(row)
+            journal_bridge.record_request_decision(view, actor=str(actor))
+            return {"request": view, "rejected": True}
         except ExecutionRequestError:
             session.rollback()
             raise

@@ -3151,6 +3151,7 @@ class PaperPlanExecutor:
         attribution = {
             "strategy_run_id": binding["strategy_run_id"],
             "strategy_id": str(plan.get("strategy_id") or ""),
+            "account_ref": str(binding.get("account_id") or plan.get("account_id") or ""),
             "plan_id": plan_id,
             "reservation_id": (reservation or {}).get("reservation_id"),
             "step_no": step_no,

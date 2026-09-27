@@ -1224,6 +1224,9 @@ class ExecutorSubmissionTests(ExecutorTestCase, unittest.IsolatedAsyncioTestCase
         self.assertEqual(order.metadata["plan_id"], "plan-1")
         self.assertEqual(order.metadata["reservation_id"], self.ledger.for_plan("plan-1")["reservation_id"])
         self.assertEqual(order.metadata["step_no"], 1)
+        # The journal keys a paper strategy run on (strategy_run_id, account):
+        # without the account the fill is never journaled.
+        self.assertEqual(order.metadata["account_ref"], ACCOUNT)
         self.assertEqual(order.quantity, 10)
         self.assertEqual(order.transaction_type, "buy")
 

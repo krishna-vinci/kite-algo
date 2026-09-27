@@ -357,6 +357,10 @@ async def combined_lifespan(app: FastAPI):
     try:
         # Ensure the schema is applied before any other database operations
         run_schema_migrations()
+        # Hosted-strategy decisions join the auto-journal in the app process.
+        from backend.strategies import journal_bridge
+
+        journal_bridge.set_recorder(journal_bridge.JournalDecisionRecorder())
         try:
             prewarmed = await asyncio.to_thread(prewarm_options_engine)
             if prewarmed:

@@ -1245,15 +1245,30 @@ async def load_worker_run_pnl_for_protection(request: Any, run: Dict[str, Any]) 
 
 async def submit_worker_protection_exit(request: Any, run: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
     from backend.api.services.control_plane import exit_control_strategy
+    from backend.strategies import journal_bridge
 
-    return await exit_control_strategy(
+    triggered_rule = str(state.get("triggered_rule") or "unknown")
+    result = await exit_control_strategy(
         request,
         str(run["strategy_run_id"]),
         account_scope=str(run.get("account_scope") or "default"),
-        reason=f"backend_protection:{state.get('triggered_rule') or 'unknown'}",
+        reason=f"backend_protection:{triggered_rule}",
         dry_run=False,
         idempotency_key=str(state.get("exit_idempotency_key") or "") or None,
     )
+    journal_bridge.record_decision(
+        event="protection_exit",
+        environment=str(run.get("execution_mode") or "").lower(),
+        strategy_run_id=str(run.get("strategy_run_id") or ""),
+        account_id=str(run.get("account_scope") or ""),
+        summary=f"protection exit: {triggered_rule}",
+        context={
+            "triggered_rule": triggered_rule,
+            "exit_idempotency_key": state.get("exit_idempotency_key"),
+            "result_status": (result or {}).get("status") if isinstance(result, dict) else None,
+        },
+    )
+    return result
 
 
 async def reconcile_worker_protection_exit(

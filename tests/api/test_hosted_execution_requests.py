@@ -2189,6 +2189,57 @@ def test_dependent_release_of_an_approval_based_plan_is_unaffected(world):
     assert world["service"].authorize_dependent_release(plan, now=NOW) is None
 
 
+@pytest.fixture
+def journal_calls():
+    from backend.strategies import journal_bridge
+
+    calls = []
+    journal_bridge.set_recorder(lambda **kwargs: calls.append(kwargs))
+    try:
+        yield calls
+    finally:
+        journal_bridge.set_recorder(None)
+
+
+def test_request_and_owner_approval_are_journaled(world, journal_calls):
+    plan_id, _hash = _plan(world["factory"], strategy=world["strategy"])
+    created = world["service"].create_for_job(
+        job=world["job"], plan_id=plan_id, idempotency_key="exec-key-journal-1", now=NOW
+    )
+    request_id = created["request"]["request_id"]
+    world["service"].approve(
+        request_id, owner_id=OWNER, strategy_id=world["strategy"].id, actor=OWNER, now=NOW
+    )
+    assert [call["event"] for call in journal_calls] == [
+        "request_awaiting_approval",
+        "request_approved",
+    ]
+    assert journal_calls[1]["context"]["request_id"] == request_id
+    assert journal_calls[1]["strategy_run_id"] == created["request"]["strategy_run_id"]
+    assert journal_calls[1]["environment"] == created["request"]["execution_environment"]
+
+
+def test_owner_rejection_is_journaled(world, journal_calls):
+    plan_id, _hash = _plan(world["factory"], strategy=world["strategy"])
+    created = world["service"].create_for_job(
+        job=world["job"], plan_id=plan_id, idempotency_key="exec-key-journal-2", now=NOW
+    )
+    world["service"].reject(
+        created["request"]["request_id"], owner_id=OWNER, strategy_id=world["strategy"].id,
+        actor=OWNER, reason="no", now=NOW,
+    )
+    assert [call["event"] for call in journal_calls][-1] == "request_rejected"
+
+
+def test_an_idempotent_replay_is_not_journaled_twice(world, journal_calls):
+    plan_id, _hash = _plan(world["factory"], strategy=world["strategy"])
+    for _ in range(2):
+        world["service"].create_for_job(
+            job=world["job"], plan_id=plan_id, idempotency_key="exec-key-journal-3", now=NOW
+        )
+    assert [call["event"] for call in journal_calls] == ["request_awaiting_approval"]
+
+
 # ---------------------------------------------------------------------------
 # the owned-work snapshot
 # ---------------------------------------------------------------------------
