@@ -14,7 +14,10 @@ from __future__ import annotations
 
 from datetime import date, datetime, time, timezone
 
+import pytest
+
 from backend.broker_api.market.exchange_calendar import CalendarUnavailable
+from backend.strategies import market_session as market_session_module
 from backend.strategies.market_session import (
     day_state,
     is_gated_exchange,
@@ -32,6 +35,17 @@ def _utc(*args: int) -> datetime:
 
 def _raising_reader(*_args):
     raise AssertionError("the calendar must not be read for this case")
+
+
+def _mcx_rows(rows):
+    return lambda day: rows.get(day)
+
+
+@pytest.fixture(autouse=True)
+def _no_mcx_calendar(monkeypatch):
+    """Unit tests never read the database: no MCX rows unless a test injects them."""
+    monkeypatch.setattr(market_session_module, "_default_mcx_day_reader", lambda _day: None)
+    monkeypatch.delenv("MCX_SESSION_CLOSE", raising=False)
 
 
 def test_a_weekend_is_closed_without_reading_the_calendar():
@@ -107,11 +121,11 @@ def test_the_gated_set_covers_equities_derivatives_and_commodities():
 
 
 def test_the_commodity_window_is_the_published_one():
-    assert session_window("MCX") == (time(9, 0), time(23, 30))
+    assert session_window("MCX", date(2026, 10, 14)) == (time(9, 0), time(23, 30))
     # Case-folded, because the scheduler passes a stored exchange value.
-    assert session_window("mcx") == (time(9, 0), time(23, 30))
+    assert session_window("mcx", date(2026, 10, 14)) == (time(9, 0), time(23, 30))
     # A session job outlives the 14.5-hour window by the fence margin only.
-    assert session_job_duration_s("MCX") == 14 * 3600 + 30 * 60 + 300
+    assert session_job_duration_s("MCX") in (14 * 3600 + 30 * 60 + 300, 14 * 3600 + 55 * 60 + 300)
 
 
 def test_the_equity_window_is_unchanged():
@@ -133,7 +147,7 @@ def test_the_commodity_close_is_configurable(monkeypatch):
 def test_an_unusable_commodity_close_falls_back_to_the_default(monkeypatch):
     for raw in ("", "   ", "not-a-time", "23:30:00", "05:00"):
         monkeypatch.setenv("MCX_SESSION_CLOSE", raw)
-        assert mcx_session_close() == time(23, 30)
+        assert mcx_session_close(date(2026, 10, 14)) == time(23, 30)
 
 
 def test_an_open_commodity_session_says_its_holidays_are_unverified():
@@ -182,3 +196,70 @@ def test_an_nse_holiday_does_not_close_the_commodity_session():
     assert day_state("MCX", date(2026, 10, 14), trading_day_reader=nse_holiday_reader) == "trading"
     state = session_state("MCX", _utc(2026, 10, 14, 5, 0), trading_day_reader=nse_holiday_reader)
     assert state["open"] is True
+
+
+def test_mcx_closes_at_2330_during_us_daylight_saving():
+    assert mcx_session_close(date(2026, 10, 14)) == time(23, 30)
+    assert session_window("MCX", date(2026, 7, 1)) == (time(9, 0), time(23, 30))
+
+
+def test_mcx_closes_at_2355_outside_us_daylight_saving():
+    # US DST 2026 ends Sunday 1 Nov; 2 Nov onwards the late session runs to 23:55.
+    assert mcx_session_close(date(2026, 11, 2)) == time(23, 55)
+    assert mcx_session_close(date(2027, 1, 15)) == time(23, 55)
+    # US DST 2027 starts Sunday 14 Mar.
+    assert mcx_session_close(date(2027, 3, 12)) == time(23, 55)
+    assert mcx_session_close(date(2027, 3, 15)) == time(23, 30)
+
+
+def test_a_winter_evening_at_2340_is_still_open():
+    # 18:10 UTC on 2026-12-01 is 23:40 IST.
+    assert session_state("MCX", _utc(2026, 12, 1, 18, 10))["open"] is True
+    assert session_state("MCX", _utc(2026, 12, 1, 18, 26))["reason"] == "after_close"
+
+
+def test_the_env_close_overrides_both_seasons(monkeypatch):
+    monkeypatch.setenv("MCX_SESSION_CLOSE", "19:00")
+    assert mcx_session_close(date(2026, 7, 1)) == time(19, 0)
+    assert mcx_session_close(date(2026, 12, 1)) == time(19, 0)
+
+
+def test_an_imported_mcx_holiday_closes_the_session():
+    reader = _mcx_rows({date(2026, 10, 14): {"session_type": "HOLIDAY"}})
+    assert day_state("MCX", date(2026, 10, 14), mcx_day_reader=reader) == "holiday"
+    state = session_state("MCX", _utc(2026, 10, 14, 6, 0), mcx_day_reader=reader)
+    assert state["open"] is False
+    assert state["reason"] == "holiday"
+    assert state["holiday_status"] == "verified"
+    assert state["detail"]["holiday_source"] == "imported"
+
+
+def test_an_imported_mcx_special_session_uses_its_own_times():
+    # e.g. a holiday with only the evening session: 17:00-23:55 IST.
+    reader = _mcx_rows({date(2026, 11, 9): {"session_type": "SPECIAL", "opens_at": "17:00", "closes_at": "23:55"}})
+    morning = session_state("MCX", _utc(2026, 11, 9, 5, 0), mcx_day_reader=reader)  # 10:30 IST
+    assert morning["open"] is False
+    assert morning["reason"] == "before_open"
+    evening = session_state("MCX", _utc(2026, 11, 9, 13, 0), mcx_day_reader=reader)  # 18:30 IST
+    assert evening["open"] is True
+    assert evening["holiday_status"] == "verified"
+
+
+def test_an_imported_regular_mcx_day_is_verified():
+    reader = _mcx_rows({date(2026, 10, 14): {"session_type": "REGULAR", "opens_at": "09:00", "closes_at": "23:30"}})
+    state = session_state("MCX", _utc(2026, 10, 14, 6, 0), mcx_day_reader=reader)
+    assert state["open"] is True
+    assert state["holiday_status"] == "verified"
+
+
+def test_an_mcx_day_without_a_row_stays_unverified():
+    state = session_state("MCX", _utc(2026, 10, 14, 6, 0), mcx_day_reader=_mcx_rows({}))
+    assert state["open"] is True
+    assert state["holiday_status"] == "not_verified_holiday"
+
+
+def test_an_mcx_reader_error_never_closes_the_session():
+    def broken(_day):
+        raise RuntimeError("db down")
+
+    assert day_state("MCX", date(2026, 10, 14), mcx_day_reader=broken) == "trading"

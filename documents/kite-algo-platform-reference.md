@@ -410,9 +410,9 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
   (weekend / NSE holiday / before_open / after_close in `detail`), and `MARKET_CALENDAR_UNAVAILABLE` when the
   imported calendar cannot be read (fail closed). Reductions, exits, repairs, flattens and MIS square-offs are never
   gated, and paper is unchanged. Gated exchanges are NSE, BSE, NFO, BFO and MCX; every other exchange is `not_gated`.
-  MCX trades 09:00-23:30 IST (close configurable through `MCX_SESSION_CLOSE`, default 23:30) on its own clock, with
-  weekends the only known closure: its holiday calendar is not imported, so MCX answers carry
-  `holiday_status: not_verified_holiday` in `detail` instead of claiming a verified trading day.
+  MCX: 09:00 to 23:30 IST during US DST, 23:55 otherwise (`MCX_SESSION_CLOSE` overrides). Holidays/special sessions
+  are honoured once imported (`python -m backend.cli.import_exchange_calendar <csv> --exchange MCX --segment COM
+  --apply ...`); days without an imported row are flagged `not_verified_holiday`.
 - **MISSING:**
   - A per-plan or per-day **count** cap on orders, trades or legs. The searches for `max_orders`, `max_trades` and
     `max_legs` found none. Order **rate** is limited to ≤10 Kite writes per second, with excess queued (§3).
@@ -694,7 +694,7 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
 | Portfolio / investing (equal weight, momentum) | `target_weights` / cnc | EXISTS | EXISTS (fake broker only), staged financing | Once-a-day schedule fits | Basket % rules |
 | Equity signal, delivery | `single_instrument` CNC / cnc | EXISTS | EXISTS (fake broker only), one leg | **Needs intraday.** Only a run-now loop, not proven | Position % rules |
 | Intraday equity | `single_instrument` MIS / mis | EXISTS | EXISTS (fake broker only), one leg | Needs intraday (same gap) | % rules plus MIS square-off |
-| Futures (NFO, MCX) | `target_futures` / futures | EXISTS | EXISTS (fake broker only), one leg, `near`/`next`/`far` contract selector, roll state machine | `market_session` schedules cover the 09:00-23:30 MCX window; holidays unverified | % rules; freeze refused only if declared |
+| Futures (NFO, MCX) | `target_futures` / futures | EXISTS | EXISTS (fake broker only), one leg, `near`/`next`/`far` contract selector, roll state machine | `market_session` schedules cover the 09:00-23:30 MCX window (23:55 outside US DST); holidays honoured once imported, else `not_verified_holiday` | % rules; freeze refused only if declared |
 | Options | `option_structure` / options | EXISTS | EXISTS (fake broker only): hedge gate, LIMIT, roll, repair | Needs intraday (same gap) | % rules, staged exit; **index, premium and MTM rules dead**; no Greeks |
 | Order bundle | `intent_bundle` | EXISTS | MISSING | — | — |
 

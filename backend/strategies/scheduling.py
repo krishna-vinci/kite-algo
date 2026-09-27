@@ -391,7 +391,7 @@ class ScheduleScheduler:
         elif kind == "market_session":
             today = moment.date()
             opens_at_clock, closes_at_clock = market_session.session_window(
-                schedule.get("exchange")
+                schedule.get("exchange"), today
             )
             for offset in range(LOOKBACK_DAYS):
                 day = today - timedelta(days=offset)
@@ -1318,7 +1318,7 @@ def next_occurrence(schedule: Mapping[str, Any], *, now: datetime) -> Optional[O
     def occurrence_for(day: date) -> Optional[Occurrence]:
         if kind == "market_session":
             opens_at_clock, closes_at_clock = market_session.session_window(
-                schedule.get("exchange")
+                schedule.get("exchange"), day
             )
             opens_at = datetime.combine(
                 day, opens_at_clock, tzinfo=market_session.IST

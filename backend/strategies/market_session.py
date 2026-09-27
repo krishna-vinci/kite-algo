@@ -13,11 +13,12 @@ operator ``GET /strategies/calendar`` route uses. Nothing here infers a session
 from a weekday: a weekday the calendar does not cover is UNKNOWN, and UNKNOWN
 fails closed for live admission rather than reading as open.
 
-MCX is the one gated exchange without an imported calendar of its own. Its
-session is a real clock (09:00 to ``MCX_SESSION_CLOSE``, 23:30 IST by default)
-and its weekends are closed, but a weekday carries no holiday claim: the answer
-is marked ``not_verified_holiday`` so an unimported holiday reads as a stated
-note rather than as a silent "closed" or a silent "open".
+MCX trades on its own clock (09:00 IST to ``MCX_SESSION_CLOSE``, 23:30 during US
+daylight saving and 23:55 otherwise) and its own imported calendar
+(``MCX_CALENDAR_SOURCE``). Its holidays and special sessions are honoured once
+they are imported for that calendar; a weekday with no imported row carries no
+holiday claim and is marked ``not_verified_holiday``, so an unimported holiday
+reads as a stated note rather than as a silent "closed" or a silent "open".
 """
 
 from __future__ import annotations
@@ -25,7 +26,8 @@ from __future__ import annotations
 import logging
 import os
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Mapping, Optional
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +42,15 @@ SESSION_CLOSE = time(15, 30)
 #: MCX's session clock: an early commodity open and a late close, because the
 #: commodity segment trades one long session rather than the equity one.
 MCX_SESSION_OPEN = time(9, 0)
-DEFAULT_MCX_SESSION_CLOSE = time(23, 30)
+
+#: MCX's late session follows the US market: it ends at 23:30 IST while US
+#: daylight saving is in effect and at 23:55 IST otherwise. Non-agri contracts
+#: (bullion, energy, base metals); agri contracts close earlier and are not
+#: modelled here.
+MCX_SUMMER_CLOSE = time(23, 30)
+MCX_WINTER_CLOSE = time(23, 55)
+DEFAULT_MCX_SESSION_CLOSE = MCX_SUMMER_CLOSE  # kept for importers of the old name
+_US_EASTERN = ZoneInfo("America/New_York")
 
 #: The environment knob for the MCX close. A commodity close is a venue policy,
 #: not a platform constant, so it is configuration with a stated default.
@@ -51,8 +61,8 @@ MCX_SESSION_CLOSE_ENV = "MCX_SESSION_CLOSE"
 #: would gate trades on a guess.
 GATED_EXCHANGES = ("NSE", "BSE", "NFO", "BFO", "MCX")
 
-#: Gated exchanges whose days come from the imported NSE calendar. MCX is gated
-#: on its own clock instead: only its weekends are known closed.
+#: Gated exchanges whose days come from the imported NSE calendar. MCX reads its
+#: own imported calendar (``MCX_CALENDAR_SOURCE``) and its own clock instead.
 CALENDAR_BACKED_EXCHANGES = ("NSE", "BSE", "NFO", "BFO")
 
 #: The imported calendar that answers for every gated exchange: only NSE/CM is
@@ -60,9 +70,16 @@ CALENDAR_BACKED_EXCHANGES = ("NSE", "BSE", "NFO", "BFO")
 #: trading holidays.
 CALENDAR_SOURCE = ("NSE", "CM")
 
-#: The note carried by any MCX answer whose weekday is unverified: the MCX
-#: holiday calendar is not imported, so a weekday is "not a weekend", not a
-#: proven trading day.
+#: Where imported MCX sessions live (loaded with
+#: ``python -m backend.cli.import_exchange_calendar <csv> --exchange MCX --segment COM``).
+MCX_CALENDAR_SOURCE = ("MCX", "COM")
+
+#: One MCX day's imported row ({session_type, opens_at, closes_at}) or None.
+McxDayReader = Callable[[date], Optional[Mapping[str, Any]]]
+
+#: The note carried by any MCX answer whose weekday is unverified: no MCX row is
+#: imported for that day, so a weekday is "not a weekend", not a proven trading
+#: day.
 UNVERIFIED_HOLIDAY = "not_verified_holiday"
 
 #: How long a session-length hosted job may outlive the session before the
@@ -89,16 +106,18 @@ def is_calendar_backed_exchange(exchange: Any) -> bool:
     return str(exchange or "").strip().upper() in CALENDAR_BACKED_EXCHANGES
 
 
-def mcx_session_close() -> time:
-    """MCX's close (IST): ``MCX_SESSION_CLOSE`` when usable, else 23:30.
+def _mcx_season_close(day: date) -> time:
+    noon = datetime(day.year, day.month, day.day, 12, 0, tzinfo=_US_EASTERN)
+    return MCX_SUMMER_CLOSE if noon.dst() not in (None, timedelta(0)) else MCX_WINTER_CLOSE
 
-    A malformed value, or one that would not leave a session at all, falls back
-    to the default rather than opening a window the venue does not run - and says
-    so in the log instead of failing silently.
-    """
+
+def mcx_session_close(day: Optional[date] = None) -> time:
+    """MCX's close (IST) for ``day``: ``MCX_SESSION_CLOSE`` when usable, else by season."""
+    session_day = day or datetime.now(IST).date()
+    default = _mcx_season_close(session_day)
     raw = str(os.environ.get(MCX_SESSION_CLOSE_ENV) or "").strip()
     if not raw:
-        return DEFAULT_MCX_SESSION_CLOSE
+        return default
     try:
         hour, minute = raw.split(":", 1)
         parsed = time(int(hour), int(minute))
@@ -107,20 +126,20 @@ def mcx_session_close() -> time:
             "mcx_session_close_invalid",
             extra={"variable": MCX_SESSION_CLOSE_ENV, "value": raw},
         )
-        return DEFAULT_MCX_SESSION_CLOSE
+        return default
     if parsed <= MCX_SESSION_OPEN:
         logger.warning(
             "mcx_session_close_before_open",
             extra={"variable": MCX_SESSION_CLOSE_ENV, "value": raw},
         )
-        return DEFAULT_MCX_SESSION_CLOSE
+        return default
     return parsed
 
 
-def session_window(exchange: Any) -> tuple:
-    """The open/close clock (IST) this exchange trades on."""
+def session_window(exchange: Any, day: Optional[date] = None) -> tuple:
+    """The open/close clock (IST) this exchange trades on, for ``day``."""
     if str(exchange or "").strip().upper() == "MCX":
-        return (MCX_SESSION_OPEN, mcx_session_close())
+        return (MCX_SESSION_OPEN, mcx_session_close(day))
     return (SESSION_OPEN, SESSION_CLOSE)
 
 
@@ -138,15 +157,17 @@ def day_state(
     day: date,
     *,
     trading_day_reader: Optional[TradingDayReader] = None,
+    mcx_day_reader: Optional[McxDayReader] = None,
 ) -> str:
     """One day's state: ``trading`` / ``weekend`` / ``holiday`` / ...
 
     Returns ``weekend``, ``holiday``, ``trading``, ``calendar_unavailable`` (the
     calendar could not be read) or ``not_gated`` (this exchange has no imported
     clock, so no day-level claim is made). Weekends never consult the calendar: a
-    Saturday is closed whether or not the calendar is readable. An MCX weekday is
-    ``trading`` on its own clock and never reads the NSE calendar, so an NSE
-    holiday cannot silently close the commodity session.
+    Saturday is closed whether or not the calendar is readable. An MCX weekday
+    reads its own imported calendar and never the NSE one, so an NSE holiday
+    cannot silently close the commodity session; a day with no imported MCX row
+    is ``trading`` on its own clock.
     """
     key = str(exchange or "").strip().upper()
     if key not in GATED_EXCHANGES:
@@ -154,8 +175,9 @@ def day_state(
     if day.weekday() >= 5:
         return "weekend"
     if not is_calendar_backed_exchange(key):
-        # MCX: the weekday is real, its holidays are not imported, and that gap
-        # is named (``not_verified_holiday``) on the session answer.
+        row = _mcx_row(day, mcx_day_reader)
+        if row is not None and str(row.get("session_type") or "").upper() == "HOLIDAY":
+            return "holiday"
         return "trading"
     reader = trading_day_reader or _default_trading_day_reader
     try:
@@ -173,15 +195,17 @@ def session_state(
     now: Optional[datetime] = None,
     *,
     trading_day_reader: Optional[TradingDayReader] = None,
+    mcx_day_reader: Optional[McxDayReader] = None,
 ) -> Dict[str, Any]:
     """Whether ``exchange`` is open at ``now``, and why not when it is not.
 
     ``reason`` is one of ``open`` / ``before_open`` / ``after_close`` /
     ``weekend`` / ``holiday`` / ``calendar_unavailable`` / ``not_gated``.
     ``next_open`` is the next opening bell (IST, ISO) when it is cheap to work
-    out, and ``None`` when it is not. An exchange whose holidays are not imported
-    (MCX) carries ``holiday_status: not_verified_holiday``, so no caller reads an
-    unverified weekday as a verified trading day.
+    out, and ``None`` when it is not. An MCX day with an imported row carries
+    ``holiday_status: verified``; a day without one carries
+    ``holiday_status: not_verified_holiday``, so no caller reads an unverified
+    weekday as a verified trading day.
     """
     key = str(exchange or "").strip().upper()
     if key not in GATED_EXCHANGES:
@@ -192,7 +216,14 @@ def session_state(
     today = local.date()
     reader = trading_day_reader or _default_trading_day_reader
 
-    state = day_state(key, today, trading_day_reader=reader)
+    mcx_row = _mcx_row(today, mcx_day_reader) if key == "MCX" else None
+    verified = mcx_row is not None
+    state = day_state(
+        key,
+        today,
+        trading_day_reader=reader,
+        mcx_day_reader=(lambda _d: mcx_row) if key == "MCX" else None,
+    )
     if state in ("weekend", "holiday", "calendar_unavailable"):
         return _with_notes(
             key,
@@ -201,11 +232,22 @@ def session_state(
                 "open": False,
                 "reason": state,
                 "session_date": today.isoformat(),
-                "next_open": _next_open_iso(key, today, reader=reader, now_local=local),
+                "next_open": _next_open_iso(
+                    key,
+                    today,
+                    reader=reader,
+                    now_local=local,
+                    mcx_day_reader=mcx_day_reader,
+                ),
             },
+            verified=verified,
         )
 
-    opens_at, closes_at = session_window(key)
+    opens_at, closes_at = session_window(key, today)
+    if mcx_row is not None and str(mcx_row.get("session_type") or "").upper() == "SPECIAL":
+        if mcx_row.get("opens_at") and mcx_row.get("closes_at"):
+            opens_at = time.fromisoformat(str(mcx_row["opens_at"])[:5])
+            closes_at = time.fromisoformat(str(mcx_row["closes_at"])[:5])
     clock = local.time().replace(tzinfo=None)
     if clock < opens_at:
         return _with_notes(
@@ -215,8 +257,15 @@ def session_state(
                 "open": False,
                 "reason": "before_open",
                 "session_date": today.isoformat(),
-                "next_open": _next_open_iso(key, today, reader=reader, now_local=local),
+                "next_open": _next_open_iso(
+                    key,
+                    today,
+                    reader=reader,
+                    now_local=local,
+                    mcx_day_reader=mcx_day_reader,
+                ),
             },
+            verified=verified,
         )
     if clock >= closes_at:
         return _with_notes(
@@ -226,8 +275,15 @@ def session_state(
                 "open": False,
                 "reason": "after_close",
                 "session_date": today.isoformat(),
-                "next_open": _next_open_iso(key, today, reader=reader, now_local=local),
+                "next_open": _next_open_iso(
+                    key,
+                    today,
+                    reader=reader,
+                    now_local=local,
+                    mcx_day_reader=mcx_day_reader,
+                ),
             },
+            verified=verified,
         )
     return _with_notes(
         key,
@@ -238,13 +294,19 @@ def session_state(
             "session_date": today.isoformat(),
             "next_open": None,
         },
+        verified=verified,
     )
 
 
-def _with_notes(key: str, state: Dict[str, Any]) -> Dict[str, Any]:
+def _with_notes(key: str, state: Dict[str, Any], verified: bool = False) -> Dict[str, Any]:
     """Add the provenance note this exchange's clock can honestly make."""
     if is_calendar_backed_exchange(key):
         state["session_source"] = "calendar"
+        return state
+    if verified:
+        state["session_source"] = "calendar"
+        state["holiday_status"] = "verified"
+        state["detail"] = {"session_source": "calendar", "holiday_source": "imported"}
         return state
     state["session_source"] = "session_window"
     state["holiday_status"] = UNVERIFIED_HOLIDAY
@@ -262,12 +324,15 @@ def _next_open_iso(
     *,
     reader: TradingDayReader,
     now_local: datetime,
+    mcx_day_reader: Optional[McxDayReader] = None,
 ) -> Optional[str]:
     """The ISO instant of the next opening bell at or after ``start_day``."""
     day = start_day
     opens_at = session_window(exchange)[0]
     for _ in range(NEXT_OPEN_LOOKAHEAD_DAYS):
-        state = day_state(exchange, day, trading_day_reader=reader)
+        state = day_state(
+            exchange, day, trading_day_reader=reader, mcx_day_reader=mcx_day_reader
+        )
         if state == "calendar_unavailable":
             return None
         if state in ("trading", "not_gated"):
@@ -284,6 +349,34 @@ def _as_aware(value: Optional[datetime]) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value
+
+
+def _default_mcx_day_reader(day: date) -> Optional[Dict[str, Any]]:
+    """The imported MCX row for ``day``, or None when none is imported."""
+    exchange, segment = MCX_CALENDAR_SOURCE
+    from backend.app.database import get_db_connection
+    from backend.broker_api.market.exchange_calendar import get_calendar_sessions
+
+    conn = get_db_connection()
+    try:
+        payload = get_calendar_sessions(
+            conn, exchange=exchange, segment=segment, from_date=day, to_date=day
+        )
+    finally:
+        conn.close()
+    sessions = list(payload.get("sessions") or [])
+    return dict(sessions[0]) if len(sessions) == 1 else None
+
+
+def _mcx_row(day: date, reader: Optional[McxDayReader]) -> Optional[Mapping[str, Any]]:
+    """Read one MCX day; a failed read is 'not imported', never 'closed'."""
+    try:
+        return (reader or _default_mcx_day_reader)(day)
+    except Exception as exc:  # noqa: BLE001 - MCX degrades to the unverified clock
+        logger.warning(
+            "mcx_calendar_unavailable", extra={"day": day.isoformat(), "error": repr(exc)}
+        )
+        return None
 
 
 def _default_trading_day_reader(exchange: str, day: date) -> bool:
