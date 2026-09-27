@@ -326,12 +326,16 @@ def _load_instrument_map(
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT tradingsymbol, instrument_token, exchange, last_updated
-            FROM kite_instruments
-            WHERE instrument_type = 'EQ'
+            SELECT tradingsymbol, broker_token AS instrument_token, exchange,
+                   NULL AS last_updated
+            FROM public.instrument_catalog_published_v
+            WHERE broker = 'kite'
+              AND lifecycle_status = 'active'
+              AND broker_token IS NOT NULL
+              AND instrument_type = 'EQ'
               AND exchange = 'NSE'
               AND (tradingsymbol = ANY(%s) OR tradingsymbol LIKE ANY(%s))
-            ORDER BY tradingsymbol, instrument_token
+            ORDER BY tradingsymbol, broker_token
             """,
             (symbols, [f"{symbol}-%" for symbol in symbols]),
         )

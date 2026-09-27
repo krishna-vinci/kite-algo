@@ -195,8 +195,10 @@ async def resolve_identifier(identifier: str, db: Session) -> int:
     exchange, symbol = identifier.split(":", 1)
     
     stmt = text("""
-        SELECT instrument_token FROM public.kite_instruments
-        WHERE exchange = :exchange AND tradingsymbol = :symbol
+        SELECT broker_token FROM public.instrument_catalog_published_v
+        WHERE broker = 'kite' AND lifecycle_status = 'active'
+          AND exchange = :exchange AND tradingsymbol = :symbol
+          AND broker_token IS NOT NULL
         LIMIT 1
     """)
     result = db.execute(stmt, {"exchange": exchange.upper(), "symbol": symbol.upper()}).scalar_one_or_none()

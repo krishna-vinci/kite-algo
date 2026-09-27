@@ -857,11 +857,11 @@ async def sql_fallback_fuzzy_search(query: str, limit: int = 50, parsed: Optiona
             exchange, underlying, option_type
         FROM (
           SELECT
-            instrument_token,
-            exchange_token,
+            broker_token AS instrument_token,
+            broker_exchange_token AS exchange_token,
             tradingsymbol,
             name,
-            last_price,
+            NULL::DOUBLE PRECISION AS last_price,
             expiry,
             strike,
             tick_size,
@@ -871,24 +871,10 @@ async def sql_fallback_fuzzy_search(query: str, limit: int = 50, parsed: Optiona
             exchange,
             underlying,
             option_type
-          FROM public.kite_instruments
-          UNION ALL
-          SELECT
-            instrument_token,
-            exchange_token,
-            tradingsymbol,
-            name,
-            last_price,
-            expiry,
-            strike,
-            tick_size,
-            lot_size,
-            instrument_type,
-            segment,
-            exchange,
-            NULL::VARCHAR(255) AS underlying,
-            NULL::VARCHAR(10) AS option_type
-          FROM public.kite_indices
+          FROM public.instrument_catalog_published_v
+          WHERE broker = 'kite'
+            AND lifecycle_status = 'active'
+            AND broker_token IS NOT NULL
         ) AS instruments_search_v
         WHERE {where_clause}
         ORDER BY
@@ -930,11 +916,11 @@ async def sql_fallback_plain(query: str, limit: int = 50) -> List[Dict[str, Any]
             exchange, underlying, option_type
         FROM (
           SELECT
-            instrument_token,
-            exchange_token,
+            broker_token AS instrument_token,
+            broker_exchange_token AS exchange_token,
             tradingsymbol,
             name,
-            last_price,
+            NULL::DOUBLE PRECISION AS last_price,
             expiry,
             strike,
             tick_size,
@@ -944,24 +930,10 @@ async def sql_fallback_plain(query: str, limit: int = 50) -> List[Dict[str, Any]
             exchange,
             underlying,
             option_type
-          FROM public.kite_instruments
-          UNION ALL
-          SELECT
-            instrument_token,
-            exchange_token,
-            tradingsymbol,
-            name,
-            last_price,
-            expiry,
-            strike,
-            tick_size,
-            lot_size,
-            instrument_type,
-            segment,
-            exchange,
-            NULL::VARCHAR(255) AS underlying,
-            NULL::VARCHAR(10) AS option_type
-          FROM public.kite_indices
+          FROM public.instrument_catalog_published_v
+          WHERE broker = 'kite'
+            AND lifecycle_status = 'active'
+            AND broker_token IS NOT NULL
         ) AS instruments_search_v
         WHERE tradingsymbol ILIKE :prefix OR name ILIKE :contains
         ORDER BY LENGTH(tradingsymbol) ASC
@@ -980,15 +952,18 @@ async def get_anchor_price_for_underlying(underlying_symbol: str) -> Optional[fl
         return None
 
     index_map = {
-        "NIFTY": "NIFTY 50",
-        "BANKNIFTY": "NIFTY BANK",
-        "FINNIFTY": "FINNIFTY",
-        "SENSEX": "SENSEX",
+        "NIFTY": ("NSE", "NIFTY 50"),
+        "BANKNIFTY": ("NSE", "NIFTY BANK"),
+        "FINNIFTY": ("NSE", "NIFTY FIN SERVICE"),
+        "MIDCPNIFTY": ("NSE", "NIFTY MID SELECT"),
+        "SENSEX": ("BSE", "SENSEX"),
+        "BANKEX": ("BSE", "BANKEX"),
     }
     
-    index_tradingsymbol = index_map.get(underlying_symbol.upper())
-    if not index_tradingsymbol:
+    index_mapping = index_map.get(underlying_symbol.upper())
+    if not index_mapping:
         return None
+    index_exchange, index_tradingsymbol = index_mapping
 
     db = None
     try:
@@ -1003,7 +978,7 @@ async def get_anchor_price_for_underlying(underlying_symbol: str) -> Optional[fl
         # Set a short timeout to avoid blocking the search request for too long
         kite.set_timeout(5)
 
-        instrument = f"INDICES:{index_tradingsymbol}"
+        instrument = f"{index_exchange}:{index_tradingsymbol}"
         ltp_data = kite.ltp([instrument])
         
         if ltp_data and instrument in ltp_data and "last_price" in ltp_data[instrument]:
@@ -1484,7 +1459,7 @@ async def get_historical_data_progress():
 @router.post("/update_indices_from_instruments")
 async def update_indices_from_instruments():
     """
-    Updates the kite_indices table with data from kite_instruments where the segment is 'INDICES'.
+    Updates the legacy kite_indices cache from the active published catalog.
     """
     try:
         # First, clear the existing indices to ensure the table is fresh
@@ -1498,12 +1473,16 @@ async def update_indices_from_instruments():
                 expiry, strike, tick_size, lot_size, instrument_type, segment, exchange, last_updated
             )
             SELECT
-                instrument_token, exchange_token, tradingsymbol, name, last_price,
-                expiry, strike, tick_size, lot_size, instrument_type, segment, exchange, last_updated
+                broker_token, broker_exchange_token, tradingsymbol, name,
+                NULL AS last_price, expiry, strike, tick_size, lot_size,
+                instrument_type, segment, exchange, NOW()
             FROM
-                kite_instruments
+                public.instrument_catalog_published_v
             WHERE
-                segment = 'INDICES'
+                broker = 'kite'
+                AND lifecycle_status = 'active'
+                AND broker_token IS NOT NULL
+                AND segment = 'INDICES'
         """
         await database.execute(insert_query)
 
@@ -1673,35 +1652,33 @@ from typing import Optional as _Opt, List as _List, Dict as _Dict, Any as _Any
 async def instruments_top_defaults():
     """
     Curated Top defaults for instrument picker.
-    Defaults: NIFTY 50, NIFTY BANK, SENSEX, FINNIFTY, NIFTY MIDCAP 100
+    Defaults cover the six supported NSE/BSE option-chain indices.
     Returns minimal fields required by the picker.
     """
-    names = ["NIFTY 50", "NIFTY BANK", "SENSEX", "FINNIFTY", "NIFTY MIDCAP 100"]
+    names = [
+        "NIFTY 50",
+        "NIFTY BANK",
+        "NIFTY FIN SERVICE",
+        "NIFTY MID SELECT",
+        "SENSEX",
+        "BANKEX",
+    ]
 
-    # Build safe placeholders for two IN clauses (indices table + instruments fallback)
-    ph_a = ", ".join([f":a{i}" for i in range(len(names))])
-    ph_b = ", ".join([f":b{i}" for i in range(len(names))])
+    ph = ", ".join([f":symbol{i}" for i in range(len(names))])
     params = {}
     for i, n in enumerate(names):
-        params[f"a{i}"] = n
-        params[f"b{i}"] = n
+        params[f"symbol{i}"] = n
 
     sql = f"""
-    WITH src AS (
-        SELECT instrument_token, tradingsymbol, name, COALESCE(exchange, 'INDICES') AS exchange,
-               instrument_type, segment
-        FROM kite_indices
-        WHERE tradingsymbol IN ({ph_a})
-        UNION
-        SELECT instrument_token, tradingsymbol, name, COALESCE(exchange, 'INDICES') AS exchange,
-               instrument_type, segment
-        FROM kite_instruments
-        WHERE segment = 'INDICES' AND tradingsymbol IN ({ph_b})
-    )
-    SELECT DISTINCT ON (tradingsymbol)
-           instrument_token, tradingsymbol, name, exchange, instrument_type, segment
-    FROM src
-    ORDER BY tradingsymbol;
+    SELECT broker_token AS instrument_token, tradingsymbol, name, exchange,
+           instrument_type, segment
+    FROM public.instrument_catalog_published_v
+    WHERE broker = 'kite'
+      AND lifecycle_status = 'active'
+      AND broker_token IS NOT NULL
+      AND segment = 'INDICES'
+      AND tradingsymbol IN ({ph})
+    ORDER BY tradingsymbol
     """
     rows = await database.fetch_all(sql, params)
     return {"data": [dict(r) for r in rows]}
@@ -1716,9 +1693,8 @@ class ResolveRequest(_BM):
 @router.post("/instruments/resolve")
 async def instruments_resolve(req: ResolveRequest):
     """
-    Resolve a list of {exchange, tradingsymbol} pairs (case-insensitive) to canonical rows.
-    - If exchange is 'INDICES' or missing, resolve from kite_indices first, then fallback to instruments (segment='INDICES')
-    - Otherwise resolve from kite_instruments filtered by exchange.
+    Resolve {exchange, tradingsymbol} pairs against the active published catalog.
+    If exchange is 'INDICES' or missing, restrict resolution to index rows.
     Response: { data: [ {found: bool, instrument?} ] }
     """
     out: _List[_Dict[str, _Any]] = []
@@ -1728,23 +1704,21 @@ async def instruments_resolve(req: ResolveRequest):
         row = None
 
         if ex in ("", "INDICES"):
-            # Try indices table
             row = await database.fetch_one(
-                "SELECT instrument_token, tradingsymbol, name, 'INDICES' AS exchange, instrument_type, segment "
-                "FROM kite_indices WHERE lower(tradingsymbol) = lower(:ts) LIMIT 1",
+                "SELECT broker_token AS instrument_token, tradingsymbol, name, exchange, instrument_type, segment "
+                "FROM public.instrument_catalog_published_v "
+                "WHERE broker = 'kite' AND lifecycle_status = 'active' "
+                "AND broker_token IS NOT NULL AND segment = 'INDICES' "
+                "AND lower(tradingsymbol) = lower(:ts) LIMIT 1",
                 {"ts": ts}
             )
-            if not row:
-                # Fallback to instruments where segment is INDICES
-                row = await database.fetch_one(
-                    "SELECT instrument_token, tradingsymbol, name, COALESCE(exchange, 'INDICES') AS exchange, instrument_type, segment "
-                    "FROM kite_instruments WHERE segment = 'INDICES' AND lower(tradingsymbol) = lower(:ts) LIMIT 1",
-                    {"ts": ts}
-                )
         else:
             row = await database.fetch_one(
-                "SELECT instrument_token, tradingsymbol, name, exchange, instrument_type, segment "
-                "FROM kite_instruments WHERE upper(exchange) = :ex AND lower(tradingsymbol) = lower(:ts) LIMIT 1",
+                "SELECT broker_token AS instrument_token, tradingsymbol, name, exchange, instrument_type, segment "
+                "FROM public.instrument_catalog_published_v "
+                "WHERE broker = 'kite' AND lifecycle_status = 'active' "
+                "AND broker_token IS NOT NULL AND upper(exchange) = :ex "
+                "AND lower(tradingsymbol) = lower(:ts) LIMIT 1",
                 {"ex": ex, "ts": ts}
             )
 

@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 from urllib.parse import urlencode
 
 import httpx
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.orm import Session
 
 from backend.app.database import SessionLocal
@@ -26,6 +26,15 @@ from backend.broker_api.instruments.catalog import (
 )
 
 logger = logging.getLogger("instruments")
+
+_UNDERLYING_CONFIG = {
+    "NIFTY": ("NFO", "NSE", "NIFTY 50"),
+    "BANKNIFTY": ("NFO", "NSE", "NIFTY BANK"),
+    "FINNIFTY": ("NFO", "NSE", "NIFTY FIN SERVICE"),
+    "MIDCPNIFTY": ("NFO", "NSE", "NIFTY MID SELECT"),
+    "SENSEX": ("BFO", "BSE", "SENSEX"),
+    "BANKEX": ("BFO", "BSE", "BANKEX"),
+}
 
 # ── Go HTTP client singletons ────────────────────────────────────────────────
 _GO_BASE_URL = "http://market-runtime:8780"
@@ -141,41 +150,68 @@ class InstrumentsRepository:
     # ── symbol normalisation ─────────────────────────────────────────────
 
     def normalize_underlying_symbol(self, input_symbol: str) -> tuple[str, str]:
-        symbol_map = {
-            "NIFTY": ("NIFTY", "NIFTY 50"),
-            "BANKNIFTY": ("BANKNIFTY", "NIFTY BANK"),
-        }
-        return symbol_map.get(input_symbol.upper(), (input_symbol, input_symbol))
+        underlying = str(input_symbol or "").strip().upper()
+        config = _UNDERLYING_CONFIG.get(underlying)
+        return (underlying, config[2]) if config else (underlying, underlying)
+
+    def _options_exchange(self, underlying: str) -> str:
+        normalized = str(underlying or "").strip().upper()
+        config = _UNDERLYING_CONFIG.get(normalized)
+        return config[0] if config else "NFO"
 
     def get_spot_token(self, underlying_symbol: str) -> Optional[int]:
-        _, spot_tradingsymbol = self.normalize_underlying_symbol(underlying_symbol)
-        if "NIFTY" in spot_tradingsymbol:
-            query = text(
-                "SELECT instrument_token FROM kite_instruments WHERE segment='INDICES' AND tradingsymbol=:ts LIMIT 1"
-            )
-        else:
-            query = text(
-                "SELECT instrument_token FROM kite_instruments WHERE exchange='NSE' AND instrument_type='EQ' AND tradingsymbol=:ts LIMIT 1"
-            )
+        underlying, spot_tradingsymbol = self.normalize_underlying_symbol(
+            underlying_symbol
+        )
+        config = _UNDERLYING_CONFIG.get(underlying)
+        spot_exchange = config[1] if config else "NSE"
+        query = text(
+            """
+            SELECT broker_token
+            FROM public.instrument_catalog_published_v
+            WHERE broker = 'kite' AND lifecycle_status = 'active'
+              AND exchange = :exchange AND segment = 'INDICES'
+              AND tradingsymbol = :tradingsymbol AND broker_token IS NOT NULL
+            ORDER BY broker_token
+            LIMIT 1
+            """
+        )
         with self._session_scope() as db:
-            result = db.execute(query, {"ts": spot_tradingsymbol}).scalar_one_or_none()
+            result = db.execute(
+                query,
+                {
+                    "exchange": spot_exchange,
+                    "tradingsymbol": spot_tradingsymbol,
+                },
+            ).scalar_one_or_none()
             return result
 
     # ── expiry helpers ───────────────────────────────────────────────────
 
     def get_expiries(self, underlying: str, today: date) -> List[date]:
+        normalized_underlying = str(underlying or "").strip().upper()
         query = text(
             """
-            SELECT DISTINCT expiry FROM kite_instruments
-            WHERE exchange='NFO' AND underlying=:underlying AND instrument_type IN ('CE','PE')
-            AND expiry >= :today ORDER BY expiry ASC
+            SELECT DISTINCT expiry FROM public.instrument_catalog_published_v
+            WHERE broker = 'kite' AND lifecycle_status = 'active'
+              AND exchange = :exchange AND underlying = :underlying
+              AND instrument_type IN ('CE','PE') AND broker_token IS NOT NULL
+              AND expiry >= :today ORDER BY expiry ASC
             """
         )
         with self._session_scope() as db:
             result = db.execute(
-                query, {"underlying": underlying, "today": today}
+                query,
+                {
+                    "exchange": self._options_exchange(normalized_underlying),
+                    "underlying": normalized_underlying,
+                    "today": today,
+                },
             ).fetchall()
-            return [row[0] for row in result]
+            return [
+                date.fromisoformat(row[0][:10]) if isinstance(row[0], str) else row[0]
+                for row in result
+            ]
 
     def classify_weekly_monthly(
         self, expiries: List[date]
@@ -207,21 +243,10 @@ class InstrumentsRepository:
     def get_expiries_grouped(
         self, underlying: str, today: date
     ) -> Dict[date, List[date]]:
-        query = text(
-            """
-            SELECT date_trunc('month', expiry)::date AS ym,
-                   array_agg(DISTINCT expiry ORDER BY expiry) AS expiries
-            FROM kite_instruments
-            WHERE exchange='NFO' AND instrument_type IN ('CE','PE')
-            AND underlying=:underlying AND expiry >= :today
-            GROUP BY 1 ORDER BY 1 ASC
-            """
-        )
-        with self._session_scope() as db:
-            result = db.execute(
-                query, {"underlying": underlying, "today": today}
-            ).mappings()
-            return {row["ym"]: row["expiries"] for row in result}
+        grouped: Dict[date, List[date]] = {}
+        for expiry in self.get_expiries(underlying, today):
+            grouped.setdefault(date(expiry.year, expiry.month, 1), []).append(expiry)
+        return grouped
 
     def pick_monthly_per_month(
         self, grouped: Dict[date, List[date]]
@@ -243,47 +268,64 @@ class InstrumentsRepository:
         monthlies = sorted(list(all_monthly_expiries))
         normalized_underlying = (underlying or "").strip().upper()
         if normalized_underlying == "NIFTY":
-            target_weeklies = weeklies[:3]
-            target_monthlies = monthlies[:2]
+            target_weeklies, target_monthlies = weeklies[:3], monthlies[:2]
+        elif normalized_underlying == "SENSEX":
+            target_weeklies, target_monthlies = weeklies[:4], monthlies[:3]
         else:
-            target_weeklies = weeklies[:4]
-            target_monthlies = monthlies[:3]
+            target_weeklies, target_monthlies = [], monthlies[:3]
         target_expiries = sorted(list(set(target_weeklies + target_monthlies)))
         return target_expiries
 
     # ── strike helpers ───────────────────────────────────────────────────
 
     def get_distinct_strikes(self, underlying: str, expiry: date) -> List[float]:
+        normalized_underlying = str(underlying or "").strip().upper()
         query = text(
             """
-            SELECT DISTINCT strike FROM kite_instruments
-            WHERE exchange='NFO' AND underlying=:underlying AND expiry=:expiry
-            AND instrument_type IN ('CE','PE') ORDER BY strike ASC
+            SELECT DISTINCT strike FROM public.instrument_catalog_published_v
+            WHERE broker = 'kite' AND lifecycle_status = 'active'
+              AND exchange = :exchange AND underlying = :underlying
+              AND expiry = :expiry AND broker_token IS NOT NULL
+              AND instrument_type IN ('CE','PE') ORDER BY strike ASC
             """
         )
         with self._session_scope() as db:
             result = db.execute(
-                query, {"underlying": underlying, "expiry": expiry}
+                query,
+                {
+                    "exchange": self._options_exchange(normalized_underlying),
+                    "underlying": normalized_underlying,
+                    "expiry": expiry,
+                },
             ).fetchall()
-            return [row[0] for row in result]
+            return [float(row[0]) for row in result]
 
     def get_option_instruments_for_strikes(
         self, underlying: str, expiry: date, strikes: List[float]
     ) -> List[Dict]:
         if not strikes:
             return []
+        normalized_underlying = str(underlying or "").strip().upper()
         query = text(
             """
-            SELECT instrument_token, tradingsymbol, strike, option_type, lot_size
-            FROM kite_instruments
-            WHERE exchange='NFO' AND underlying=:underlying AND expiry=:expiry
-            AND strike IN :strikes AND instrument_type IN ('CE', 'PE')
+            SELECT broker_token AS instrument_token, tradingsymbol, strike,
+                   option_type, lot_size
+            FROM public.instrument_catalog_published_v
+            WHERE broker = 'kite' AND lifecycle_status = 'active'
+              AND exchange = :exchange AND underlying = :underlying
+              AND expiry = :expiry AND broker_token IS NOT NULL
+              AND strike IN :strikes AND instrument_type IN ('CE', 'PE')
             """
-        )
+        ).bindparams(bindparam("strikes", expanding=True))
         with self._session_scope() as db:
             result = db.execute(
                 query,
-                {"underlying": underlying, "expiry": expiry, "strikes": tuple(strikes)},
+                {
+                    "exchange": self._options_exchange(normalized_underlying),
+                    "underlying": normalized_underlying,
+                    "expiry": expiry,
+                    "strikes": strikes,
+                },
             ).mappings().all()
             return [dict(row) for row in result]
 
@@ -414,7 +456,12 @@ class InstrumentsRepository:
             return None
 
         try:
-            return self.catalog.resolve_broker_token(token).to_dict()
+            descriptor = self.catalog.resolve_broker_token(token)
+            return (
+                descriptor.to_dict()
+                if descriptor.lifecycle_status == "active"
+                else None
+            )
         except CatalogUnavailableError:
             pass
         except InstrumentNotFoundError:
@@ -434,7 +481,12 @@ class InstrumentsRepository:
             return None
 
         try:
-            return self.catalog.resolve_public_key(f"{ex}:{sym}").to_dict()
+            descriptor = self.catalog.resolve_public_key(f"{ex}:{sym}")
+            return (
+                descriptor.to_dict()
+                if descriptor.lifecycle_status == "active"
+                else None
+            )
         except CatalogUnavailableError:
             pass
         except InstrumentNotFoundError:
@@ -466,22 +518,19 @@ class InstrumentsRepository:
         return self.get_instrument_by_exchange_symbol(exchange, tradingsymbol)
 
     def get_lot_size(self, instrument_token: int) -> Optional[int]:
-        # Lot size is a compatibility helper used by order/options code.  Keep
-        # its single scalar query fast; the full catalog remains authoritative
-        # for identity and activation decisions.
-        legacy_lot_size = self._get_lot_size_sql(instrument_token)
-        if legacy_lot_size is not None:
-            return int(legacy_lot_size)
-        try:
-            descriptor = self.catalog.resolve_broker_token(int(instrument_token))
-            if descriptor.lot_size is not None:
-                return int(descriptor.lot_size)
-        except (CatalogUnavailableError, InstrumentNotFoundError):
-            pass
-        instrument = self.get_instrument_by_token(instrument_token)
-        if instrument is not None and instrument.get("lot_size") is not None:
-            return int(instrument["lot_size"])
-        return None
+        query = text(
+            """
+            SELECT lot_size FROM public.instrument_catalog_published_v
+            WHERE broker = 'kite' AND lifecycle_status = 'active'
+              AND broker_token = :broker_token
+            LIMIT 1
+            """
+        )
+        with self._session_scope() as db:
+            lot_size = db.execute(
+                query, {"broker_token": int(instrument_token)}
+            ).scalar_one_or_none()
+        return int(lot_size) if lot_size is not None else None
 
     def search_market_instruments(self, query: str, *, exchange: Optional[str] = None, limit: int = 20) -> List[Dict[str, object]]:
         """Search the published catalog, with a legacy-table fallback."""
@@ -491,12 +540,17 @@ class InstrumentsRepository:
         normalized_exchange = str(exchange or "").strip().upper() or None
         safe_limit = max(1, min(int(limit or 20), 50))
         try:
-            catalog_rows = [row.to_dict() for row in self.catalog.search(
+            catalog_descriptors = self.catalog.search(
                 normalized_text,
                 exchange=normalized_exchange,
                 limit=safe_limit,
-            )]
-            if catalog_rows or not self._catalog_uninitialized():
+            )
+            catalog_rows = [
+                row.to_dict()
+                for row in catalog_descriptors
+                if row.lifecycle_status == "active"
+            ]
+            if catalog_descriptors or not self._catalog_uninitialized():
                 return catalog_rows
         except CatalogUnavailableError:
             pass
@@ -571,14 +625,3 @@ class InstrumentsRepository:
                 },
             ).mappings().first()
             return dict(row) if row else None
-
-    def _get_lot_size_sql(self, instrument_token: int) -> Optional[int]:
-        query = text(
-            """
-            SELECT lot_size FROM kite_instruments
-            WHERE instrument_token = :token LIMIT 1
-            """
-        )
-        with self._session_scope() as db:
-            result = db.execute(query, {"token": instrument_token}).scalar_one_or_none()
-            return result
