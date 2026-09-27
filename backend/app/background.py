@@ -22,6 +22,7 @@ def _worker_protection_squareoff_schedule() -> dict[str, str]:
         "NSE:MIS": "15:20",
         "BSE:MIS": "15:20",
         "NFO:MIS": "15:25",
+        "BFO:MIS": "15:25",
         "CDS:MIS": "16:45",
         "MCX:MIS": "23:20",
     }

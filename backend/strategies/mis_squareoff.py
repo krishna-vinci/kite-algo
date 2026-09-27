@@ -48,6 +48,7 @@ DEFAULT_SQUAREOFF_SCHEDULE = {
     "NSE:MIS": "15:20",
     "BSE:MIS": "15:20",
     "NFO:MIS": "15:25",
+    "BFO:MIS": "15:25",
     "CDS:MIS": "16:45",
     "MCX:MIS": "23:20",
 }

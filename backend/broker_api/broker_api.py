@@ -1050,8 +1050,9 @@ async def schedule_daily_instruments_update():
             now_utc = datetime.utcnow().replace(tzinfo=pytz.utc)
             now_ist = now_utc.astimezone(IST)
 
-            # Calculate next run time for 07:00 AM IST
-            next_run_ist = now_ist.replace(hour=7, minute=0, second=0, microsecond=0)
+            # 08:20 IST: after the 08:00 headless login, so the broker refresh
+            # runs on today's token (yesterday's expires around 06:00).
+            next_run_ist = now_ist.replace(hour=8, minute=20, second=0, microsecond=0)
             if now_ist >= next_run_ist:
                 next_run_ist += timedelta(days=1)
 

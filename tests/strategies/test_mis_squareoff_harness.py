@@ -117,6 +117,8 @@ class ScheduleTests(SquareoffHarnessTestCase):
         # Two copies of a schedule is two chances to disagree about when the
         # platform squares off, and the wrong one is the one nobody checked.
         self.assertEqual(squareoff_schedule(), dict(_worker_protection_squareoff_schedule()))
+        # SENSEX/BANKEX F&O MIS squares off with the other derivatives segment.
+        self.assertEqual(squareoff_schedule()["BFO:MIS"], "15:25")
 
 
 class IsolationTests(SquareoffHarnessTestCase):
