@@ -46,9 +46,25 @@ def _bounded(title: str, message: str) -> tuple[str, str]:
 
 
 async def _send(message: str, title: str = "", tags: Sequence[str] | None = None) -> None:
-    from backend.broker_api.broker_api import send_ntfy_notification
+    """POST one alert to ntfy; raises on any failure so the caller can report it.
 
-    await send_ntfy_notification(message, title=title, tags=list(tags or []))
+    Self-contained (httpx + the config reader) rather than importing
+    ``broker_api``: that module has an import cycle when loaded cold, and an
+    alert path must not depend on import order.
+    """
+    import httpx
+
+    from backend.app.config import get_scheduler_ntfy_url
+
+    url = get_scheduler_ntfy_url()
+    if not url:
+        raise RuntimeError("SCHEDULER_NTFY_URL is unset")
+    headers = {"Title": title or "kite-algo"}
+    if tags:
+        headers["Tags"] = ",".join(str(tag) for tag in tags)
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.post(url, content=message.encode("utf-8"), headers=headers)
+        response.raise_for_status()
 
 
 async def _deliver(*, title: str, message: str, tags: Sequence[str]) -> None:
