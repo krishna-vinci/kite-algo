@@ -162,3 +162,31 @@ class ShapeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExitExchangeTests(unittest.TestCase):
+    """A protective exit must never be sent to the wrong derivatives segment."""
+
+    def test_symbol_exchange_mapping(self):
+        from backend.broker_api.instruments.instruments_repository import options_exchange_for_symbol
+
+        self.assertEqual(options_exchange_for_symbol("SENSEX26O0181000PE"), "BFO")
+        self.assertEqual(options_exchange_for_symbol("BANKEX26OCT60000CE"), "BFO")
+        self.assertEqual(options_exchange_for_symbol("BANKNIFTY26OCT55000CE"), "NFO")
+        self.assertEqual(options_exchange_for_symbol("NIFTY26O0623000PE"), "NFO")
+        self.assertEqual(options_exchange_for_symbol("RELIANCE26OCT3000CE"), "NFO")
+
+    def test_a_sensex_leg_without_an_exchange_exits_on_bfo(self):
+        from backend.options.protection.exit_builder import build_grouped_exit_orders
+
+        orders, _skipped = build_grouped_exit_orders(
+            [{"tradingsymbol": "SENSEX26O0181000PE", "net_quantity": -20, "product": "NRML"}]
+        )
+        self.assertEqual(orders[0]["exchange"], "BFO")
+        self.assertEqual(orders[0]["product"], "NRML")
+
+    def test_a_sensex_structure_leg_without_an_exchange_exits_on_bfo(self):
+        leg = short("SENSEX26O0181000PE", 20, underlying="SENSEX")
+        leg.pop("exchange")
+        orders, _detail = build_structure_exit_orders([leg])
+        self.assertEqual(orders[0]["exchange"], "BFO")

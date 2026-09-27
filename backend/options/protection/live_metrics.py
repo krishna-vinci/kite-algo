@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from backend.broker_api.instruments.instruments_repository import options_exchange_for_symbol
+
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
@@ -202,7 +204,7 @@ async def _position_token(
     symbol = str(position.get("symbol") or f"leg_{index + 1}")
     if token_resolver is None:
         return None
-    resolved = await token_resolver(str(position.get("exchange") or "NFO"), symbol)
+    resolved = await token_resolver(str(position.get("exchange") or options_exchange_for_symbol(symbol)), symbol)
     if resolved is not None:
         return int(resolved)
     raise ValueError(f"option leg has no instrument token: {symbol}")

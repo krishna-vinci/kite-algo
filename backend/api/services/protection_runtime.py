@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from backend.broker_api.instruments.instruments_repository import options_exchange_for_symbol
+
 import hashlib
 import json
 import asyncio
@@ -831,7 +833,7 @@ class WorkerProtectionRuntime:
                         token = int(position.get("instrument_token"))
                     except (TypeError, ValueError):
                         token = await self._option_token_resolver()(
-                            str(position.get("exchange") or "NFO"),
+                            str(position.get("exchange") or options_exchange_for_symbol(position.get("symbol"))),
                             str(position.get("symbol") or ""),
                         )
                     if token is not None:
@@ -1493,7 +1495,7 @@ async def submit_worker_protection_structure_exit(
             attribution["client_order_ref"] = client_order_ref
             payload_orders.append(
                 {
-                    "exchange": str(leg.get("exchange") or "NFO"),
+                    "exchange": str(leg.get("exchange") or options_exchange_for_symbol(leg.get("tradingsymbol"))),
                     "tradingsymbol": str(leg.get("tradingsymbol") or ""),
                     "transaction_type": str(leg.get("transaction_type") or ""),
                     "quantity": int(leg.get("quantity") or 0),

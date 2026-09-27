@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from backend.broker_api.instruments.instruments_repository import options_exchange_for_symbol
+
 from copy import deepcopy
 from typing import Any
 
@@ -169,7 +171,11 @@ def _build_run_exit_orders(run: OptionRunState) -> list[dict[str, Any]]:
             trade = next((item for item in run.trades if str(item.get("leg_id") or "") == leg_id), {})
             positions.append(
                 {
-                    "exchange": leg.get("exchange") or trade.get("exchange") or "NFO",
+                    "exchange": leg.get("exchange")
+                    or trade.get("exchange")
+                    or options_exchange_for_symbol(
+                        leg.get("tradingsymbol") or trade.get("tradingsymbol")
+                    ),
                     "tradingsymbol": leg.get("tradingsymbol") or trade.get("tradingsymbol"),
                     "net_quantity": net_quantity,
                     "product": run.product,

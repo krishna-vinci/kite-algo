@@ -46,6 +46,8 @@ available after the child's authority is gone. It never re-grants that authority
 
 from __future__ import annotations
 
+from backend.broker_api.instruments.instruments_repository import options_exchange_for_symbol
+
 import hashlib
 import json
 import uuid
@@ -1122,7 +1124,7 @@ class StagedStructureExit:
                     "run_leg_id": leg_id,
                     "side": "SELL" if liability < 0 else "BUY",
                     "quantity": int(liability),
-                    "exchange": str(leg.get("exchange") or "NFO"),
+                    "exchange": str(leg.get("exchange") or options_exchange_for_symbol(symbol)),
                     "product": str(run.product or leg.get("product") or ""),
                     "underlying": str(metadata.get("underlying") or ""),
                     "expiry": str(leg.get("expiry_key") or metadata.get("expiry") or ""),
@@ -1205,7 +1207,7 @@ class StagedStructureExit:
                     # The expectations a later ingestion read is checked against:
                     # a fill that disagrees with these is NOT this run's evidence.
                     "instrument_token": run_leg.get("instrument_token"),
-                    "exchange": str(order.get("exchange") or "NFO"),
+                    "exchange": str(order.get("exchange") or options_exchange_for_symbol(symbol)),
                     "product": str(order.get("product") or ""),
                     "variety": str(order.get("variety") or "regular"),
                     "order_type": str(order.get("order_type") or "MARKET"),

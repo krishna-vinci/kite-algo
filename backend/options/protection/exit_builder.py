@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from backend.broker_api.instruments.instruments_repository import options_exchange_for_symbol
+
 from typing import Any, Dict, Iterable, List
 
 
@@ -23,7 +25,7 @@ def build_grouped_exit_orders(
         transaction_type = "SELL" if _position_quantity(payload) > 0 else "BUY"
         order_type = str(payload.get("exit_order_type") or payload.get("order_type") or exit_order_type).upper()
         order = {
-            "exchange": payload.get("exchange", "NFO"),
+            "exchange": payload.get("exchange") or options_exchange_for_symbol(payload.get("tradingsymbol")),
             "tradingsymbol": tradingsymbol,
             "transaction_type": transaction_type,
             "variety": payload.get("exit_variety") or payload.get("variety") or order_variety,
@@ -165,7 +167,7 @@ def _close_order(
         payload.get("exit_order_type") or payload.get("order_type") or exit_order_type
     ).upper()
     order: Dict[str, Any] = {
-        "exchange": payload.get("exchange", "NFO"),
+        "exchange": payload.get("exchange") or options_exchange_for_symbol(payload.get("tradingsymbol")),
         "tradingsymbol": payload.get("tradingsymbol"),
         "transaction_type": "SELL" if position > 0 else "BUY",
         "variety": payload.get("exit_variety") or payload.get("variety") or order_variety,

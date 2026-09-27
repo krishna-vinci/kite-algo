@@ -42,6 +42,19 @@ def options_exchange_for(underlying: str) -> str:
     config = _UNDERLYING_CONFIG.get(str(underlying or "").strip().upper())
     return config[0] if config else "NFO"
 
+
+def options_exchange_for_symbol(tradingsymbol: str) -> str:
+    """The derivatives exchange an F&O tradingsymbol lists on.
+
+    SENSEX/BANKEX contracts are BFO; every other index and stock derivative is
+    NFO. Longest name first, so ``BANKEX...`` never matches a shorter prefix.
+    """
+    symbol = str(tradingsymbol or "").strip().upper()
+    for name in sorted(_UNDERLYING_CONFIG, key=len, reverse=True):
+        if symbol.startswith(name):
+            return _UNDERLYING_CONFIG[name][0]
+    return "NFO"
+
 # ── Go HTTP client singletons ────────────────────────────────────────────────
 _GO_BASE_URL = "http://market-runtime:8780"
 _sync_client: Optional[httpx.Client] = None
