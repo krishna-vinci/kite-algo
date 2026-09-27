@@ -324,3 +324,72 @@ def test_session_context_is_none_for_a_scheduled_occurrence(tmp_path, monkeypatc
 
     assert ctx.occurrence is not None
     assert ctx.session is None
+
+
+def test_child_context_exposes_the_hosted_surface(tmp_path):
+    calls = []
+
+    class FakeRun:
+        def submit_proposal(self, payload):
+            calls.append(("propose", dict(payload)))
+            return {"plan": {"plan_id": "p1"}}
+
+        def submit_and_request_execution(self, payload, *, idempotency_key):
+            calls.append(("propose_and_execute", dict(payload), idempotency_key))
+            return {"proposal": {}, "execution_request": {}}
+
+        def execution_requests(self, *, limit=50):
+            calls.append(("execution_requests", limit))
+            return {"items": []}
+
+        def log_decision_event(self, **payload):
+            calls.append(("log_decision", payload))
+            return {"ok": True}
+
+    class FakeOptions:
+        def get_chain(self, underlying, *, expiry=None):
+            calls.append(("option_chain", underlying, expiry))
+            return {"rows": []}
+
+    class FakeClient:
+        options = FakeOptions()
+
+        def get_quotes(self, instruments, mode="quote"):
+            calls.append(("quotes", list(instruments), mode))
+            return {}
+
+        def get_candles(self, instrument, interval="5minute", lookback=50):
+            calls.append(("candles", instrument, interval, lookback))
+            return {}
+
+    ctx = ChildContext(
+        params={}, client=FakeClient(), run=FakeRun(), scratch=tmp_path,
+        template_id="hosted:hs_1", execution_mode="paper", run_id="run-1",
+    )
+    ctx.propose({"target_kind": "single_instrument"})
+    ctx.propose_and_execute({"target_kind": "single_instrument"}, idempotency_key="k1")
+    ctx.execution_requests(limit=5)
+    ctx.quotes(["NSE:RELIANCE"])
+    ctx.candles("NSE:RELIANCE", interval="15minute", lookback=20)
+    ctx.option_chain("NIFTY", expiry="2026-10-06")
+    ctx.log_decision(summary="entered")
+    assert [call[0] for call in calls] == [
+        "propose", "propose_and_execute", "execution_requests",
+        "quotes", "candles", "option_chain", "log_decision",
+    ]
+    assert calls[1][2] == "k1"
+    assert calls[4] == ("candles", "NSE:RELIANCE", "15minute", 20)
+    assert calls[5] == ("option_chain", "NIFTY", "2026-10-06")
+
+
+def test_raw_mutations_are_labelled_external_only():
+    from kite_algo_worker.client import KiteAlgoWorkerClient
+    from kite_algo_worker.managed_run import ManagedRun
+
+    label = "External worker runs only"
+    for name in ("place_order", "place_basket", "cancel_order", "modify_order", "create_bracket",
+                 "cancel_bracket", "place_gtt", "modify_gtt", "delete_gtt", "patch_risk",
+                 "update_backend_protection", "exit_run"):
+        assert label in (getattr(KiteAlgoWorkerClient, name).__doc__ or ""), name
+    for name in ("place_order", "place_basket", "patch_risk", "update_backend_protection", "exit_run"):
+        assert label in (getattr(ManagedRun, name).__doc__ or ""), name

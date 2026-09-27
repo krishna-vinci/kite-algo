@@ -4,6 +4,59 @@ Kite Algo is a self-hosted algorithmic trading platform for Zerodha/Kite workflo
 
 **The contract:** strategy code owns decisions. Kite Algo owns execution, attribution, grouped accounting, protection state, and journal-visible truth.
 
+## Hosted strategies (start here)
+
+A hosted (deployable) strategy is one Python file with `def main(ctx)`. It
+DECIDES; the platform admits, approves and executes. Everything a strategy
+needs is on `ctx`:
+
+| Need | Call |
+| --- | --- |
+| Parameters | `ctx.params` |
+| Market data | `ctx.quotes([...])`, `ctx.candles(instrument, interval, lookback)`, `ctx.option_chain("NIFTY")` |
+| Decide | `ctx.propose(payload)` → frozen plan (places nothing) |
+| Execute (governed) | `ctx.request_execution(plan_id, idempotency_key=...)` or `ctx.propose_and_execute(payload, idempotency_key=...)` |
+| Your own book | `ctx.owned_work()`, `ctx.execution_requests()` |
+| Explain | `ctx.log_decision(summary=...)`, `ctx.progress("...")` |
+| Session jobs | `ctx.session` (`market_open()`, `next_evaluation_id()`) |
+
+```python
+def main(ctx):
+    params = dict(ctx.params or {})
+    symbol = str(params.get("tradingsymbol") or "RELIANCE")
+    exchange = str(params.get("exchange") or "NSE")
+    quantity = int(params.get("quantity") or 1)
+    account_scope = str(ctx.run.run.get("account_scope") or ctx.run.config.account_scope)
+    ctx.quotes([f"{exchange}:{symbol}"])
+    payload = {
+        "evaluation_kind": "run_now",
+        "strategy_run_id": ctx.run_id,
+        "strategy_id": str(params["strategy_id"]),
+        "account_scope": account_scope,
+        "target_kind": "single_instrument",
+        "evaluation_id": f"{ctx.run_id}:entry",
+        "payload": {
+            "instrument_token": int(params.get("instrument_token") or 738561),
+            "exchange": exchange,
+            "tradingsymbol": symbol,
+            "product": str(params.get("product") or "CNC"),
+            "reference_price": float(params.get("reference_price") or 1.0),
+            "target_quantity": quantity,
+        },
+    }
+    ctx.propose_and_execute(payload, idempotency_key=f"{ctx.run_id}:entry")
+    return 0
+```
+
+`place_order`, `place_basket`, brackets, GTT, `patch_risk` and `exit_run` on the
+raw client are for **external worker runs only**; a hosted child calling them is
+refused with `HOSTED_RAW_MUTATION_FORBIDDEN`.
+
+## External workers
+
+A process you run yourself (`create_run` / `attach_run`, then the order
+helpers below). Everything after this point documents the full client.
+
 ## Package status and install
 
 ```bash
@@ -44,7 +97,7 @@ A hosted strategy's proposal is inert until execution is requested, and the
 strategy's **authorization mode** decides what happens next:
 
 ```python
-plan = ctx.client.submit_proposal(payload)["plan"]         # frozen, places nothing
+plan = ctx.propose(payload)["plan"]                        # frozen, places nothing
 request = ctx.request_execution(plan["plan_id"],           # durable + idempotent
                                 idempotency_key="eval-42-attempt-1")
 if request["status"] == "awaiting_approval":

@@ -19,7 +19,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Mapping, Optional, Union
 
 __all__ = ["ChildContext", "build_context", "load_strategy_main", "run_child"]
 
@@ -121,6 +121,44 @@ class ChildContext:
     def owned_work(self) -> Dict[str, Any]:
         """The strategy's own positions plus its pending execution work."""
         return self.run.owned_work()
+
+    # -- the hosted surface ------------------------------------------------
+    #
+    # A hosted strategy DECIDES; the platform executes. Everything below is
+    # read-only data or a governed proposal. Raw order placement is not part
+    # of this surface (the server refuses it for hosted children).
+
+    def propose(self, payload: Mapping[str, Any]) -> Dict[str, Any]:
+        """Submit a proposal for this run; returns the frozen plan (places nothing)."""
+        return self.run.submit_proposal(payload)
+
+    def propose_and_execute(
+        self, payload: Mapping[str, Any], *, idempotency_key: str
+    ) -> Dict[str, Any]:
+        """Propose, then request execution of the resulting plan (governed)."""
+        return self.run.submit_and_request_execution(payload, idempotency_key=idempotency_key)
+
+    def execution_requests(self, *, limit: int = 50) -> Dict[str, Any]:
+        """This run's execution requests, newest first."""
+        return self.run.execution_requests(limit=limit)
+
+    def quotes(self, instruments: Iterable[Union[str, int]], mode: str = "quote") -> Dict[str, Any]:
+        """Live quotes for ``EXCHANGE:SYMBOL`` strings or instrument tokens."""
+        return self.client.get_quotes(instruments, mode=mode)
+
+    def candles(
+        self, instrument: Union[str, int], interval: str = "5minute", lookback: int = 50
+    ) -> Dict[str, Any]:
+        """Recent candles for one instrument."""
+        return self.client.get_candles(instrument, interval=interval, lookback=lookback)
+
+    def option_chain(self, underlying: str, *, expiry: Optional[str] = None) -> Dict[str, Any]:
+        """The live option chain (Greeks included) for an index underlying."""
+        return self.client.options.get_chain(underlying, expiry=expiry)
+
+    def log_decision(self, **payload: Any) -> Dict[str, Any]:
+        """Record why the strategy did what it did (lands in the journal)."""
+        return self.run.log_decision_event(**payload)
 
 
 def _require(name: str) -> str:

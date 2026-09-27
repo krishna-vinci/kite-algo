@@ -122,6 +122,7 @@ class ManagedRun:
         metadata: Mapping[str, Any] | None = None,
         safety_token: str | None = None,
     ) -> JsonDict:
+        """External worker runs only; hosted strategies use ``ctx.propose(...)``."""
         return self.client.place_order(
             self.run_id,
             order,
@@ -141,6 +142,7 @@ class ManagedRun:
         dry_run: bool = False,
         safety_token: str | None = None,
     ) -> JsonDict:
+        """External worker runs only; hosted strategies use ``ctx.propose(...)``."""
         return self.client.place_basket(
             self.run_id,
             orders,
@@ -153,6 +155,7 @@ class ManagedRun:
         )
 
     def patch_risk(self, patch: Mapping[str, Any], *, reason: str | None = None) -> JsonDict:
+        """External worker runs only; hosted strategies use ``ctx.propose(...)``."""
         return self.client.patch_risk(self.run_id, patch, reason=reason, session_nonce=self.session_nonce)
 
     def update_backend_protection(
@@ -162,6 +165,7 @@ class ManagedRun:
         reason: str | None = None,
         reset_trailing: bool = True,
     ) -> JsonDict:
+        """External worker runs only; hosted strategies use ``ctx.propose(...)``."""
         return self.client.update_backend_protection(
             self.run_id,
             protection,
@@ -186,6 +190,7 @@ class ManagedRun:
         idempotency_key: str | None = None,
         dry_run: bool = False,
     ) -> JsonDict:
+        """External worker runs only; hosted strategies use ``ctx.propose(...)``."""
         return self.client.exit_run(
             self.run_id,
             reason=reason,

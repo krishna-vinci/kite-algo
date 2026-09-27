@@ -462,6 +462,7 @@ class KiteAlgoWorkerClient:
         variety: str = "regular",
         session_nonce: Optional[str] = None,
     ) -> JsonDict:
+        """External worker runs only; hosted strategies use ``ctx.propose(...)``."""
         return self._request(
             "POST",
             f"/worker/orders/{order_id}/cancel",
@@ -478,6 +479,7 @@ class KiteAlgoWorkerClient:
         variety: str = "regular",
         session_nonce: Optional[str] = None,
     ) -> JsonDict:
+        """External worker runs only; hosted strategies use ``ctx.propose(...)``."""
         return self._request(
             "POST",
             f"/worker/orders/{order_id}/modify",
@@ -557,6 +559,7 @@ class KiteAlgoWorkerClient:
         metadata: Optional[Mapping[str, Any]] = None,
         session_nonce: str,
     ) -> JsonDict:
+        """External worker runs only; hosted strategies use ``ctx.propose(...)``."""
         return self._request(
             "POST",
             f"/worker/runs/{strategy_run_id}/brackets",
@@ -593,6 +596,7 @@ class KiteAlgoWorkerClient:
         return WorkerBracketIntent.model_validate(self.get_bracket(strategy_run_id, bracket_intent_id))
 
     def cancel_bracket(self, strategy_run_id: str, bracket_intent_id: str, *, session_nonce: str) -> JsonDict:
+        """External worker runs only; hosted strategies use ``ctx.propose(...)``."""
         return self._request(
             "POST",
             f"/worker/runs/{strategy_run_id}/brackets/{bracket_intent_id}/cancel",
@@ -663,6 +667,7 @@ class KiteAlgoWorkerClient:
         return RunProtectionState.model_validate(state).model_dump()
 
     def place_gtt(self, payload: Mapping[str, Any]) -> JsonDict:
+        """External worker runs only; hosted strategies use ``ctx.propose(...)``."""
         return self._request("POST", "/worker/gtt/triggers", json=dict(payload))
 
     def place_gtt_snapshot(self, payload: Mapping[str, Any]) -> WorkerGttWriteResult:
@@ -684,12 +689,14 @@ class KiteAlgoWorkerClient:
         return WorkerGttTrigger.model_validate(self.get_gtt(trigger_id))
 
     def modify_gtt(self, trigger_id: int, payload: Mapping[str, Any]) -> JsonDict:
+        """External worker runs only; hosted strategies use ``ctx.propose(...)``."""
         return self._request("PUT", f"/worker/gtt/triggers/{int(trigger_id)}", json=dict(payload))
 
     def modify_gtt_snapshot(self, trigger_id: int, payload: Mapping[str, Any]) -> WorkerGttWriteResult:
         return WorkerGttWriteResult.model_validate(self.modify_gtt(trigger_id, payload))
 
     def delete_gtt(self, trigger_id: int) -> JsonDict:
+        """External worker runs only; hosted strategies use ``ctx.propose(...)``."""
         return self._request("DELETE", f"/worker/gtt/triggers/{int(trigger_id)}")
 
     def delete_gtt_snapshot(self, trigger_id: int) -> WorkerGttWriteResult:
@@ -1062,6 +1069,7 @@ class KiteAlgoWorkerClient:
         safety_token: Optional[str] = None,
         session_nonce: Optional[str] = None,
     ) -> JsonDict:
+        """External worker runs only; hosted strategies use ``ctx.propose(...)``."""
         payload = build_intent_payload(
             intent_type="place_order",
             body_key="order",
@@ -1089,6 +1097,7 @@ class KiteAlgoWorkerClient:
         safety_token: Optional[str] = None,
         session_nonce: Optional[str] = None,
     ) -> JsonDict:
+        """External worker runs only; hosted strategies use ``ctx.propose(...)``."""
         order_list: List[JsonDict] = [dict(order) for order in orders]
         payload = build_intent_payload(
             intent_type="place_basket",
@@ -1112,6 +1121,7 @@ class KiteAlgoWorkerClient:
         reason: Optional[str] = None,
         session_nonce: Optional[str] = None,
     ) -> JsonDict:
+        """External worker runs only; hosted strategies use ``ctx.propose(...)``."""
         return self._request(
             "PATCH",
             f"/worker/runs/{strategy_run_id}/risk",
@@ -1128,6 +1138,7 @@ class KiteAlgoWorkerClient:
         reset_trailing: bool = True,
         session_nonce: Optional[str] = None,
     ) -> JsonDict:
+        """External worker runs only; hosted strategies use ``ctx.propose(...)``."""
         return self._request(
             "PATCH",
             f"/worker/runs/{strategy_run_id}/protection",
@@ -1147,6 +1158,7 @@ class KiteAlgoWorkerClient:
         dry_run: bool = False,
         session_nonce: Optional[str] = None,
     ) -> JsonDict:
+        """External worker runs only; hosted strategies use ``ctx.propose(...)``."""
         return self._request(
             "POST",
             f"/worker/runs/{strategy_run_id}/exit",
