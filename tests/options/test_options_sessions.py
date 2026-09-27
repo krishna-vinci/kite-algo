@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 import types
 from typing import Any, Dict, cast
@@ -20,7 +21,7 @@ if "numba" not in sys.modules:
     sys.modules["numba"] = numba_stub
 
 from backend.broker_api.options.options_greeks import black76_price
-from backend.broker_api.options.options_sessions import OptionsSession
+from backend.broker_api.options.options_sessions import OptionsSession, OptionsSessionManager
 
 
 class _FakeMarketData:
@@ -115,3 +116,51 @@ def test_per_strike_iv_falls_back_to_expiry_sigma_when_solve_fails():
     # Unaffected strikes still solve per-strike.
     put_wing_idx = strikes.index(19900.0)
     assert iv_source[put_wing_idx] == "per_strike"
+
+
+class _SessionRepo:
+    def normalize_underlying_symbol(self, value: str):
+        return value.strip().upper(), value.strip().upper()
+
+
+def _counting_manager(monkeypatch, *, starts: list, fail: bool = False):
+    manager = OptionsSessionManager(cast(Any, object()), cast(Any, _SessionRepo()))
+
+    async def _fake_start(underlying, window_size=12, cadence_sec=5):
+        starts.append((underlying, window_size, cadence_sec))
+        if fail:
+            raise RuntimeError("no spot token")
+        manager.sessions[underlying] = cast(Any, object())
+
+    async def _noop_converge():
+        return None
+
+    monkeypatch.setattr(manager, "start_session", _fake_start)
+    monkeypatch.setattr(manager, "_converge_subscriptions", _noop_converge)
+    return manager
+
+
+def test_ensure_session_starts_once_and_is_bounded(monkeypatch):
+    monkeypatch.setenv("OPTIONS_AUTOSTART_UNDERLYINGS", "NIFTY,BANKNIFTY")
+    starts: list = []
+    manager = _counting_manager(monkeypatch, starts=starts)
+
+    assert asyncio.run(manager.ensure_session("NIFTY")) is True
+    # Idempotent: an existing session is not started a second time.
+    assert asyncio.run(manager.ensure_session("nifty")) is True
+    assert starts == [("NIFTY", 12, 5)]
+
+    # Bounded: an underlying outside the configured set starts nothing.
+    assert asyncio.run(manager.ensure_session("FINNIFTY")) is False
+    assert starts == [("NIFTY", 12, 5)]
+
+
+def test_ensure_session_contains_a_failed_start(monkeypatch):
+    monkeypatch.setenv("OPTIONS_AUTOSTART_UNDERLYINGS", "NIFTY")
+    starts: list = []
+    manager = _counting_manager(monkeypatch, starts=starts, fail=True)
+
+    assert asyncio.run(manager.ensure_session("NIFTY")) is False
+    assert starts == [("NIFTY", 12, 5)]
+    # A half-started session is not left behind, so a later attempt can retry.
+    assert "NIFTY" not in manager.sessions

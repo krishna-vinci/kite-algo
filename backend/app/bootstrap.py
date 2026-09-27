@@ -283,6 +283,44 @@ async def stop_live_outcome_consumer(app: FastAPI) -> None:
     app.state.live_outcome_task = None
 
 
+async def autostart_option_sessions(
+    app: FastAPI,
+    market_data_runtime: MarketDataRuntime,
+    *,
+    manager=None,
+) -> Dict[str, Any]:
+    """Create the options session manager and auto-start configured underlyings.
+
+    A live option plan freezes against the live chain, so a session must exist
+    without waiting for an operator ``POST /api/options/sessions``. Each
+    underlying is independent: one failure is logged and never blocks the others
+    or startup. Returns the started/failed names for status reporting.
+    """
+    from backend.broker_api.options.options_sessions import (
+        OptionsSessionManager,
+        autostart_underlyings,
+    )
+
+    if manager is None:
+        manager = OptionsSessionManager(
+            market_data_runtime, InstrumentsRepository(db=SessionLocal)
+        )
+    app.state.options_session_manager = manager
+
+    started: list[str] = []
+    failed: list[str] = []
+    for underlying in autostart_underlyings():
+        try:
+            ok = await manager.ensure_session(underlying)
+        except Exception as exc:  # noqa: BLE001 - one bad underlying must not stop the rest
+            ok = False
+            logging.warning(
+                "Options session autostart failed for %s: %s", underlying, exc, exc_info=True
+            )
+        (started if ok else failed).append(underlying)
+    return {"started": started, "failed": failed}
+
+
 async def combined_lifespan(app: FastAPI):
     global market_data_runtime
     # Perform headless login at startup and store the KiteConnect instance
@@ -416,6 +454,29 @@ async def combined_lifespan(app: FastAPI):
                 "effective_tokens": runtime_status.get("effective_tokens"),
             },
         )
+
+        # Option-chain sessions are created eagerly and the configured
+        # underlyings auto-started, so a live option plan has a chain to freeze
+        # against without waiting for an operator POST. This must never block
+        # startup: a missing instrument catalog or broker session is a warning.
+        try:
+            autostarted = await autostart_option_sessions(app, market_data_runtime)
+            set_component_status(
+                "options_sessions",
+                "healthy" if not autostarted["failed"] else "degraded",
+                detail=(
+                    "Autostarted option sessions: "
+                    + (", ".join(autostarted["started"]) or "(none)")
+                ),
+                meta=autostarted,
+            )
+        except Exception as exc:  # noqa: BLE001 - autostart must never break startup
+            logging.warning(
+                "Options session autostart unavailable; continuing startup: %s",
+                exc,
+                exc_info=True,
+            )
+            set_component_status("options_sessions", "degraded", detail=str(exc))
 
         async def _order_runtime_worker():
             poll_seconds = max(1.0, float(os.getenv("ORDER_RUNTIME_POLL_SECONDS", "1.0")))

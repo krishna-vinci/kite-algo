@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from datetime import date, datetime, timezone, timedelta
 from math import floor
 from typing import Any, Dict, List, Optional, Set
@@ -30,6 +31,25 @@ logger = logging.getLogger(__name__)
 
 # --- Vectorized Computation Flag ---
 OPTIONS_SESSIONS_USE_VECTORIZED = True
+
+
+# Underlyings whose option-chain sessions start automatically at boot and that an
+# admission/read path is allowed to start on demand. The CSV env var keeps the
+# set operator-controlled; names outside it are ignored rather than guessed.
+DEFAULT_AUTOSTART_UNDERLYINGS = ("NIFTY", "BANKNIFTY", "SENSEX")
+
+
+def autostart_underlyings() -> List[str]:
+    """The configured auto-start (and known) underlyings, normalized and de-duplicated."""
+    raw = os.environ.get("OPTIONS_AUTOSTART_UNDERLYINGS")
+    if raw is None:
+        raw = ",".join(DEFAULT_AUTOSTART_UNDERLYINGS)
+    ordered: List[str] = []
+    for part in raw.split(","):
+        symbol = part.strip().upper()
+        if symbol and symbol not in ordered:
+            ordered.append(symbol)
+    return ordered
 
 
 # Constants
@@ -811,6 +831,34 @@ class OptionsSessionManager:
         session = OptionsSession(underlying, self, window_size, cadence_sec)
         self.sessions[underlying] = session
         await session.start()
+
+    async def ensure_session(
+        self, underlying: str, window_size: int = 12, cadence_sec: int = 5
+    ) -> bool:
+        """Start ``underlying``'s session if it is missing; idempotent and bounded.
+
+        Only a *known* underlying (one named in ``OPTIONS_AUTOSTART_UNDERLYINGS``)
+        may be started this way, so a read or admission path cannot open an
+        arbitrary session. Returns ``True`` when a session exists afterwards. A
+        start failure is logged and reported as ``False`` rather than raised, so
+        one bad underlying never blocks a caller or boot.
+        """
+        normalized, _ = self.instrument_repo.normalize_underlying_symbol(underlying)
+        normalized = str(normalized or "").strip().upper()
+        if not normalized or normalized not in autostart_underlyings():
+            return False
+        if normalized in self.sessions:
+            return True
+        try:
+            await self.start_session(normalized, window_size, cadence_sec)
+            await self._converge_subscriptions()
+        except Exception as exc:  # noqa: BLE001 - a failed start is a False, not a crash
+            self.sessions.pop(normalized, None)
+            logger.warning(
+                "Unable to start option session for %s: %s", normalized, exc, exc_info=True
+            )
+            return False
+        return True
 
     async def stop_session(self, underlying: str):
         """

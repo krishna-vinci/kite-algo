@@ -41,6 +41,7 @@ the plan back for trading.
 
 from __future__ import annotations
 
+import logging
 import re
 from datetime import date
 from typing import Any, Dict
@@ -59,9 +60,12 @@ from backend.api.routers.worker_shared import (
     require_worker_token,
 )
 from backend.api.schemas.proposals import PlanResponse, ProposalSubmitRequest, ProposalSubmitResponse
+from backend.options.api.market_router import ensure_option_session
 from backend.options.market.service import OptionsMarketService
 from backend.strategies.proposals import ProposalConflict, ProposalStore, ProposalStoreError
 from backend.strategies.proposals import ProposalSubmission
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/algo-workers", tags=["Algo Workers"])
 
@@ -120,6 +124,28 @@ def _require_option_market_source(
                 "message": "No active option market session source is configured",
             },
         )
+
+
+async def _start_option_session_before_admission(
+    request: Request, *, payload: ProposalSubmitRequest, target_kind: str
+) -> None:
+    """ONE best-effort session start before a live/paper option admission refuses.
+
+    A relative or delta option structure is admitted only against a live chain;
+    when no session exists for the underlying, the freeze refuses
+    ``OPTION_CHAIN_SNAPSHOT_UNAVAILABLE``. Starting it here (once, idempotently,
+    bounded to known underlyings) turns that into a normal admission on the first
+    try. A start that does not happen leaves the existing refusal path intact.
+    """
+    if str(target_kind or "") != "option_structure":
+        return
+    underlying = str((payload.payload or {}).get("underlying") or "").strip()
+    if not underlying:
+        return
+    manager = getattr(request.app.state, "options_session_manager", None)
+    if manager is None:
+        return
+    await ensure_option_session(manager, underlying)
 
 
 def _authority_for(
@@ -321,6 +347,11 @@ async def submit_proposal(request: Request, payload: ProposalSubmitRequest) -> P
         request,
         target_kind=target_kind,
         account_scope=authority["account_id"],
+    )
+    # Before this live/paper option plan can be refused for a missing chain,
+    # attempt one session start for its underlying.
+    await _start_option_session_before_admission(
+        request, payload=payload, target_kind=target_kind
     )
     option_market = (
         target_kind == "option_structure"

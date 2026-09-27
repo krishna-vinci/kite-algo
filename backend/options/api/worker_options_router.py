@@ -26,7 +26,7 @@ from backend.options.api.execution_router import (
     preview_option_run_entry,
     preview_option_run_exit,
 )
-from backend.options.api.market_router import get_options_session_manager
+from backend.options.api.market_router import ensure_option_session, get_options_session_manager
 from backend.options.api.protection_router import (
     get_option_run_protection_state,
     replay_option_run_protection,
@@ -164,6 +164,10 @@ async def get_worker_option_session(
     manager=Depends(get_options_session_manager),
 ):
     await _hosted_read_guard(request, _token)
+    # The worker's session read is also the "ensure" call: if no session exists
+    # for this underlying, start it once (idempotent, bounded to known
+    # underlyings) so the returned state is a live chain, not a 404.
+    await ensure_option_session(manager, underlying)
     return OptionsMarketService(manager).get_session(underlying)
 
 

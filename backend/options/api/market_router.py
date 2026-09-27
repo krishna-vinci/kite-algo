@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
@@ -13,6 +14,8 @@ from backend.app.database import SessionLocal
 from backend.options.market.service import OptionsMarketService
 
 router = APIRouter(prefix="/api/options", tags=["Options"])
+
+logger = logging.getLogger(__name__)
 
 
 class OptionsSessionItemPayload(BaseModel):
@@ -37,6 +40,24 @@ def get_options_session_manager(request: Request):
             instrument_repo,
         )
     return request.app.state.options_session_manager
+
+
+async def ensure_option_session(manager, underlying: str) -> bool:
+    """ONE best-effort, idempotent session start for a read or admission path.
+
+    The manager only starts underlyings it recognizes and is a no-op when the
+    session already exists, so a miss costs at most one start. A failed start
+    returns ``False`` (logging a warning) instead of raising, so the caller's own
+    refusal/response path is never masked by the start attempt.
+    """
+    ensure = getattr(manager, "ensure_session", None)
+    if ensure is None:
+        return False
+    try:
+        return bool(await ensure(underlying))
+    except Exception:  # noqa: BLE001 - a failed start must not mask the refusal
+        logger.warning("Option session ensure failed for %s", underlying, exc_info=True)
+        return False
 
 
 def _raw_session_snapshot(manager: OptionsSessionManager, underlying: str) -> dict:

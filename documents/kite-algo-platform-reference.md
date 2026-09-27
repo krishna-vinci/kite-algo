@@ -121,8 +121,10 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
 - **Option chain and Greeks: EXISTS, started lazily.**
   - An `OptionsSession` per underlying recomputes every **5 s** (`backend/broker_api/options/options_sessions.py:45-55`)
     over a strike window of ±12 (`backend/options/api/market_router.py:19-20`). Expiries refresh every 60 s.
-  - Sessions start only via `POST /api/options/sessions` (`market_router.py:50`). There is no auto-start at boot. A
-    missing session returns `OPTION_SESSION_NOT_FOUND`.
+  - Sessions start from the configured auto-start set (`OPTIONS_AUTOSTART_UNDERLYINGS`, default
+    `NIFTY,BANKNIFTY,SENSEX`) at boot, on the worker's `GET .../session` (the SDK `ensure_session`), and once before a
+    live/paper option admission; `POST /api/options/sessions` still starts them explicitly. A missing session returns
+    `OPTION_SESSION_NOT_FOUND`.
   - **Model:** Black-76 on a synthetic forward `F = S + C_atm − P_atm`. There is **one IV per expiry**, inverted
     from the ATM call, and it is applied to every strike, so there is no smile or skew (`options_sessions.py:324-395,604-640`).
     Kernels are in `options_greeks.py:50-300`. Theta is per day; vega is per 1%.
