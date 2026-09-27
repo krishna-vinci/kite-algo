@@ -2086,6 +2086,10 @@ async def approve_execution_request(
         )
     except ExecutionRequestError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.as_detail()) from exc
+    if bool(result.get("approved")) and result["request"].get("executable"):
+        notify = getattr(request.app.state, "notify_execution_work_ready", None)
+        if callable(notify):
+            notify()
     return ExecutionRequestDecisionResponse(
         request=ExecutionRequestRow(**result["request"]),
         approved=bool(result.get("approved")),

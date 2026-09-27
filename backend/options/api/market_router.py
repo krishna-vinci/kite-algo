@@ -30,16 +30,19 @@ class OptionsSessionsStartPayload(BaseModel):
 
 
 def get_options_session_manager(request: Request):
-    if not hasattr(request.app.state, "options_session_manager"):
-        market_data_runtime = getattr(request.app.state, "market_data_runtime", None)
+    # Request is the HTTP dependency; bootstrap passes the app itself so the
+    # live dispatcher can lazily resolve the same process-wide option source.
+    app = getattr(request, "app", request)
+    if not hasattr(app.state, "options_session_manager"):
+        market_data_runtime = getattr(app.state, "market_data_runtime", None)
         if market_data_runtime is None:
             raise HTTPException(status_code=503, detail="Market runtime not available")
         instrument_repo = InstrumentsRepository(db=SessionLocal)
-        request.app.state.options_session_manager = OptionsSessionManager(
+        app.state.options_session_manager = OptionsSessionManager(
             market_data_runtime,
             instrument_repo,
         )
-    return request.app.state.options_session_manager
+    return app.state.options_session_manager
 
 
 async def ensure_option_session(manager, underlying: str) -> bool:

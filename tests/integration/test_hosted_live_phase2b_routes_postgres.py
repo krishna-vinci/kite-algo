@@ -310,6 +310,7 @@ def _build_app(factory, broker, clock):
     from backend.api.routers import auth as auth_module
     from backend.api.routers import hosted_lifecycle, strategies, worker_auth, worker_execution
     from backend.api.routers import worker_proposals
+    from backend.options.market.service import OptionsMarketService
     from backend.strategies.attribution import SqlAttributionStore
     from backend.strategies.execution import PaperPlanExecutor
     from backend.strategies.live_service import LivePlanExecutor
@@ -338,6 +339,12 @@ def _build_app(factory, broker, clock):
         session_factory=factory,
         intent_handler=broker,
         clock=clock,
+        option_chain_reader=lambda plan: OptionsMarketService(
+            app.state.options_session_manager
+        ).get_chain(
+            str((plan.get("resolved_plan") or {}).get("underlying") or ""),
+            str((plan.get("resolved_plan") or {}).get("expiry") or ""),
+        ),
         quote_reader=lambda leg: {
             "instrument_id": str(leg.get("instrument_id") or ""),
             "ltp": 1500.0,

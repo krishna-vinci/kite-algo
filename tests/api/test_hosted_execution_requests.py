@@ -2782,6 +2782,8 @@ async def test_owner_decision_routes_and_cross_owner_invisibility(world):
     app, patches = _operator_client(world)
     try:
         async with _client(app) as client:
+            wake_calls = []
+            app.state.notify_execution_work_ready = lambda: wake_calls.append(True)
             listed = await client.get(f"/api/strategies/{strategy_id}/execution-requests")
             assert listed.status_code == 200, listed.text
             assert [row["request_id"] for row in listed.json()["requests"]] == [request_id]
@@ -2793,6 +2795,7 @@ async def test_owner_decision_routes_and_cross_owner_invisibility(world):
             assert approved.status_code == 200, approved.text
             assert approved.json()["approved"] is True
             assert approved.json()["request"]["status"] == "queued"
+            assert wake_calls == [True]
 
             # The same request cannot be approved twice.
             again = await client.post(

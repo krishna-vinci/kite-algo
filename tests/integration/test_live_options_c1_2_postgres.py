@@ -482,6 +482,31 @@ def _margin_boundary(monkeypatch):
     return evidence
 
 
+class _DelayedOptionsManager(_FakeOptionsManager):
+    """Replace the current chain after freeze while retaining harness timing."""
+
+    def __init__(self, clock, *, prices=None, age_seconds=0):
+        super().__init__(clock)
+        self.prices = dict(prices or {})
+        self.age_seconds = float(age_seconds)
+
+    def get_snapshot(self, underlying):
+        payload = super().get_snapshot(underlying)
+        now = self.clock() - timedelta(seconds=self.age_seconds)
+        payload["updated_at"] = now
+        for expiry_payload in payload["per_expiry"].values():
+            for row in expiry_payload["rows"]:
+                for key in ("ce", "pe"):
+                    packet = row.get(key)
+                    if isinstance(packet, dict):
+                        row[key] = {
+                            **packet,
+                            "ltp": self.prices.get(packet["token"], packet["ltp"]),
+                            "updated_at": now,
+                        }
+        return payload
+
+
 @pytest.mark.asyncio
 async def test_fresh_evidence_dispatches_and_a_stale_release_records_a_blocker(pg, live_env, _margin_boundary):
     """A fresh chain admits the first leg; age at the short release blocks it."""
@@ -548,6 +573,9 @@ async def test_fresh_evidence_dispatches_and_a_stale_release_records_a_blocker(p
             sequence_releaser=executor.release_sequence,
         )
         clock.now = clock.now + timedelta(seconds=6)
+        app.state.options_session_manager = _DelayedOptionsManager(
+            clock, age_seconds=6
+        )
         counts = await consumer.poll_once()
         claims = _claims(pg["factory"], plan["plan_id"])
         assert counts["sequence_blocked"] == 1, (counts, claims)
@@ -558,11 +586,86 @@ async def test_fresh_evidence_dispatches_and_a_stale_release_records_a_blocker(p
         assert len(broker_calls) == 1, "stale evidence released the short"
 
         clock.now = clock.now - timedelta(seconds=6)
+        app.state.options_session_manager = _DelayedOptionsManager(clock)
         counts = await consumer.poll_once()
         claims = _claims(pg["factory"], plan["plan_id"])
         assert counts["sequence_released"] == 1, (counts, claims)
         assert claims[0]["state"] == "pending", claims
         assert len(broker_calls) == 2
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("prices", "age_seconds", "expected_status", "expected_reason"),
+    [
+        (None, 0, "accepted", None),
+        ({OPT_HEDGE_TOKEN: 50.0}, 0, "refused", "OPTION_PRICE_DRIFT_EXCEEDED"),
+        (None, 600, "refused", "OPTION_CHAIN_SNAPSHOT_STALE"),
+    ],
+)
+async def test_delayed_approval_uses_fresh_current_chain_price_safety(
+    pg, live_env, monkeypatch, prices, age_seconds, expected_status, expected_reason
+):
+    """An approval 10 minutes later re-reads the chain; freeze is only reference."""
+    _fresh_options_manager(monkeypatch)
+    _seed_catalog(pg["factory"])
+    clock = _clock()
+    broker_calls = []
+
+    class _Broker:
+        async def handle(self, intent, *, context=None):
+            broker_calls.append(intent)
+            return {"result": {"order_id": f"O-{len(broker_calls)}"}}
+
+    app, _executor = _build_app(pg["factory"], _Broker(), clock)
+    client = await _operator_client(app)
+    try:
+        from backend.api.routers import strategies as strategies_module
+
+        def _fresh_margin(_scope, _plan):
+            return {
+                "usable": 5_000_000.0,
+                "required_margin_inr": 1_000_000.0,
+                "as_of": clock().isoformat(),
+            }
+
+        monkeypatch.setattr(strategies_module, "_live_margin_evidence", _fresh_margin)
+        attempt = await _prepare_live_attempt(
+            client,
+            account_scope=live_env["account_scope"],
+            lease_until=clock() + timedelta(hours=12),
+        )
+        _declare_version_risk_policy(
+            pg["factory"],
+            attempt["strategy_id"],
+            {"allowed_structure_families": ["vertical_spread"]},
+        )
+        proposed = await _submit_proposal(
+            client,
+            attempt,
+            _option_payload(phase="entry"),
+            account_scope=live_env["account_scope"],
+        )
+        assert proposed.status_code < 400, proposed.text
+        plan = proposed.json()["plan"]
+        assert plan is not None, proposed.text
+
+        clock.now += timedelta(minutes=10)
+        app.state.options_session_manager = _DelayedOptionsManager(
+            clock, prices=prices, age_seconds=age_seconds
+        )
+        executed, _reservation = await _execute(
+            client, attempt["strategy_id"], plan["plan_id"]
+        )
+        if expected_status == "accepted":
+            assert executed.status_code < 400, executed.text
+            assert len(broker_calls) == 1, executed.text
+        else:
+            assert executed.status_code == 409, executed.text
+            assert executed.json()["detail"]["rejection_reason"] == expected_reason
+            assert broker_calls == []
     finally:
         await client.aclose()
 

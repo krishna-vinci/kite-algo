@@ -168,9 +168,21 @@ def ensure_governed_execution_state(app: FastAPI) -> None:
     factory = getattr(app.state, "strategies_session_factory", None) or SessionLocal
 
     def _live_executor() -> Any:
+        def _option_chain_reader(plan: dict) -> dict:
+            from backend.options.api.market_router import get_options_session_manager
+            from backend.options.market.service import OptionsMarketService
+
+            resolved = plan.get("resolved_plan") or {}
+            manager = get_options_session_manager(app)
+            return OptionsMarketService(manager).get_chain(
+                str(resolved.get("underlying") or ""),
+                str(resolved.get("expiry") or ""),
+            )
+
         return LivePlanExecutor(
             session_factory=factory,
             authorization=ExecutionRequestService(factory),
+            option_chain_reader=_option_chain_reader,
         )
 
     def _paper_executor() -> Any:
@@ -216,6 +228,7 @@ async def start_hosted_execution_dispatcher(app: FastAPI) -> Optional[asyncio.Ta
             service=ExecutionRequestService(factory, pipeline=pipeline),
         )
         app.state.hosted_execution_dispatcher = dispatcher
+        app.state.notify_execution_work_ready = dispatcher.notify_work_ready
 
         def _dispatcher_health(snapshot: dict) -> None:
             set_component_status(

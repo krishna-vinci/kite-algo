@@ -843,7 +843,7 @@ class _FakeOptionMarket:
     def _payload(self):
         return [
             {"strike": 100.0, "ce": self.packets["opt-a"], "pe": None},
-            {"strike": 110.0, "ce": None, "pe": self.packets["opt-b"]},
+            {"strike": 110.0, "ce": None, "pe": self.packets.get("opt-b")},
         ]
 
     def get_chain(self, _underlying, _expiry):
@@ -857,7 +857,7 @@ class _FakeOptionMarket:
 
 
 class LiveOptionChainFreshnessTests(unittest.TestCase):
-    """Freeze binds the plan; the release pass rechecks the immutable evidence."""
+    """Freeze binds what to trade; send re-reads fresh current prices."""
 
     NOW = datetime(2026, 9, 25, 10, 0, tzinfo=timezone.utc)
 
@@ -876,15 +876,21 @@ class LiveOptionChainFreshnessTests(unittest.TestCase):
                 "underlying": "NIFTY", "expiry": "2026-10-29",
                 "option_run": {"phase": "exit"},
                 "legs": [
-                    {"instrument_id": "opt-a", "broker_token": "opt-a"},
-                    {"instrument_id": "opt-b", "broker_token": "opt-b"},
+                    {
+                        "instrument_id": "opt-a", "broker_token": "opt-a",
+                        "side": "SELL",
+                    },
+                    {
+                        "instrument_id": "opt-b", "broker_token": "opt-b",
+                        "side": "BUY",
+                    },
                 ],
             },
         }
         from backend.options.market.freshness import option_chain_freeze_evidence
 
         plan["resolved_plan"]["option_chain_evidence"] = option_chain_freeze_evidence(
-            market, plan, now=self.NOW
+            market, plan, now=self.NOW - timedelta(seconds=age_seconds)
         )
         return plan, market
 
@@ -905,10 +911,47 @@ class LiveOptionChainFreshnessTests(unittest.TestCase):
             self._plan(drop=True)
         self.assertEqual(ctx.exception.reason_code, "OPTION_CHAIN_SNAPSHOT_UNAVAILABLE")
 
-    def test_stale_snapshot_and_stale_greeks_are_separate_refusals(self):
+    def _adapter(self, *, market):
+        from backend.strategies.live_adapter import LivePlanAdapter
+        return LivePlanAdapter(
+            session_factory=lambda: None,
+            admission=_Admission(),
+            approvals=_Durable(),
+            ledger=_Durable(),
+            barrier=_Durable(),
+            submissions=_Durable(),
+            clock=lambda: self.NOW,
+            option_chain_reader=lambda _plan: market.get_chain("NIFTY", "2026-10-29"),
+        )
+
+    def test_stale_freeze_with_fresh_current_chain_is_accepted(self):
+        stale_plan, _frozen = self._plan(age_seconds=600)
+        current = _FakeOptionMarket(now=self.NOW)
+        result = self._adapter(market=current)._check_admission(
+            stale_plan, margin_evidence=None, catalog_state=None
+        )
+        self.assertTrue(result["admitted"])
+
+    def test_stale_or_missing_current_chain_fails_closed(self):
         from backend.strategies.live_adapter import LivePlanAdapter, LiveRefusal
 
-        adapter = LivePlanAdapter(
+        stale_plan, _frozen = self._plan(age_seconds=600)
+        stale_current = _FakeOptionMarket(now=self.NOW - timedelta(seconds=6))
+        adapter = self._adapter(market=stale_current)
+        with self.assertRaises(LiveRefusal) as stale:
+            adapter._check_admission(stale_plan, margin_evidence=None, catalog_state=None)
+        self.assertEqual(stale.exception.reason_code, "OPTION_CHAIN_SNAPSHOT_STALE")
+
+        missing_plan, _frozen = self._plan(age_seconds=600)
+        missing_current = _FakeOptionMarket(now=self.NOW)
+        missing_current.packets.pop("opt-b")
+        with self.assertRaises(LiveRefusal) as missing:
+            self._adapter(market=missing_current)._check_admission(
+                missing_plan, margin_evidence=None, catalog_state=None
+            )
+        self.assertEqual(missing.exception.reason_code, "OPTION_CHAIN_SNAPSHOT_UNAVAILABLE")
+
+        no_reader_adapter = LivePlanAdapter(
             session_factory=lambda: None,
             admission=_Admission(),
             approvals=_Durable(),
@@ -917,21 +960,34 @@ class LiveOptionChainFreshnessTests(unittest.TestCase):
             submissions=_Durable(),
             clock=lambda: self.NOW,
         )
-        stale_plan, _ = self._plan(age_seconds=6)
-        with self.assertRaises(LiveRefusal) as stale:
-            adapter._check_admission(stale_plan, margin_evidence=None, catalog_state=None)
-        self.assertEqual(stale.exception.reason_code, "OPTION_CHAIN_SNAPSHOT_STALE")
+        with self.assertRaises(LiveRefusal) as unavailable:
+            no_reader_adapter._check_admission(
+                stale_plan, margin_evidence=None, catalog_state=None
+            )
+        self.assertEqual(
+            unavailable.exception.reason_code,
+            "OPTION_CHAIN_SNAPSHOT_UNAVAILABLE",
+        )
 
-        stale_greeks, _ = self._plan(greek_age_seconds=6)
-        with self.assertRaises(LiveRefusal) as greeks:
-            adapter._check_admission(stale_greeks, margin_evidence=None, catalog_state=None)
-        self.assertEqual(greeks.exception.reason_code, "OPTION_GREEKS_STALE")
+    def test_small_drift_is_allowed_and_large_adverse_drift_is_refused(self):
+        from backend.strategies.live_adapter import LivePlanAdapter, LiveRefusal
 
-        fresh_plan, _ = self._plan()
-        result = adapter._check_admission(
-            fresh_plan, margin_evidence=None, catalog_state=None
+        delayed_plan, _frozen = self._plan(age_seconds=600)
+        small = _FakeOptionMarket(now=self.NOW)
+        small.packets["opt-a"]["ltp"] = 101.0
+        small.packets["opt-b"]["ltp"] = 41.1
+        result = self._adapter(market=small)._check_admission(
+            delayed_plan, margin_evidence=None, catalog_state=None
         )
         self.assertTrue(result["admitted"])
+
+        large = _FakeOptionMarket(now=self.NOW)
+        large.packets["opt-b"]["ltp"] = 50.0
+        with self.assertRaises(LiveRefusal) as drift:
+            self._adapter(market=large)._check_admission(
+                delayed_plan, margin_evidence=None, catalog_state=None
+            )
+        self.assertEqual(drift.exception.reason_code, "OPTION_PRICE_DRIFT_EXCEEDED")
 
 
 if __name__ == "__main__":

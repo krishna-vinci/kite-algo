@@ -64,6 +64,7 @@ class HostedExecutionDispatcher:
         self.claim_timeout_seconds = max(1, int(claim_timeout_seconds))
         self._enabled = enabled or hosted_execution_dispatch_enabled
         self._clock = clock or _utcnow
+        self._wake_event: Optional[asyncio.Event] = None
         self._state = "starting"
         self._last_pass_at: Optional[datetime] = None
         self._last_counts: Dict[str, Any] = {}
@@ -92,6 +93,11 @@ class HostedExecutionDispatcher:
             self._state = str(fields["state"])
         if "last_error" in fields:
             self._last_error = fields["last_error"]
+
+    def notify_work_ready(self) -> None:
+        """Wake an idle loop now; extra notifications coalesce into one pass."""
+        if self._wake_event is not None:
+            self._wake_event.set()
 
     async def poll_once(self) -> Dict[str, Any]:
         """One bounded pass. Never raises: a degraded pass is reported."""
@@ -189,8 +195,12 @@ class HostedExecutionDispatcher:
     ) -> None:
         """Poll until cancelled; the handler covers the idle sleep too."""
         self._note(state="ok" if self._enabled() else "disabled")
+        self._wake_event = asyncio.Event()
         try:
             while True:
+                # A set entered while the previous pass was running means the
+                # newly queued row may have been after that claim query.
+                self._wake_event.clear()
                 try:
                     await self.poll_once()
                 except Exception as exc:  # noqa: BLE001 - one bad pass never kills the loop
@@ -200,7 +210,14 @@ class HostedExecutionDispatcher:
                         health_sink(self.health())
                     except Exception:  # noqa: BLE001
                         pass
-                await asyncio.sleep(self.interval_seconds)
+                if self._wake_event.is_set():
+                    continue
+                try:
+                    await asyncio.wait_for(
+                        self._wake_event.wait(), timeout=self.interval_seconds
+                    )
+                except asyncio.TimeoutError:
+                    pass
         except asyncio.CancelledError:
             self._note(state="stopped")
             raise

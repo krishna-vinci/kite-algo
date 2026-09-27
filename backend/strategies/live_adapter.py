@@ -64,7 +64,7 @@ from .admission import AdmissionService, margin_max_age_seconds
 from .approvals import ApprovalService
 from backend.options.market.freshness import (
     LIVE_OPTION_CHAIN_MAX_AGE_SECONDS,
-    validate_option_chain_evidence,
+    validate_option_chain_at_send,
 )
 from .live_limit_orders import (
     # Re-exported under its historical name: C1.1's drift bound and the
@@ -78,6 +78,7 @@ from .live_limit_orders import (
     frozen_reference_price,
     gated_limit_timeout_seconds,
     is_gated_limit_step,
+    option_approval_max_drift_pct,
     option_limit_max_drift_pct,
     quote_reference_ltp,
     staged_buy_max_price_drift_pct,
@@ -552,6 +553,8 @@ class LivePlanAdapter:
         position_reader: Any = None,
         authority_reader: Any = None,
         tick_reader: Any = None,
+        option_chain_reader: Optional[Callable[[Mapping[str, Any]], Mapping[str, Any]]] = None,
+        option_price_max_drift_pct: Optional[float] = None,
     ) -> None:
         if session_factory is None:
             session_factory = SessionLocal
@@ -578,6 +581,15 @@ class LivePlanAdapter:
             lambda plan, leg: live_catalog_tick_size(
                 plan, leg, session_factory=session_factory
             )
+        )
+        #: The CURRENT option-chain boundary at send. The frozen chain remains
+        #: the plan's price reference; it is never accepted as fresh send-time
+        #: evidence merely because the owner approved it recently.
+        self.option_chain_reader = option_chain_reader
+        self.option_price_max_drift_pct = (
+            option_approval_max_drift_pct()
+            if option_price_max_drift_pct is None
+            else float(option_price_max_drift_pct)
         )
         self._clock = clock or _utcnow
         self.quote_max_age_seconds = float(quote_max_age_seconds)
@@ -1269,13 +1281,34 @@ class LivePlanAdapter:
         margin_evidence: Optional[Mapping[str, Any]],
         catalog_state: Optional[Mapping[str, Any]],
     ) -> Dict[str, Any]:
+        plan_id = str(plan.get("plan_id") or "")
         resolved_target_kind = str((plan.get("resolved_plan") or {}).get("target_kind") or "")
         if resolved_target_kind == "option_structure":
+            current_chain = None
+            if self.option_chain_reader is not None:
+                try:
+                    current_chain = self.option_chain_reader(plan)
+                except Exception as exc:  # noqa: BLE001 - an unreadable current read fails closed
+                    from backend.options.market.freshness import OptionChainEvidenceRefusal
+
+                    if isinstance(exc, OptionChainEvidenceRefusal):
+                        raise
+                    raise LiveRefusal(
+                        "OPTION_CHAIN_SNAPSHOT_UNAVAILABLE",
+                        {
+                            "plan_id": plan_id,
+                            "stage": "send",
+                            "reason": "current_chain_read_failed",
+                            "error": str(exc),
+                        },
+                    ) from exc
             try:
-                validate_option_chain_evidence(
+                validate_option_chain_at_send(
                     plan,
                     now=self._clock(),
+                    current_chain=current_chain,
                     max_age_seconds=self.live_option_chain_max_age_seconds,
+                    max_drift_pct=self.option_price_max_drift_pct,
                 )
             except Exception as exc:
                 from backend.options.market.freshness import OptionChainEvidenceRefusal

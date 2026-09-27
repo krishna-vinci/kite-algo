@@ -112,6 +112,8 @@ def build_live_plan_adapter(
     position_reader: Any = None,
     authority_reader: Any = None,
     clock: Optional[Callable[[], datetime]] = None,
+    option_chain_reader: Optional[Callable[[Mapping[str, Any]], Mapping[str, Any]]] = None,
+    option_price_max_drift_pct: Optional[float] = None,
 ) -> LivePlanAdapter:
     """The production live adapter: every reader comes from real platform data.
 
@@ -131,6 +133,8 @@ def build_live_plan_adapter(
         fill_reader=fill_reader or ingested_fill_reader(factory),
         position_reader=position_reader or attributed_position_reader(factory),
         authority_reader=authority_reader or live_authority_reader(factory),
+        option_chain_reader=option_chain_reader,
+        option_price_max_drift_pct=option_price_max_drift_pct,
         # The bounded-LIMIT dispatch needs the broker TICK from the instrument
         # catalog; an unknown tick refuses rather than guessing a grid.
         tick_reader=lambda plan, leg: live_catalog_tick_size(
@@ -157,6 +161,8 @@ class LivePlanExecutor:
         session_id_reader: Any = None,
         mis_clock: Optional[Callable[[], datetime]] = None,
         authorization: Any = None,
+        option_chain_reader: Optional[Callable[[Mapping[str, Any]], Mapping[str, Any]]] = None,
+        option_price_max_drift_pct: Optional[float] = None,
     ) -> None:
         self.session_factory = session_factory or SessionLocal
         self.adapter = adapter
@@ -170,6 +176,8 @@ class LivePlanExecutor:
         self._quote_reader = quote_reader
         self._margin_reader = margin_reader
         self._session_id_reader = session_id_reader
+        self._option_chain_reader = option_chain_reader
+        self._option_price_max_drift_pct = option_price_max_drift_pct
         #: The clock the PLATFORM SESSION compares a square-off schedule against.
         #: Production leaves it equal to the executor's clock; it is separate so a
         #: deployment (or a test) can pin the session instant while authority,
@@ -296,7 +304,11 @@ class LivePlanExecutor:
                 if hasattr(quote, "__await__"):
                     quote = await quote
             adapter = self.adapter or build_live_plan_adapter(
-                self.session_factory, intent_handler=self._intent_handler, clock=self._clock
+                self.session_factory,
+                intent_handler=self._intent_handler,
+                clock=self._clock,
+                option_chain_reader=self._option_chain_reader,
+                option_price_max_drift_pct=self._option_price_max_drift_pct,
             )
             submission = await adapter.submit(
                 plan,
@@ -604,6 +616,8 @@ class LivePlanExecutor:
             self.session_factory,
             intent_handler=self._intent_handler,
             clock=self._clock,
+            option_chain_reader=self._option_chain_reader,
+            option_price_max_drift_pct=self._option_price_max_drift_pct,
         )
         return await adapter.expire_timed_out_limits(limit=limit)
 
@@ -791,6 +805,8 @@ class LivePlanExecutor:
                     self.session_factory,
                     intent_handler=self._intent_handler,
                     clock=self._clock,
+                    option_chain_reader=self._option_chain_reader,
+                    option_price_max_drift_pct=self._option_price_max_drift_pct,
                 )
                 staged_gate = str(spec.release_rule) == RULE_STAGED_FUNDING_GATE
                 result = await adapter.release_step(

@@ -138,6 +138,20 @@ def option_limit_max_drift_pct(environ: Optional[Mapping[str, str]] = None) -> f
     )
 
 
+#: How far (adverse) a leg's CURRENT price may be from its frozen reference
+#: when an approved option plan is finally sent. Approval can come minutes after
+#: the freeze, so this is wider than the LIMIT band; the LIMIT price itself is
+#: still bounded from the fresh quote at send.
+DEFAULT_OPTION_APPROVAL_MAX_DRIFT_PCT = 0.05
+
+
+def option_approval_max_drift_pct(environ: Optional[Mapping[str, str]] = None) -> float:
+    """Adverse drift allowed between freeze and send (``LIVE_OPTION_APPROVAL_MAX_DRIFT_PCT``)."""
+    return _env_pct(
+        environ, "LIVE_OPTION_APPROVAL_MAX_DRIFT_PCT", DEFAULT_OPTION_APPROVAL_MAX_DRIFT_PCT
+    )
+
+
 def staged_buy_max_price_drift_pct(environ: Optional[Mapping[str, str]] = None) -> float:
     """C1.1's band half-width, under its established name and default."""
     return _env_pct(

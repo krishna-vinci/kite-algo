@@ -181,6 +181,34 @@ def test_run_forever_stops_on_cancellation():
     assert health["state"] == "stopped"
 
 
+def test_notify_work_ready_wakes_the_idle_loop():
+    service = StubService(claimed=[])
+    dispatcher = HostedExecutionDispatcher(
+        service=service, interval_seconds=1.0, enabled=lambda: True
+    )
+
+    async def _main():
+        task = asyncio.ensure_future(dispatcher.run_forever())
+        try:
+            await asyncio.sleep(0)
+            assert service.calls[-1] == ("claim", dispatcher.limit)
+            dispatcher.notify_work_ready()
+            for _ in range(20):
+                if sum(call[0] == "claim" for call in service.calls) >= 2:
+                    break
+                await asyncio.sleep(0.01)
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.get_event_loop().run_until_complete(_main())
+    assert sum(call[0] == "claim" for call in service.calls) == 2
+    assert service.calls[-1] == ("claim", dispatcher.limit)
+
+
 # ---------------------------------------------------------------------------
 # application-lifecycle wiring
 # ---------------------------------------------------------------------------

@@ -16,6 +16,11 @@ from typing import Any, Mapping, Optional
 
 OPTION_CHAIN_MAX_AGE_SECONDS = 10.0
 LIVE_OPTION_CHAIN_MAX_AGE_SECONDS = 5.0
+OPTION_CHAIN_UNAVAILABLE = "OPTION_CHAIN_SNAPSHOT_UNAVAILABLE"
+OPTION_CHAIN_STALE = "OPTION_CHAIN_SNAPSHOT_STALE"
+OPTION_GREEKS_UNAVAILABLE = "OPTION_GREEKS_UNAVAILABLE"
+OPTION_GREEKS_STALE = "OPTION_GREEKS_STALE"
+OPTION_PRICE_DRIFT_EXCEEDED = "OPTION_PRICE_DRIFT_EXCEEDED"
 
 
 class OptionChainEvidenceRefusal(Exception):
@@ -266,3 +271,197 @@ def validate_option_chain_evidence(
                 {"instrument_id": instrument_id, "fields": ["iv", "delta"]},
             )
     return dict(evidence)
+
+
+def validate_option_chain_at_send(
+    plan: Mapping[str, Any],
+    *,
+    current_chain: Optional[Mapping[str, Any]],
+    now: datetime,
+    max_age_seconds: float = LIVE_OPTION_CHAIN_MAX_AGE_SECONDS,
+    max_drift_pct: float = 0.005,
+) -> dict[str, Any]:
+    """Re-read price evidence at send, using frozen prices only as reference.
+
+    The freeze owns *what* to trade. Freshness at send belongs to the current
+    chain, not to the age of the approval: an owner may approve much later, but
+    the send is still bounded by a fresh read of every frozen contract.
+    """
+    resolved = dict(plan.get("resolved_plan") or {})
+    evidence = resolved.get("option_chain_evidence")
+    legs = resolved.get("legs")
+    if not isinstance(evidence, Mapping):
+        raise OptionChainEvidenceRefusal(
+            OPTION_CHAIN_UNAVAILABLE,
+            {"reason": "freeze_evidence_missing"},
+        )
+    if not isinstance(legs, list) or not legs:
+        raise OptionChainEvidenceRefusal(
+            OPTION_CHAIN_UNAVAILABLE,
+            {"reason": "resolved_legs_missing"},
+        )
+
+    frozen_underlying = str(evidence.get("underlying") or "")
+    frozen_expiry = str(evidence.get("expiry") or "")
+    underlying = str(resolved.get("underlying") or "")
+    expiry = str(resolved.get("expiry") or "")
+    if not frozen_underlying or frozen_underlying != underlying:
+        raise OptionChainEvidenceRefusal(
+            OPTION_CHAIN_UNAVAILABLE,
+            {"freeze_underlying": frozen_underlying, "plan_underlying": underlying},
+        )
+    if not frozen_expiry or frozen_expiry != expiry:
+        raise OptionChainEvidenceRefusal(
+            OPTION_CHAIN_UNAVAILABLE,
+            {"freeze_expiry": frozen_expiry, "plan_expiry": expiry},
+        )
+    frozen_legs = evidence.get("legs")
+    if not isinstance(frozen_legs, Mapping):
+        raise OptionChainEvidenceRefusal(
+            OPTION_CHAIN_UNAVAILABLE,
+            {"reason": "frozen_legs_missing"},
+        )
+    if current_chain is None or not isinstance(current_chain, Mapping):
+        raise OptionChainEvidenceRefusal(
+            OPTION_CHAIN_UNAVAILABLE,
+            {"underlying": underlying, "expiry": expiry, "reason": "current_chain_missing"},
+        )
+
+    current_updated_at = _as_datetime(current_chain.get("updated_at"))
+    if current_updated_at is None:
+        raise OptionChainEvidenceRefusal(
+            OPTION_CHAIN_UNAVAILABLE,
+            {"reason": "current_snapshot_timestamp_missing"},
+        )
+    current_age = (now - current_updated_at).total_seconds()
+    if current_age > max_age_seconds:
+        raise OptionChainEvidenceRefusal(
+            OPTION_CHAIN_STALE,
+            {
+                "age_seconds": current_age,
+                "max_age_seconds": max_age_seconds,
+                "stage": "send",
+            },
+        )
+    if str(current_chain.get("underlying") or "") != underlying or str(
+        current_chain.get("expiry") or ""
+    ) != expiry:
+        raise OptionChainEvidenceRefusal(
+            OPTION_CHAIN_UNAVAILABLE,
+            {
+                "requested_underlying": underlying,
+                "requested_expiry": expiry,
+                "snapshot_underlying": str(current_chain.get("underlying") or ""),
+                "snapshot_expiry": str(current_chain.get("expiry") or ""),
+            },
+        )
+
+    current_packets: dict[str, Mapping[str, Any]] = {}
+    for chain_row in current_chain.get("chain") or []:
+        if not isinstance(chain_row, Mapping):
+            continue
+        for option_type in ("ce", "pe"):
+            packet = chain_row.get(option_type)
+            if isinstance(packet, Mapping) and packet.get("token") is not None:
+                current_packets[str(packet.get("token"))] = packet
+
+    uses_greeks = _plan_uses_greeks(plan)
+    checked_legs: dict[str, dict[str, Any]] = {}
+    for leg in legs:
+        if not isinstance(leg, Mapping):
+            continue
+        instrument_id = str(leg.get("instrument_id") or "")
+        token = str(leg.get("broker_token") if leg.get("broker_token") is not None else instrument_id)
+        frozen_packet = frozen_legs.get(instrument_id)
+        if not isinstance(frozen_packet, Mapping):
+            raise OptionChainEvidenceRefusal(
+                OPTION_CHAIN_UNAVAILABLE,
+                {"instrument_id": instrument_id, "reason": "leg_missing_from_freeze"},
+            )
+        frozen_ltp = _finite(frozen_packet.get("ltp"))
+        if frozen_ltp is None or frozen_ltp <= 0.0:
+            raise OptionChainEvidenceRefusal(
+                OPTION_CHAIN_UNAVAILABLE,
+                {"instrument_id": instrument_id, "reason": "frozen_ltp_not_finite"},
+            )
+        current_packet = current_packets.get(token)
+        if current_packet is None:
+            raise OptionChainEvidenceRefusal(
+                OPTION_CHAIN_UNAVAILABLE,
+                {
+                    "instrument_id": instrument_id,
+                    "reason": "leg_missing_from_current_snapshot",
+                    "stage": "send",
+                },
+            )
+        current_ltp = _finite(current_packet.get("ltp"))
+        if current_ltp is None or current_ltp <= 0.0:
+            raise OptionChainEvidenceRefusal(
+                OPTION_CHAIN_UNAVAILABLE,
+                {
+                    "instrument_id": instrument_id,
+                    "reason": "current_ltp_not_finite",
+                    "stage": "send",
+                },
+            )
+        if uses_greeks:
+            current_packet_updated_at = _as_datetime(current_packet.get("updated_at"))
+            if current_packet_updated_at is None:
+                raise OptionChainEvidenceRefusal(
+                    OPTION_GREEKS_UNAVAILABLE,
+                    {"instrument_id": instrument_id, "reason": "greek_timestamp_missing"},
+                )
+            greek_age = (now - current_packet_updated_at).total_seconds()
+            if greek_age > max_age_seconds:
+                raise OptionChainEvidenceRefusal(
+                    OPTION_GREEKS_STALE,
+                    {
+                        "instrument_id": instrument_id,
+                        "age_seconds": greek_age,
+                        "max_age_seconds": max_age_seconds,
+                    },
+                )
+            if _finite(current_packet.get("iv")) is None or _finite(current_packet.get("delta")) is None:
+                raise OptionChainEvidenceRefusal(
+                    OPTION_GREEKS_UNAVAILABLE,
+                    {"instrument_id": instrument_id, "fields": ["iv", "delta"]},
+                )
+
+        side = str(leg.get("side") or "").upper()
+        if side == "BUY":
+            bound = frozen_ltp * (1.0 + max_drift_pct)
+            exceeded = current_ltp > bound
+        elif side == "SELL":
+            bound = frozen_ltp * (1.0 - max_drift_pct)
+            exceeded = current_ltp < bound
+        else:
+            raise OptionChainEvidenceRefusal(
+                OPTION_CHAIN_UNAVAILABLE,
+                {"instrument_id": instrument_id, "reason": "side_missing"},
+            )
+        if exceeded:
+            raise OptionChainEvidenceRefusal(
+                OPTION_PRICE_DRIFT_EXCEEDED,
+                {
+                    "instrument_id": instrument_id,
+                    "side": side,
+                    "frozen_ltp": frozen_ltp,
+                    "current_ltp": current_ltp,
+                    "max_drift_pct": max_drift_pct,
+                    "bound": bound,
+                },
+            )
+        checked_legs[instrument_id] = {
+            "frozen_ltp": frozen_ltp,
+            "current_ltp": current_ltp,
+            "side": side,
+            "bound": bound,
+        }
+
+    return {
+        "underlying": underlying,
+        "expiry": expiry,
+        "current_snapshot_updated_at": current_updated_at.isoformat(),
+        "current_age_seconds": current_age,
+        "legs": checked_legs,
+    }
