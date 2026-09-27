@@ -20,6 +20,7 @@ resizing is a non-goal, and this phase's verdict is consumed by nothing yet.
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -59,6 +60,7 @@ ADMISSION_REFUSALS = (
     "OPTION_STRUCTURE_FAMILY_NOT_ALLOWED",
     "OPTION_EXPIRY_POLICY_NOT_ALLOWED",
     "OPTION_NAKED_NOT_PERMITTED",
+    "OPTION_NAKED_REQUIRES_STOP",
     "OPTION_MAX_LOSS_EXCEEDED",
     "STRATEGY_NOTIONAL_LIMIT_EXCEEDED",
     "CATALOG_INVALID",
@@ -622,11 +624,59 @@ class AdmissionService:
             isinstance(protection_policy, Mapping)
             and protection_policy.get("naked")
         )
+
+        # A leg without a strategy-supplied reference price takes its entry
+        # premium from the chain LTP frozen with the plan (the same evidence the
+        # freeze validated), so relative/delta legs are priced, never guessed.
+        chain_evidence = resolved.get("option_chain_evidence")
+        evidence_legs = (
+            chain_evidence.get("legs")
+            if isinstance(chain_evidence, Mapping)
+            and isinstance(chain_evidence.get("legs"), Mapping)
+            else {}
+        )
+        priced_legs = []
+        for leg in legs:
+            if leg.get("reference_price") is None:
+                frozen = evidence_legs.get(str(leg.get("instrument_id") or ""))
+                if isinstance(frozen, Mapping) and frozen.get("ltp") is not None:
+                    leg = {**leg, "reference_price": frozen.get("ltp")}
+            priced_legs.append(leg)
+        legs = priced_legs
+
+        missing_reference_prices = []
+        for leg in legs:
+            try:
+                reference_price = float(leg.get("reference_price"))
+            except (TypeError, ValueError):
+                reference_price = None
+            if reference_price is None or not math.isfinite(reference_price):
+                missing_reference_prices.append(
+                    str(
+                        leg.get("tradingsymbol")
+                        or leg.get("broker_symbol")
+                        or leg.get("instrument_id")
+                        or "<unknown>"
+                    )
+                )
+        if missing_reference_prices:
+            return AdmissionVerdict(
+                False,
+                "REFERENCE_PRICE_UNAVAILABLE",
+                {
+                    **detail,
+                    "reference_price_missing": sorted(set(missing_reference_prices)),
+                    "message": (
+                        "the option loss calculation requires a frozen entry premium "
+                        "for every leg; no premium is guessed"
+                    ),
+                },
+            )
+
         unhedged = unhedged_target(plan)
-        detail["naked_permitted"] = bool(effective.get("naked_permitted"))
-        if unhedged is not None and not (
-            bool(effective.get("naked_permitted")) and frozen_naked
-        ):
+        naked_permitted = effective.get("naked_permitted")
+        detail["naked_permitted"] = naked_permitted
+        if unhedged is not None and naked_permitted is False:
             return AdmissionVerdict(
                 False,
                 "OPTION_NAKED_NOT_PERMITTED",
@@ -634,9 +684,23 @@ class AdmissionService:
                     **detail,
                     "frozen_naked": frozen_naked,
                     "message": (
-                        "the target leaves a short leg uncovered; a version admits "
-                        "that only when its policy permits naked exposure AND the "
-                        "frozen structure declares it"
+                        "the target leaves a short leg uncovered and the effective "
+                        "policy explicitly denies naked exposure"
+                    ),
+                    **unhedged,
+                },
+            )
+        if unhedged is not None and not frozen_protection_stop(protection_policy):
+            return AdmissionVerdict(
+                False,
+                "OPTION_NAKED_REQUIRES_STOP",
+                {
+                    **detail,
+                    "frozen_naked": frozen_naked,
+                    "reason": "naked_exposure_requires_protective_exit_rule",
+                    "message": (
+                        "a naked option structure requires at least one frozen option "
+                        "protection exit rule on an enforceable safety metric"
                     ),
                     **unhedged,
                 },
@@ -653,24 +717,25 @@ class AdmissionService:
             }
         )
         if worst_loss is None:
-            # A permitted naked structure has no numeric bound to check, so it
-            # must be stoppable instead: the declaration must require a stop and
-            # the frozen structure must actually carry one.
-            protection = dict(effective.get("protection") or {})
-            if not (
-                protection.get("stop_required")
-                and frozen_protection_stop(protection_policy)
-            ):
+            # An unbounded structure has no numeric ceiling to check. Explicit
+            # denial still wins; otherwise the option protection engine is the
+            # safety boundary and must carry an exit rule.
+            if naked_permitted is False or not frozen_protection_stop(protection_policy):
                 return AdmissionVerdict(
                     False,
-                    "OPTION_NAKED_NOT_PERMITTED",
+                    "OPTION_NAKED_NOT_PERMITTED"
+                    if naked_permitted is False
+                    else "OPTION_NAKED_REQUIRES_STOP",
                     {
                         **detail,
-                        "reason": "unbounded_loss_requires_protection_stop",
+                        "reason": (
+                            "naked_permission_explicitly_denied"
+                            if naked_permitted is False
+                            else "unbounded_loss_requires_protective_exit_rule"
+                        ),
                         "message": (
-                            "an unbounded structure is only admitted when the policy "
-                            "requires a protective stop and the frozen structure "
-                            "declares one"
+                            "an unbounded structure is only admitted when the frozen "
+                            "option protection policy carries a protective exit rule"
                         ),
                     },
                 )

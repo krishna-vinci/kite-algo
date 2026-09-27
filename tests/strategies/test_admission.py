@@ -1573,10 +1573,34 @@ class StrategyRiskPolicyTests(AdmissionTestCase):
             )
         ]
 
-    def test_a_naked_target_is_refused_without_the_permission_and_the_declaration(self):
+    def _short_straddle(self):
+        return [
+            self._option_leg(
+                side="SELL", option_type="CE", strike=25000, quantity=75,
+                price=100.0, instrument_id="opt-naked-25000CE",
+            ),
+            self._option_leg(
+                side="SELL", option_type="PE", strike=25000, quantity=75,
+                price=100.0, instrument_id="opt-naked-25000PE",
+            ),
+        ]
+
+    @staticmethod
+    def _index_exit_rule():
+        return {
+            "rules": [
+                {
+                    "metric": "index_ltp",
+                    "operator": "lte",
+                    "threshold": 22000.0,
+                    "action": "exit",
+                }
+            ]
+        }
+
+    def test_a_naked_target_is_refused_without_a_protection_exit_rule(self):
         self.policy(allocation_inr=1000000.0)
-        # The version permits naked structures, but the frozen structure does not
-        # declare itself naked: BOTH are required.
+        # A naked option needs a frozen option protection exit rule.
         self.declare_risk_policy(
             {
                 "allowed_structure_families": ["short_single"],
@@ -1584,7 +1608,7 @@ class StrategyRiskPolicyTests(AdmissionTestCase):
             }
         )
         self._refused(
-            self._option_plan(self._short_call()), "OPTION_NAKED_NOT_PERMITTED"
+            self._option_plan(self._short_call()), "OPTION_NAKED_REQUIRES_STOP"
         )
 
     def test_a_declared_naked_structure_is_refused_without_the_version_permission(self):
@@ -1602,7 +1626,7 @@ class StrategyRiskPolicyTests(AdmissionTestCase):
             "OPTION_NAKED_NOT_PERMITTED",
         )
 
-    def test_a_permitted_naked_target_needs_a_required_frozen_stop(self):
+    def test_a_permitted_naked_target_needs_a_frozen_protection_exit_rule(self):
         self.policy(allocation_inr=1000000.0)
         self.declare_risk_policy(
             {
@@ -1610,13 +1634,12 @@ class StrategyRiskPolicyTests(AdmissionTestCase):
                 "naked_permitted": True,
             }
         )
-        # Permission + a naked declaration, but no stop is required: an unbounded
-        # loss is never admitted without a stoppable protective rule.
+        # Permission is present, but no option protection exit rule is frozen.
         self._refused(
             self._option_plan(
                 self._short_call(), protection_policy={"naked": True, "stop_loss_pct": 25}
             ),
-            "OPTION_NAKED_NOT_PERMITTED",
+            "OPTION_NAKED_REQUIRES_STOP",
         )
 
     def test_a_permitted_naked_target_with_a_required_stop_is_admitted(self):
@@ -1624,18 +1647,54 @@ class StrategyRiskPolicyTests(AdmissionTestCase):
         self.declare_risk_policy(
             {
                 "allowed_structure_families": ["short_single"],
-                "naked_permitted": True,
                 "protection": {"stop_required": True},
             }
         )
         verdict = self._admitted(
             self._option_plan(
                 self._short_call(),
-                protection_policy={"naked": True, "stop_loss_pct": 25},
+                protection_policy=self._index_exit_rule(),
             )
         )
         # Unbounded: there is no numeric bound to check.
         self.assertIsNone(verdict.detail["worst_case_loss_inr"])
+
+    def test_option_short_straddle_with_index_stop_is_admitted_without_naked_flag(self):
+        self.policy(allocation_inr=1000000.0)
+        self.declare_risk_policy({"allowed_structure_families": ["straddle"]})
+        verdict = self._admitted(
+            self._option_plan(
+                self._short_straddle(), protection_policy=self._index_exit_rule()
+            )
+        )
+        self.assertEqual(verdict.detail["structure_family"], "straddle")
+        self.assertIsNone(verdict.detail["naked_permitted"])
+
+    def test_option_short_straddle_without_exit_rule_requires_stop(self):
+        self.policy(allocation_inr=1000000.0)
+        self.declare_risk_policy({"allowed_structure_families": ["straddle"]})
+        self._refused(
+            self._option_plan(self._short_straddle()), "OPTION_NAKED_REQUIRES_STOP"
+        )
+
+    def test_option_short_straddle_explicit_naked_deny_wins_over_exit_rule(self):
+        self.policy(allocation_inr=1000000.0)
+        self.declare_risk_policy(
+            {"allowed_structure_families": ["straddle"], "naked_permitted": False}
+        )
+        self._refused(
+            self._option_plan(
+                self._short_straddle(), protection_policy=self._index_exit_rule()
+            ),
+            "OPTION_NAKED_NOT_PERMITTED",
+        )
+
+    def test_option_missing_entry_premium_refuses_by_name(self):
+        self.policy(allocation_inr=1000000.0)
+        self.declare_risk_policy({"allowed_structure_families": ["vertical_spread"]})
+        spread = self._vertical()
+        spread[0].pop("reference_price")
+        self._refused(self._option_plan(spread), "REFERENCE_PRICE_UNAVAILABLE")
 
     # -- max loss -----------------------------------------------------------
 
@@ -1650,7 +1709,7 @@ class StrategyRiskPolicyTests(AdmissionTestCase):
         verdict = self._refused(
             self._option_plan(self._vertical()), "OPTION_MAX_LOSS_EXCEEDED"
         )
-        self.assertEqual(verdict.detail["worst_case_loss_inr"], 75000.0)
+        self.assertEqual(verdict.detail["worst_case_loss_inr"], 73500.0)
 
     def test_a_worst_case_within_the_declared_max_loss_is_admitted(self):
         self.policy(allocation_inr=1000000.0)

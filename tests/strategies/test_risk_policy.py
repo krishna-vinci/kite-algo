@@ -5,8 +5,8 @@ effective policy must take the MINIMUM of every level that states a limit and
 the intersection of every allow-list, because a ceiling that could loosen a
 declaration is not a ceiling. The family classifier must read the frozen legs
 alone and name shapes by their equality structure, because an allow-list that
-admits by accident is not an allow-list. And the worst-case loss must be
-evaluated with premium ignored, so it can only ever over-state the loss.
+admits by accident is not an allow-list. And the worst-case loss must include
+the frozen entry premium.
 """
 
 from __future__ import annotations
@@ -25,15 +25,19 @@ from backend.strategies.risk_policy import (
 )
 
 
-def leg(side, option_type, strike, quantity, ratio=1):
-    return {
+def leg(side, option_type, strike, quantity, ratio=1, price=None, expiry="2026-10-29"):
+    result = {
         "option_type": option_type,
         "side": side,
         "strike": float(strike),
+        "expiry": expiry,
         "ratio": ratio,
         "quantity": int(quantity),
         "signed_quantity": int(quantity) if side == "BUY" else -int(quantity),
     }
+    if price is not None:
+        result["reference_price"] = float(price)
+    return result
 
 
 class ValidateTests(unittest.TestCase):
@@ -47,7 +51,7 @@ class ValidateTests(unittest.TestCase):
         self.assertIn("risk_policy.max_loss_inr", str(ctx.exception))
 
         with self.assertRaises(RiskPolicyError) as ctx:
-            validate_risk_policy({"allowed_structure_families": ["diagonal"]})
+            validate_risk_policy({"allowed_structure_families": ["not_a_family"]})
         self.assertIn("allowed_structure_families", str(ctx.exception))
 
         with self.assertRaises(RiskPolicyError) as ctx:
@@ -111,8 +115,8 @@ class EffectivePolicyTests(unittest.TestCase):
         self.assertEqual(effective["max_loss_inr"], 100.0)
         self.assertIsNone(effective["notional_limit_inr"])
 
-        # Naked exposure is opt-in: an unstated declaration is not permission.
-        self.assertFalse(effective_risk_policy({}, {}, {})["naked_permitted"])
+        # An unset policy is distinguished from an explicit deny.
+        self.assertIsNone(effective_risk_policy({}, {}, {})["naked_permitted"])
 
     def test_a_stop_requirement_tightens_when_any_level_demands_it(self):
         declared = {"protection": {"stop_required": False}}
@@ -152,7 +156,9 @@ class PlatformCeilingTests(unittest.TestCase):
         )
         self.assertEqual(ceiling["max_loss_inr"], 5000.0)
         self.assertEqual(ceiling["notional_limit_inr"], 1000000.0)
-        self.assertEqual(ceiling["allowed_structure_families"], ["vertical_spread"])
+        self.assertEqual(
+            ceiling["allowed_structure_families"], ["vertical_spread", "diagonal"]
+        )
         self.assertFalse(ceiling["naked_permitted"])
 
 
@@ -189,9 +195,32 @@ class ClassifierTests(unittest.TestCase):
         self.assertEqual(classify_structure_family(condor), "iron_condor")
         self.assertEqual(classify_structure_family(butterfly), "iron_butterfly")
 
+    def test_butterfly_calendar_diagonal_and_ratio_families_are_named(self):
+        butterfly = [
+            leg("BUY", "CE", 25000, 75),
+            leg("SELL", "CE", 25500, 150),
+            leg("BUY", "CE", 26000, 75),
+        ]
+        calendar = [
+            leg("BUY", "CE", 25000, 75, expiry="2026-10-29"),
+            leg("SELL", "CE", 25000, 75, expiry="2026-11-26"),
+        ]
+        diagonal = [
+            leg("BUY", "CE", 25000, 75, expiry="2026-10-29"),
+            leg("SELL", "CE", 26000, 75, expiry="2026-11-26"),
+        ]
+        ratio = [
+            leg("BUY", "CE", 25000, 75),
+            leg("SELL", "CE", 26000, 150),
+        ]
+        self.assertEqual(classify_structure_family(butterfly), "butterfly")
+        self.assertEqual(classify_structure_family(calendar), "calendar")
+        self.assertEqual(classify_structure_family(diagonal), "diagonal")
+        self.assertEqual(classify_structure_family(ratio), "ratio_spread")
+
     def test_anything_unrecognised_is_custom_not_the_nearest_shape(self):
         ratio = [leg("BUY", "CE", 25000, 75), leg("SELL", "CE", 26000, 150)]
-        self.assertEqual(classify_structure_family(ratio), "vertical_spread")
+        self.assertEqual(classify_structure_family(ratio), "ratio_spread")
         three = [
             leg("SELL", "CE", 25000, 75),
             leg("BUY", "CE", 25500, 75),
@@ -202,31 +231,58 @@ class ClassifierTests(unittest.TestCase):
 
 
 class WorstCaseLossTests(unittest.TestCase):
-    def test_a_long_call_can_lose_only_its_own_strike_distance(self):
+    def test_a_long_call_can_lose_only_its_entry_premium(self):
         self.assertEqual(
-            worst_case_loss_inr([leg("BUY", "CE", 25000, 75)]), 0.0
+            worst_case_loss_inr([leg("BUY", "CE", 25000, 75, price=100)]), 7500.0
         )
 
-    def test_a_vertical_spread_loses_the_width_times_the_quantity(self):
-        spread = [leg("SELL", "CE", 25000, 75), leg("BUY", "CE", 26000, 75)]
-        self.assertEqual(worst_case_loss_inr(spread), 75000.0)
+    def test_a_credit_spread_loses_width_minus_credit(self):
+        spread = [
+            leg("SELL", "CE", 25000, 75, price=100),
+            leg("BUY", "CE", 26000, 75, price=80),
+        ]
+        self.assertEqual(worst_case_loss_inr(spread), 73500.0)
+
+    def test_a_debit_spread_loses_the_net_debit(self):
+        spread = [
+            leg("BUY", "CE", 25000, 75, price=100),
+            leg("SELL", "CE", 26000, 75, price=80),
+        ]
+        self.assertEqual(worst_case_loss_inr(spread), 1500.0)
 
     def test_a_short_put_is_bounded_by_its_strike(self):
         # A naked PUT loses at most strike x quantity, so it is bounded and the
         # numeric ceiling still applies.
-        self.assertEqual(worst_case_loss_inr([leg("SELL", "PE", 25000, 75)]), 1875000.0)
+        self.assertEqual(
+            worst_case_loss_inr([leg("SELL", "PE", 25000, 75, price=100)]), 1867500.0
+        )
 
     def test_an_iron_condor_is_bounded_by_its_wings(self):
         condor = [
-            leg("SELL", "PE", 24500, 75),
-            leg("SELL", "CE", 25500, 75),
-            leg("BUY", "PE", 24400, 75),
-            leg("BUY", "CE", 25600, 75),
+            leg("SELL", "PE", 24500, 75, price=60),
+            leg("SELL", "CE", 25500, 75, price=60),
+            leg("BUY", "PE", 24400, 75, price=50),
+            leg("BUY", "CE", 25600, 75, price=50),
         ]
-        self.assertEqual(worst_case_loss_inr(condor), 7500.0)
+        self.assertEqual(worst_case_loss_inr(condor), 6000.0)
+
+    def test_a_butterfly_loses_the_net_debit(self):
+        butterfly = [
+            leg("BUY", "CE", 25000, 75, price=100),
+            leg("SELL", "CE", 25500, 150, price=50),
+            leg("BUY", "CE", 26000, 75, price=20),
+        ]
+        self.assertEqual(worst_case_loss_inr(butterfly), 1500.0)
+
+    def test_a_ratio_spread_with_a_net_short_call_is_unbounded(self):
+        ratio = [
+            leg("BUY", "CE", 25000, 75, price=100),
+            leg("SELL", "CE", 26000, 150, price=80),
+        ]
+        self.assertIsNone(worst_case_loss_inr(ratio))
 
     def test_a_net_short_call_is_unbounded(self):
-        self.assertIsNone(worst_case_loss_inr([leg("SELL", "CE", 25000, 75)]))
+        self.assertIsNone(worst_case_loss_inr([leg("SELL", "CE", 25000, 75, price=100)]))
 
     def test_an_unreadable_leg_is_never_proof_of_a_bound(self):
         broken = [{"side": "BUY", "quantity": 75}]  # no option type or strike
@@ -237,8 +293,25 @@ class FrozenProtectionStopTests(unittest.TestCase):
     def test_a_declared_stop_is_recognised_and_an_absent_one_is_not(self):
         self.assertFalse(frozen_protection_stop(None))
         self.assertFalse(frozen_protection_stop({"naked": True}))
-        self.assertTrue(frozen_protection_stop({"naked": True, "stop_loss_pct": 25}))
-        self.assertTrue(frozen_protection_stop({"stop": {"premium_pct": 50}}))
+        self.assertFalse(
+            frozen_protection_stop(
+                {"rules": [{"metric": "index_ltp", "action": "notify"}]}
+            )
+        )
+        self.assertTrue(
+            frozen_protection_stop(
+                {
+                    "rules": [
+                        {
+                            "metric": "index_ltp",
+                            "operator": "lte",
+                            "threshold": 22000,
+                            "action": "exit",
+                        }
+                    ]
+                }
+            )
+        )
 
 
 if __name__ == "__main__":

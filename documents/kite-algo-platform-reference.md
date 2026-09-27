@@ -193,6 +193,8 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
   - `risk_policy` (`backend/strategies/service.py:128-318,541-629`).
 - **Per-version risk policy:** `max_loss_inr`, `notional_limit_inr`, `margin_limit_inr`, `protection`,
   `expiry_policy`, `allowed_structure_families` and `naked_permitted` (`backend/strategies/risk_policy.py:79-87`).
+  - Option max-loss arithmetic includes frozen entry premiums and the classifier
+    names butterfly, ratio-spread, calendar and diagonal families (`backend/strategies/risk_policy.py:58-67,561-621`).
   - Effective policy = min(declared, operator, platform ceiling).
   - The operator policy is applied to **option** plans only (`admission.py:494`).
   - **PARTIAL:** there is no UI to author it; it is API only.
@@ -386,7 +388,7 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
 - **Option risk gate** (`:488-730`):
   - A strategy without a declared policy is refused with `STRATEGY_RISK_POLICY_MISSING`.
   - Other refusals: `OPTION_STRUCTURE_FAMILY_NOT_ALLOWED`, `OPTION_EXPIRY_POLICY_NOT_ALLOWED`,
-    `OPTION_NAKED_NOT_PERMITTED`, `OPTION_MAX_LOSS_EXCEEDED`, `STRATEGY_NOTIONAL_LIMIT_EXCEEDED`, `MARGIN_INSUFFICIENT`.
+    `OPTION_NAKED_NOT_PERMITTED`, `OPTION_NAKED_REQUIRES_STOP`, `OPTION_MAX_LOSS_EXCEEDED`, `STRATEGY_NOTIONAL_LIMIT_EXCEEDED`, `MARGIN_INSUFFICIENT`.
   - Reducing exits and adjusts skip this gate.
 - **Live margin and funds.** Evidence must be no older than `ADMISSION_MARGIN_MAX_AGE_SECONDS` (60 s). The basket
   margin is `required_margin_inr`. Cash below the requirement is refused, except for a staged CNC plan (`:1332-1385`).

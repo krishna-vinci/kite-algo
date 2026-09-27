@@ -14,9 +14,9 @@ The effective policy is therefore ``min(declared, operator, ceiling)`` for every
 numeric limit, the intersection of every allow-list, and a boolean that only
 ever tightens:
 
-* ``naked_permitted`` is a *permission*: it is granted only when every level
-  that states it grants it (AND), and an unstated declaration means "not
-  permitted" - naked exposure is opt-in, never a default;
+* ``naked_permitted`` is an explicit deny switch: it is false when any level
+  states false, true when all stated levels grant it, and ``None`` when no level
+  states it. Naked exposure still requires a frozen option protection exit rule;
 * ``protection.stop_required`` is a *requirement*: it applies when ANY level
   demands it (OR). Applying AND here would let a floor that names no stop
   requirement silently cancel a declaration that does, which is the opposite of
@@ -27,9 +27,10 @@ same policy and the same ceiling always produce the same effective policy.
 
 The two arithmetic helpers - :func:`classify_structure_family` and
 :func:`worst_case_loss_inr` - read only the FROZEN legs (option type, side,
-strike, signed quantity). They are deliberately small: a classifier that a
-moving chain could redefine is not a control, and the worst case is evaluated
-with premium ignored, which can only over-state the loss.
+strike, expiry, signed quantity and reference price). They are deliberately
+small: a classifier that a moving chain could redefine is not a control, and
+the worst case includes the frozen entry premium rather than guessing when it
+is absent.
 """
 
 from __future__ import annotations
@@ -59,6 +60,10 @@ STRUCTURE_FAMILIES = (
     "long_single",
     "short_single",
     "vertical_spread",
+    "ratio_spread",
+    "calendar",
+    "diagonal",
+    "butterfly",
     "straddle",
     "strangle",
     "iron_condor",
@@ -96,20 +101,6 @@ _CEILING_FAMILIES_ENV = "ADMISSION_RISK_ALLOWED_STRUCTURE_FAMILIES"
 _CEILING_EXPIRY_ENV = "ADMISSION_RISK_EXPIRY_POLICIES"
 _CEILING_NAKED_ENV = "ADMISSION_RISK_NAKED_PERMITTED"
 _CEILING_STOP_ENV = "ADMISSION_RISK_STOP_REQUIRED"
-
-#: The keys a frozen ``protection_policy`` may use to declare a protective stop.
-#: Nothing else in the platform fixes this vocabulary yet, so the gate accepts
-#: any of them and requires one to be present (and truthy) for an unbounded
-#: structure that is permitted to be naked.
-PROTECTION_STOP_KEYS = (
-    "stop",
-    "stoploss",
-    "stop_loss",
-    "stop_loss_pct",
-    "stop_loss_inr",
-    "stop_loss_percent",
-)
-
 
 class RiskPolicyError(ValueError):
     """An invalid ``risk_policy`` declaration, naming the offending field."""
@@ -345,7 +336,7 @@ def effective_risk_policy(
 
     Numeric limits take the minimum of every level that states one, allow-lists
     intersect, ``naked_permitted`` is AND (granted only where every level that
-    states it grants it, defaulting to not-permitted), and
+    states it grants it; when no level states it, the result is ``None``), and
     ``protection.stop_required`` is OR (required as soon as any level requires
     it). Absent values never widen an explicitly stated one.
     """
@@ -361,13 +352,12 @@ def effective_risk_policy(
         ]
         return min(values) if values else None
 
-    declared_part: Mapping[str, Any] = declared if isinstance(declared, Mapping) else {}
-    naked_permitted = bool(declared_part.get("naked_permitted", False))
-    for part in parts:
-        if part is declared_part:
-            continue
-        if "naked_permitted" in part:
-            naked_permitted = naked_permitted and bool(part["naked_permitted"])
+    naked_values = [
+        bool(part["naked_permitted"])
+        for part in parts
+        if "naked_permitted" in part
+    ]
+    naked_permitted = all(naked_values) if naked_values else None
 
     return {
         "max_loss_inr": minimum("max_loss_inr"),
@@ -408,27 +398,75 @@ def _option_type(leg: Mapping[str, Any]) -> str:
     return str(leg.get("option_type") or leg.get("instrument_type") or "").strip().upper()
 
 
-def classify_structure_family(legs: Sequence[Mapping[str, Any]]) -> str:
-    """The frozen structure's family, from option type, side and strike alone.
+def _expiry(leg: Mapping[str, Any]) -> Optional[str]:
+    value = leg.get("expiry")
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
-    Small by design. Equality of strikes and option types is what separates a
-    straddle from a strangle and a vertical from a condor; direction is carried
-    by ``side`` and by whether the shorts sit inside the longs. Anything the
-    classifier cannot name is ``custom`` - never silently the nearest shape,
-    because an allow-list that admits by accident is not an allow-list.
+
+def _side(leg: Mapping[str, Any]) -> str:
+    return str(leg.get("side") or "BUY").strip().upper()
+
+
+def _same_expiry(first: Mapping[str, Any], second: Mapping[str, Any]) -> bool:
+    """Treat two omitted expiries as the same frozen expiry.
+
+    Older frozen test fixtures omitted expiry because all legs were implicitly
+    one expiry. A calendar/diagonal, on the other hand, must name both expiry
+    values so it cannot be inferred from an absent field.
+    """
+    return _expiry(first) == _expiry(second)
+
+
+def _same_type(legs: Sequence[Mapping[str, Any]]) -> bool:
+    types = {_option_type(leg) for leg in legs}
+    return len(types) == 1 and "" not in types
+
+
+def _butterfly(legs: Sequence[Mapping[str, Any]]) -> bool:
+    if len(legs) != 3 or not _same_type(legs):
+        return False
+    expiries = {_expiry(leg) for leg in legs}
+    if len(expiries) != 1:
+        return False
+    ordered = sorted(legs, key=lambda leg: (_strike(leg) is None, _strike(leg)))
+    strikes = [_strike(leg) for leg in ordered]
+    if None in strikes or len(set(strikes)) != 3:
+        return False
+    quantities = [_signed_quantity(leg) for leg in ordered]
+    if any(quantity is None for quantity in quantities):
+        return False
+    magnitudes = [abs(int(quantity)) for quantity in quantities]
+    if not (magnitudes[0] == magnitudes[2] and magnitudes[1] == 2 * magnitudes[0]):
+        return False
+    return (
+        quantities[0] != 0
+        and quantities[0] == quantities[2]
+        and quantities[1] == -quantities[0] * 2
+    )
+
+
+def classify_structure_family(legs: Sequence[Mapping[str, Any]]) -> str:
+    """The frozen structure's family, from its option geometry and quantities.
+
+    Anything the classifier cannot name is ``custom`` - never silently the
+    nearest shape, because an allow-list that admits by accident is not an
+    allow-list.
     """
     option_legs = [leg for leg in legs if isinstance(leg, Mapping)]
     if not option_legs:
         return "custom"
     if len(option_legs) == 1:
-        side = str(option_legs[0].get("side") or "BUY").strip().upper()
+        side = _side(option_legs[0])
         return "short_single" if side == "SELL" else "long_single"
     if len(option_legs) == 2:
         first, second = option_legs
         first_type, second_type = _option_type(first), _option_type(second)
         first_strike, second_strike = _strike(first), _strike(second)
-        first_side = str(first.get("side") or "BUY").strip().upper()
-        second_side = str(second.get("side") or "BUY").strip().upper()
+        first_side, second_side = _side(first), _side(second)
+        first_quantity, second_quantity = _signed_quantity(first), _signed_quantity(second)
         same_strike = (
             first_strike is not None
             and second_strike is not None
@@ -436,11 +474,30 @@ def classify_structure_family(legs: Sequence[Mapping[str, Any]]) -> str:
         )
         if first_type != second_type:
             return "straddle" if same_strike else "strangle"
+        if (
+            not same_strike
+            and first_quantity is not None
+            and second_quantity is not None
+            and abs(first_quantity) != abs(second_quantity)
+        ):
+            return "ratio_spread"
         if first_side != second_side:
+            if (
+                not same_strike
+                and _expiry(first) is not None
+                and _expiry(second) is not None
+                and not _same_expiry(first, second)
+            ):
+                return "diagonal"
+            if same_strike and _expiry(first) is not None and _expiry(second) is not None:
+                if not _same_expiry(first, second):
+                    return "calendar"
             # Opposite sides on one option type: same strike closes itself out,
             # a different strike is a spread.
             return "custom" if same_strike else "vertical_spread"
         return "custom"
+    if len(option_legs) == 3 and _butterfly(option_legs):
+        return "butterfly"
     if len(option_legs) == 4:
         shorts = [leg for leg in option_legs if str(leg.get("side") or "").strip().upper() == "SELL"]
         longs = [leg for leg in option_legs if str(leg.get("side") or "").strip().upper() == "BUY"]
@@ -474,24 +531,33 @@ def _find(legs: Sequence[Mapping[str, Any]], option_type: str) -> Optional[Mappi
 
 def _expiry_payoff(rows: Sequence[tuple], spot: float) -> float:
     total = 0.0
-    for option_type, strike, quantity in rows:
+    for option_type, strike, quantity, _reference_price in rows:
         intrinsic = max(spot - strike, 0.0) if option_type == "CE" else max(strike - spot, 0.0)
         total += quantity * intrinsic
     return total
 
 
-def worst_case_loss_inr(legs: Sequence[Mapping[str, Any]]) -> Optional[float]:
-    """The frozen target's worst-case LOSS at expiry, ignoring premium credit.
+def _reference_price(leg: Mapping[str, Any]) -> Optional[float]:
+    try:
+        value = float(leg.get("reference_price"))
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
 
-    Premium is deliberately ignored: a credit can only make the true worst case
-    smaller, so treating it as zero cannot under-state the loss. The payoff of a
-    piecewise-linear option book is minimised at a breakpoint, so every strike,
-    zero and a far upside point are evaluated.
+
+def worst_case_loss_inr(legs: Sequence[Mapping[str, Any]]) -> Optional[float]:
+    """The frozen target's worst-case LOSS at expiry, including entry premium.
+
+    The premium is the signed cash flow at entry: a BUY pays ``quantity ×
+    reference_price`` while a SELL receives it. The expiry P&L is therefore the
+    intrinsic payoff minus the signed premium. The piecewise-linear payoff is
+    minimised at zero, every strike, and the upper tail after the last strike.
 
     ``None`` means the loss is UNBOUNDED, or the frozen legs cannot be read well
     enough to bound it - a net short call has no upper bound, and an unreadable
-    leg is never proof of coverage. Both are the caller's cue to require a
-    declared, stoppable naked structure rather than a numeric ceiling.
+    leg is never proof of coverage. Admission distinguishes missing premiums by
+    name and requires a frozen option protection exit rule for an unbounded
+    structure rather than inventing a numeric ceiling.
     """
     rows: List[tuple] = []
     strikes: List[float] = []
@@ -501,35 +567,60 @@ def worst_case_loss_inr(legs: Sequence[Mapping[str, Any]]) -> Optional[float]:
         option_type = _option_type(leg)
         strike = _strike(leg)
         quantity = _signed_quantity(leg)
-        if option_type not in ("CE", "PE") or strike is None or quantity is None:
+        reference_price = _reference_price(leg)
+        if (
+            option_type not in ("CE", "PE")
+            or strike is None
+            or quantity is None
+            or reference_price is None
+        ):
             return None
-        rows.append((option_type, strike, quantity))
+        rows.append((option_type, strike, quantity, reference_price))
         strikes.append(strike)
     if not rows:
         return 0.0
-    net_calls = sum(quantity for option_type, _strike_value, quantity in rows if option_type == "CE")
+    net_calls = sum(
+        quantity for option_type, _strike_value, quantity, _reference_price in rows
+        if option_type == "CE"
+    )
     if net_calls < 0:
         # A net short call loses without bound as the underlying rises. A long
         # call above it would have cancelled this, so there is nothing to sample.
         return None
+    entry_premium = sum(
+        quantity * reference_price
+        for _option_type_value, _strike_value, quantity, reference_price in rows
+    )
     points: Set[float] = {0.0, *strikes, max(strikes) * 10.0 + 1000.0}
-    worst = min(_expiry_payoff(rows, spot) for spot in points)
+    worst = min(_expiry_payoff(rows, spot) - entry_premium for spot in points)
     return float(-worst) if worst < 0 else 0.0
 
 
 def frozen_protection_stop(protection_policy: Any) -> bool:
-    """Whether a frozen ``protection_policy`` declares a protective stop."""
+    """Whether a frozen policy carries an option-metric exit rule.
+
+    These are the metrics the option protection engine can evaluate and use to
+    submit an exit. Generic legacy keys (for example ``stop_loss_pct``) are not
+    enough evidence for an option structure's naked-loss safety gate.
+    """
     if not isinstance(protection_policy, Mapping):
         return False
-    for key in PROTECTION_STOP_KEYS:
-        if key not in protection_policy:
+    protected_metrics = {
+        "index_ltp",
+        "combined_premium",
+        "combined_premium_change_pct",
+        "strategy_mtm",
+        "net_delta",
+    }
+    rules = protection_policy.get("rules")
+    if not isinstance(rules, list):
+        return False
+    for rule in rules:
+        if not isinstance(rule, Mapping):
             continue
-        value = protection_policy[key]
-        if isinstance(value, bool):
-            if value:
-                return True
-            continue
-        if value not in (None, "", 0, 0.0, {}):
+        metric = str(rule.get("metric") or "").strip()
+        action = str(rule.get("action") or "exit").strip().lower()
+        if metric in protected_metrics and action == "exit":
             return True
     return False
 
@@ -539,10 +630,9 @@ def unhedged_target(plan: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
 
     Reuses the adjustment gate's own coverage rule
     (``option_adjust_would_unhedge``) against the TARGET state, but with the
-    frozen ``protection_policy.naked`` declaration removed from the probe: B2.5
-    requires BOTH the version-level permission and the structure's own
-    declaration, so the policy cannot be allowed to silence the rule that decides
-    whether it is naked in the first place.
+    frozen ``protection_policy.naked`` declaration removed from the probe. The
+    caller then applies explicit policy denial and the option protection exit
+    rule as the separate admission controls.
     """
     from backend.options.execution.plan_binding import option_adjust_would_unhedge
 
