@@ -963,12 +963,12 @@ class RealTimePositionsService:
                         INSERT INTO account_positions (
                             account_id, instrument_token, product, exchange, tradingsymbol,
                             net_quantity, buy_quantity, sell_quantity, buy_value, sell_value,
-                            average_price, realized_pnl, last_price, close_price, last_reconciled_at,
+                            average_price, realized_pnl, last_price, close_price, m2m, last_reconciled_at,
                             reconcile_version, last_updated_source, version, updated_at
                         ) VALUES (
                             :account_id, :instrument_token, :product, :exchange, :tradingsymbol,
                             :net_quantity, :buy_quantity, :sell_quantity, :buy_value, :sell_value,
-                            :average_price, :realized_pnl, :last_price, :close_price, NOW(), :reconcile_version, 'reconcile', 1, NOW()
+                            :average_price, :realized_pnl, :last_price, :close_price, :m2m, NOW(), :reconcile_version, 'reconcile', 1, NOW()
                         )
                         ON CONFLICT (account_id, instrument_token, product) DO UPDATE
                         SET exchange = EXCLUDED.exchange,
@@ -982,6 +982,7 @@ class RealTimePositionsService:
                             realized_pnl = EXCLUDED.realized_pnl,
                             last_price = EXCLUDED.last_price,
                             close_price = EXCLUDED.close_price,
+                            m2m = EXCLUDED.m2m,
                             last_reconciled_at = EXCLUDED.last_reconciled_at,
                             reconcile_version = EXCLUDED.reconcile_version,
                             last_updated_source = EXCLUDED.last_updated_source,
@@ -1004,6 +1005,8 @@ class RealTimePositionsService:
                         "realized_pnl": realized_pnl,
                         "last_price": last_price,
                         "close_price": _to_float(pos.get("close_price")),
+                        # Kite's day mark-to-market (from the last close); None when absent.
+                        "m2m": _to_float(pos["m2m"]) if pos.get("m2m") is not None else None,
                         "reconcile_version": reconcile_version,
                     },
                 )

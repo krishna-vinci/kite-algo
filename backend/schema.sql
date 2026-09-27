@@ -670,6 +670,7 @@ CREATE TABLE IF NOT EXISTS public.account_positions (
   realized_pnl NUMERIC(18,6) NOT NULL DEFAULT 0,
   last_price NUMERIC(18,6),
   close_price NUMERIC(18,6),
+  m2m NUMERIC(18,6),
   last_trade_price NUMERIC(18,6),
   last_trade_at TIMESTAMPTZ,
   last_reconciled_at TIMESTAMPTZ,

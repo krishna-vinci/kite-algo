@@ -82,7 +82,7 @@ def session_factory():
             "CREATE TABLE public.account_positions ("
             " account_id TEXT, instrument_token INTEGER, product TEXT, exchange TEXT,"
             " tradingsymbol TEXT, net_quantity INTEGER DEFAULT 0, realized_pnl REAL DEFAULT 0,"
-            " last_price REAL, average_price REAL, last_reconciled_at TEXT)"
+            " last_price REAL, average_price REAL, m2m REAL, last_reconciled_at TEXT)"
         )
         dbapi_connection.commit()
 
@@ -505,8 +505,8 @@ async def test_status_reports_the_account_day_pnl_and_the_cap_it_is_tested_again
             text(
                 "INSERT INTO public.account_positions "
                 "(account_id, instrument_token, product, exchange, tradingsymbol, "
-                " net_quantity, realized_pnl, last_price, average_price, last_reconciled_at) "
-                "VALUES ('kite:XJJ12345', 100, 'CNC', 'NSE', 'RELIANCE', 0, -4500.0, 0, 0, :at)"
+                " net_quantity, realized_pnl, last_price, average_price, m2m, last_reconciled_at) "
+                "VALUES ('kite:XJJ12345', 100, 'CNC', 'NSE', 'RELIANCE', 0, -4500.0, 0, 0, -4500.0, :at)"
             ),
             {"at": (trading_now - timedelta(seconds=10)).isoformat()},
         )
@@ -522,7 +522,7 @@ async def test_status_reports_the_account_day_pnl_and_the_cap_it_is_tested_again
     # The day's loss reaching the cap flips it, without any flatten.
     with session_factory() as session:
         session.execute(
-            text("UPDATE public.account_positions SET realized_pnl = -5000.0")
+            text("UPDATE public.account_positions SET realized_pnl = -5000.0, m2m = -5000.0")
         )
         session.commit()
     reached = (await client.get(f"{BASE}/status")).json()

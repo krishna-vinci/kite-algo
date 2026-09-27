@@ -403,8 +403,9 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
     exposure-INCREASING plan is refused with `DAILY_LOSS_BUDGET_EXCEEDED` once the realized loss reaches the budget;
     reductions are never blocked. Unreadable evidence still refuses with `DAILY_LOSS_BUDGET_UNAVAILABLE`.
   - Account cap: the optional `account_daily_loss_cap_inr` (platform live settings, migration `20260926_000053`)
-    is tested against the broker's own day P&L, summed from the reconciled `account_positions` book
-    (`realized_pnl` + unrealised, the same `pnl` the realtime positions service publishes). An exposure-increasing
+    is tested against the broker's own day P&L: the sum of Kite's per-position `m2m` (day mark-to-market from the
+    last close; column added by migration `20260927_000056`) over the reconciled `account_positions` book, one row
+    per position. A row without `m2m` is unreadable evidence. An exposure-increasing
     LIVE plan is refused with `ACCOUNT_DAILY_LOSS_CAP_REACHED` once the account loss reaches the cap; unreadable
     evidence with a cap set refuses too (fail closed), and reductions are never blocked.
   - `GET /api/platform/status` surfaces the cap state as `risk: {day_pnl_inr, cap_inr, cap_reached}`.
@@ -518,7 +519,7 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
 | Dead-submission disposition | EXISTS | EXISTS | |
 | Option owner exit | EXISTS | EXISTS | Via `option_run_repair.py:427-621` |
 | Flatten | EXISTS | EXISTS | Live non-option books reduce through the live executor via `PlanExecutionPipeline` |
-| Kill switch (`POST /api/platform/kill-switch`) | EXISTS | EXISTS | Owner+same-origin, body `confirm: "FLATTEN ALL"`; stops every active job, flattens every exposed strategy, closes all live lanes |
+| Kill switch (`POST /api/platform/kill-switch`) | EXISTS | EXISTS | Owner+same-origin, body `confirm: "FLATTEN ALL"`; stops every active job, flattens every exposed strategy (a non-zero book or an unresolved live order, whose unfilled remainder is cancelled), closes all live lanes |
 
 ---
 

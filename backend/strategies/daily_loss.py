@@ -472,12 +472,13 @@ def account_day_pnl_inr(
 ) -> Optional[float]:
     """The broker's own day P&L for the account, or ``None`` when unreadable.
 
-    The figure is the sum over the reconciled ``account_positions`` book of
-    ``realized_pnl + (last_price - average_price) * net_quantity`` - exactly the
-    ``pnl`` the realtime positions service publishes per position. A book is
-    readable only when reconciliation is current for the active IST session. A
-    non-flat position whose price was never marked is not readable evidence (a
-    zero last price would fabricate a loss).
+    The figure is the sum of the broker's per-position ``m2m`` (Kite's day
+    mark-to-market from the last close, realised and unrealised) over the
+    reconciled ``account_positions`` book - one row per position. P&L since
+    entry (``realised + (last - average) * qty``) is NOT a day figure: a carried
+    position's earlier gains would hide today's loss. A book is readable only
+    when reconciliation is current for the active IST session, and a row
+    without ``m2m`` is not readable evidence.
     """
     from backend.platform.settings import platform_session_factory
 
@@ -489,10 +490,8 @@ def account_day_pnl_inr(
         rows = session.execute(
             text(
                 """
-                SELECT realized_pnl, last_price, average_price, net_quantity,
-                       MAX(last_reconciled_at) AS last_reconciled_at
+                SELECT instrument_token, product, m2m, last_reconciled_at
                 FROM public.account_positions WHERE account_id = :account_id
-                GROUP BY realized_pnl, last_price, average_price, net_quantity
                 """
             ),
             {"account_id": str(account_id)},
@@ -504,10 +503,12 @@ def account_day_pnl_inr(
         if session is not None:
             session.close()
 
-    last_reconciled = next(
-        (_as_datetime(_row_mapping(row).get("last_reconciled_at")) for row in rows),
-        None,
-    )
+    stamps = [
+        stamp
+        for stamp in (_as_datetime(_row_mapping(row).get("last_reconciled_at")) for row in rows)
+        if stamp is not None
+    ]
+    last_reconciled = max(stamps) if stamps else None
     session_day = session_date(moment)
     session_start = datetime.combine(session_day, SESSION_OPEN, IST)
     if (
@@ -520,19 +521,10 @@ def account_day_pnl_inr(
 
     total_pnl = 0.0
     for row in rows:
-        values = _row_mapping(row)
-        quantity = int(values.get("net_quantity") or 0)
-        realized = _as_float(values.get("realized_pnl"))
-        if realized is None:
+        day_mtm = _as_float(_row_mapping(row).get("m2m"))
+        if day_mtm is None:
             return None
-        total_pnl += float(realized)
-        if quantity == 0:
-            continue
-        last_price = _as_float(values.get("last_price"))
-        average_price = _as_float(values.get("average_price"))
-        if last_price is None or last_price <= 0 or average_price is None:
-            return None
-        total_pnl += (float(last_price) - float(average_price)) * quantity
+        total_pnl += float(day_mtm)
     return total_pnl
 
 
