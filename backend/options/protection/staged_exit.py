@@ -646,10 +646,15 @@ class StagedStructureExit:
                 legs[order_id] = {**leg, "account_id": account_id}
         # Account-scoped: another account's order with the same id is NOT ours.
         fills: Dict[str, List[Dict[str, Any]]] = {}
+        order_ids_by_account: Dict[str, List[str]] = {}
         for order_id, leg in legs.items():
             account_id = str(leg.get("account_id") or "")
-            for row in self.order_fills([order_id], account_id=account_id).get(order_id, []):
-                fills.setdefault(order_id, []).append(row)
+            order_ids_by_account.setdefault(account_id, []).append(order_id)
+        for account_id, account_order_ids in order_ids_by_account.items():
+            for order_id, rows in self.order_fills(
+                account_order_ids, account_id=account_id
+            ).items():
+                fills.setdefault(order_id, []).extend(rows)
         for order_id, rows in fills.items():
             leg = legs.get(order_id)
             if leg is None:
@@ -1005,9 +1010,20 @@ class StagedStructureExit:
         # Account-scoped reads: an order id that belongs to another account is not
         # a working order of this run.
         fills: Dict[str, List[Dict[str, Any]]] = {}
+        terminal_statuses: Dict[str, str] = {}
+        order_ids_by_account: Dict[str, List[str]] = {}
         for order_id in order_ids:
+            order_ids_by_account.setdefault(accounts.get(order_id, ""), []).append(
+                order_id
+            )
+        for account_id, account_order_ids in order_ids_by_account.items():
             fills.update(
-                self.order_fills([order_id], account_id=accounts.get(order_id, ""))
+                self.order_fills(account_order_ids, account_id=account_id)
+            )
+            terminal_statuses.update(
+                self.order_terminal_status(
+                    account_order_ids, account_id=account_id
+                )
             )
         for leg in legs:
             symbol = str(leg.get("tradingsymbol") or "")
@@ -1021,6 +1037,12 @@ class StagedStructureExit:
                 for row in fills.get(order_id, [])
                 if str(row.get("transaction_type") or "").upper() in ("", side)
             )
+            # A terminal order has no working remainder. Its confirmed fills are
+            # already reflected in the run's own position; any unfilled remainder
+            # is therefore still exposure and must be picked up by a new fenced
+            # stage. Missing projection evidence stays conservatively working.
+            if terminal_statuses.get(order_id, "").endswith("|TERMINAL"):
+                continue
             outstanding = max(0, requested - filled)
             if outstanding <= 0:
                 continue
@@ -1107,6 +1129,7 @@ class StagedStructureExit:
                     "exit_order_type": leg.get("exit_order_type"),
                     "exit_price": leg.get("exit_price"),
                     "limit_price": leg.get("limit_price"),
+                    "market_protection": leg.get("market_protection"),
                 }
             )
         return rows
@@ -1186,6 +1209,7 @@ class StagedStructureExit:
                     "product": str(order.get("product") or ""),
                     "variety": str(order.get("variety") or "regular"),
                     "order_type": str(order.get("order_type") or "MARKET"),
+                    "market_protection": order.get("market_protection"),
                 }
             )
         return legs
@@ -1293,11 +1317,13 @@ class StagedStructureExit:
         # only a settled "nothing was placed" outcome advances it, which is what
         # lets a refused leg be tried again without ever colliding with the
         # platform's unique client reference of the attempt that already happened.
-        attempt = 1 + sum(
-            1
-            for row in self.stage_records(run)
-            if str(row.get("stage_digest")) == digest
-            and str(row.get("state")) != STAGE_SENDING
+        attempt = 1 + max(
+            (
+                int(row.get("attempt") or 1)
+                for row in self.stage_records(run)
+                if str(row.get("stage_digest")) == digest
+            ),
+            default=0,
         )
         # The exit builder's rows carry the CONTRACT, so the claim resolves the
         # run's own leg id BY SYMBOL. Resolve against ``known_run_legs`` - the
@@ -1332,20 +1358,12 @@ class StagedStructureExit:
         if previous is not None:
             previous_state = str(previous.get("state") or "")
             if previous_state in (STAGE_SUBMITTED, STAGE_PARTIAL):
-                return {
-                    "submitted": True,
-                    "complete": flat,
-                    "reason": "already_submitted",
-                    "stage_digest": digest,
-                    "option_run_id": str(run.strategy_run_id),
-                    "orders": orders,
-                    "order_ids": [
-                        str(leg.get("order_id"))
-                        for leg in (previous.get("legs") or [])
-                        if leg.get("order_id")
-                    ],
-                    "detail": detail,
-                }
+                # ``plan_exit`` subtracts every non-terminal working remainder.
+                # Reaching this branch with orders still owed therefore means the
+                # previous acknowledged attempt is terminal and left exposure;
+                # fence a new attempt even when the evidence digest is unchanged
+                # (for example, a zero-fill rejection).
+                detail = {**detail, "retry_after": previous_state}
             if previous_state == STAGE_UNKNOWN:
                 # An attempted send whose outcome is unknown is NEVER re-sent.
                 return {
@@ -1361,7 +1379,8 @@ class StagedStructureExit:
             # Anything else - a REJECTED stage, or one the platform proved never
             # reached the order path - placed NOTHING, so a later pass may try
             # again under fresh evidence instead of treating it as submitted.
-            detail = {**detail, "retry_after": previous_state}
+            if previous_state not in (STAGE_SUBMITTED, STAGE_PARTIAL):
+                detail = {**detail, "retry_after": previous_state}
         if self._place_orders is None:
             return {
                 "submitted": False,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 from sqlalchemy import text
@@ -565,21 +566,50 @@ class DurableOptionRunStore:
             session.close()
 
     def update_protection_metrics(
-        self, strategy_run_id: str, metrics: dict[str, Any], *, errors: dict[str, str] | None = None
+        self,
+        strategy_run_id: str,
+        metrics: dict[str, Any],
+        *,
+        errors: dict[str, str] | None = None,
+        observed_at: str | None = None,
     ) -> OptionRunState:
-        """Merge a fresh metric snapshot into the run's existing metadata."""
+        """Replace the metric snapshot and persist availability for every metric."""
 
         self._require_id(strategy_run_id)
         session = self._session_factory()
         try:
             run = self._get_run_in_session(session, strategy_run_id, for_update=True)
             metadata = dict(run.metadata or {})
-            previous = metadata.get("protection_metrics")
-            merged = dict(previous) if isinstance(previous, dict) else {}
-            merged.update(dict(metrics or {}))
-            metadata["protection_metrics"] = merged
-            if errors is not None:
-                metadata["protection_metric_errors"] = dict(errors)
+            snapshot = dict(metrics or {})
+            metric_errors = dict(errors or {})
+            checked_at = str(
+                observed_at or datetime.now(timezone.utc).isoformat()
+            )
+            metadata["protection_metrics"] = snapshot
+            metadata["protection_metric_errors"] = metric_errors
+
+            from backend.options.protection.models import (
+                SUPPORTED_PROTECTION_METRIC_KEYS,
+            )
+
+            observations: dict[str, dict[str, Any]] = {}
+            for key in sorted(SUPPORTED_PROTECTION_METRIC_KEYS):
+                if key in snapshot and snapshot.get(key) is not None:
+                    observations[key] = {
+                        "available": True,
+                        "observed_at": checked_at,
+                    }
+                    continue
+                observations[key] = {
+                    "available": False,
+                    "observed_at": None,
+                    "reason": str(
+                        metric_errors.get(key)
+                        or "metric unavailable in latest snapshot"
+                    ),
+                    "checked_at": checked_at,
+                }
+            metadata["protection_metric_observations"] = observations
             run.metadata = metadata
             self._update_run_in_session(session, run)
             session.commit()

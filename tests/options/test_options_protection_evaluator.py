@@ -4,7 +4,11 @@ from datetime import datetime, timezone
 from backend.options.execution.models import OptionRunState
 from backend.options.protection.live_metrics import derive_live_option_protection_metrics
 from backend.options.protection.evaluator import evaluate_option_rules
-from backend.options.protection.exit_builder import build_grouped_exit_orders
+from backend.options.protection.exit_builder import (
+    build_grouped_exit_orders,
+    build_structure_exit_orders,
+)
+from backend.options.protection.runtime import evaluate_option_protection_state
 
 
 def test_evaluate_option_rules_returns_first_matching_rule_by_precedence():
@@ -330,3 +334,83 @@ def test_live_option_metrics_omit_stale_market_inputs():
     assert metrics["combined_premium_change_pct"] == -100.0
     assert metrics["strategy_mtm"] == 3000.0
     assert errors["index_ltp"].startswith("underlying index LTP")
+
+
+def test_live_snapshot_never_backfills_a_missing_metric_from_metadata():
+    run = _option_run()
+    run.metadata = {
+        "protection_metrics": {
+            "index_ltp": 21900.0,
+            "as_of": "2020-01-01T00:00:00+00:00",
+        }
+    }
+    run.trades = [
+        {
+            "leg_id": "short_ce",
+            "transaction_type": "SELL",
+            "quantity": 75,
+            "price": 100.0,
+        }
+    ]
+
+    verdict = evaluate_option_protection_state(
+        run=run,
+        metric_snapshot={"open_quantity": 75},
+    )
+
+    assert verdict["triggered"] is False
+    assert "index_ltp" not in verdict["metrics"]
+
+
+def test_latest_metric_unavailability_is_exposed_for_the_increase_gate():
+    from backend.api.routers.worker_protection import (
+        _build_option_observation_snapshot,
+        _option_gate_status,
+    )
+
+    run = _option_run()
+    run.metadata = {
+        "protection_metrics": {"open_quantity": 75},
+        "protection_metric_observations": {
+            "index_ltp": {
+                "available": False,
+                "observed_at": None,
+                "checked_at": "2026-09-27T04:00:00+00:00",
+                "reason": "underlying index LTP is missing or stale",
+            }
+        },
+    }
+
+    verdict = evaluate_option_protection_state(run=run)
+
+    assert verdict["triggered"] is False
+    assert verdict["unavailable_metrics"] == [
+        {
+            "metric": "index_ltp",
+            "observed_at": None,
+            "checked_at": "2026-09-27T04:00:00+00:00",
+            "reason": "underlying index LTP is missing or stale",
+        }
+    ]
+    snapshot = _build_option_observation_snapshot(run)
+    assert snapshot["triggered"] is False
+    assert snapshot["blocking"] is True
+    assert snapshot["blocking_reason"] == "OPTIONS_PROTECTION_METRIC_UNAVAILABLE"
+    assert _option_gate_status(snapshot) == "__options_protection_state_unavailable__"
+
+
+def test_structure_market_exits_always_carry_market_protection():
+    orders, _detail = build_structure_exit_orders(
+        [
+            {
+                "tradingsymbol": "NIFTY26MAY25000CE",
+                "side": "SELL",
+                "quantity": -75,
+                "exchange": "NFO",
+                "product": "NRML",
+            }
+        ]
+    )
+
+    assert orders[0]["order_type"] == "MARKET"
+    assert orders[0]["market_protection"] == -1

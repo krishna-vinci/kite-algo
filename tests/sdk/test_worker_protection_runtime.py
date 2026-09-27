@@ -156,11 +156,14 @@ class _OptionRunStore:
     def get_run(self, _option_run_id):
         return self.run
 
-    def update_protection_metrics(self, _option_run_id, metrics, *, errors=None):
+    def update_protection_metrics(
+        self, _option_run_id, metrics, *, errors=None, observed_at=None
+    ):
         self.run.metadata = {
             **(self.run.metadata or {}),
             "protection_metrics": dict(metrics),
             "protection_metric_errors": dict(errors or {}),
+            "protection_metrics_observed_at": observed_at,
         }
         return self.run
 
@@ -214,6 +217,18 @@ class WorkerProtectionRuntimeTests(unittest.IsolatedAsyncioTestCase):
         }
         repo = _StructureRepo(structure=structure)
         exit_submitter = AsyncMock(return_value={"status": "closed"})
+        structure_exit_submitter = AsyncMock(
+            return_value={
+                "submitted": True,
+                "complete": True,
+                "orders": [{"tradingsymbol": "HEDGE-CE"}],
+                "trace": {
+                    "structure_digest": "digest-abc",
+                    "order_count": 1,
+                    "naked_short_quantity": 0,
+                },
+            }
+        )
         runtime = WorkerProtectionRuntime(
             repo=repo,
             pnl_loader=AsyncMock(return_value={"legs": [
@@ -221,6 +236,7 @@ class WorkerProtectionRuntimeTests(unittest.IsolatedAsyncioTestCase):
                  "net_quantity": 1, "average_price": 100, "last_price": 94}
             ]}),
             exit_submitter=exit_submitter,
+            structure_exit_submitter=structure_exit_submitter,
             now_fn=lambda: datetime(2026, 4, 25, 12, 1, tzinfo=timezone.utc),
             squareoff_schedule={},
         )
@@ -231,7 +247,8 @@ class WorkerProtectionRuntimeTests(unittest.IsolatedAsyncioTestCase):
         # The exit went through the SAME durable claim path the generic exit uses,
         # so idempotency and single-claim-per-exit are inherited rather than
         # re-implemented.
-        exit_submitter.assert_awaited_once()
+        structure_exit_submitter.assert_awaited_once()
+        exit_submitter.assert_not_awaited()
         state = repo.saved[-1][1]["backend_protection_state"]
         self.assertTrue(state["exit_submitted"])
         # And the whole chain is traced, so a reader can see which link ran.
@@ -272,7 +289,7 @@ class WorkerProtectionRuntimeTests(unittest.IsolatedAsyncioTestCase):
         # reaches a pretend-submitted state.
         self.assertNotEqual(state.get("exit_submission_status"), "submitted")
         self.assertFalse(state["exit_submitted"])
-        self.assertEqual(state["exit_submission_status"], "seam_failed")
+        self.assertEqual(state["exit_submission_status"], "staged_exit_not_wired")
         self.assertFalse(state["structure_exit"]["submitted"])
 
     async def test_a_run_without_a_structure_keeps_todays_behaviour(self):
@@ -377,7 +394,7 @@ class WorkerProtectionRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["triggered"], 0)
         exit_submitter.assert_not_awaited()
 
-    async def test_submit_exception_records_unknown_terminal_state_with_claim(self):
+    async def test_submit_exception_records_unresolved_state_without_claiming_submission(self):
         repo = _Repo()
         runtime = WorkerProtectionRuntime(
             repo=repo,
@@ -391,10 +408,88 @@ class WorkerProtectionRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["triggered"], 0)
         state = repo.saved[-1][1]["backend_protection_state"]
-        self.assertEqual(state["status"], "error")
-        self.assertTrue(state["exit_submitted"])
-        self.assertEqual(state["exit_submission_status"], "unknown")
+        self.assertEqual(state["status"], "triggered")
+        self.assertFalse(state["exit_submitted"])
+        self.assertEqual(state["exit_submission_status"], "unresolved")
         self.assertTrue(state["exit_claim_id"])
+
+    async def test_unresolved_exit_adopts_acceptance_without_resubmitting(self):
+        repo = _Repo()
+        repo.runs[0]["runtime_state"]["backend_protection_state"] = {
+            "generation": 2,
+            "status": "triggered",
+            "triggered_rule": "position_stoploss",
+            "exit_claim_id": "claim-1",
+            "exit_claimed_at": "2026-04-25T11:59:00+00:00",
+            "exit_idempotency_key": "backend-protection:run-1:g2:position_stoploss:abc",
+            "exit_submitted": False,
+            "exit_submission_status": "unresolved",
+        }
+        submitter = AsyncMock()
+        reconciler = AsyncMock(
+            return_value={"status": "accepted", "broker_order_ids": ["OID-1"]}
+        )
+        runtime = WorkerProtectionRuntime(
+            repo=repo,
+            pnl_loader=AsyncMock(),
+            exit_submitter=submitter,
+            exit_reconciler=reconciler,
+            now_fn=lambda: datetime(2026, 4, 25, 12, 1, tzinfo=timezone.utc),
+            squareoff_schedule={},
+        )
+
+        result = await runtime.evaluate_once()
+
+        self.assertEqual(result["triggered"], 0)
+        submitter.assert_not_awaited()
+        reconciler.assert_awaited_once()
+        state = repo.saved[-1][1]["backend_protection_state"]
+        self.assertTrue(state["exit_submitted"])
+        self.assertEqual(state["exit_submission_status"], "reconciled_accepted")
+
+    async def test_unresolved_exit_resubmits_only_after_non_acceptance_is_proven(self):
+        repo = _Repo()
+        repo.runs[0]["runtime_state"]["backend_protection_state"] = {
+            "generation": 2,
+            "status": "triggered",
+            "triggered_rule": "position_stoploss",
+            "exit_claim_id": "claim-1",
+            "exit_claimed_at": "2026-04-25T11:59:00+00:00",
+            "exit_idempotency_key": "backend-protection:run-1:g2:position_stoploss:abc",
+            "exit_submitted": False,
+            "exit_submission_status": "unresolved",
+        }
+        submitter = AsyncMock(return_value={"status": "closed"})
+        reconciler = AsyncMock(return_value={"status": "not_accepted"})
+        runtime = WorkerProtectionRuntime(
+            repo=repo,
+            pnl_loader=AsyncMock(
+                return_value={
+                    "legs": [
+                        {
+                            "symbol": "NSE:INFY",
+                            "product": "CNC",
+                            "side": "BUY",
+                            "quantity": 1,
+                            "net_quantity": 1,
+                            "average_price": 100,
+                            "last_price": 94,
+                        }
+                    ]
+                }
+            ),
+            exit_submitter=submitter,
+            exit_reconciler=reconciler,
+            now_fn=lambda: datetime(2026, 4, 25, 12, 1, tzinfo=timezone.utc),
+            squareoff_schedule={},
+        )
+
+        result = await runtime.evaluate_once()
+
+        self.assertEqual(result["triggered"], 1)
+        reconciler.assert_awaited_once()
+        submitter.assert_awaited_once()
+        self.assertTrue(repo.saved[-1][1]["backend_protection_state"]["exit_submitted"])
 
     async def test_deferred_exit_result_keeps_claim_for_retry_without_marking_exit_submitted(self):
         repo = _Repo()

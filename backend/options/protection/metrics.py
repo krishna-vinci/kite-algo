@@ -14,6 +14,7 @@ def derive_protection_metrics(
     metric_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     metrics: dict[str, Any] = {}
+    snapshot_supplied = metric_snapshot is not None
     snapshot = dict(metric_snapshot or {})
 
     for key in SUPPORTED_PROTECTION_METRIC_KEYS:
@@ -23,9 +24,15 @@ def derive_protection_metrics(
     if "open_quantity" not in metrics:
         metrics["open_quantity"] = derive_open_quantity(run)
 
-    metadata_metrics = _extract_metadata_metrics(run)
-    for key, value in metadata_metrics.items():
-        metrics.setdefault(key, value)
+    # A supplied snapshot is one complete observation, even when it is sparse.
+    # Missing live values are unavailable; they must never be backfilled from a
+    # previous metadata snapshot because that can turn an old market price into a
+    # current protection trigger. Metadata remains the read model for callers
+    # that did not supply a live snapshot (for example, the owner state route).
+    if not snapshot_supplied:
+        metadata_metrics = _extract_metadata_metrics(run)
+        for key, value in metadata_metrics.items():
+            metrics.setdefault(key, value)
 
     return metrics
 

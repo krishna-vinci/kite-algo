@@ -126,6 +126,7 @@ async def _worker_protection_loop(app: FastAPI):
     from backend.api.services.protection_runtime import (
         WorkerProtectionRuntime,
         load_worker_run_pnl_for_protection,
+        reconcile_worker_protection_exit,
         submit_worker_protection_exit,
         submit_worker_protection_structure_exit,
     )
@@ -158,6 +159,9 @@ async def _worker_protection_loop(app: FastAPI):
         repo=repo,
         pnl_loader=lambda run: load_worker_run_pnl_for_protection(request, run),
         exit_submitter=lambda run, state: submit_worker_protection_exit(request, run, state),
+        exit_reconciler=lambda run, state: reconcile_worker_protection_exit(
+            request, run, state
+        ),
         # An option STRUCTURE is never liquidated as a whole book: its exits are
         # derived server-side from the durable option run's own legs and own
         # confirmed fills, staged short-first, through the platform's own

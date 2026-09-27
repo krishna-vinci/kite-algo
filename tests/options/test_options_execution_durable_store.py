@@ -258,6 +258,38 @@ def test_record_orders_and_trades_are_append_only():
     assert any("FOR UPDATE" in sql for sql, _params in session.calls)
 
 
+def test_protection_metric_snapshots_replace_old_values_and_record_availability():
+    session = _FakeSession()
+    store = DurableOptionRunStore(session_factory=lambda: session)
+    seeded = OptionRunState.from_create_request(
+        _create_request(), strategy_run_id="opt_run_metric_snapshot"
+    )
+    seeded.metadata["protection_metrics"] = {
+        "index_ltp": 21900.0,
+        "strategy_mtm": -500.0,
+    }
+    session.seed_run(seeded)
+
+    updated = store.update_protection_metrics(
+        seeded.strategy_run_id,
+        {"strategy_mtm": 125.0},
+        errors={"index_ltp": "underlying index LTP is missing or stale"},
+        observed_at="2026-09-27T04:00:00+00:00",
+    )
+
+    assert updated.metadata["protection_metrics"] == {"strategy_mtm": 125.0}
+    assert updated.metadata["protection_metric_observations"]["strategy_mtm"] == {
+        "available": True,
+        "observed_at": "2026-09-27T04:00:00+00:00",
+    }
+    assert updated.metadata["protection_metric_observations"]["index_ltp"] == {
+        "available": False,
+        "observed_at": None,
+        "reason": "underlying index LTP is missing or stale",
+        "checked_at": "2026-09-27T04:00:00+00:00",
+    }
+
+
 def test_missing_run_and_empty_id_errors_are_clear():
     session = _FakeSession()
     store = DurableOptionRunStore(session_factory=lambda: session)

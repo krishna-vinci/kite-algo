@@ -75,11 +75,15 @@ def evaluate_option_protection_state(
     metrics = derive_protection_metrics(run, metric_snapshot=metric_snapshot)
 
     rules = list(config.get("rules") or [])
+    unavailable_metrics = _unavailable_rule_metrics(
+        run, rules
+    ) if metric_snapshot is None else []
     if not rules:
         return {
             "triggered": False,
             "matched_rule": None,
             "metrics": metrics,
+            "unavailable_metrics": unavailable_metrics,
             "recommended_exit_orders": [],
         }
 
@@ -89,6 +93,7 @@ def evaluate_option_protection_state(
             "triggered": False,
             "matched_rule": None,
             "metrics": metrics,
+            "unavailable_metrics": unavailable_metrics,
             "recommended_exit_orders": [],
         }
 
@@ -107,8 +112,37 @@ def evaluate_option_protection_state(
         "triggered": True,
         "matched_rule": deepcopy(matched) if isinstance(matched, dict) else matched,
         "metrics": metrics,
+        "unavailable_metrics": unavailable_metrics,
         "recommended_exit_orders": recommended_exit_orders,
     }
+
+
+def _unavailable_rule_metrics(
+    run: OptionRunState, rules: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    metadata = run.metadata if isinstance(run.metadata, dict) else {}
+    observations = metadata.get("protection_metric_observations")
+    if not isinstance(observations, dict):
+        return []
+    unavailable: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for rule in rules:
+        metric = str(rule.get("metric") or "")
+        if not metric or metric in seen:
+            continue
+        observation = observations.get(metric)
+        if not isinstance(observation, dict) or observation.get("available") is not False:
+            continue
+        seen.add(metric)
+        unavailable.append(
+            {
+                "metric": metric,
+                "observed_at": observation.get("observed_at"),
+                "checked_at": observation.get("checked_at"),
+                "reason": str(observation.get("reason") or "metric unavailable"),
+            }
+        )
+    return unavailable
 
 
 def _build_run_exit_orders(run: OptionRunState) -> list[dict[str, Any]]:

@@ -577,14 +577,22 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
   - Live prices come from `realtime_positions_service` (`worker_protection.py:427-483`).
   - A durable claim precedes any submit. Structures exit through `StagedStructureExit`; others exit the whole book
     (`protection_runtime.py:58-313,633-784`).
-  - Exit orders are MARKET without `market_protection`; live F&O exits use Kite autoslice (`:719-733`).
-- **Option rule vocabulary: PARTIAL, effectively dead.**
+  - Exit orders are MARKET with Kite `market_protection=-1`; live F&O exits also use Kite autoslice
+    (`protection_runtime.py`, `options/protection/exit_builder.py`).
+  - An exception after a generic exit send is persisted as unresolved. Later ticks reconcile the durable
+    `live_order_intents` idempotency/client references and retry only when the absence of a pre-send record, or a
+    complete broker order-book read, proves non-acceptance (`protection_runtime.py`).
+- **Option rule vocabulary: EXISTS for live owner runs.**
   - The metrics are `index_ltp`, `combined_premium`, `combined_premium_change_pct`, `strategy_mtm` and
     `open_quantity` (`backend/options/protection/models.py:24-30`).
-  - **Nothing writes `metadata["protection_metrics"]`.** Only `open_quantity` is derived (`metrics.py:23-66`), and a
-    missing metric is skipped silently (`evaluator.py:6-30`).
-  - A triggered verdict only **blocks** increases (`OPTION_ADJUSTMENT_PROTECTION_ACTIVE`,
-    `OPTIONS_PROTECTION_TRIGGERED`). It never places an exit.
+  - The 5-second protection loop derives the run's index, option-premium, MTM, open-quantity and configured Greeks
+    from fresh ticks/fills, then replaces the entire durable snapshot. Each metric records observation time and
+    availability; missing/stale live values are never backfilled from older metadata and cannot trigger an exit
+    (`live_metrics.py`, `durable_store.py`, `metrics.py`, `protection_runtime.py`).
+  - A triggered owner-run verdict both **blocks** increases (`OPTION_ADJUSTMENT_PROTECTION_ACTIVE`,
+    `OPTIONS_PROTECTION_TRIGGERED`) and submits the run's short-first staged exit. Confirmed fills and terminal order
+    states are read in account-scoped batches; cancelled/rejected unfilled remainders receive a new fenced attempt,
+    while hedges remain held until every short is proven closed (`staged_exit.py`).
   - `bridge.py` has no importers, and its vocabulary doesn't match the runtime.
   - **The only underlying stop today is strategy code** that reads spot and proposes an exit, and that dies with the
     worker.

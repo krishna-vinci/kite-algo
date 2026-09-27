@@ -665,7 +665,11 @@ def _option_gate_status(snapshot: Dict[str, Any]) -> str | None:
     """
 
     reason = snapshot.get("blocking_reason")
-    if reason in ("OPTIONS_PROTECTION_STATE_UNAVAILABLE", _OPTION_PROTECTION_OWNER_UNKNOWN):
+    if reason in (
+        "OPTIONS_PROTECTION_STATE_UNAVAILABLE",
+        "OPTIONS_PROTECTION_METRIC_UNAVAILABLE",
+        _OPTION_PROTECTION_OWNER_UNKNOWN,
+    ):
         return _OPTION_PROTECTION_STATE_UNAVAILABLE
     return snapshot.get("run_status")
 
@@ -678,6 +682,7 @@ def _compute_option_observation_fingerprint(snapshot: Dict[str, Any]) -> str:
         "blocking_reason": snapshot.get("blocking_reason"),
         "matched_rule": dict(snapshot.get("matched_rule") or {}) if isinstance(snapshot.get("matched_rule"), dict) else snapshot.get("matched_rule"),
         "metrics": dict(snapshot.get("metrics") or {}),
+        "unavailable_metrics": list(snapshot.get("unavailable_metrics") or []),
         "recommended_exit_orders_count": _to_int(snapshot.get("recommended_exit_orders_count"), default=0),
     }
     return hashlib.sha1(json.dumps(canonical, sort_keys=True, default=_json_default, separators=(",", ":")).encode("utf-8")).hexdigest()
@@ -688,9 +693,12 @@ def _build_option_observation_snapshot(run: Any) -> Dict[str, Any]:
     run_status = str(getattr(run, "status", "") or "")
     verdict = evaluate_option_protection_state(run=run)
     triggered = bool(verdict.get("triggered"))
+    unavailable_metrics = list(verdict.get("unavailable_metrics") or [])
     status_blocks = bool(run_status and option_run_status_blocks_trading(run_status))
     if triggered:
         blocking_reason = "OPTIONS_PROTECTION_TRIGGERED"
+    elif unavailable_metrics:
+        blocking_reason = "OPTIONS_PROTECTION_METRIC_UNAVAILABLE"
     elif status_blocks:
         blocking_reason = "OPTIONS_RUN_NOT_ACTIVE"
     else:
@@ -701,10 +709,11 @@ def _build_option_observation_snapshot(run: Any) -> Dict[str, Any]:
         "run_status": run_status,
         "evaluation_mode": "run_state",
         "triggered": triggered,
-        "blocking": bool(triggered or status_blocks),
+        "blocking": bool(blocking_reason),
         "blocking_reason": blocking_reason,
         "matched_rule": verdict.get("matched_rule"),
         "metrics": dict(verdict.get("metrics") or {}),
+        "unavailable_metrics": unavailable_metrics,
         "recommended_exit_orders_count": len(recommended_exit_orders),
     }
 

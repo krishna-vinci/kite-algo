@@ -57,10 +57,14 @@ class WorkerProtectionRuntime:
         option_greeks_loader: Optional[
             Callable[[str, str], Awaitable[Dict[str, Any] | None]]
         ] = None,
+        exit_reconciler: Optional[
+            Callable[[Dict[str, Any], Dict[str, Any]], Awaitable[Dict[str, Any]]]
+        ] = None,
     ) -> None:
         self.repo = repo
         self.pnl_loader = pnl_loader
         self.exit_submitter = exit_submitter
+        self.exit_reconciler = exit_reconciler
         self.now_fn = now_fn
         self.squareoff_schedule = squareoff_schedule or {}
         #: The STRUCTURE-aware exit. A hedged structure may not be liquidated as a
@@ -271,6 +275,72 @@ class WorkerProtectionRuntime:
         config = validate_backend_protection_payload(runtime_state.get("backend_protection"), live=str(run.get("execution_mode") or "").lower() == "live")
         state = dict(runtime_state.get("backend_protection_state") or {})
         now = self.now_fn()
+        if str(state.get("exit_submission_status") or "") == "unresolved":
+            resolution = await self._reconcile_unresolved_exit(run, state)
+            resolution_status = str(resolution.get("status") or "unresolved")
+            if resolution_status == "accepted":
+                accepted_state = {
+                    **state,
+                    "exit_submitted": True,
+                    "exit_submission_status": "reconciled_accepted",
+                    "exit_reconciliation": resolution,
+                    "last_checked_at": now.isoformat(),
+                }
+                persisted = await self._persist_state(
+                    run,
+                    runtime_state,
+                    state,
+                    accepted_state,
+                    expected_generation=state.get("generation"),
+                    expected_triggered_rule=state.get("triggered_rule") or "",
+                    expected_exit_claim_id=state.get("exit_claim_id") or "",
+                )
+                if persisted is not None:
+                    await self._publish_timeline_rows(
+                        persisted.get("timeline_events") or []
+                    )
+                return False
+            if resolution_status != "not_accepted":
+                unresolved_state = {
+                    **state,
+                    "exit_submitted": False,
+                    "exit_submission_status": "unresolved",
+                    "exit_reconciliation": resolution,
+                    "last_checked_at": now.isoformat(),
+                }
+                await self._persist_state(
+                    run,
+                    runtime_state,
+                    state,
+                    unresolved_state,
+                    expected_generation=state.get("generation"),
+                    expected_triggered_rule=state.get("triggered_rule") or "",
+                    expected_exit_claim_id=state.get("exit_claim_id") or "",
+                )
+                return False
+            # Only an authoritative non-acceptance proof clears the claim and
+            # permits the normal trigger path to submit the same idempotent exit.
+            retry_state = {
+                **state,
+                "exit_submitted": False,
+                "exit_submission_status": "not_accepted",
+                "exit_reconciliation": resolution,
+                "exit_claim_id": None,
+                "exit_claimed_at": None,
+            }
+            persisted = await self._persist_state(
+                run,
+                runtime_state,
+                state,
+                retry_state,
+                expected_generation=state.get("generation"),
+                expected_triggered_rule=state.get("triggered_rule") or "",
+                expected_exit_claim_id=state.get("exit_claim_id") or "",
+            )
+            if persisted is None:
+                return False
+            state = retry_state
+            runtime_state["backend_protection_state"] = retry_state
         if self._has_recent_exit_claim(state, now):
             return False
         owner = self._protection_owner_context(run)
@@ -314,6 +384,10 @@ class WorkerProtectionRuntime:
                 "exit_claimed_at": now.isoformat(),
                 "exit_idempotency_key": self._idempotency_key(run, next_state),
             }
+            if state.get("exit_reconciliation") is not None:
+                claimed_state["exit_reconciliation"] = state.get(
+                    "exit_reconciliation"
+                )
             claimed_result = await self._persist_state(
                 run,
                 runtime_state,
@@ -384,9 +458,9 @@ class WorkerProtectionRuntime:
             except Exception as exc:
                 unknown_state = {
                     **claimed_state,
-                    "status": "error",
-                    "exit_submitted": True,
-                    "exit_submission_status": "unknown",
+                    "status": "triggered",
+                    "exit_submitted": False,
+                    "exit_submission_status": "unresolved",
                     "exit_error": str(exc),
                 }
                 persisted_unknown = await self._persist_state(
@@ -453,6 +527,36 @@ class WorkerProtectionRuntime:
             await self._publish_timeline_rows(persisted_non_trigger.get("timeline_events") or [])
         return did_trigger
 
+    async def _reconcile_unresolved_exit(
+        self, run: Dict[str, Any], state: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        if self.exit_reconciler is None:
+            return {
+                "status": "unresolved",
+                "reason": "exit_reconciler_unavailable",
+            }
+        try:
+            result = await self.exit_reconciler(run, state)
+        except Exception as exc:  # noqa: BLE001 - unreadable evidence stays unresolved
+            return {
+                "status": "unresolved",
+                "reason": "exit_reconcile_failed",
+                "error": str(exc),
+            }
+        if not isinstance(result, dict):
+            return {
+                "status": "unresolved",
+                "reason": "exit_reconcile_invalid",
+            }
+        status = str(result.get("status") or "unresolved")
+        if status not in {"accepted", "not_accepted", "unresolved"}:
+            return {
+                **result,
+                "status": "unresolved",
+                "reason": "exit_reconcile_invalid_status",
+            }
+        return dict(result)
+
     async def _evaluate_option_owner_run(
         self,
         run: Dict[str, Any],
@@ -481,15 +585,17 @@ class WorkerProtectionRuntime:
             index_tick_loader=self._index_tick_loader(),
             option_tick_loader=self._option_tick_loader(),
             option_token_resolver=self._option_token_resolver(),
-            option_greeks_loader=self._option_greeks_loader(),
+            # ``None`` means Greeks are not part of this runtime's live snapshot;
+            # do not manufacture an availability error for an unconfigured metric.
+            option_greeks_loader=self.option_greeks_loader,
             now=now,
         )
-        persisted_metrics = {**metrics, "as_of": now.isoformat()}
         await asyncio.to_thread(
             self._option_run_store().update_protection_metrics,
             str(option_run.strategy_run_id),
-            persisted_metrics,
+            metrics,
             errors=metric_errors,
+            observed_at=now.isoformat(),
         )
         await self._record_option_metric_availability(
             run,
@@ -1150,6 +1256,153 @@ async def submit_worker_protection_exit(request: Any, run: Dict[str, Any], state
     )
 
 
+async def reconcile_worker_protection_exit(
+    request: Any, run: Dict[str, Any], state: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Resolve an ambiguous live protection send before any possible retry.
+
+    The order path writes ``live_order_intents`` before every broker call. No row
+    proves the send was never attempted; a broker order id proves acceptance; an
+    idless row requires a complete broker order-book read by its immutable client
+    reference. An unavailable or incomplete read remains unresolved.
+    """
+    from sqlalchemy import text
+
+    from backend.api.routers.worker_shared import _load_live_kite_for_account
+
+    idempotency_key = str(state.get("exit_idempotency_key") or "")
+    account_id = str(run.get("account_scope") or "")
+    strategy_run_id = str(run.get("strategy_run_id") or "")
+    if str(run.get("execution_mode") or "").lower() != "live":
+        return {"status": "unresolved", "reason": "non_live_reconcile_unsupported"}
+    if not idempotency_key or not account_id or not strategy_run_id:
+        return {"status": "unresolved", "reason": "exit_identity_missing"}
+
+    repo = getattr(request.app.state, "algo_worker_repository", None)
+    session_factory = getattr(repo, "session_factory", None)
+    if session_factory is None:
+        return {"status": "unresolved", "reason": "intent_store_unavailable"}
+    try:
+        with session_factory() as session:
+            rows = (
+                session.execute(
+                    text(
+                        "SELECT client_order_ref, broker_order_id, status, idempotency_key "
+                        "FROM public.live_order_intents "
+                        "WHERE account_id = :account_id "
+                        "AND strategy_run_id = :strategy_run_id "
+                        "AND (idempotency_key = :idempotency_key "
+                        "OR LEFT(idempotency_key, LENGTH(:idempotency_key) + 1) "
+                        "= :idempotency_key || ':') "
+                        "ORDER BY created_at, client_order_ref"
+                    ),
+                    {
+                        "account_id": account_id,
+                        "strategy_run_id": strategy_run_id,
+                        "idempotency_key": idempotency_key,
+                    },
+                )
+                .mappings()
+                .all()
+            )
+    except Exception as exc:  # noqa: BLE001 - unreadable fence is unresolved
+        return {
+            "status": "unresolved",
+            "reason": "intent_read_failed",
+            "error": str(exc),
+        }
+    intents = [dict(row) for row in rows]
+    live_exit = dict(((run.get("runtime_state") or {}).get("live_exit")) or {})
+    expected_orders = list(live_exit.get("orders") or [])
+    expected_count = len(expected_orders)
+    if not intents:
+        return {
+            "status": "not_accepted",
+            "reason": "no_pre_send_record",
+            "idempotency_key": idempotency_key,
+        }
+
+    broker_order_ids = sorted(
+        {
+            str(row.get("broker_order_id"))
+            for row in intents
+            if row.get("broker_order_id")
+        }
+    )
+    if broker_order_ids and (
+        expected_count <= 1 or len(broker_order_ids) >= expected_count
+    ):
+        return {
+            "status": "accepted",
+            "reason": "broker_order_recorded",
+            "broker_order_ids": broker_order_ids,
+            "idempotency_key": idempotency_key,
+        }
+
+    refs = [str(row.get("client_order_ref") or "") for row in intents]
+    if any(not ref for ref in refs):
+        return {
+            "status": "unresolved",
+            "reason": "client_order_ref_missing",
+            "idempotency_key": idempotency_key,
+        }
+    try:
+        kite = await asyncio.to_thread(_load_live_kite_for_account, account_id)
+        broker_orders = await asyncio.to_thread(kite.orders)
+    except Exception as exc:  # noqa: BLE001 - failed authoritative read is unknown
+        return {
+            "status": "unresolved",
+            "reason": "broker_order_read_failed",
+            "error": str(exc),
+            "idempotency_key": idempotency_key,
+        }
+
+    matches: list[dict[str, Any]] = []
+    wanted = set(refs)
+    for raw in list(broker_orders or []):
+        payload = (
+            raw.model_dump(mode="json")
+            if hasattr(raw, "model_dump")
+            else dict(raw or {})
+        )
+        tags = {str(payload.get("tag") or "")}
+        tags.update(str(tag) for tag in (payload.get("tags") or []) if tag)
+        if not wanted.intersection(tags):
+            continue
+        matches.append(payload)
+    accepted_order_ids = sorted(
+        {
+            *broker_order_ids,
+            *(str(row.get("order_id")) for row in matches if row.get("order_id")),
+        }
+    )
+    if accepted_order_ids and (
+        expected_count <= 1 or len(accepted_order_ids) >= expected_count
+    ):
+        return {
+            "status": "accepted",
+            "reason": "broker_order_found_by_client_ref",
+            "broker_order_ids": accepted_order_ids,
+            "client_order_refs": sorted(wanted),
+            "idempotency_key": idempotency_key,
+        }
+    if accepted_order_ids:
+        return {
+            "status": "unresolved",
+            "reason": "partial_acceptance",
+            "broker_order_ids": accepted_order_ids,
+            "expected_order_count": expected_count,
+            "client_order_refs": sorted(wanted),
+            "idempotency_key": idempotency_key,
+        }
+    return {
+        "status": "not_accepted",
+        "reason": "broker_has_no_client_order_ref",
+        "client_order_refs": sorted(wanted),
+        "idempotency_key": idempotency_key,
+    }
+
+
 async def submit_worker_protection_structure_exit(
     request: Any, run: Dict[str, Any], state: Dict[str, Any]
 ) -> Dict[str, Any]:
@@ -1232,6 +1485,7 @@ async def submit_worker_protection_structure_exit(
                     "variety": str(leg.get("variety") or "regular"),
                     "product": str(leg.get("product") or "NRML"),
                     "order_type": str(leg.get("order_type") or "MARKET"),
+                    "market_protection": leg.get("market_protection"),
                     "autoslice": should_autoslice(str(leg.get("exchange") or "")),
                     "attribution": attribution,
                 }

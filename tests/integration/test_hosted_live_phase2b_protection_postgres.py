@@ -149,6 +149,7 @@ class _FakeBrokerBoundary:
         #: Set to a BaseException class to simulate a crash AFTER acceptance and
         #: BEFORE the caller records the outcome.
         self.crash_after_accept: type[BaseException] | None = None
+        self.fail_before_intent: type[Exception] | None = None
 
     async def place_orders(self, *, orders, idempotency_key):
         """The staged structure exit's broker boundary: acceptance only."""
@@ -175,6 +176,8 @@ class _FakeBrokerBoundary:
         _ = (kite, corr_id, response, session_id)
         from sqlalchemy import text
 
+        if self.fail_before_intent is not None:
+            raise self.fail_before_intent("order path failed before pre-send intent")
         if self.session_factory is not None:
             with self.session_factory() as session:
                 for order in request.orders:
@@ -408,6 +411,7 @@ def _runtime(
     from backend.api.repositories.algo_worker_repo import SqlAlchemyAlgoWorkerRepository
     from backend.api.services.protection_runtime import (
         WorkerProtectionRuntime,
+        reconcile_worker_protection_exit,
         submit_worker_protection_exit,
     )
 
@@ -438,6 +442,9 @@ def _runtime(
         repo=repo,
         pnl_loader=_pnl,
         exit_submitter=lambda run, state: submit_worker_protection_exit(request, run, state),
+        exit_reconciler=lambda run, state: reconcile_worker_protection_exit(
+            request, run, state
+        ),
         # The PRODUCTION structure submitter, over the real OrdersService boundary
         # (only the broker call inside it is faked, by app.state's orders service).
         structure_exit_submitter=lambda run, state: _production_structure_submitter(
@@ -738,6 +745,102 @@ def test_mis_dead_child_squareoff_executes_through_the_control_plane(pg):
     again = asyncio.run(_run())
     assert again["errors"] == 0, again
     assert len(broker.placed) == 1, broker.placed
+
+
+def test_generic_exit_timeout_adopts_the_durable_broker_order_on_the_next_tick(pg):
+    broker = _FakeBrokerBoundary()
+    broker.crash_after_accept = RuntimeError
+    seeded = _seed_live_run(
+        pg["factory"],
+        legs=[
+            {
+                "symbol": "NIFTY26SEP25000CE",
+                "token": TOKEN,
+                "product": "MIS",
+                "net_quantity": 75,
+            }
+        ],
+        protection={"exit_on_worker_stale": True, "worker_stale_sec": 60},
+    )
+    runtime, _request = _runtime(
+        pg["factory"],
+        broker,
+        pnl_legs=[
+            {
+                "tradingsymbol": "NIFTY26SEP25000CE",
+                "product": "MIS",
+                "quantity": 75,
+                "net_quantity": 75,
+                "exchange": "NFO",
+                "instrument_token": TOKEN,
+            }
+        ],
+    )
+
+    first = asyncio.run(runtime.evaluate_once())
+
+    assert first == {"evaluated": 1, "triggered": 0, "errors": 0}, first
+    assert len(broker.placed) == 1, broker.placed
+    unresolved = _protection_state(pg, seeded["run_id"])
+    assert unresolved["exit_submitted"] is False, unresolved
+    assert unresolved["exit_submission_status"] == "unresolved", unresolved
+
+    # The pre-send intent already carries the accepted broker order id. The next
+    # tick adopts it and must not call the broker boundary a second time.
+    broker.crash_after_accept = None
+    second = asyncio.run(runtime.evaluate_once())
+
+    assert second == {"evaluated": 1, "triggered": 0, "errors": 0}, second
+    assert len(broker.placed) == 1, broker.placed
+    reconciled = _protection_state(pg, seeded["run_id"])
+    assert reconciled["exit_submitted"] is True, reconciled
+    assert reconciled["exit_submission_status"] == "reconciled_accepted", reconciled
+    assert reconciled["exit_reconciliation"]["broker_order_ids"], reconciled
+
+
+def test_generic_exit_retries_after_absent_pre_send_record_proves_no_acceptance(pg):
+    broker = _FakeBrokerBoundary()
+    broker.fail_before_intent = RuntimeError
+    seeded = _seed_live_run(
+        pg["factory"],
+        legs=[
+            {
+                "symbol": "NIFTY26SEP25000CE",
+                "token": TOKEN,
+                "product": "MIS",
+                "net_quantity": 75,
+            }
+        ],
+        protection={"exit_on_worker_stale": True, "worker_stale_sec": 60},
+    )
+    runtime, _request = _runtime(
+        pg["factory"],
+        broker,
+        pnl_legs=[
+            {
+                "tradingsymbol": "NIFTY26SEP25000CE",
+                "product": "MIS",
+                "quantity": 75,
+                "net_quantity": 75,
+                "exchange": "NFO",
+                "instrument_token": TOKEN,
+            }
+        ],
+    )
+
+    first = asyncio.run(runtime.evaluate_once())
+    assert first == {"evaluated": 1, "triggered": 0, "errors": 0}, first
+    assert broker.placed == []
+    assert _protection_state(pg, seeded["run_id"])["exit_submission_status"] == "unresolved"
+
+    broker.fail_before_intent = None
+    second = asyncio.run(runtime.evaluate_once())
+
+    assert second == {"evaluated": 1, "triggered": 1, "errors": 0}, second
+    assert len(broker.placed) == 1, broker.placed
+    final_state = _protection_state(pg, seeded["run_id"])
+    assert final_state["exit_submitted"] is True, final_state
+    assert final_state["exit_reconciliation"]["reason"] == "no_pre_send_record"
 
 
 def test_option_structure_protection_exit_executes_short_first(pg):
@@ -1059,6 +1162,91 @@ def test_one_closed_short_does_not_unlock_the_hedge_of_another(pg):
         if str(order["tradingsymbol"]) == "NIFTY26OCT30000CE"
     ]
     assert hedge_orders == [150], hedge_orders
+
+
+def test_cancelled_partial_short_exit_retries_only_the_terminal_remainder(pg):
+    broker = _FakeBrokerBoundary()
+    seeded = _seed_live_run(
+        pg["factory"],
+        legs=[
+            {
+                "symbol": "NIFTY26OCT25000CE",
+                "token": 900001,
+                "product": "NRML",
+                "net_quantity": -50,
+            }
+        ],
+        protection={"exit_on_worker_stale": True, "worker_stale_sec": 60},
+        structure={"structure_digest": "phase2b-terminal-retry", "legs": []},
+    )
+    option_run = _seed_option_run(
+        pg["factory"],
+        worker_run_id=seeded["run_id"],
+        strategy_id=seeded["strategy_id"],
+        legs=[
+            {
+                "leg_id": "leg-short",
+                "tradingsymbol": "NIFTY26OCT25000CE",
+                "transaction_type": "SELL",
+                "quantity": 50,
+                "exchange": "NFO",
+                "product": "NRML",
+            }
+        ],
+    )
+    clock = _MoveableClock(datetime.now(timezone.utc))
+    runtime, _request = _runtime(pg["factory"], broker, pnl_legs=[], now_fn=clock)
+
+    first = asyncio.run(runtime.evaluate_once())
+    assert first["errors"] == 0, first
+    assert [int(order["quantity"]) for order in broker.placed] == [50]
+    assert broker.placed[0]["market_protection"] == -1
+
+    _ingest_platform_order_fill(
+        pg["factory"],
+        order_id=_stage_order_id(broker, symbol="NIFTY26OCT25000CE"),
+        trade_id="TR-CANCELLED-PARTIAL",
+        quantity=20,
+        side="BUY",
+        symbol="NIFTY26OCT25000CE",
+        token=900001,
+        terminal=True,
+    )
+    from sqlalchemy import text
+
+    with pg["factory"]() as session:
+        session.execute(
+            text(
+                "UPDATE public.order_state_projection "
+                "SET latest_status = 'CANCELLED', terminal = true "
+                "WHERE account_id = :account AND order_id = :order_id"
+            ),
+            {
+                "account": ACCOUNT,
+                "order_id": _stage_order_id(
+                    broker, symbol="NIFTY26OCT25000CE"
+                ),
+            },
+        )
+        session.commit()
+
+    clock.advance(180)
+    second = asyncio.run(runtime.evaluate_once())
+
+    assert second["errors"] == 0, second
+    assert [int(order["quantity"]) for order in broker.placed] == [50, 30]
+    assert broker.placed[1]["market_protection"] == -1
+    from backend.options.execution.durable_store import DurableOptionRunStore
+
+    recorded = DurableOptionRunStore(session_factory=pg["factory"]).get_run(
+        option_run.strategy_run_id
+    )
+    attempts = [
+        int(row.get("attempt") or 0)
+        for row in recorded.orders
+        if row.get("stage_digest") and row.get("state") == "sending"
+    ]
+    assert attempts == [1, 1]
 
 
 def test_a_structure_run_with_unknown_attribution_is_refused(pg):

@@ -178,6 +178,11 @@ def _close_order(
     )
     if order_type == "LIMIT" and limit_price is not None:
         order["price"] = limit_price
+    if order_type == "MARKET":
+        market_protection = payload.get("market_protection")
+        order["market_protection"] = (
+            -1 if market_protection is None else market_protection
+        )
     return order
 
 
