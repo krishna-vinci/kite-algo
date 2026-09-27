@@ -16,6 +16,7 @@ from backend.broker_api.instruments.index_ingestion import (
     refresh_supported_indices,
 )
 from backend.app.monitor import heartbeat, set_component_status, set_meta
+from backend.platform.owner_alerts import alert_owner_nowait
 
 daily_token_ready: asyncio.Event = asyncio.Event()
 
@@ -44,6 +45,8 @@ async def _schedule_daily_token_refresh() -> None:
     """
     tz = ZoneInfo("Asia/Kolkata")
     set_component_status("daily_token_scheduler", "healthy", detail="Daily token scheduler started")
+    login_attempt_date = None
+    login_attempt = 0
     while True:
         try:
             now = datetime.now(tz)
@@ -67,10 +70,14 @@ async def _schedule_daily_token_refresh() -> None:
             set_component_status("daily_token_scheduler", "running", detail="Refreshing daily system token")
 
             # Retry loop until success
-            retry_count = 0
             while True:
                 try:
-                    retry_count += 1
+                    ist_date = datetime.now(tz).date().isoformat()
+                    if ist_date != login_attempt_date:
+                        login_attempt_date = ist_date
+                        login_attempt = 0
+                    login_attempt += 1
+                    retry_count = login_attempt
                     heartbeat("daily_token_scheduler", detail="Attempting headless broker login", meta={"attempt": retry_count})
                     db = SessionLocal()
                     try:
@@ -88,6 +95,16 @@ async def _schedule_daily_token_refresh() -> None:
                     })
                     break
                 except Exception as e:
+                    if retry_count == 1 or retry_count % 10 == 0:
+                        alert_owner_nowait(
+                            key=f"broker-login:{ist_date}:{retry_count // 10}",
+                            title="Broker login failing",
+                            message=(
+                                f"Daily broker login failed {retry_count} time(s) today: "
+                                f"{type(e).__name__}. Live trading will fail until it succeeds."
+                            ),
+                            tags=["warning"],
+                        )
                     logging.warning("[SCHED] Headless login failed: %s; retrying in 30s", e)
                     set_component_status("daily_token_scheduler", "degraded", detail=f"Headless login failed: {e}", meta={"attempt": retry_count})
                     set_meta("daily_broker_login", {

@@ -47,6 +47,7 @@ from backend.strategies.models import (
     StrategyJob,
 )
 from backend.strategies.plan_pipeline import PlanExecutionPipeline, PipelineRefusal
+from backend.platform.owner_alerts import alert_owner_nowait
 
 #: The attempt statuses that may spend authority (mirrors the hosted-attempt
 #: guard in ``backend/api/services/hosted_attempt.py``).
@@ -629,6 +630,16 @@ class ExecutionRequestService:
             session.commit()
             view = self._view(row)
             journal_bridge.record_request_decision(view)
+            if view["status"] == "awaiting_approval":
+                alert_owner_nowait(
+                    key=f"approval:{view['request_id']}",
+                    title="Approval needed",
+                    message=(
+                        f"Strategy {view['strategy_id']} requests execution of plan "
+                        f"{view['plan_id']} ({view['execution_environment']}). Approve or reject in the app."
+                    ),
+                    tags=["bell"],
+                )
             return {"idempotent": False, "request": view}
         except ExecutionRequestError:
             session.rollback()
@@ -1309,7 +1320,18 @@ class ExecutionRequestService:
             row = self._load_or_raise(session, str(request_id))
             session.add(self._audit(row, str(status), str(refusal_code or ""), "system", moment))
             session.commit()
-            return self._view(row)
+            view = self._view(row)
+            if status == "dispatch_unresolved":
+                alert_owner_nowait(
+                    key=f"dispatch:{request_id}",
+                    title="Order outcome UNKNOWN",
+                    message=(
+                        f"Execution request {request_id} (plan {row.plan_id}, {row.execution_environment}) "
+                        "has an unknown broker outcome - reconcile before trading."
+                    ),
+                    tags=["rotating_light"],
+                )
+            return view
         except ExecutionRequestError:
             session.rollback()
             raise

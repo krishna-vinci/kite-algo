@@ -623,6 +623,10 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
   Universes are resolved every 300 s (`backend/screeners`, `worker_entry.py:896-951`).
 - **Notifications: EXISTS, outbound only.** Telegram `sendMessage` and ntfy (`backend/notifications/adapters/`).
   There are **no inbound commands**.
+- **Owner alerts:** risk/action alerts send directly to ntfy via `SCHEDULER_NTFY_URL`, independent of the
+  alerts-worker, for protection exits/triggers, unknown order outcomes, approvals, blocked kill-switch targets
+  and repeated broker-login failures. Alerts deduplicate per stable key for 300 s by default
+  (`OWNER_ALERT_COOLDOWN_SECONDS`).
 - **Journal and analytics: EXISTS.** Daily, weekly and monthly journal; episodes with notes; analytics for
   summary, strategy, equity, costs and paper-vs-live; the live journal projector (`backend/journaling`,
   `api/routers/{journal,analytics}.py`). Hosted strategies: paper and live fills land on a journal run keyed by

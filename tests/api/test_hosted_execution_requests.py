@@ -22,6 +22,7 @@ import json
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 import pytest
 
@@ -908,9 +909,16 @@ def _dispatch(service, request_id, *, now=NOW):
 
 def test_manual_request_waits_and_executes_nothing(world):
     plan_id, _hash = _plan(world["factory"], strategy=world["strategy"])
-    result = world["service"].create_for_job(
-        job=world["job"], plan_id=plan_id, idempotency_key="exec-key-0001", now=NOW
-    )
+    with patch("backend.strategies.execution_requests.alert_owner_nowait") as alert:
+        result = world["service"].create_for_job(
+            job=world["job"], plan_id=plan_id, idempotency_key="exec-key-0001", now=NOW
+        )
+        replay = world["service"].create_for_job(
+            job=world["job"], plan_id=plan_id, idempotency_key="exec-key-0001", now=NOW
+        )
+    assert replay["idempotent"] is True
+    alert.assert_called_once()
+    assert alert.call_args.kwargs["key"].startswith("approval:")
     request = result["request"]
     assert result["idempotent"] is False
     assert request["status"] == "awaiting_approval"
@@ -1601,12 +1609,17 @@ def test_dispatch_records_the_executors_own_outcome_not_a_blanket_executed(
 
 
 def test_dispatch_of_a_transport_failure_is_unresolved_and_never_replayed(world):
-    _service, outcome = _dispatch_with_executor(
-        world, _CannedExecutor(error=RuntimeError("socket closed")), key="outcome-error"
-    )
+    with patch("backend.strategies.execution_requests.alert_owner_nowait") as alert:
+        _service, outcome = _dispatch_with_executor(
+            world, _CannedExecutor(error=RuntimeError("socket closed")), key="outcome-error"
+        )
     assert outcome["status"] == "dispatch_unresolved", outcome
     assert outcome["refusal_code"] == "EXECUTION_OUTCOME_UNKNOWN", outcome
     assert outcome["executable"] is False
+    dispatch_alerts = [
+        call for call in alert.call_args_list if call.kwargs["key"].startswith("dispatch:")
+    ]
+    assert len(dispatch_alerts) == 1
 
 
 def test_next_action_never_claims_a_fill_for_a_bare_dispatch(world):

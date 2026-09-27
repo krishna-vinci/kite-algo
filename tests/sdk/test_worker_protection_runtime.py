@@ -198,6 +198,42 @@ class WorkerProtectionRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(repo.saved[-1][1]["backend_protection_state"]["action"], "exit_strategy")
         self.assertTrue(repo.saved[-1][1]["backend_protection_state"]["exit_submitted"])
 
+    async def test_exit_submitter_failure_alerts_owner_as_unresolved(self):
+        repo = _Repo()
+        runtime = WorkerProtectionRuntime(
+            repo=repo,
+            pnl_loader=AsyncMock(return_value={"legs": [{"symbol": "NSE:INFY", "product": "CNC", "side": "BUY", "quantity": 1, "net_quantity": 1, "average_price": 100, "last_price": 94}]}),
+            exit_submitter=AsyncMock(side_effect=RuntimeError("broker down")),
+            now_fn=lambda: datetime(2026, 4, 25, 12, 1, tzinfo=timezone.utc),
+            squareoff_schedule={},
+        )
+
+        with patch("backend.api.services.protection_runtime.alert_owner_nowait") as alert:
+            await runtime.evaluate_once()
+
+        unresolved = [
+            call for call in alert.call_args_list if "unresolved" in call.kwargs["title"]
+        ]
+        self.assertEqual(len(unresolved), 1)
+        self.assertTrue(unresolved[0].kwargs["key"].startswith("protection:"))
+
+    async def test_trigger_alerts_owner_after_claim_persist(self):
+        repo = _Repo()
+        runtime = WorkerProtectionRuntime(
+            repo=repo,
+            pnl_loader=AsyncMock(return_value={"legs": [{"symbol": "NSE:INFY", "product": "CNC", "side": "BUY", "quantity": 1, "net_quantity": 1, "average_price": 100, "last_price": 94}]}),
+            exit_submitter=AsyncMock(return_value={"status": "closed"}),
+            now_fn=lambda: datetime(2026, 4, 25, 12, 1, tzinfo=timezone.utc),
+            squareoff_schedule={},
+        )
+
+        with patch("backend.api.services.protection_runtime.alert_owner_nowait") as alert:
+            await runtime.evaluate_once()
+
+        alert.assert_called_once()
+        self.assertTrue(alert.call_args.kwargs["key"].startswith("protection-trigger:"))
+        self.assertEqual(alert.call_args.kwargs["title"], "Protection triggered")
+
     async def test_a_structure_aware_trigger_claims_and_submits_through_the_seam(self):
         """Gap C: a structure-aware trigger must actually SUBMIT its exits.
 

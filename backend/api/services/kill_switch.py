@@ -40,6 +40,7 @@ from backend.api.services.owner_actions import (
     owner_action_scope,
 )
 from backend.platform.settings import LIVE_LANE_KEYS, update_live_settings
+from backend.platform.owner_alerts import alert_owner_nowait
 from backend.strategies.attribution_models import (
     LivePlanSubmission,
     StrategyPositionProjection,
@@ -578,6 +579,27 @@ class KillSwitchService:
             ),
         }
 
+    @staticmethod
+    def _alert_blocked(snapshot: Mapping[str, Any]) -> None:
+        blocked = [
+            row for row in (snapshot.get("strategies") or [])
+            if str(row.get("status") or "") == STATUS_BLOCKED
+        ]
+        if not blocked:
+            return
+        details = ", ".join(
+            f"{row.get('strategy_id')}: {row.get('refusal') or 'blocked'}"
+            for row in blocked[:10]
+        )
+        alert_owner_nowait(
+            key=f"killswitch:{snapshot.get('operation_id')}",
+            title="Kill switch BLOCKED",
+            message=(
+                f"{len(blocked)} strategies could not be flattened: {details} - act manually."
+            ),
+            tags=["rotating_light"],
+        )
+
     # -------------------------------------------------------------- public
 
     def latest(self) -> Optional[Dict[str, Any]]:
@@ -625,7 +647,9 @@ class KillSwitchService:
                     await self._run(target, owner, reason)
                     for target in existing["targets"]
                 ]
-                return self._snapshot(existing, progress, idempotent=True)
+                snapshot = self._snapshot(existing, progress, idempotent=True)
+                self._alert_blocked(snapshot)
+                return snapshot
 
         strategies = self._all_strategies()
         owners = {
@@ -661,10 +685,12 @@ class KillSwitchService:
             },
             "targets": targets,
         }
-        return self._snapshot(
+        snapshot = self._snapshot(
             operation,
             progress,
             idempotent=False,
             jobs=jobs,
             lanes_closed=lanes_closed,
         )
+        self._alert_blocked(snapshot)
+        return snapshot

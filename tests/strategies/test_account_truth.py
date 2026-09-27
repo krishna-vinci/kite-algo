@@ -28,6 +28,22 @@ from backend.strategies.attribution import SqlAttributionStore, StrategyAttribut
 from backend.strategies.account_truth import AccountTruthService, AccountTruthStore
 
 
+def test_owner_channels_reads_orm_rows_and_dicts():
+    from types import SimpleNamespace
+
+    from backend.strategies.account_truth import _owner_channels
+
+    class Repo:
+        def list_channels(self, owner_id):
+            return [
+                SimpleNamespace(name="ops", enabled=True),
+                SimpleNamespace(name="muted", enabled=False),
+                {"name": "legacy", "status": "active"},
+            ]
+
+    assert _owner_channels(Repo(), "app:owner") == ["ops", "legacy"]
+
+
 async def _inline(func, /, **kwargs):
     """Run the store call inline so the service logic is what is under test."""
     return func(**kwargs)

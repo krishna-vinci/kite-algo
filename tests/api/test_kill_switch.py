@@ -19,6 +19,7 @@ Pinned properties:
 from __future__ import annotations
 
 import os
+from unittest.mock import patch
 
 import pytest
 from sqlalchemy import create_engine
@@ -290,9 +291,12 @@ async def test_kill_switch_is_idempotent_while_the_operation_is_open(
         owner_action_reduction_plan_builder=_canned_reduction_builder(),
         owner_action_reduction_pipeline=pipeline,
     ) as client:
-        first = await client.post(
-            KILL_URL, json={"reason": "abort", "confirm": CONFIRM}
-        )
+        with patch("backend.api.services.kill_switch.alert_owner_nowait") as alert:
+            first = await client.post(
+                KILL_URL, json={"reason": "abort", "confirm": CONFIRM}
+            )
+        alert.assert_called_once()
+        assert alert.call_args.kwargs["key"].startswith("killswitch:")
         assert first.status_code == 200, first.text
         first_body = first.json()
         assert first_body["status"] == "blocked", first_body

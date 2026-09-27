@@ -21,6 +21,7 @@ from backend.options.protection.runtime import (
     evaluate_option_protection_state,
     normalize_protection_config as normalize_option_protection_config,
 )
+from backend.platform.owner_alerts import alert_owner_nowait
 
 
 def _utcnow() -> datetime:
@@ -310,7 +311,7 @@ class WorkerProtectionRuntime:
                     "exit_reconciliation": resolution,
                     "last_checked_at": now.isoformat(),
                 }
-                await self._persist_state(
+                persisted_unresolved = await self._persist_state(
                     run,
                     runtime_state,
                     state,
@@ -319,6 +320,16 @@ class WorkerProtectionRuntime:
                     expected_triggered_rule=state.get("triggered_rule") or "",
                     expected_exit_claim_id=state.get("exit_claim_id") or "",
                 )
+                if persisted_unresolved is not None:
+                    alert_owner_nowait(
+                        key=f"protection:{run.get('strategy_run_id')}:unresolved:{state.get('exit_claim_id')}",
+                        title="PROTECTION EXIT unresolved",
+                        message=(
+                            f"Run {run.get('strategy_run_id')} ({run.get('account_scope')}): exit for rule "
+                            f"{state.get('triggered_rule')} is unresolved - check the broker now."
+                        ),
+                        tags=["rotating_light"],
+                    )
                 return False
             # Only an authoritative non-acceptance proof clears the claim and
             # permits the normal trigger path to submit the same idempotent exit.
@@ -341,6 +352,15 @@ class WorkerProtectionRuntime:
             )
             if persisted is None:
                 return False
+            alert_owner_nowait(
+                key=f"protection:{run.get('strategy_run_id')}:not_accepted:{state.get('exit_claim_id')}",
+                title="PROTECTION EXIT not_accepted",
+                message=(
+                    f"Run {run.get('strategy_run_id')} ({run.get('account_scope')}): exit for rule "
+                    f"{state.get('triggered_rule')} was not accepted - check the broker now."
+                ),
+                tags=["rotating_light"],
+            )
             state = retry_state
             runtime_state["backend_protection_state"] = retry_state
         if self._has_recent_exit_claim(state, now):
@@ -400,6 +420,15 @@ class WorkerProtectionRuntime:
             )
             if claimed_result is None:
                 return False
+            alert_owner_nowait(
+                key=f"protection-trigger:{run.get('strategy_run_id')}:{claimed_state.get('generation')}",
+                title="Protection triggered",
+                message=(
+                    f"Run {run.get('strategy_run_id')} ({run.get('account_scope')}): protection rule "
+                    f"{claimed_state.get('triggered_rule')} triggered; an exit is being placed."
+                ),
+                tags=["warning"],
+            )
             await self._publish_timeline_rows(claimed_result.get("timeline_events") or [])
 
             if structure is not None:
@@ -476,6 +505,15 @@ class WorkerProtectionRuntime:
                 if persisted_unknown is None:
                     persisted_unknown = await self._persist_state(run, runtime_state, claimed_state, unknown_state)
                 if persisted_unknown is not None:
+                    alert_owner_nowait(
+                        key=f"protection:{run.get('strategy_run_id')}:unresolved:{unknown_state.get('exit_claim_id')}",
+                        title="PROTECTION EXIT unresolved",
+                        message=(
+                            f"Run {run.get('strategy_run_id')} ({run.get('account_scope')}): exit for rule "
+                            f"{unknown_state.get('triggered_rule')} is unresolved - check the broker now."
+                        ),
+                        tags=["rotating_light"],
+                    )
                     await self._publish_timeline_rows(persisted_unknown.get("timeline_events") or [])
                 return False
             if self._is_deferred_exit_result(exit_result):
@@ -496,6 +534,15 @@ class WorkerProtectionRuntime:
                 if persisted_deferred is None:
                     persisted_deferred = await self._persist_state(run, runtime_state, claimed_state, deferred_state)
                 if persisted_deferred is not None:
+                    alert_owner_nowait(
+                        key=f"protection:{run.get('strategy_run_id')}:deferred:{deferred_state.get('exit_claim_id')}",
+                        title="PROTECTION EXIT deferred",
+                        message=(
+                            f"Run {run.get('strategy_run_id')} ({run.get('account_scope')}): exit for rule "
+                            f"{deferred_state.get('triggered_rule')} was deferred - check the broker now."
+                        ),
+                        tags=["rotating_light"],
+                    )
                     await self._publish_timeline_rows(persisted_deferred.get("timeline_events") or [])
                 return False
             next_state = {

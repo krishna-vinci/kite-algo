@@ -46,7 +46,7 @@ import asyncio
 import os
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Iterable, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Sequence, Set, Tuple
 
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
@@ -1103,12 +1103,17 @@ def _owner_channels(repository: Any, owner_id: str) -> list:
         channels = repository.list_channels(owner_id) if hasattr(repository, "list_channels") else []
     except Exception:
         channels = []
-    enabled = [
-        str(channel.get("name") or channel.get("channel_name") or "")
-        for channel in channels or []
-        if str(channel.get("status") or "active") == "active"
-    ]
-    return [name for name in enabled if name]
+    names = []
+    for channel in channels or []:
+        if isinstance(channel, Mapping):
+            name = channel.get("name") or channel.get("channel_name")
+            active = str(channel.get("status") or "active") == "active" and channel.get("enabled", True) is not False
+        else:
+            name = getattr(channel, "name", None)
+            active = bool(getattr(channel, "enabled", True))
+        if name and active:
+            names.append(str(name))
+    return names
 
 
 def _default_trades_provider(account_id: str) -> Sequence[Dict[str, Any]]:
