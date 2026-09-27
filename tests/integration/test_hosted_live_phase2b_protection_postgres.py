@@ -1342,6 +1342,14 @@ class _AcceptThenLoseResponseKite:
         self.placed.append(dict(params))
         raise TimeoutError("broker accepted the order, then the response was lost")
 
+    def _post(self, route, url_args=None, params=None, **_kwargs):
+        # F&O orders carry ``autoslice`` and go through the client's own
+        # ``order.place`` POST (the installed client's place_order predates the
+        # keyword), exactly as the real KiteConnect does.
+        assert route == "order.place", route
+        self.placed.append({**dict(params or {}), **dict(url_args or {})})
+        raise TimeoutError("broker accepted the order, then the response was lost")
+
 
 def test_a_post_acceptance_timeout_via_orders_service_is_never_retried(pg, monkeypatch):
     """The REAL OrdersService is IDLESS for a timeout AFTER the broker accepted.
