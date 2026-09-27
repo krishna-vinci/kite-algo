@@ -5,9 +5,10 @@ from backend.broker_api.instruments.instruments_repository import options_exchan
 import hashlib
 import json
 import asyncio
+import os
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Iterable, Mapping, Optional
 
 from backend.api.services.protection import evaluate_backend_protection, validate_backend_protection_payload
 from backend.broker_api.core.redis_events import publish_event
@@ -38,6 +39,24 @@ def _heartbeat_age(last_heartbeat_at: Any, now: datetime) -> Optional[int]:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return max(0, int((now.astimezone(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds()))
+
+
+def _claim_inflight_seconds() -> float:
+    return max(
+        0.0, float(os.getenv("PROTECTION_CLAIM_INFLIGHT_SECONDS", "2.0"))
+    )
+
+
+def _metrics_persist_seconds() -> float:
+    return max(
+        0.0, float(os.getenv("PROTECTION_METRICS_PERSIST_SECONDS", "5"))
+    )
+
+
+def run_key(run: Mapping[str, Any]) -> str:
+    """Return the durable worker-run identity used by protection deduplication."""
+
+    return str(run.get("strategy_run_id") or "")
 
 
 class WorkerProtectionRuntime:
@@ -93,8 +112,21 @@ class WorkerProtectionRuntime:
         #: default) means the feature is off: ``net_delta``/``net_vega`` are
         #: simply never derived, never a guess.
         self.option_greeks_loader = option_greeks_loader
+        self._locks: Dict[str, asyncio.Lock] = {}
+        self._semaphore = asyncio.Semaphore(
+            max(1, int(os.getenv("PROTECTION_MAX_CONCURRENCY", "8")))
+        )
+        self._last_evaluated_states: Dict[str, Dict[str, Any]] = {}
+        self.last_evaluation_outcome: Dict[str, bool] = {}
+        self._last_persist: Dict[str, tuple[datetime, tuple[Any, ...]]] = {}
+        self._last_metric_persist: Dict[str, datetime] = {}
 
     async def evaluate_once(self) -> Dict[str, int]:
+        return await self.evaluate_runs(None)
+
+    async def pending_runs(self) -> list[Dict[str, Any]]:
+        """Return the deduplicated runs currently eligible for protection."""
+
         # OPTION STRUCTURES are enumerated by OWNER ROW, not by the worker run's
         # status: a structure whose worker run has closed is still protected until
         # the option run itself reaches a terminal status and releases the row.
@@ -122,18 +154,52 @@ class WorkerProtectionRuntime:
             if str(run.get("strategy_run_id") or "") in owned_worker_run_ids:
                 continue
             pending.append(dict(run))
-        evaluated = 0
-        triggered = 0
-        errors = 0
-        for run in pending:
-            evaluated += 1
-            try:
-                if await self._evaluate_run(dict(run)):
-                    triggered += 1
-            except Exception as exc:
-                errors += 1
-                await self._persist_run_error(run, exc)
-        return {"evaluated": evaluated, "triggered": triggered, "errors": errors}
+        return pending
+
+    def _lock_for(self, key: str) -> asyncio.Lock:
+        lock = self._locks.get(key)
+        if lock is None:
+            lock = self._locks[key] = asyncio.Lock()
+        return lock
+
+    async def evaluate_runs(
+        self, keys: Optional[Iterable[str]] = None
+    ) -> Dict[str, int]:
+        requested = None if keys is None else {str(key) for key in keys}
+        pending = [
+            run
+            for run in await self.pending_runs()
+            if requested is None or run_key(run) in requested
+        ]
+
+        async def evaluate(run: Dict[str, Any]) -> tuple[bool, bool]:
+            key = run_key(run)
+            async with self._lock_for(key):
+                async with self._semaphore:
+                    try:
+                        did_trigger = await self._evaluate_run(dict(run))
+                        self.last_evaluation_outcome[key] = bool(did_trigger)
+                        return bool(did_trigger), False
+                    except Exception as exc:
+                        self.last_evaluation_outcome[key] = False
+                        await self._persist_run_error(run, exc)
+                        return False, True
+
+        outcomes = await asyncio.gather(*(evaluate(run) for run in pending))
+        return {
+            "evaluated": len(pending),
+            "triggered": sum(1 for triggered, _error in outcomes if triggered),
+            "errors": sum(1 for _triggered, error in outcomes if error),
+        }
+
+    def exit_in_flight_keys(self) -> set[str]:
+        """Return evaluated runs with a durable, non-terminal exit claim."""
+
+        return {
+            key
+            for key, state in self._last_evaluated_states.items()
+            if state.get("exit_claim_id") and not state.get("exit_submitted")
+        }
 
     async def _protection_owner_runs(self) -> list[Dict[str, Any]]:
         """The runs an ACTIVE protection owner row names (B2.4 S2a).
@@ -277,6 +343,7 @@ class WorkerProtectionRuntime:
         runtime_state = dict(run.get("runtime_state") or {})
         config = validate_backend_protection_payload(runtime_state.get("backend_protection"), live=str(run.get("execution_mode") or "").lower() == "live")
         state = dict(runtime_state.get("backend_protection_state") or {})
+        self._last_evaluated_states[run_key(run)] = dict(state)
         now = self.now_fn()
         if str(state.get("exit_submission_status") or "") == "unresolved":
             resolution = await self._reconcile_unresolved_exit(run, state)
@@ -372,6 +439,16 @@ class WorkerProtectionRuntime:
             )
             if option_result is not None:
                 return option_result
+        structure = self._structure_identity(config)
+        if structure is not None and self._exit_in_progress(state):
+            # An exit is never abandoned mid-way, even if the verdict clears.
+            return await self._continue_structure_exit(
+                run,
+                runtime_state,
+                state,
+                owner,
+                structure,
+            )
         pnl = await self.pnl_loader(run)
         positions = list(pnl.get("legs") or pnl.get("positions") or [])
         next_state = evaluate_backend_protection(
@@ -639,20 +716,6 @@ class WorkerProtectionRuntime:
             option_greeks_loader=self.option_greeks_loader,
             now=now,
         )
-        await asyncio.to_thread(
-            self._option_run_store().update_protection_metrics,
-            str(option_run.strategy_run_id),
-            metrics,
-            errors=metric_errors,
-            observed_at=now.isoformat(),
-        )
-        await self._record_option_metric_availability(
-            run,
-            runtime_state,
-            state,
-            metric_errors,
-            now=now,
-        )
         verdict = evaluate_option_protection_state(
             run=option_run,
             protection=protection,
@@ -662,8 +725,48 @@ class WorkerProtectionRuntime:
             has_open_quantity = float(metrics.get("open_quantity") or 0) > 0
         except (TypeError, ValueError):
             has_open_quantity = False
+        key = run_key(run)
+        last_metric_persist = self._last_metric_persist.get(key)
+        metric_persist_due = (
+            last_metric_persist is None
+            or (now - last_metric_persist).total_seconds()
+            >= _metrics_persist_seconds()
+        )
+        if metric_persist_due or bool(
+            has_open_quantity and verdict.get("triggered")
+        ):
+            await asyncio.to_thread(
+                self._option_run_store().update_protection_metrics,
+                str(option_run.strategy_run_id),
+                metrics,
+                errors=metric_errors,
+                observed_at=now.isoformat(),
+            )
+            self._last_metric_persist[key] = now
+        await self._record_option_metric_availability(
+            run,
+            runtime_state,
+            state,
+            metric_errors,
+            now=now,
+        )
         if not has_open_quantity:
             return False
+        if self._exit_in_progress(state):
+            # An exit is never abandoned mid-way, even if the verdict clears.
+            structure = self._option_structure_identity(option_run, owner)
+            if structure is None:
+                raise RuntimeError(
+                    "OPTION_PROTECTION_STRUCTURE_UNKNOWN: active option-metric owner "
+                    "does not name a structure"
+                )
+            return await self._continue_structure_exit(
+                run,
+                runtime_state,
+                state,
+                owner,
+                structure,
+            )
         if not verdict.get("triggered"):
             return False
 
@@ -849,19 +952,21 @@ class WorkerProtectionRuntime:
             timeline_events=[event],
         )
 
-    async def collect_option_metric_subscription_tokens(self) -> set[int]:
-        """Tokens needed by every active owner run with option-metric rules.
+    async def run_tokens(self) -> Dict[str, set[int]]:
+        """Return the live metric-subscription tokens needed by each owner run.
 
         This is enumeration only: it reuses the same resolvers as metric reads
         and never contacts Redis or creates a market-runtime owner.
         """
 
-        tokens: set[int] = set()
+        tokens_by_run: Dict[str, set[int]] = {}
         for candidate in await self._protection_owner_runs():
             run = dict(candidate)
             owner = self._protection_owner_context(run)
             if owner is None or not self._has_option_metric_rules(run):
                 continue
+            key = run_key(run)
+            tokens = tokens_by_run.setdefault(key, set())
             try:
                 option_run = await asyncio.to_thread(
                     self._option_run_store().get_run,
@@ -887,7 +992,17 @@ class WorkerProtectionRuntime:
                         tokens.add(int(token))
             except Exception:  # noqa: BLE001 - one unreadable run cannot starve others
                 continue
-        return tokens
+        return tokens_by_run
+
+    async def collect_option_metric_subscription_tokens(self) -> set[int]:
+        """Tokens needed by every active owner run with option-metric rules."""
+
+        tokens_by_run = await self.run_tokens()
+        return {
+            token
+            for tokens in tokens_by_run.values()
+            for token in tokens
+        }
 
     @staticmethod
     def _option_rule_config(option_run: Any, owner: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -1022,6 +1137,12 @@ class WorkerProtectionRuntime:
         return self.option_greeks_loader
 
     def _has_recent_exit_claim(self, state: Dict[str, Any], now: datetime) -> bool:
+        """Hold a claim only while its broker submission may still be in flight.
+
+        The durable claim CAS and the pre-send live-order-intent fence prevent
+        duplicate sends after this short transport grace expires.
+        """
+
         if state.get("exit_submitted") or not state.get("exit_claim_id"):
             return False
         claimed_at = state.get("exit_claimed_at")
@@ -1033,7 +1154,65 @@ class WorkerProtectionRuntime:
             return True
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
-        return (now.astimezone(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds() < 60
+        return (
+            now.astimezone(timezone.utc) - parsed.astimezone(timezone.utc)
+        ).total_seconds() < _claim_inflight_seconds()
+
+    @staticmethod
+    def _exit_in_progress(state: Dict[str, Any]) -> bool:
+        return bool(state.get("exit_claim_id") and not state.get("exit_submitted"))
+
+    async def _continue_structure_exit(
+        self,
+        run: Dict[str, Any],
+        runtime_state: Dict[str, Any],
+        state: Dict[str, Any],
+        owner: Optional[Dict[str, Any]],
+        structure: Dict[str, Any],
+    ) -> bool:
+        """Continue the next stage under the existing durable exit claim."""
+
+        claim_id = str(state.get("exit_claim_id") or "")
+        self._mirror_protection_owner_action(owner, "claimed")
+        structure_exit = await self._submit_structure_exit(
+            run,
+            state,
+            structure,
+            claim_id=claim_id,
+        )
+        self._mirror_protection_owner_action(
+            owner,
+            self._owner_action_state(structure_exit),
+            stage_digest=(structure_exit or {}).get("stage_digest"),
+        )
+        next_state = {
+            **state,
+            "exit_submitted": bool(
+                structure_exit.get("submitted")
+                and structure_exit.get("complete", True)
+            ),
+            "structure_exit_complete": bool(
+                structure_exit.get("complete", True)
+            ),
+            "exit_submission_status": (
+                "submitted"
+                if structure_exit.get("submitted")
+                else str(structure_exit.get("reason") or "not_submitted")
+            ),
+            "structure_exit": structure_exit,
+        }
+        persisted = await self._persist_state(
+            run,
+            runtime_state,
+            state,
+            next_state,
+            expected_generation=state.get("generation"),
+            expected_exit_claim_id=claim_id,
+        )
+        if persisted is None:
+            return False
+        await self._publish_timeline_rows(persisted.get("timeline_events") or [])
+        return bool(structure_exit.get("submitted"))
 
     @staticmethod
     def _is_deferred_exit_result(result: Any) -> bool:
@@ -1059,8 +1238,31 @@ class WorkerProtectionRuntime:
                 previous_state=previous_protection_state,
                 next_state=protection_state,
             )
+        significant = (
+            protection_state.get("status"),
+            protection_state.get("generation"),
+            protection_state.get("triggered_rule"),
+            protection_state.get("exit_claim_id"),
+            protection_state.get("exit_submitted"),
+            protection_state.get("exit_submission_status"),
+        )
+        now = self.now_fn()
+        last_persist = self._last_persist.get(strategy_run_id)
+        if (
+            not timeline_events
+            and last_persist is not None
+            and significant == last_persist[1]
+            and (now - last_persist[0]).total_seconds()
+            < _metrics_persist_seconds()
+        ):
+            runtime_state["backend_protection_state"] = dict(protection_state)
+            self._last_evaluated_states[strategy_run_id] = dict(protection_state)
+            return {
+                "run": {**run, "runtime_state": dict(runtime_state)},
+                "timeline_events": [],
+            }
         if hasattr(self.repo, "update_run_backend_protection_state_with_events"):
-            return await self.repo.update_run_backend_protection_state_with_events(
+            persisted = await self.repo.update_run_backend_protection_state_with_events(
                 strategy_run_id,
                 protection_state,
                 expected_generation=expected,
@@ -1068,6 +1270,10 @@ class WorkerProtectionRuntime:
                 expected_exit_claim_id=expected_exit_claim_id,
                 timeline_events=timeline_events,
             )
+            if persisted is not None:
+                self._last_evaluated_states[strategy_run_id] = dict(protection_state)
+                self._last_persist[strategy_run_id] = (now, significant)
+            return persisted
         if hasattr(self.repo, "update_run_backend_protection_state"):
             updated = await self.repo.update_run_backend_protection_state(
                 strategy_run_id,
@@ -1078,11 +1284,15 @@ class WorkerProtectionRuntime:
             )
             if updated is None:
                 return None
+            self._last_evaluated_states[strategy_run_id] = dict(protection_state)
+            self._last_persist[strategy_run_id] = (now, significant)
             return {"run": updated, "timeline_events": []}
         runtime_state["backend_protection_state"] = protection_state
         updated = await self.repo.update_run_runtime_state(strategy_run_id, runtime_state)
         if updated is None:
             return None
+        self._last_evaluated_states[strategy_run_id] = dict(protection_state)
+        self._last_persist[strategy_run_id] = (now, significant)
         return {"run": updated, "timeline_events": []}
 
     async def _persist_run_error(self, run: Dict[str, Any], exc: Exception) -> None:

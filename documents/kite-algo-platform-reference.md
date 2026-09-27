@@ -43,11 +43,12 @@ plans.
   - protection ownership per option run
   - repair, owner exit and cancel-pending
   - per-strategy attribution and account truth
-  - a 5-second server-side protection loop: SL, target and trailing %, basket rules, worker-stale exit, MIS square-off
+  - event-driven server-side protection (250 ms tick debounce plus order updates, with a 5-second watchdog): SL,
+    target and trailing %, basket rules, worker-stale exit, MIS square-off
 - **Weak or missing today:**
   - **Intraday cadence.** Schedules fire at most once a day. A run-now loop that makes many decisions is allowed
     by the code, but no test proves it.
-  - **Index, premium and MTM option stops never fire**, because nothing ever writes their metrics.
+  - Option index, premium and MTM stops use fresh live snapshots; position Greeks remain unavailable.
   - **No position Greeks.**
   - **No freeze-quantity slicing.**
   - **A live daily loss budget blocks all live admissions** once it is set.
@@ -85,7 +86,7 @@ plans.
 | position subscription sync | 10 s | bootstrap.py:463-504 |
 | system token watcher | 30–60 s | bootstrap.py:506-534 |
 | account ingest | 60 s | background.py:51-54 |
-| **worker protection** | **5 s** | background.py:122-167 |
+| **worker protection** | **250 ms tick debounce and order updates; 5 s watchdog** | background.py:123-221, api/services/protection_scheduler.py |
 | stale-run recovery | 30 s | background.py:167 |
 | exiting-run recovery | 10 s | background.py:191 |
 | bracket executor | 1 s | background.py:215 |
@@ -576,7 +577,11 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
 
 ## 7. Protection (risk exits)
 
-- **Generic runtime: EXISTS.** A 5 s loop (`WORKER_PROTECTION_ENABLED`, `WORKER_PROTECTION_INTERVAL_SECONDS`).
+- **Generic runtime: EXISTS.** Ticks schedule affected runs after a 250 ms debounce and order updates schedule every
+  exit-in-flight run; the 5 s loop remains a watchdog (`WORKER_PROTECTION_ENABLED`,
+  `WORKER_PROTECTION_INTERVAL_SECONDS`). Watchdog runs are evaluated concurrently (default 8), with a per-run lock
+  preventing overlapping in-process evaluation. Protection reads finance-app's in-memory tick cache first and falls
+  back to Redis on a cache miss (`protection_scheduler.py`, `background.py:123-221`, `protection_runtime.py`).
   - Rules (`backend/api/services/protection.py:117-613`):
     - per position: SL %, target % and trailing SL %
     - basket: SL %, target %, trailing activate/drawdown
@@ -591,10 +596,14 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
   - An exception after a generic exit send is persisted as unresolved. Later ticks reconcile the durable
     `live_order_intents` idempotency/client references and retry only when the absence of a pre-send record, or a
     complete broker order-book read, proves non-acceptance (`protection_runtime.py`).
+  - A fresh exit claim has a 2 s in-flight grace. After that, an incomplete staged exit continues under the same
+    claim even if its triggering metric has cleared; metric-only writes are limited to once per 5 s per run.
+  - The `worker_protection` heartbeat records `last_breach_to_submit_ms`, measured from the scheduling tick through
+    a successful exit submission.
 - **Option rule vocabulary: EXISTS for live owner runs.**
   - The metrics are `index_ltp`, `combined_premium`, `combined_premium_change_pct`, `strategy_mtm` and
     `open_quantity` (`backend/options/protection/models.py:24-30`).
-  - The 5-second protection loop derives the run's index, option-premium, MTM, open-quantity and configured Greeks
+  - Event-driven protection derives the run's index, option-premium, MTM, open-quantity and configured Greeks
     from fresh ticks/fills, then replaces the entire durable snapshot. Each metric records observation time and
     availability; missing/stale live values are never backfilled from older metadata and cannot trigger an exit
     (`live_metrics.py`, `durable_store.py`, `metrics.py`, `protection_runtime.py`).
@@ -690,7 +699,11 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
 | `PAPER_PARTIAL_FILL_RATIO` | 1.0 |
 | `SCHEDULE_MISFIRE_GRACE_SECONDS` | 3600 |
 | `FUTURES_EXPIRY_WARNING_DAYS` | 5 |
-| `WORKER_PROTECTION_*` | — |
+| `WORKER_PROTECTION_INTERVAL_SECONDS` | 5 |
+| `PROTECTION_TICK_DEBOUNCE_MS` | 250 |
+| `PROTECTION_CLAIM_INFLIGHT_SECONDS` | 2.0 |
+| `PROTECTION_MAX_CONCURRENCY` | 8 |
+| `PROTECTION_METRICS_PERSIST_SECONDS` | 5 |
 | `ACCOUNT_INGEST_*` | — |
 | `KITE_WRITE_OPS_PER_SEC` | 9 |
 | `HOSTED_SUPERVISOR_*` | — |
@@ -710,7 +723,7 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
 | Equity signal, delivery | `single_instrument` CNC / cnc | EXISTS | EXISTS (fake broker only), one leg | **Needs intraday.** Only a run-now loop, not proven | Position % rules |
 | Intraday equity | `single_instrument` MIS / mis | EXISTS | EXISTS (fake broker only), one leg | Needs intraday (same gap) | % rules plus MIS square-off |
 | Futures (NFO, MCX) | `target_futures` / futures | EXISTS | EXISTS (fake broker only), one leg, `near`/`next`/`far` contract selector, roll state machine | `market_session` schedules cover the 09:00-23:30 MCX window (23:55 outside US DST); holidays honoured once imported, else `not_verified_holiday` | % rules; freeze refused only if declared |
-| Options | `option_structure` / options | EXISTS | EXISTS (fake broker only): hedge gate, LIMIT, roll, repair | Needs intraday (same gap) | % rules, staged exit; **index, premium and MTM rules dead**; no Greeks |
+| Options | `option_structure` / options | EXISTS | EXISTS (fake broker only): hedge gate, LIMIT, roll, repair | Needs intraday (same gap) | % plus fresh index, premium and MTM rules; staged exit; no position Greeks |
 | Order bundle | `intent_bundle` | EXISTS | MISSING | — | — |
 
 ## 12. Known gaps, ranked by production risk
@@ -718,8 +731,8 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
 1. **No real broker round trip yet.** Every live claim is fake-broker proven (C2 not started).
 2. **Freeze limits.** Nothing slices orders, including protective exits. `autoslice` exists in the order model but
    is never set.
-3. **Option index, premium and MTM stops are dead.** No position Greeks. No rupee or underlying rule in the generic
-   runtime.
+3. **Position Greeks remain unavailable.** There is no rupee rule in the generic runtime; option index, premium and
+   MTM rules now use fresh live snapshots.
 4. **A live daily loss budget blocks all live plans.** There is no account-wide loss cap and no single kill switch.
    Stopping a job does not flatten, and live non-option flatten is refused.
 5. **Intraday cadence.** Schedules fire once a day. The run-now loop is unproven. `continuous` is only a label. One

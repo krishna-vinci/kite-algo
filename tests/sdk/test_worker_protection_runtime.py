@@ -1,3 +1,6 @@
+import asyncio
+import copy
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -152,6 +155,7 @@ class _OwnerMirrorStore:
 class _OptionRunStore:
     def __init__(self, run):
         self.run = run
+        self.metric_updates = 0
 
     def get_run(self, _option_run_id):
         return self.run
@@ -159,6 +163,7 @@ class _OptionRunStore:
     def update_protection_metrics(
         self, _option_run_id, metrics, *, errors=None, observed_at=None
     ):
+        self.metric_updates += 1
         self.run.metadata = {
             **(self.run.metadata or {}),
             "protection_metrics": dict(metrics),
@@ -175,11 +180,94 @@ class _Clock:
     def __call__(self):
         return self.now
 
-    def advance(self, seconds: int) -> None:
-        self.now = self.now + timedelta(seconds=int(seconds))
+    def advance(self, seconds: float) -> None:
+        self.now = self.now + timedelta(seconds=float(seconds))
 
 
 class WorkerProtectionRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_evaluate_runs_only_touches_the_requested_runs(self):
+        repo = _Repo()
+        run_b = copy.deepcopy(repo.runs[0])
+        run_b["strategy_run_id"] = "run-2"
+        repo.runs.append(run_b)
+        pnl_loader = AsyncMock(
+            return_value={
+                "legs": [
+                    {
+                        "symbol": "NSE:INFY",
+                        "product": "CNC",
+                        "side": "BUY",
+                        "quantity": 1,
+                        "net_quantity": 1,
+                        "average_price": 100,
+                        "last_price": 100,
+                    }
+                ]
+            }
+        )
+        runtime = WorkerProtectionRuntime(
+            repo=repo,
+            pnl_loader=pnl_loader,
+            exit_submitter=AsyncMock(),
+        )
+
+        result = await runtime.evaluate_runs({"run-1"})
+
+        self.assertEqual(result, {"evaluated": 1, "triggered": 0, "errors": 0})
+        self.assertEqual(pnl_loader.await_count, 1)
+        self.assertEqual(
+            pnl_loader.await_args.args[0]["strategy_run_id"], "run-1"
+        )
+
+    async def test_the_same_run_is_never_evaluated_concurrently(self):
+        repo = _Repo()
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def load_pnl(_run):
+            started.set()
+            await release.wait()
+            return {"legs": []}
+
+        pnl_loader = AsyncMock(side_effect=load_pnl)
+        runtime = WorkerProtectionRuntime(
+            repo=repo,
+            pnl_loader=pnl_loader,
+            exit_submitter=AsyncMock(),
+        )
+
+        first = asyncio.create_task(runtime.evaluate_runs({"run-1"}))
+        await started.wait()
+        second = asyncio.create_task(runtime.evaluate_runs({"run-1"}))
+        await asyncio.sleep(0.05)
+        self.assertEqual(pnl_loader.await_count, 1)
+        release.set()
+        await asyncio.gather(first, second)
+        self.assertEqual(pnl_loader.await_count, 2)
+
+    async def test_evaluate_once_runs_runs_concurrently(self):
+        repo = _Repo()
+        run_b = copy.deepcopy(repo.runs[0])
+        run_b["strategy_run_id"] = "run-2"
+        repo.runs.append(run_b)
+
+        async def load_pnl(_run):
+            await asyncio.sleep(0.2)
+            return {"legs": []}
+
+        runtime = WorkerProtectionRuntime(
+            repo=repo,
+            pnl_loader=AsyncMock(side_effect=load_pnl),
+            exit_submitter=AsyncMock(),
+        )
+
+        started_at = time.monotonic()
+        result = await runtime.evaluate_once()
+        elapsed = time.monotonic() - started_at
+
+        self.assertEqual(result["evaluated"], 2)
+        self.assertLess(elapsed, 0.35)
+
     async def test_runtime_submits_exit_and_persists_state_when_triggered(self):
         repo = _Repo()
         runtime = WorkerProtectionRuntime(
@@ -413,7 +501,7 @@ class WorkerProtectionRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "status": "triggered",
             "triggered_rule": "position_stoploss",
             "exit_claim_id": "claim-1",
-            "exit_claimed_at": "2026-04-25T12:00:45+00:00",
+            "exit_claimed_at": "2026-04-25T12:00:59+00:00",
             "exit_submitted": False,
         }
         exit_submitter = AsyncMock(return_value={"status": "closed"})
@@ -838,6 +926,79 @@ class WorkerProtectionRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(owner_store.calls[-1][1], "unresolved")
         self.assertEqual(owner_store.calls[-1][2], "stage-3")
 
+    async def test_a_staged_exit_continues_on_the_next_pass_without_a_long_wait(self):
+        repo = _OwnerRowRepo()
+        structure_exit = AsyncMock(
+            side_effect=[
+                {"submitted": True, "complete": False, "reason": "submitted"},
+                {"submitted": True, "complete": True, "reason": "submitted"},
+            ]
+        )
+        clock = _Clock(datetime(2026, 4, 25, 12, 1, tzinfo=timezone.utc))
+        runtime = WorkerProtectionRuntime(
+            repo=repo,
+            pnl_loader=AsyncMock(
+                return_value={
+                    "legs": [
+                        {
+                            "symbol": "NSE:INFY",
+                            "product": "CNC",
+                            "side": "BUY",
+                            "quantity": 1,
+                            "net_quantity": 1,
+                            "average_price": 100,
+                            "last_price": 94,
+                        }
+                    ]
+                }
+            ),
+            exit_submitter=AsyncMock(),
+            structure_exit_submitter=structure_exit,
+            owner_store=_OwnerMirrorStore(),
+            now_fn=clock,
+        )
+
+        await runtime.evaluate_once()
+        first_claim = repo.runs[0]["runtime_state"]["backend_protection_state"][
+            "exit_claim_id"
+        ]
+        clock.advance(2.5)
+        await runtime.evaluate_once()
+
+        self.assertEqual(structure_exit.await_count, 2)
+        self.assertEqual(
+            repo.runs[0]["runtime_state"]["backend_protection_state"][
+                "exit_claim_id"
+            ],
+            first_claim,
+        )
+
+    async def test_a_fresh_claim_is_not_re_submitted_inside_the_inflight_grace(self):
+        repo = _StructureRepo(structure=dict(_OWNED_STRUCTURE))
+        clock = _Clock(datetime(2026, 4, 25, 12, 1, tzinfo=timezone.utc))
+        repo.runs[0]["runtime_state"]["backend_protection_state"] = {
+            "generation": 2,
+            "status": "triggered",
+            "triggered_rule": "position_stoploss",
+            "exit_claim_id": "claim-1",
+            "exit_claimed_at": (clock.now - timedelta(seconds=1)).isoformat(),
+            "exit_submitted": False,
+            "structure_exit_complete": False,
+            "exit_submission_status": "submitted",
+        }
+        structure_exit = AsyncMock()
+        runtime = WorkerProtectionRuntime(
+            repo=repo,
+            pnl_loader=AsyncMock(),
+            exit_submitter=AsyncMock(),
+            structure_exit_submitter=structure_exit,
+            now_fn=clock,
+        )
+
+        await runtime.evaluate_once()
+
+        structure_exit.assert_not_awaited()
+
     async def _evaluate_option_metrics(self, *, index_tick, clock):
         from backend.options.execution.models import OptionRunState
 
@@ -953,6 +1114,39 @@ class WorkerProtectionRuntimeTests(unittest.IsolatedAsyncioTestCase):
         structure_exit.assert_awaited_once()
         generic_exit.assert_not_awaited()
 
+    async def test_an_exit_in_progress_continues_after_the_metric_clears(self):
+        clock = _Clock(datetime(2026, 4, 25, 12, 1, tzinfo=timezone.utc))
+        index_tick = {
+            "last_price": 21900.0,
+            "received_at": clock.now.isoformat(),
+        }
+        runtime, repo, _option_store, structure_exit, generic_exit, _owner_store = (
+            await self._evaluate_option_metrics(index_tick=index_tick, clock=clock)
+        )
+        structure_exit.side_effect = [
+            {"submitted": True, "complete": False, "reason": "submitted"},
+            {"submitted": True, "complete": True, "reason": "submitted"},
+        ]
+
+        await runtime.evaluate_once()
+        first_claim = repo.runs[0]["runtime_state"]["backend_protection_state"][
+            "exit_claim_id"
+        ]
+        clock.advance(2.5)
+        index_tick.update(
+            {"last_price": 23000.0, "received_at": clock.now.isoformat()}
+        )
+        await runtime.evaluate_once()
+
+        self.assertEqual(structure_exit.await_count, 2)
+        generic_exit.assert_not_awaited()
+        self.assertEqual(
+            repo.runs[0]["runtime_state"]["backend_protection_state"][
+                "exit_claim_id"
+            ],
+            first_claim,
+        )
+
     async def test_option_metric_tokens_join_the_positions_subscription_set(self):
         clock = _Clock(datetime(2026, 4, 25, 12, 1, tzinfo=timezone.utc))
         runtime, _repo, _option_store, _structure_exit, _generic_exit, _owner_store = (
@@ -970,6 +1164,35 @@ class WorkerProtectionRuntimeTests(unittest.IsolatedAsyncioTestCase):
         # The index plus the open short leg; both are required to evaluate every
         # rule on this run without a silent missing-metric fallback.
         self.assertEqual(tokens, {1, 101})
+
+    async def test_metric_only_changes_are_persisted_at_most_every_five_seconds(self):
+        clock = _Clock(datetime(2026, 4, 25, 12, 1, tzinfo=timezone.utc))
+        index_tick = {
+            "last_price": 23000.0,
+            "received_at": clock.now.isoformat(),
+        }
+        runtime, _repo, option_store, structure_exit, _generic_exit, _owner_store = (
+            await self._evaluate_option_metrics(index_tick=index_tick, clock=clock)
+        )
+
+        for _ in range(3):
+            index_tick["received_at"] = clock.now.isoformat()
+            await runtime.evaluate_once()
+            clock.advance(1)
+        self.assertEqual(option_store.metric_updates, 1)
+
+        clock.advance(5)
+        index_tick["received_at"] = clock.now.isoformat()
+        await runtime.evaluate_once()
+        self.assertEqual(option_store.metric_updates, 2)
+
+        clock.advance(1)
+        index_tick.update(
+            {"last_price": 21900.0, "received_at": clock.now.isoformat()}
+        )
+        await runtime.evaluate_once()
+        self.assertEqual(option_store.metric_updates, 3)
+        structure_exit.assert_awaited_once()
 
     async def test_a_stale_option_index_tick_is_omitted_and_never_exits(self):
         clock = _Clock(datetime(2026, 4, 25, 12, 1, tzinfo=timezone.utc))

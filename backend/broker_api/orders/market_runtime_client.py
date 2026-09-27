@@ -3,7 +3,7 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import quote
 
 import httpx
@@ -119,6 +119,38 @@ class MarketDataRuntime:
         self._running = False
         self._pending_position_ticks: Dict[int, Dict[str, Any]] = {}
         self._tick_lock = asyncio.Lock()
+        self._tick_listeners: List[Callable[[int, Dict[str, Any]], None]] = []
+        self._order_update_listeners: List[Callable[[Dict[str, Any]], None]] = []
+
+    def add_tick_listener(
+        self, callback: Callable[[int, Dict[str, Any]], None]
+    ) -> Callable[[], None]:
+        """Call ``callback(token, tick)`` for every tick, after the cache update.
+
+        Listeners run inline on the tick loop, so they must only schedule work.
+        A failing listener is logged and never breaks the loop.
+        """
+        self._tick_listeners.append(callback)
+        return lambda: self._tick_listeners.remove(callback) if callback in self._tick_listeners else None
+
+    def add_order_update_listener(
+        self, callback: Callable[[Dict[str, Any]], None]
+    ) -> Callable[[], None]:
+        """Call ``callback(update)`` for every broker order update, after ingestion."""
+        self._order_update_listeners.append(callback)
+        return (
+            lambda: self._order_update_listeners.remove(callback)
+            if callback in self._order_update_listeners
+            else None
+        )
+
+    @staticmethod
+    def _notify(listeners: List[Callable[..., None]], *args: Any) -> None:
+        for listener in list(listeners):
+            try:
+                listener(*args)
+            except Exception:  # noqa: BLE001 - a listener never breaks the feed
+                logger.warning("market runtime listener failed", exc_info=True)
 
     async def start(self) -> None:
         if self._running:
@@ -317,6 +349,7 @@ class MarketDataRuntime:
         self.latest_ticks[token] = tick
         async with self._tick_lock:
             self._pending_position_ticks[token] = tick
+        self._notify(self._tick_listeners, token, tick)
 
     async def _positions_tick_loop(self) -> None:
         while self._running:
@@ -352,6 +385,7 @@ class MarketDataRuntime:
             return
         try:
             ingest_result = await order_event_runtime.ingest_ws_event(payload_dict, corr_id="market_runtime_order_update")
+            self._notify(self._order_update_listeners, payload_dict)
             if ingest_result.get("duplicate"):
                 return
             event_timestamp = payload_dict.get("exchange_update_timestamp") or payload_dict.get("order_timestamp")

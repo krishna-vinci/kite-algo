@@ -131,6 +131,7 @@ async def _worker_protection_loop(app: FastAPI):
         submit_worker_protection_exit,
         submit_worker_protection_structure_exit,
     )
+    from backend.api.services.protection_scheduler import ProtectionScheduler
 
     interval = max(1.0, float(os.getenv("WORKER_PROTECTION_INTERVAL_SECONDS", "5")))
     request = SimpleNamespace(headers={}, app=app, is_disconnected=lambda: False)
@@ -139,6 +140,17 @@ async def _worker_protection_loop(app: FastAPI):
         repo = SqlAlchemyAlgoWorkerRepository()
         app.state.algo_worker_repository = repo
     ensure_attribution_state(app)
+    market_data_runtime = getattr(app.state, "market_data_runtime", None)
+
+    async def cached_tick_loader(token: int) -> Dict[str, Any] | None:
+        if market_data_runtime is not None:
+            tick = market_data_runtime.latest_ticks.get(int(token))
+            if tick is not None:
+                return tick
+        from backend.broker_api.core.redis_events import get_redis
+
+        raw = await get_redis().get(f"market:tick:{int(token)}")
+        return json.loads(raw) if raw else None
 
     async def option_greeks_loader(underlying: str, expiry_key: str):
         """``net_delta``/``net_vega`` evidence: this app's own live chain session."""
@@ -172,19 +184,53 @@ async def _worker_protection_loop(app: FastAPI):
         ),
         squareoff_schedule=_worker_protection_squareoff_schedule(),
         option_greeks_loader=option_greeks_loader,
+        index_tick_loader=cached_tick_loader if market_data_runtime is not None else None,
+        option_tick_loader=cached_tick_loader if market_data_runtime is not None else None,
     )
+    scheduler = ProtectionScheduler(runtime)
+    scheduler.refresh_tokens()
+    unsubscribe = []
+    if market_data_runtime is not None:
+        unsubscribe.extend(
+            [
+                market_data_runtime.add_tick_listener(scheduler.on_tick),
+                market_data_runtime.add_order_update_listener(
+                    scheduler.on_order_update
+                ),
+            ]
+        )
     set_component_status("worker_protection", "healthy", detail="Worker protection runtime started")
-    while True:
-        try:
-            result = await runtime.evaluate_once()
-            heartbeat("worker_protection", detail="Evaluated worker backend protection", meta={**result, "interval_seconds": interval})
-        except asyncio.CancelledError:
-            set_component_status("worker_protection", "stopped", detail="Worker protection runtime cancelled")
-            break
-        except Exception as exc:
-            logging.warning("Worker protection loop failed: %s", exc, exc_info=True)
-            set_component_status("worker_protection", "degraded", detail=str(exc))
-        await asyncio.sleep(interval)
+    try:
+        while True:
+            try:
+                result = await runtime.evaluate_once()
+                scheduler.refresh_tokens()
+                heartbeat(
+                    "worker_protection",
+                    detail="Evaluated worker backend protection",
+                    meta={
+                        **result,
+                        "interval_seconds": interval,
+                        "last_breach_to_submit_ms": (
+                            scheduler.last_breach_to_submit_ms
+                        ),
+                    },
+                )
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                set_component_status(
+                    "worker_protection",
+                    "stopped",
+                    detail="Worker protection runtime cancelled",
+                )
+                break
+            except Exception as exc:
+                logging.warning("Worker protection loop failed: %s", exc, exc_info=True)
+                set_component_status("worker_protection", "degraded", detail=str(exc))
+                await asyncio.sleep(interval)
+    finally:
+        for remove_listener in unsubscribe:
+            remove_listener()
 
 async def _notify_option_run_owner(request: Any, *, run: Dict[str, Any], text: str, subject: str, idempotency_key: str) -> bool:
     """Notify a hosted option run's app OWNER, on its own enabled channels.
