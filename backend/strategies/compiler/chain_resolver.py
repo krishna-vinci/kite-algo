@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Mapping, Optional
 
+from backend.broker_api.instruments.instruments_repository import options_exchange_for
 from backend.options.market.expiry_selectors import ExpirySelectorError, resolve_expiry_selector
 from backend.strategies.compiler.base import ValidationRefusal
 from backend.strategies.compiler.option_structure import ChainResolver
@@ -109,7 +110,9 @@ def build_production_chain_resolver(market_service: Any) -> ChainResolver:
         if not resolved:
             return None
         contract = dict(resolved[0])
-        contract.setdefault("exchange", "NFO")
+        # The resolved contract carries no exchange; SENSEX/BANKEX list on BFO,
+        # and a wrong exchange makes the pinned catalog lookup find nothing.
+        contract.setdefault("exchange", options_exchange_for(underlying))
         return contract
 
     return resolve

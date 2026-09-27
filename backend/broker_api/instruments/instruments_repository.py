@@ -36,6 +36,12 @@ _UNDERLYING_CONFIG = {
     "BANKEX": ("BFO", "BSE", "BANKEX"),
 }
 
+
+def options_exchange_for(underlying: str) -> str:
+    """The derivatives exchange an index's options list on (SENSEX -> BFO)."""
+    config = _UNDERLYING_CONFIG.get(str(underlying or "").strip().upper())
+    return config[0] if config else "NFO"
+
 # ── Go HTTP client singletons ────────────────────────────────────────────────
 _GO_BASE_URL = "http://market-runtime:8780"
 _sync_client: Optional[httpx.Client] = None
@@ -155,9 +161,7 @@ class InstrumentsRepository:
         return (underlying, config[2]) if config else (underlying, underlying)
 
     def _options_exchange(self, underlying: str) -> str:
-        normalized = str(underlying or "").strip().upper()
-        config = _UNDERLYING_CONFIG.get(normalized)
-        return config[0] if config else "NFO"
+        return options_exchange_for(underlying)
 
     def get_spot_token(self, underlying_symbol: str) -> Optional[int]:
         underlying, spot_tradingsymbol = self.normalize_underlying_symbol(
