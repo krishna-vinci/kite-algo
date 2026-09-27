@@ -41,7 +41,7 @@ import math
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from sqlalchemy import select, text
 
@@ -102,6 +102,18 @@ EXECUTABLE_RESERVATION_STATUSES = ("active", "renewed")
 #: (acquire-first) and option structures (hedge-first) own their own ordering and
 #: are deliberately excluded.
 CNC_REBALANCE_PLAN_KINDS = ("intent_bundle", "target_weights")
+
+
+def append_structure_generation(
+    history: Iterable[Mapping[str, Any]], entry: Mapping[str, Any]
+) -> List[Dict[str, Any]]:
+    """Append a released leg generation, keeping every earlier one.
+
+    A released generation's fills keep their old leg ids for the life of the
+    run, so dropping its record would make those trades unattributable
+    (staged exit, repair and owner exit all read this history).
+    """
+    return [dict(row) for row in (history or [])] + [dict(entry)]
 
 
 def _utcnow() -> datetime:
@@ -2390,9 +2402,9 @@ class PaperPlanExecutor:
                     )
                 else:
                     # Every leg landed. The desired state becomes the run's HELD
-                    # state, under a new generation, with the previous generation's
-                    # legs kept (bounded) so the basis a strategy observed stays
-                    # answerable after the fact.
+                    # state, under a new generation, with every previous generation's
+                    # legs kept so the basis a strategy observed stays answerable
+                    # after the fact.
                     previous_legs = [
                         dict(leg) for leg in target.get("_adjust_previous_legs") or []
                     ]
@@ -2403,13 +2415,13 @@ class PaperPlanExecutor:
                     )
                     metadata = dict(getattr(run, "metadata", None) or {})
                     generation = self._option_run_generation(run)
-                    history = list(metadata.get("structure_generation_history") or [])
-                    history.append(
+                    history = append_structure_generation(
+                        metadata.get("structure_generation_history") or [],
                         {
                             "generation": generation,
                             "structure_digest": previous_digest,
                             "legs": previous_legs,
-                        }
+                        },
                     )
                     metadata["structure_generation"] = generation + 1
                     if frozen_digest:
@@ -2418,7 +2430,7 @@ class PaperPlanExecutor:
                         # additive/removal adjust makes the two differ - and the
                         # duplicate gate must compare against what is held.
                         metadata["structure_digest"] = frozen_digest
-                    metadata["structure_generation_history"] = history[-10:]
+                    metadata["structure_generation_history"] = history
                     run.metadata = metadata
                     run.protection = self._adjusted_protection(run, plan)
                     frozen_protection = dict(run.protection or {})

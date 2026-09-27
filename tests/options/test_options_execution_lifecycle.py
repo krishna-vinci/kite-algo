@@ -1,6 +1,9 @@
+import unittest
+
 import pytest
 
 from backend.options.execution.lifecycle import (
+    SETTLEABLE_STATUSES,
     mark_adjusted,
     mark_adjusting,
     mark_closed,
@@ -12,6 +15,7 @@ from backend.options.execution.lifecycle import (
     mark_cleanup_required,
     mark_partial_entry,
     mark_partial_exit,
+    mark_settled,
     transition_to,
 )
 from backend.options.execution.models import OptionRunState, OptionRunStatus
@@ -119,3 +123,25 @@ def test_an_adjust_may_only_start_from_a_held_run():
             mark_adjusting(OptionRunState(status=status))
     # A rejected required leg is cleanup work, never a fabricated "entered".
     assert mark_cleanup_required(OptionRunState(status="adjusting")).status == "cleanup_required"
+
+
+def _state(status: str) -> OptionRunState:
+    return OptionRunState(
+        strategy_run_id="run-1", strategy_name="s", product="NRML", legs=[], protection=None,
+        metadata={}, status=status, completed_legs=[], failed_legs=[], pending_legs=[],
+        orders=[], trades=[],
+    )
+
+
+class SettledLifecycleTests(unittest.TestCase):
+    def test_held_and_exited_runs_can_settle(self):
+        self.assertEqual(SETTLEABLE_STATUSES, ("cleanup_required", "entered", "exited", "partial_exit"))
+        for status in SETTLEABLE_STATUSES:
+            self.assertEqual(mark_settled(_state(status)).status, "settled")
+
+    def test_settled_is_terminal_and_unreachable_from_in_flight_states(self):
+        with self.assertRaises(ValueError):
+            transition_to(_state("settled"), OptionRunStatus.ENTERED)
+        for status in ("created", "entering", "exiting", "adjusting"):
+            with self.assertRaises(ValueError):
+                mark_settled(_state(status))

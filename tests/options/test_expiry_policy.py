@@ -56,6 +56,52 @@ class ExpiryTestCase(unittest.TestCase):
 
         _Base.metadata.create_all(self.engine)
         self.factory = sessionmaker(bind=self.engine)
+        # option_run_states has no ORM model; the database owns it. Mirror the
+        # columns the settlement path reads.
+        with self.engine.begin() as conn:
+            conn.execute(text(
+                """
+                CREATE TABLE public.option_run_states (
+                    strategy_run_id TEXT PRIMARY KEY, strategy_name TEXT, product TEXT,
+                    status TEXT NOT NULL, legs TEXT, protection TEXT, metadata TEXT,
+                    orders TEXT, trades TEXT, completed_legs TEXT, failed_legs TEXT,
+                    pending_legs TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            ))
+            conn.execute(text(
+                """
+                CREATE TABLE public.strategy_plan_option_runs (
+                    plan_id TEXT PRIMARY KEY,
+                    option_run_id TEXT NOT NULL,
+                    worker_run_id TEXT,
+                    strategy_id TEXT NOT NULL,
+                    account_id TEXT NOT NULL,
+                    execution_environment TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            ))
+            conn.execute(text(
+                """
+                CREATE TABLE public.option_protection_owners (
+                    option_run_id TEXT PRIMARY KEY,
+                    strategy_id TEXT,
+                    account_id TEXT,
+                    execution_environment TEXT,
+                    owner_run_id TEXT,
+                    owner_epoch INTEGER,
+                    policy_version TEXT,
+                    policy TEXT,
+                    action_state TEXT,
+                    stage_digest TEXT,
+                    state TEXT,
+                    released_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            ))
         self.notified: list = []
         os.environ.pop("OPTIONS_EXPIRY_WARNING_DAYS", None)
 
@@ -76,6 +122,34 @@ class ExpiryTestCase(unittest.TestCase):
             return True
 
         return OptionExpiryPolicy(notifier=notifier)
+
+    def seed_run(self, run_id, *, status="entered", digest="d-1", account_id="kite:A",
+                 strategy_id="stg-A", environment="paper", owned=True):
+        import json as _json
+
+        with self.engine.begin() as conn:
+            conn.execute(text(
+                "INSERT OR IGNORE INTO strategies (id, owner_id, name, account_scope) "
+                "VALUES (:sid, 'app:owner', :sid, :acct)"
+            ), {"sid": strategy_id, "acct": account_id})
+            conn.execute(text(
+                "INSERT INTO public.option_run_states (strategy_run_id, strategy_name, product, "
+                "status, legs, metadata, orders, trades, completed_legs, failed_legs, pending_legs) "
+                "VALUES (:rid, 'n', 'NRML', :status, '[]', :meta, '[]', '[]', '[]', '[]', '[]')"
+            ), {"rid": run_id, "status": status,
+                "meta": _json.dumps({"structure_digest": digest} if digest else {})})
+            if owned:
+                conn.execute(text(
+                    "INSERT INTO public.option_protection_owners (option_run_id, strategy_id, "
+                    "account_id, execution_environment, policy_version, policy, state) "
+                    "VALUES (:rid, :sid, :acct, :env, 'v1', '{}', 'released')"
+                ), {"rid": run_id, "sid": strategy_id, "acct": account_id, "env": environment})
+
+    def run_status(self, run_id):
+        with self.engine.connect() as conn:
+            return conn.execute(text(
+                "SELECT status FROM public.option_run_states WHERE strategy_run_id = :rid"
+            ), {"rid": run_id}).scalar()
 
 
 class CutoffTests(ExpiryTestCase):
@@ -183,6 +257,7 @@ class EvidenceTests(ExpiryTestCase):
             self.assertIn("position_disappeared", str(ctx.exception.detail) + "position_disappeared")
 
     def test_cash_settlement_with_evidence_settles_the_run(self):
+        self.seed_run("run-1", digest="d-1")
         result = self.service().settle(
             account_id="kite:A", option_run_id="run-1", structure_digest="d-1",
             settlement_kind="cash", evidence_source="contract_note",
@@ -190,12 +265,15 @@ class EvidenceTests(ExpiryTestCase):
         )
         self.assertTrue(result["settled"])
         self.assertEqual(result["run_state"], "settled")
+        self.assertFalse(result["already_settled"])
+        self.assertEqual(self.run_status("run-1"), "settled")
         rows = self.service().evidence_for(option_run_id="run-1")
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["evidence_source"], "contract_note")
         self.assertEqual(rows[0]["settlement_kind"], "cash")
 
     def test_physical_settlement_is_recorded_as_its_own_kind(self):
+        self.seed_run("run-2", digest="d-2")
         result = self.service().settle(
             account_id="kite:A", option_run_id="run-2", structure_digest="d-2",
             settlement_kind="physical", evidence_source="exchange_file",
@@ -203,6 +281,55 @@ class EvidenceTests(ExpiryTestCase):
         )
         self.assertTrue(result["settled"])
         self.assertEqual(result["evidence"]["settlement_kind"], "physical")
+
+    def _refusal(self, **overrides):
+        from backend.options.protection.expiry_policy import SettlementRefusal
+
+        kwargs = dict(
+            account_id="kite:A", option_run_id="run-1", structure_digest="d-1",
+            evidence_source="contract_note", evidence_ref={"n": 1}, recorded_by="app:owner",
+        )
+        kwargs.update(overrides)
+        with self.assertRaises(SettlementRefusal) as ctx:
+            self.service().settle(**kwargs)
+        return ctx.exception
+
+    def test_an_unknown_run_is_refused_and_records_nothing(self):
+        self.assertEqual(self._refusal().reason_code, "SETTLEMENT_RUN_UNKNOWN")
+        self.assertEqual(self.service().evidence_for(option_run_id="run-1"), [])
+
+    def test_an_unowned_run_is_refused(self):
+        self.seed_run("run-1", owned=False)
+        self.assertEqual(self._refusal().reason_code, "SETTLEMENT_RUN_UNOWNED")
+
+    def test_another_accounts_run_is_refused(self):
+        self.seed_run("run-1", account_id="kite:B")
+        self.assertEqual(self._refusal().reason_code, "SETTLEMENT_ACCOUNT_MISMATCH")
+        self.assertEqual(self.run_status("run-1"), "entered")
+
+    def test_a_different_structure_digest_is_refused(self):
+        self.seed_run("run-1", digest="d-other")
+        self.assertEqual(self._refusal().reason_code, "SETTLEMENT_DIGEST_MISMATCH")
+        self.assertEqual(self.service().evidence_for(option_run_id="run-1"), [])
+
+    def test_an_in_flight_run_is_not_settleable(self):
+        self.seed_run("run-1", status="exiting")
+        self.assertEqual(self._refusal().reason_code, "SETTLEMENT_RUN_NOT_SETTLEABLE")
+        self.assertEqual(self.run_status("run-1"), "exiting")
+
+    def test_settling_twice_is_idempotent(self):
+        self.seed_run("run-1")
+        first = self.service().settle(
+            account_id="kite:A", option_run_id="run-1", structure_digest="d-1",
+            evidence_source="broker_ledger", evidence_ref={"l": 1}, recorded_by="app:owner",
+        )
+        second = self.service().settle(
+            account_id="kite:A", option_run_id="run-1", structure_digest="d-1",
+            evidence_source="broker_ledger", evidence_ref={"l": 2}, recorded_by="app:owner",
+        )
+        self.assertTrue(second["already_settled"])
+        self.assertEqual(second["evidence"]["id"], first["evidence"]["id"])
+        self.assertEqual(len(self.service().evidence_for(option_run_id="run-1")), 1)
 
     def test_an_invented_settlement_kind_refuses(self):
         from backend.options.protection.expiry_policy import SettlementRefusal
@@ -244,33 +371,55 @@ class EvidenceTests(ExpiryTestCase):
         )
         self.assertEqual(axes, [])
 
-    def test_the_adapter_reports_settled_once_evidence_exists(self):
+    def _axes(self, strategy_id="stg-A", environment="paper"):
         from backend.options.protection.expiry_policy import option_settlement_axes
 
+        with self.factory() as session:
+            return option_settlement_axes(
+                account_id="kite:A", strategy_id=strategy_id,
+                execution_environment=environment, db=session,
+            )
+
+    def test_a_strategy_without_option_runs_is_satisfied(self):
+        (axis,) = self._axes()
+        self.assertEqual(axis["state"], "satisfied")
+        self.assertEqual(axis["detail"]["reason"], "no_option_runs")
+
+    def test_an_open_run_fails_the_axis(self):
+        self.seed_run("run-open", status="entered")
+        (axis,) = self._axes()
+        self.assertEqual(axis["state"], "failed")
+        self.assertEqual(axis["detail"]["reason"], "option_runs_open")
+        self.assertEqual(axis["detail"]["open_runs"], ["run-open"])
+
+    def test_settled_and_exited_runs_satisfy_the_axis(self):
+        self.seed_run("run-9")
+        self.seed_run("run-10", status="exited")
         self.service().settle(
-            account_id="kite:A", option_run_id="run-9", structure_digest="d-9",
+            account_id="kite:A", option_run_id="run-9", structure_digest="d-1",
             evidence_source="broker_ledger", evidence_ref={"ledger": "L-1"},
             recorded_by="app:owner",
         )
-        with self.factory() as session:
-            axes = option_settlement_axes(
-                account_id="kite:A", strategy_id="stg-A", execution_environment="paper",
-                db=session,
-            )
-        self.assertEqual(axes[0]["state"], "settled")
-        self.assertEqual(axes[0]["detail"]["option_runs"], ["run-9"])
+        (axis,) = self._axes()
+        self.assertEqual(axis["state"], "satisfied")
+        self.assertEqual(axis["detail"]["settled_runs"], ["run-9"])
 
-    def test_the_adapter_reports_unsettled_when_there_is_no_evidence(self):
-        from backend.options.protection.expiry_policy import option_settlement_axes
+    def test_the_axis_is_scoped_to_the_strategy_and_environment(self):
+        self.seed_run("run-other", strategy_id="stg-B")
+        self.seed_run("run-live", environment="live")
+        (axis,) = self._axes()
+        self.assertEqual(axis["state"], "satisfied")
+        self.assertEqual(axis["detail"]["reason"], "no_option_runs")
 
-        with self.factory() as session:
-            axes = option_settlement_axes(
-                account_id="kite:A", strategy_id="stg-A", execution_environment="paper",
-                db=session,
-            )
-        # Expiry time alone leaves the domain unsettled, which is the honest answer.
-        self.assertEqual(axes[0]["state"], "unsettled")
-        self.assertEqual(axes[0]["detail"]["reason"], "no_authoritative_settlement_evidence")
+    def test_the_axis_uses_the_barrier_vocabulary(self):
+        """_make_axis turns anything else into unknown; the rollup must see the real state."""
+        from backend.strategies.settlement import _make_axis, _rollup
+
+        self.seed_run("run-10", status="exited")
+        (axis,) = self._axes()
+        made = _make_axis(axis["name"], axis["state"], axis["detail"])
+        self.assertEqual(made["state"], "satisfied")
+        self.assertEqual(_rollup([made]), "settled")
 
 
 if __name__ == "__main__":

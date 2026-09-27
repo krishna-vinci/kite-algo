@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any, Callable, Dict, List, Mapping, Optional
 
+from sqlalchemy import select
+
 from backend.strategies.attribution_models import OptionSettlementEvidence
 
 #: Days before expiry at which an unrolled structure warns its owner.
@@ -74,7 +76,13 @@ def days_to_expiry(expiry: Any, *, now: datetime) -> Optional[int]:
 class SettlementRefusal(Exception):
     reason_code = "SETTLEMENT_EVIDENCE_REQUIRED"
 
-    def __init__(self, detail: Optional[Mapping[str, Any]] = None) -> None:
+    def __init__(
+        self,
+        detail: Optional[Mapping[str, Any]] = None,
+        reason_code: Optional[str] = None,
+    ) -> None:
+        if reason_code:
+            self.reason_code = str(reason_code)
         self.detail = dict(detail or {})
         super().__init__(self.reason_code)
 
@@ -179,6 +187,53 @@ class OptionExpiryPolicy:
         )
 
 
+def _run_owner_accounts(db: Any, option_run_id: str) -> set:
+    """Every account that holds an ownership record for ``option_run_id``."""
+    from sqlalchemy import text as _text
+
+    rows = db.execute(
+        _text(
+            """
+            SELECT account_id FROM public.strategy_plan_option_runs
+            WHERE option_run_id = :rid
+            UNION
+            SELECT account_id FROM public.option_protection_owners
+            WHERE option_run_id = :rid
+            """
+        ),
+        {"rid": str(option_run_id)},
+    ).fetchall()
+    return {str(row[0]) for row in rows}
+
+
+def _owned_option_run_ids(
+    db: Any, *, account_id: str, strategy_id: str, execution_environment: str
+) -> set:
+    """The option runs one strategy owns in one environment of one account."""
+    from sqlalchemy import text as _text
+
+    params = {
+        "acct": str(account_id),
+        "sid": str(strategy_id),
+        "env": str(execution_environment),
+    }
+    rows = db.execute(
+        _text(
+            """
+            SELECT option_run_id FROM public.strategy_plan_option_runs
+            WHERE account_id = :acct AND strategy_id = :sid
+              AND execution_environment = :env
+            UNION
+            SELECT option_run_id FROM public.option_protection_owners
+            WHERE account_id = :acct AND strategy_id = :sid
+              AND execution_environment = :env
+            """
+        ),
+        params,
+    ).fetchall()
+    return {str(row[0]) for row in rows}
+
+
 class OptionSettlementService:
     """Records authoritative settlement evidence and applies the adjustment."""
 
@@ -207,19 +262,10 @@ class OptionSettlementService:
         most tempting non-source there is, and it is exactly the one that books an
         adjustment against a position that may still be open.
         """
-        if str(settlement_kind) not in SETTLEMENT_KINDS:
-            raise SettlementRefusal({"settlement_kind": str(settlement_kind)})
-        if str(evidence_source) not in AUTHORITATIVE_SOURCES:
-            raise SettlementRefusal(
-                {
-                    "evidence_source": str(evidence_source),
-                    "authoritative": list(AUTHORITATIVE_SOURCES),
-                    "message": (
-                        "Settlement requires an authoritative source; a position that "
-                        "is merely not visible is not evidence that it was settled"
-                    ),
-                }
-            )
+        self._validate_source(
+            settlement_kind=settlement_kind,
+            evidence_source=evidence_source,
+        )
 
         import uuid
 
@@ -254,11 +300,20 @@ class OptionSettlementService:
         adjustment_id: Optional[str] = None,
         now: Optional[datetime] = None,
     ) -> Dict[str, Any]:
-        """Settle a structure — ONLY with evidence.
+        """Settle ONE owned run — only with evidence, in one transaction.
 
-        With no evidence this records nothing and refuses. The negative case is the
-        important one: expiry time passing must not move the book.
+        Locks the run, proves the account owns it and the digest is the held
+        shape, moves it to ``settled`` by compare-and-set, records the evidence
+        and releases its protection owner. Any refusal leaves nothing behind.
         """
+        import json
+        import uuid
+
+        from sqlalchemy import text as _text
+
+        from backend.options.execution.lifecycle import SETTLEABLE_STATUSES
+        from backend.options.protection.ownership import OptionProtectionOwnerStore
+
         _ = now
         if not evidence_source:
             raise SettlementRefusal(
@@ -270,17 +325,98 @@ class OptionSettlementService:
                     ),
                 }
             )
-        evidence = self.record_evidence(
-            account_id=account_id,
-            option_run_id=option_run_id,
-            structure_digest=structure_digest,
-            settlement_kind=settlement_kind,
-            evidence_source=evidence_source,
-            evidence_ref=evidence_ref or {},
-            recorded_by=recorded_by,
-            adjustment_id=adjustment_id,
-        )
-        return {"settled": True, "run_state": "settled", "evidence": evidence}
+        self._validate_source(settlement_kind=settlement_kind, evidence_source=evidence_source)
+
+        with self.session_factory() as session:
+            dialect = str(getattr(getattr(session.get_bind(), "dialect", None), "name", "") or "")
+            lock = "" if dialect == "sqlite" else " FOR UPDATE"
+            row = session.execute(
+                _text(
+                    "SELECT status, metadata FROM public.option_run_states "
+                    "WHERE strategy_run_id = :rid" + lock
+                ),
+                {"rid": str(option_run_id)},
+            ).first()
+            if row is None:
+                raise SettlementRefusal({"option_run_id": option_run_id}, "SETTLEMENT_RUN_UNKNOWN")
+            status = str(row[0] or "")
+            metadata = row[1]
+            if isinstance(metadata, (str, bytes)):
+                metadata = json.loads(metadata or "{}")
+            metadata = dict(metadata or {})
+
+            owners = _run_owner_accounts(session, option_run_id)
+            if not owners:
+                raise SettlementRefusal({"option_run_id": option_run_id}, "SETTLEMENT_RUN_UNOWNED")
+            if str(account_id) not in owners:
+                raise SettlementRefusal(
+                    {"option_run_id": option_run_id, "account_id": str(account_id)},
+                    "SETTLEMENT_ACCOUNT_MISMATCH",
+                )
+            held_digest = str(metadata.get("structure_digest") or "")
+            if held_digest and held_digest != str(structure_digest):
+                raise SettlementRefusal(
+                    {"option_run_id": option_run_id, "held_digest": held_digest,
+                     "structure_digest": str(structure_digest)},
+                    "SETTLEMENT_DIGEST_MISMATCH",
+                )
+
+            if status == "settled":
+                latest = session.execute(
+                    select(OptionSettlementEvidence)
+                    .where(OptionSettlementEvidence.option_run_id == str(option_run_id))
+                    .order_by(OptionSettlementEvidence.created_at.desc())
+                ).scalars().first()
+                session.rollback()
+                return {
+                    "settled": True,
+                    "run_state": "settled",
+                    "evidence": self._view(latest) if latest is not None else None,
+                    "already_settled": True,
+                }
+            if status not in SETTLEABLE_STATUSES:
+                raise SettlementRefusal(
+                    {"option_run_id": option_run_id, "status": status,
+                     "settleable": list(SETTLEABLE_STATUSES)},
+                    "SETTLEMENT_RUN_NOT_SETTLEABLE",
+                )
+
+            placeholders = ", ".join(f":s{i}" for i in range(len(SETTLEABLE_STATUSES)))
+            moved = session.execute(
+                _text(
+                    "UPDATE public.option_run_states SET status = 'settled', "
+                    "pending_legs = '[]', updated_at = CURRENT_TIMESTAMP "
+                    f"WHERE strategy_run_id = :rid AND status IN ({placeholders})"
+                ),
+                {"rid": str(option_run_id),
+                 **{f"s{i}": value for i, value in enumerate(SETTLEABLE_STATUSES)}},
+            ).rowcount
+            if moved != 1:
+                session.rollback()
+                raise SettlementRefusal(
+                    {"option_run_id": option_run_id, "status": status},
+                    "SETTLEMENT_RUN_NOT_SETTLEABLE",
+                )
+
+            evidence = OptionSettlementEvidence(
+                id=str(uuid.uuid4()),
+                account_id=str(account_id),
+                option_run_id=str(option_run_id),
+                structure_digest=str(structure_digest),
+                settlement_kind=str(settlement_kind),
+                evidence_source=str(evidence_source),
+                evidence_ref=dict(evidence_ref or {}),
+                recorded_by=str(recorded_by),
+                adjustment_id=adjustment_id,
+            )
+            session.add(evidence)
+            session.flush()
+            view = self._view(evidence)
+            OptionProtectionOwnerStore(session_factory=self.session_factory).release(
+                str(option_run_id), db=session
+            )
+            session.commit()
+        return {"settled": True, "run_state": "settled", "evidence": view, "already_settled": False}
 
     def evidence_for(self, *, option_run_id: str) -> List[Dict[str, Any]]:
         from sqlalchemy import select
@@ -292,6 +428,22 @@ class OptionSettlementService:
                 .order_by(OptionSettlementEvidence.created_at)
             ).scalars().all()
             return [self._view(row) for row in rows]
+
+    @staticmethod
+    def _validate_source(*, settlement_kind: str, evidence_source: str) -> None:
+        if str(settlement_kind) not in SETTLEMENT_KINDS:
+            raise SettlementRefusal({"settlement_kind": str(settlement_kind)})
+        if str(evidence_source) not in AUTHORITATIVE_SOURCES:
+            raise SettlementRefusal(
+                {
+                    "evidence_source": str(evidence_source),
+                    "authoritative": list(AUTHORITATIVE_SOURCES),
+                    "message": (
+                        "Settlement requires an authoritative source; a position that "
+                        "is merely not visible is not evidence that it was settled"
+                    ),
+                }
+            )
 
     @staticmethod
     def _view(row: OptionSettlementEvidence) -> Dict[str, Any]:
@@ -311,58 +463,61 @@ class OptionSettlementService:
 def option_settlement_axes(
     *, account_id: str, strategy_id: str, execution_environment: str, db: Any = None
 ) -> List[Dict[str, Any]]:
-    """A Phase 5 domain adapter: what the option domain contributes to settlement.
+    """What the option domain contributes to ONE strategy book's settlement.
 
-    Registered rather than discovered, so the barrier never learns about option
-    runs: it asks each domain what it knows and rolls the answers up. Two things it
-    reports, and the distinction matters.
-
-    A run that has recorded authoritative settlement evidence contributes ``settled``
-    — the option domain is DONE with it. A run that is merely past its expiry
-    contributes ``unsettled`` with a reason, because expiry time is not evidence and
-    a barrier that treated it as one would release attribution against a position
-    that may still exist.
+    Scoped to the strategy's own option runs in this environment. Answers in
+    the barrier's vocabulary (``satisfied``/``failed``/``unknown``): every run
+    terminal (``exited`` or ``settled``) is satisfied; any held run fails the
+    axis, because expiry time is not evidence; an unreadable answer is unknown
+    and never releases.
     """
-    axes: List[Dict[str, Any]] = []
-    if db is None:
-        return axes
+    from sqlalchemy import text as _text
 
-    from sqlalchemy import select
+    from backend.options.protection.ownership import TERMINAL_RUN_STATUSES
+
+    name = "domain:option_settlement"
+    if db is None:
+        return []
 
     try:
-        rows = db.execute(
-            select(OptionSettlementEvidence).where(
-                OptionSettlementEvidence.account_id == str(account_id)
-            )
-        ).scalars().all()
-    except Exception:  # noqa: BLE001 - an unavailable evidence table contributes nothing
-        return axes
-
-    settled_runs = {
-        str(row.option_run_id)
-        for row in rows
-        if row.option_run_id is not None
-    }
-    if not settled_runs:
-        # No evidence for anything: the domain has nothing to settle, which is a
-        # contribution of its own — silence would read as "not asked".
-        axes.append(
-            {
-                "name": "domain:option_settlement",
-                "state": "unsettled",
-                "detail": {"reason": "no_authoritative_settlement_evidence"},
-            }
+        run_ids = _owned_option_run_ids(
+            db,
+            account_id=account_id,
+            strategy_id=strategy_id,
+            execution_environment=execution_environment,
         )
-        return axes
+        statuses: Dict[str, str] = {}
+        for run_id in sorted(run_ids):
+            status = db.execute(
+                _text(
+                    "SELECT status FROM public.option_run_states "
+                    "WHERE strategy_run_id = :rid"
+                ),
+                {"rid": run_id},
+            ).scalar()
+            if status is not None:
+                statuses[run_id] = str(status)
+    except Exception:  # noqa: BLE001 - unreadable evidence is unknown, never settled
+        return [{"name": name, "state": "unknown", "detail": {"reason": "option_runs_unreadable"}}]
 
-    axes.append(
-        {
-            "name": "domain:option_settlement",
-            "state": "settled",
-            "detail": {"option_runs": sorted(settled_runs)},
-        }
-    )
-    return axes
+    if not run_ids:
+        return [{"name": name, "state": "satisfied", "detail": {"reason": "no_option_runs"}}]
+    open_runs = sorted(r for r, s in statuses.items() if s not in TERMINAL_RUN_STATUSES)
+    if open_runs:
+        return [{"name": name, "state": "failed",
+                 "detail": {"reason": "option_runs_open", "open_runs": open_runs}}]
+    missing = sorted(r for r in run_ids if r not in statuses)
+    if missing:
+        return [{"name": name, "state": "unknown",
+                 "detail": {"reason": "option_run_state_missing", "option_runs": missing}}]
+    return [{
+        "name": name,
+        "state": "satisfied",
+        "detail": {
+            "option_runs": sorted(run_ids),
+            "settled_runs": sorted(r for r, s in statuses.items() if s == "settled"),
+        },
+    }]
 
 
 def register_option_settlement_adapter() -> None:

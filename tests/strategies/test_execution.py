@@ -4730,3 +4730,15 @@ def _run_open_by_leg(trades):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StructureGenerationHistoryTests(unittest.TestCase):
+    def test_every_released_generation_is_kept(self):
+        from backend.strategies.execution import append_structure_generation
+
+        history: list = []
+        for generation in range(1, 13):
+            history = append_structure_generation(
+                history, {"generation": generation, "structure_digest": f"d{generation}", "legs": []}
+            )
+        self.assertEqual([row["generation"] for row in history], list(range(1, 13)))

@@ -132,6 +132,19 @@ class _PgTestCase(unittest.TestCase):
     def settlement(self, sf):
         return OptionSettlementService(session_factory=sf)
 
+    def seed_run(self, sf, run_id, *, digest, status="entered", account_id="kite:A",
+                 strategy_id="stg-A", environment="paper"):
+        _exec(sf, f"INSERT INTO public.strategies (id, owner_id, name, account_scope) "
+                  f"VALUES ('{strategy_id}', 'app:o', '{strategy_id}', '{account_id}') "
+                  f"ON CONFLICT DO NOTHING")
+        _exec(sf, f"INSERT INTO public.option_run_states (strategy_run_id, strategy_name, product, "
+                  f"status, metadata) VALUES ('{run_id}', 'n', 'NRML', '{status}', "
+                  f"'{{\"structure_digest\": \"{digest}\"}}'::jsonb)")
+        _exec(sf, f"INSERT INTO public.option_protection_owners (option_run_id, strategy_id, "
+                  f"account_id, execution_environment, policy_version, policy, state) "
+                  f"VALUES ('{run_id}', '{strategy_id}', '{account_id}', '{environment}', "
+                  f"'v1', '{{}}'::jsonb, 'released')")
+
 
 def _scalar(sf, sql, params=None):
     with sf() as session:
@@ -190,6 +203,7 @@ class TestMigration(_PgTestCase):
 
     def test_evidence_is_append_only(self):
         sf = self.make_db()
+        self.seed_run(sf, "run-1", digest="d-1")
         self.settlement(sf).settle(
             account_id="kite:A", option_run_id="run-1", structure_digest="d-1",
             evidence_source="contract_note", recorded_by="app:owner",
@@ -342,6 +356,7 @@ class TestWalkthroughSix(_PgTestCase):
 
     def test_cash_settlement_with_evidence_settles_the_run(self):
         sf = self.make_db()
+        self.seed_run(sf, "run-w6", digest="digest-w6")
         result = self.settlement(sf).settle(
             account_id="kite:A", option_run_id="run-w6", structure_digest="digest-w6",
             settlement_kind="cash", evidence_source="exchange_file",
@@ -357,11 +372,15 @@ class TestWalkthroughSix(_PgTestCase):
                 account_id="kite:A", strategy_id="stg-A", execution_environment="paper",
                 db=session,
             )
-        assert axes[0]["state"] == "settled"
+        assert axes[0]["state"] == "satisfied"
+        assert _scalar(
+            sf, "SELECT status FROM public.option_run_states WHERE strategy_run_id='run-w6'"
+        ) == "settled"
 
     def test_expiry_time_alone_adjusts_nothing(self):
         """THE negative walkthrough: no evidence, no settlement, nothing recorded."""
         sf = self.make_db()
+        self.seed_run(sf, "run-w6", digest="digest-w6")
         with pytest.raises(SettlementRefusal):
             self.settlement(sf).settle(
                 account_id="kite:A", option_run_id="run-w6", structure_digest="digest-w6"
@@ -372,7 +391,7 @@ class TestWalkthroughSix(_PgTestCase):
                 account_id="kite:A", strategy_id="stg-A", execution_environment="paper",
                 db=session,
             )
-        assert axes[0]["state"] == "unsettled"
+        assert axes[0]["state"] == "failed"
 
 
 class TestExpiryAndMis(_PgTestCase):

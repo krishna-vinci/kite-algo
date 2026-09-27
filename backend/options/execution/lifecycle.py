@@ -20,13 +20,18 @@ _ALLOWED_TRANSITIONS: dict[str, set[str]] = {
         OptionRunStatus.PARTIAL_ENTRY.value,
     },
     OptionRunStatus.PARTIAL_ENTRY.value: {OptionRunStatus.CLEANUP_REQUIRED.value},
-    OptionRunStatus.CLEANUP_REQUIRED.value: {OptionRunStatus.EXIT_PREVIEWED.value},
+    OptionRunStatus.CLEANUP_REQUIRED.value: {
+        OptionRunStatus.EXIT_PREVIEWED.value,
+        # A structure held into expiry ends by settlement, with evidence.
+        OptionRunStatus.SETTLED.value,
+    },
     OptionRunStatus.ENTERED.value: {
         OptionRunStatus.EXIT_PREVIEWED.value,
         # Compatibility for direct partial-exit helpers.
         OptionRunStatus.PARTIAL_EXIT.value,
         # A desired-state mutation of the held structure.
         OptionRunStatus.ADJUSTING.value,
+        OptionRunStatus.SETTLED.value,
     },
     #: An adjust is a transient ownership of the run: it lands back in ``entered``
     #: with a new generation, stays ``adjusting`` while a leg is withheld or only
@@ -46,9 +51,21 @@ _ALLOWED_TRANSITIONS: dict[str, set[str]] = {
         OptionRunStatus.EXITING.value,
         # Compatibility for direct close helper.
         OptionRunStatus.EXITED.value,
+        OptionRunStatus.SETTLED.value,
     },
-    OptionRunStatus.EXITED.value: set(),
+    OptionRunStatus.EXITED.value: {OptionRunStatus.SETTLED.value},
+    OptionRunStatus.SETTLED.value: set(),
 }
+
+#: The statuses settlement evidence may end. Derived from the table so the two
+#: can never disagree.
+SETTLEABLE_STATUSES: tuple[str, ...] = tuple(
+    sorted(
+        status
+        for status, targets in _ALLOWED_TRANSITIONS.items()
+        if OptionRunStatus.SETTLED.value in targets
+    )
+)
 
 
 def transition_to(state: OptionRunState, target_status: OptionRunStatus | str) -> OptionRunState:
@@ -175,5 +192,11 @@ def mark_partial_exit(
 
 def mark_closed(state: OptionRunState) -> OptionRunState:
     next_state = transition_to(state, OptionRunStatus.EXITED)
+    next_state.pending_legs = []
+    return next_state
+
+
+def mark_settled(state: OptionRunState) -> OptionRunState:
+    next_state = transition_to(state, OptionRunStatus.SETTLED)
     next_state.pending_legs = []
     return next_state

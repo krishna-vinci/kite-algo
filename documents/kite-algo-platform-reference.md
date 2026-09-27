@@ -544,8 +544,11 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
 - **Option runs** (`backend/options/execution/`):
   - `OptionRunState` and the status lifecycle, including `adjusting` and `settled` (`models.py:12-142`,
     `lifecycle.py`).
+  - Settlement validates run ownership and structure digest and moves the run to `settled` in one transaction; the
+    option settlement axis is scoped to strategy plus environment and reports `satisfied`, `failed` or `unknown`
+    (`protection/expiry_policy.py`).
   - Durable store with CAS on status and generation (`durable_store.py:409-506`).
-  - A generation history capped at 10 (`execution.py:2380-2413`).
+  - A generation history with all generations kept (`execution.py:2380-2413`).
 - **Adjust: EXISTS for paper and live.**
   - **Resize** keeps the same expiry and changes the quantity.
   - **Roll** is triggered when the desired expiry differs from the held one (`execution.py:1644-1652`). It acquires

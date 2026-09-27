@@ -2225,7 +2225,7 @@ class OptionSettlementReadApiTests(_ProposalApiHarness):
 
         from backend.options.protection.expiry_policy import OptionSettlementService
 
-        OptionSettlementService(session_factory=self.factory).settle(
+        OptionSettlementService(session_factory=self.factory).record_evidence(
             account_id="kite:paper", option_run_id="run-opt-1", structure_digest="digest-1",
             settlement_kind="cash", evidence_source="contract_note",
             evidence_ref={"note_id": "CN-7"}, recorded_by="app:admin",
