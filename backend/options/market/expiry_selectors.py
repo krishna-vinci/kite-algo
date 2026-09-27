@@ -47,7 +47,7 @@ def resolve_expiry_selector(
     semantic_selector: str | None = None
     if isinstance(selector, str):
         semantic_candidate = selector.strip().lower()
-        if semantic_candidate in {"nearest", "current_week", "next_week", "current_month"}:
+        if semantic_candidate in {"nearest", "current_week", "next_week", "current_month", "next_month"}:
             semantic_selector = semantic_candidate
 
     if semantic_selector == "nearest":
@@ -76,11 +76,19 @@ def resolve_expiry_selector(
                 return expiry
         raise ExpirySelectorError("No next-week expiry is available")
 
+    if semantic_selector == "next_month":
+        # The following calendar month's last expiry: its monthly contract.
+        year, month = (current_day.year + 1, 1) if current_day.month == 12 else (
+            current_day.year,
+            current_day.month + 1,
+        )
+        label = "next-month"
+    else:
+        year, month = current_day.year, current_day.month
+        label = "current-month"
     month_expiries = [
-        expiry
-        for expiry in future_expiries
-        if expiry.year == current_day.year and expiry.month == current_day.month
+        expiry for expiry in future_expiries if expiry.year == year and expiry.month == month
     ]
     if not month_expiries:
-        raise ExpirySelectorError("No current-month expiry is available")
+        raise ExpirySelectorError(f"No {label} expiry is available")
     return month_expiries[-1]

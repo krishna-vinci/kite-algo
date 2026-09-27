@@ -521,7 +521,8 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
 ## 6. Options subsystem
 
 - **Expiry selectors: EXISTS.** `nearest`, `current_week`, `next_week`, `current_month` (the last expiry of the
-  month) or an explicit date (`backend/options/market/expiry_selectors.py:33-86`). There is no `next_month`.
+  month), `next_month` (the last expiry of the following month) or an explicit date
+  (`backend/options/market/expiry_selectors.py`). SENSEX/BANKEX selector legs resolve on BFO.
 - **Relative strikes (ATM ± N, ITMn/OTMn, `delta_target`): PARTIAL.**
   - They are resolved by `resolve_selection` (`backend/options/market/service.py:115-240`,
     `selection.py:16-223`), exposed to workers at `.../selection/resolve`, and wrapped by the SDK helpers

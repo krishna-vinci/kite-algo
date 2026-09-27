@@ -59,3 +59,18 @@ def test_raises_for_invalid_selector_date_format():
 def test_raises_for_invalid_expiry_date_format_in_list():
     with pytest.raises(ExpirySelectorError, match="Invalid expiry date format"):
         resolve_expiry_selector("nearest", ["2026-05-07", "2026/05/14"], today=date(2026, 5, 1))
+
+
+def test_resolve_next_month_picks_the_following_months_last_expiry():
+    expiries = [date(2026, 9, 29), date(2026, 10, 6), date(2026, 10, 13), date(2026, 10, 27), date(2026, 11, 24)]
+    assert resolve_expiry_selector("next_month", expiries, today=date(2026, 9, 28)) == date(2026, 10, 27)
+
+
+def test_resolve_next_month_rolls_over_the_year():
+    expiries = [date(2026, 12, 29), date(2027, 1, 26)]
+    assert resolve_expiry_selector("next_month", expiries, today=date(2026, 12, 1)) == date(2027, 1, 26)
+
+
+def test_next_month_without_a_listed_expiry_raises():
+    with pytest.raises(ExpirySelectorError, match="No next-month expiry is available"):
+        resolve_expiry_selector("next_month", [date(2026, 9, 29)], today=date(2026, 9, 28))

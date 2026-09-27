@@ -5,7 +5,7 @@ A RELATIVE leg (``ATM+N`` / ``ITMn`` / ``OTMn`` or ``delta_target``) names a
 same canonical option-chain source the freeze-evidence check reads
 (:mod:`backend.options.market.freshness`) -- never by re-deriving a strike from
 data the compiler holds itself. A structure's ``expiry`` may itself be a
-selector (``current_week`` / ``next_week`` / ``current_month``); it is resolved
+selector (``current_week`` / ``next_week`` / ``current_month`` / ``next_month``); it is resolved
 to one concrete date here, once, before any leg is asked to match against it,
 so every leg in the structure resolves against the same expiry and the frozen
 plan never carries the selector text as if it were a date.
