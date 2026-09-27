@@ -315,6 +315,8 @@ Refusals raise HTTP 409 with `rejection_reason` for owner actions
 
 ## Related documents
 
+- Nightly database backups and restore procedure:
+  `documents/runbooks/backup-restore.md`
 - Production rollout + lane order:
   `documents/hosted-strategies-production-live-readiness-plan-2026-09-25.md`
 - Deployment procedure + recorded evidence:

@@ -1,0 +1,25 @@
+# Nightly database backups. Start with:
+#   docker compose -f compose.yml -f compose.backup.yml up -d db-backup
+services:
+  db-backup:
+    image: postgres:16-alpine
+    container_name: kite-db-backup
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: ["sh", "/ops/pg_backup.sh"]
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${DB_USER:-postgres}
+      PGPASSWORD: ${DB_PASSWORD:-postgres}
+      PGDATABASE: ${DB_NAME:-postgres}
+      BACKUP_DIR: /backups
+      BACKUP_KEEP_DAYS: ${BACKUP_KEEP_DAYS:-14}
+      BACKUP_AT_IST: ${BACKUP_AT_IST:-02:30}
+      BACKUP_RUN_ON_START: ${BACKUP_RUN_ON_START:-0}
+      NTFY_URL: ${SCHEDULER_NTFY_URL:-}
+    volumes:
+      - ./scripts/ops:/ops:ro
+      - ${BACKUP_DIR:-/home/krishna/kite-algo-backups}:/backups

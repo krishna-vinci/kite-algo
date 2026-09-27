@@ -63,6 +63,9 @@ scripts/*
 !scripts/mcp_codex_headers.py
 !scripts/smoke_alerts.sh
 !scripts/alerts_capacity_benchmark.py
+!scripts/ops/
+scripts/ops/*
+!scripts/ops/pg_backup.sh
 
 # Agent Skills
 .agents/
