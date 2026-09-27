@@ -47,6 +47,7 @@ import json
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+import logging
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from sqlalchemy import text
@@ -88,6 +89,8 @@ from .settlement import ExecutionBarrier
 #: The plan kinds this adapter dispatches. Everything else - an ``intent_bundle``
 #: - is a NAMED refusal rather than a guess: live support is explicit, and each
 #: lane is wired through ``live_sequence.register_live_lane``.
+logger = logging.getLogger(__name__)
+
 LIVE_SUPPORTED_PLAN_KINDS = (
     "single_instrument",
     "target_weights",
@@ -2448,13 +2451,28 @@ class LivePlanAdapter:
         submitted_orders = [str(value) for value in (row.get("broker_order_ids") or []) if str(value)]
         if not submitted_orders:
             return None
-        run_id = bound_run_for_plan(self.session_factory, plan_id=plan_id)
-        child_orders = autoslice_child_order_ids(
-            self.session_factory,
-            account_id=str(row.get("account_id") or ""),
-            run_id=str(run_id or ""),
-            parent_order_ids=submitted_orders,
-        )
+        # Autoslice children are cancelled with their parent when they can be
+        # discovered. A failed discovery must NEVER stop the parent's cancel: a
+        # timed-out LIMIT left working is worse than a child that ingestion
+        # reconciles later.
+        child_orders: List[str] = []
+        if self.session_factory is not None:
+            try:
+                run_id = bound_run_for_plan(self.session_factory, plan_id=plan_id)
+                child_orders = autoslice_child_order_ids(
+                    self.session_factory,
+                    account_id=str(row.get("account_id") or ""),
+                    run_id=str(run_id or ""),
+                    parent_order_ids=submitted_orders,
+                )
+            except Exception:  # noqa: BLE001 - discovery is best effort; the parent cancel is not
+                logger.warning(
+                    "autoslice child discovery failed for plan %s step %s; cancelling submitted orders only",
+                    plan_id,
+                    step_no,
+                    exc_info=True,
+                )
+                child_orders = []
         orders = merge_order_ids(submitted_orders, child_orders)
         delta = dict(row.get("delta_snapshot") or {})
         ordered = abs(int(delta.get("quantity") or execution_order.get("quantity") or 0))
