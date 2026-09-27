@@ -205,3 +205,12 @@ def test_time_to_expiry_floors_after_1530_ist_on_expiry_day(monkeypatch):
     _freeze_options_session_clock(monkeypatch, datetime(2026, 5, 7, 10, 15, tzinfo=timezone.utc))
 
     assert session._time_to_expiry(expiry) == MIN_T
+
+
+def test_v1_payload_carries_session_health():
+    snapshot = {
+        "updated_at": "2026-09-28T04:00:00Z",
+        "health": {"spot_live": False, "spot_age_sec": None, "dropped_tokens": 3},
+    }
+    payload = json.loads(serialize_option_snapshot_v1(snapshot, "nifty"))
+    assert payload["health"] == {"spot_live": False, "spot_age_sec": None, "dropped_tokens": 3}

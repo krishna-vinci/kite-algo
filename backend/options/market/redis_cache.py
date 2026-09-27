@@ -32,6 +32,8 @@ def build_option_snapshot_v1_payload(snapshot: Mapping[str, Any], underlying: st
         "per_expiry": snapshot.get("per_expiry", {}),
         "desired_token_count": snapshot.get("desired_token_count"),
     }
+    if "health" in snapshot:
+        payload["health"] = snapshot.get("health")
     if "resource_error" in snapshot:
         payload["resource_error"] = snapshot.get("resource_error")
     return payload
