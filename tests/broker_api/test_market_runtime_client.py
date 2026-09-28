@@ -151,3 +151,33 @@ class MarketDataRuntimeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_paper_engine_skips_ticks_for_tokens_it_does_not_trade():
+    import asyncio as _asyncio
+
+    from backend.paper_runtime.market_engine import PaperMarketEngine
+
+    class Svc:
+        def __init__(self):
+            self.ticks = []
+
+        async def active_market_tokens(self):
+            return [111]
+
+        async def process_tick(self, tick):
+            self.ticks.append(tick["instrument_token"])
+
+    class NoRedis:
+        def pubsub(self):
+            raise AssertionError("not used")
+
+    async def run():
+        svc = Svc()
+        engine = PaperMarketEngine(service=svc, redis_client=NoRedis())
+        await engine.sync_subscriptions()
+        await engine.process_tick({"instrument_token": 111, "last_price": 1.0})
+        await engine.process_tick({"instrument_token": 999, "last_price": 1.0})
+        return svc.ticks
+
+    assert _asyncio.run(run()) == [111]

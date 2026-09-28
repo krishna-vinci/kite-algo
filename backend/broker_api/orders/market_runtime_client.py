@@ -113,11 +113,13 @@ class TickSubscription:
         maxsize: int,
         on_close: Callable[[], None],
         on_drop: Optional[Callable[[], None]] = None,
+        name: str = "unnamed",
     ):
         self._queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue(maxsize=maxsize)
         self._on_close = on_close
         self._on_drop = on_drop
         self._closed = False
+        self.name = str(name)
         self.dropped = 0
         self._last_drop_warning_at: Optional[float] = None
 
@@ -153,7 +155,9 @@ class TickSubscription:
         now = time.monotonic()
         if self._last_drop_warning_at is None or now - self._last_drop_warning_at >= 60.0:
             self._last_drop_warning_at = now
-            logger.warning("Market tick subscription queue full; dropped=%d", self.dropped)
+            logger.warning(
+                "Market tick subscription %s queue full; dropped=%d", self.name, self.dropped
+            )
 
     def close(self) -> None:
         if self._closed:
@@ -203,7 +207,7 @@ class MarketDataRuntime:
         self._tick_listeners.append(callback)
         return lambda: self._tick_listeners.remove(callback) if callback in self._tick_listeners else None
 
-    def subscribe_ticks(self, maxsize: int = 10000) -> TickSubscription:
+    def subscribe_ticks(self, maxsize: int = 10000, *, name: str = "unnamed") -> TickSubscription:
         if maxsize <= 0:
             raise ValueError("maxsize must be positive")
         subscription: TickSubscription
@@ -217,6 +221,7 @@ class MarketDataRuntime:
             maxsize=maxsize,
             on_close=remove_subscription,
             on_drop=lambda: setattr(self, "_dropped_tick_total", self._dropped_tick_total + 1),
+            name=name,
         )
         unsubscribe = self.add_tick_listener(
             lambda _token, tick: subscription._put_nowait(tick)

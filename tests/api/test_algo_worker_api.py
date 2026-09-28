@@ -648,7 +648,7 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self, subscription):
                 self.subscription = subscription
 
-            def subscribe_ticks(self):
+            def subscribe_ticks(self, **_kwargs):
                 return self.subscription
 
         ticks = [

@@ -34,6 +34,10 @@ class PaperMarketEngine:
         self._task: asyncio.Task | None = None
         self._stats: Dict[str, Any] = {"processed_ticks": 0, "last_tick": None, "last_error": None}
         self._last_sync_at: float = 0.0
+        #: Tokens with paper orders or positions (refreshed every sync). Ticks
+        #: for any other token are skipped: each processed tick costs two DB
+        #: reads, and the feed carries every subscribed instrument.
+        self._active_tokens: set[int] = set()
 
     async def start(self) -> None:
         if self._running:
@@ -67,6 +71,7 @@ class PaperMarketEngine:
                 except Exception:
                     logger.debug("Paper market engine owner cleanup skipped", exc_info=True)
         self._stats["subscribed_tokens"] = list(tokens)
+        self._active_tokens = {int(token) for token in tokens}
         self._last_sync_at = monotonic()
         return self.status()
 
@@ -74,6 +79,12 @@ class PaperMarketEngine:
         return {"running": self._running, "owner_id": self.owner_id, "stats": dict(self._stats)}
 
     async def process_tick(self, tick: Dict[str, Any]) -> None:
+        try:
+            token = int(tick.get("instrument_token") or 0)
+        except (TypeError, ValueError):
+            return
+        if token not in self._active_tokens:
+            return
         await self.service.process_tick(tick)
         self._stats["processed_ticks"] += 1
         self._stats["last_tick"] = {"instrument_token": tick.get("instrument_token"), "last_price": tick.get("last_price")}
@@ -81,7 +92,7 @@ class PaperMarketEngine:
 
     async def _run(self) -> None:
         if self.tick_source is not None:
-            subscription = self.tick_source.subscribe_ticks()
+            subscription = self.tick_source.subscribe_ticks(name="paper_market_engine")
             try:
                 while self._running:
                     try:

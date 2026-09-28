@@ -1090,7 +1090,7 @@ class WorkerMarketDataService:
             yield self._sse_event("snapshot", snapshot)
 
             if tick_source is not None:
-                subscription = tick_source.subscribe_ticks()
+                subscription = tick_source.subscribe_ticks(name="sse_quotes")
             else:
                 redis = self.redis or getattr(runtime, "redis", None)
                 if redis is None:

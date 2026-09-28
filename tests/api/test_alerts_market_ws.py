@@ -140,7 +140,7 @@ class FakeTickSource:
     def __init__(self, ticks):
         self.subscription = FakeTickSubscription(ticks)
 
-    def subscribe_ticks(self):
+    def subscribe_ticks(self, **_kwargs):
         return self.subscription
 
 

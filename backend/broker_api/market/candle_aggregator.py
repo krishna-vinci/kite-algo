@@ -234,7 +234,7 @@ class CandleAggregator:
     async def _market_runtime_tick_loop(self):
         """Consume normalized ticks from the market-runtime Redis channel."""
         if self.tick_source is not None:
-            subscription = self.tick_source.subscribe_ticks()
+            subscription = self.tick_source.subscribe_ticks(name="candle_aggregator")
             try:
                 async for payload in subscription:
                     if not self.running:

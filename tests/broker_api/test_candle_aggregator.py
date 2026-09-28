@@ -48,7 +48,7 @@ class CandleAggregatorRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 {"instrument_token": 256265, "last_price": 22451.5},
             ]
         )
-        source = type("FakeTickSource", (), {"subscribe_ticks": lambda self: subscription})()
+        source = type("FakeTickSource", (), {"subscribe_ticks": lambda self, **_kwargs: subscription})()
         aggregator = CandleAggregator("test-key", tick_source=source)
         aggregator.redis = _FakeRedis()
         aggregator.intervals = ["minute"]

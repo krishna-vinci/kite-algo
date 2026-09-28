@@ -123,7 +123,7 @@ class AlgoRuntimeLiveWorker:
 
     async def _ticks_loop(self) -> None:
         if self.tick_source is not None:
-            subscription = self.tick_source.subscribe_ticks()
+            subscription = self.tick_source.subscribe_ticks(name="algo_runtime_live")
             try:
                 async for payload in subscription:
                     if not self._running:

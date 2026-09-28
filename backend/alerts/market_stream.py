@@ -475,7 +475,7 @@ class MarketStreamHub:
 
     async def _ticks_loop(self) -> None:
         if self._tick_source is not None:
-            subscription = self._tick_source.subscribe_ticks()
+            subscription = self._tick_source.subscribe_ticks(name="market_stream_hub")
             try:
                 async for payload in subscription:
                     if not self._running:
