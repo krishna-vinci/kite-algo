@@ -220,16 +220,27 @@ func (s *KiteShard) syncLocked(previous OwnerSubscriptions) error {
 		}
 	}
 
-	allTokens := tokenKeys(s.desired)
-	if len(allTokens) > 0 {
-		if err := s.ticker.Subscribe(allTokens); err != nil {
-			return fmt.Errorf("subscribe: %w", err)
-		}
-	}
-
+	// Only tokens that are new, or whose mode changed, are (re)subscribed.
+	// Kite answers every subscribe with a full snapshot of the named tokens,
+	// so re-subscribing an unchanged set on every owner update floods the
+	// tick feed with repeated snapshots. A reconnect passes an empty
+	// previous set, so it still subscribes everything.
+	added := make([]uint32, 0)
 	byMode := map[Mode][]uint32{}
 	for token, mode := range s.desired {
-		byMode[mode] = append(byMode[mode], token)
+		previousMode, existed := previous[token]
+		if !existed {
+			added = append(added, token)
+		}
+		if !existed || previousMode != mode {
+			byMode[mode] = append(byMode[mode], token)
+		}
+	}
+	sort.Slice(added, func(i, j int) bool { return added[i] < added[j] })
+	if len(added) > 0 {
+		if err := s.ticker.Subscribe(added); err != nil {
+			return fmt.Errorf("subscribe: %w", err)
+		}
 	}
 	for _, mode := range []Mode{ModeLTP, ModeQuote, ModeFull} {
 		tokens := byMode[mode]
