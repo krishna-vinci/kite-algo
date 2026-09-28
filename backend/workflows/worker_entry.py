@@ -1080,7 +1080,13 @@ async def build_alerts_components(
         screener_window_bars = int(
             os.environ.get("ALERTS_SCREENER_WINDOW_BARS", str(DEFAULT_WINDOW_BARS))
         )
-        screener_history = PgCandleHistory(engine, bindings)
+        # Screeners rank a whole universe, not just subscribed instruments:
+        # resolve members through the catalog (the tick bindings only hold
+        # instruments with alert subscriptions, so every scheduled run found
+        # 0 bars and failed).
+        from backend.workflows.catalog_token_map import CatalogTokenMap
+
+        screener_history = PgCandleHistory(engine, CatalogTokenMap(session_factory))
         screener_scheduler = ScreenerScheduler(
             session_factory=session_factory,
             workflow_repo=workflow_repo,

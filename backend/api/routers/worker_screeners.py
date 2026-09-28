@@ -406,39 +406,12 @@ def _fundamentals_loader(request: Request):
         return None
 
 
-class _CatalogTokenMap:
-    """Lazy EXCHANGE:SYMBOL -> broker token map for the API process.
-
-    Resolves through the published catalog on first use and caches. Purpose
-    a plain mapping (no ``snapshot``) so PgCandleHistory treats it as a
-    static token map.
-    """
-
-    def __init__(self, session_factory: Callable[[], Any]) -> None:
-        self._sessions = session_factory
-        self._cache: dict = {}
-
-    def get(self, key: str) -> Optional[int]:
-        if key in self._cache:
-            return self._cache[key]
-        try:
-            from backend.workflows.worker_entry import resolve_catalog_instrument_tokens
-
-            resolved, _rejected = resolve_catalog_instrument_tokens(
-                {key}, self._sessions, fallback_tokens={}
-            )
-            token = resolved.get(key)
-        except Exception:
-            logger.warning("preview token resolution failed for %s", key, exc_info=True)
-            token = None
-        self._cache[key] = token
-        return token
-
-
 def _candle_history(request: Request):
     from backend.workflows.runtime import PgCandleHistory
 
-    return PgCandleHistory(_engine(request), _CatalogTokenMap(_session_factory(request)))
+    from backend.workflows.catalog_token_map import CatalogTokenMap
+
+    return PgCandleHistory(_engine(request), CatalogTokenMap(_session_factory(request)))
 
 
 def _engine(request: Request):
