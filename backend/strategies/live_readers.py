@@ -182,8 +182,14 @@ async def live_quote_for_leg(leg: Mapping[str, Any]) -> Dict[str, Any]:
     """
     from backend.api.services.market_data import WorkerMarketDataService, WorkerQuoteRequest
 
-    token = leg.get("instrument_token") or leg.get("token")
+    # Resolved plans freeze the broker coordinates as ``broker_token`` /
+    # ``broker_exchange``; accept those as well as the logical names.
+    token = leg.get("instrument_token") or leg.get("token") or leg.get("broker_token")
     symbol = str(leg.get("tradingsymbol") or leg.get("broker_symbol") or "")
+    exchange = str(leg.get("broker_exchange") or leg.get("exchange") or "")
+    if symbol and ":" not in symbol and exchange:
+        # The catalog resolves EXCHANGE:SYMBOL; a bare "ITC" does not resolve.
+        symbol = f"{exchange}:{symbol}"
     if not token and not symbol:
         raise LiveEvidenceUnavailable(
             "LIVE_QUOTE_MISSING",
@@ -211,7 +217,11 @@ async def live_quote_for_leg(leg: Mapping[str, Any]) -> Dict[str, Any]:
                 break
     if quote is None and symbol:
         for candidate in quotes:
-            if str(candidate.get("tradingsymbol") or candidate.get("symbol") or "").upper() == symbol.upper():
+            names = {
+                str(candidate.get("tradingsymbol") or "").upper(),
+                str(candidate.get("symbol") or "").upper(),
+            }
+            if symbol.upper() in names:
                 quote = candidate
                 break
     if quote is None:
