@@ -51,6 +51,7 @@ import hashlib
 import inspect
 import json
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Optional, Sequence, Tuple
@@ -240,7 +241,13 @@ class EvaluationService:
         except ValueError:
             self.delivery_budget_per_window = 60
         self.delivery_budget_window_s = 60.0
-        self._emission_windows: dict = {}
+        try:
+            self.emission_window_max_entries = max(
+                1, int(_os.environ.get("ALERTS_EMISSION_WINDOW_MAX_ENTRIES", "4096"))
+            )
+        except ValueError:
+            self.emission_window_max_entries = 4096
+        self._emission_windows: "OrderedDict[tuple, list]" = OrderedDict()
         # Phase 4 F10 breadth bounds. Capacity is reported as unknown rather
         # than resolved by pruning a still-valid contribution, and a stale
         # membership snapshot never supports a signal.
@@ -1125,7 +1132,11 @@ class EvaluationService:
         return sum(1 for ts in window if ts >= cutoff) >= self.delivery_budget_per_window
 
     def _record_emission(self, sub: ActiveSubscription, now: datetime) -> None:
-        window = self._emission_windows.setdefault((sub.workflow_id, sub.alert_id), [])
+        key = (sub.workflow_id, sub.alert_id)
+        window = self._emission_windows.setdefault(key, [])
+        self._emission_windows.move_to_end(key)
+        while len(self._emission_windows) > self.emission_window_max_entries:
+            self._emission_windows.popitem(last=False)
         window.append(now.timestamp())
         cutoff = now.timestamp() - self.delivery_budget_window_s
         del window[: max(0, len(window) - self.delivery_budget_per_window - 10)]

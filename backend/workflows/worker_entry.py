@@ -31,7 +31,8 @@ Environment:
 
 This module imports cleanly WITHOUT backend.app dependencies: every heavy
 import (SQLAlchemy engine, repositories, redis, market-runtime client) happens
-inside :func:`main`. Compose/service wiring is deliberately deferred.
+inside :func:`build_alerts_components`. Compose/service wiring is deliberately
+deferred.
 """
 
 from __future__ import annotations
@@ -43,6 +44,7 @@ import logging
 import os
 import signal
 import sys
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -416,6 +418,85 @@ class _SupervisedTask:
     required: bool = True
 
 
+@dataclass
+class AlertsComponents:
+    worker: Any
+    delivery_worker: Any
+    screener_scheduler: Any
+    engine: Any
+    owns_engine: bool
+    redis_client: Any
+    owner_lock: Any
+    start_owner: Any
+    release_owner: Any
+    stats_extras: Callable[[], Dict[str, Any]]
+    embedded: bool = False
+
+
+class AlertsEngineOwnerLock:
+    """Redis lease preventing embedded and standalone alert engines overlapping."""
+
+    KEY = "alerts:engine:owner"
+
+    def __init__(
+        self,
+        redis_client: Any,
+        *,
+        ttl_s: int = 30,
+        refresh_s: float = 10.0,
+        token: Optional[str] = None,
+    ) -> None:
+        self.redis = redis_client
+        self.ttl_s = max(3, int(ttl_s))
+        self.refresh_s = max(1.0, float(refresh_s))
+        self.token = token or str(uuid.uuid4())
+        self.lost_reason: Optional[str] = None
+
+    async def acquire(self) -> bool:
+        return bool(
+            await self.redis.set(self.KEY, self.token, nx=True, ex=self.ttl_s)
+        )
+
+    async def refresh(self) -> bool:
+        result = await self.redis.eval(
+            "if redis.call('get', KEYS[1]) == ARGV[1] then "
+            "return redis.call('expire', KEYS[1], ARGV[2]) else return 0 end",
+            1,
+            self.KEY,
+            self.token,
+            self.ttl_s,
+        )
+        return bool(result)
+
+    async def release(self) -> None:
+        await self.redis.eval(
+            "if redis.call('get', KEYS[1]) == ARGV[1] then "
+            "return redis.call('del', KEYS[1]) else return 0 end",
+            1,
+            self.KEY,
+            self.token,
+        )
+
+    async def keepalive(self, stop: asyncio.Event) -> None:
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=self.refresh_s)
+                return
+            except asyncio.TimeoutError:
+                pass
+            try:
+                if not await self.refresh():
+                    self.lost_reason = "owner lock lost"
+                    logger.error("alerts engine owner lock lost; stopping components")
+                    stop.set()
+                    return
+            except Exception:
+                self.lost_reason = "owner lock refresh failed"
+                logger.error("alerts engine owner lock refresh failed; stopping components", exc_info=True)
+                stop.set()
+                return
+
+
 async def supervise(
     worker: Any,
     delivery_worker: Any,
@@ -425,7 +506,10 @@ async def supervise(
     screener_scheduler: Any = None,
     restart_backoff_s: Optional[float] = None,
     max_consecutive_failures: Optional[int] = None,
+    crash_window_s: float = 600.0,
     release_owner: Any = None,
+    start_owner: Any = None,
+    owner_alert: Any = None,
 ) -> list:
     """Run the required tasks until ``stop``, restarting crashes with backoff.
 
@@ -444,16 +528,16 @@ async def supervise(
     """
     if restart_backoff_s is None:
         try:
-            restart_backoff_s = float(os.environ.get("ALERTS_TASK_RESTART_BACKOFF_S", "5"))
+            restart_backoff_s = float(os.environ.get("ALERTS_TASK_RESTART_BACKOFF_S", "1"))
         except ValueError:
-            restart_backoff_s = 5.0
+            restart_backoff_s = 1.0
     if max_consecutive_failures is None:
         try:
             max_consecutive_failures = int(
-                os.environ.get("ALERTS_TASK_MAX_CONSECUTIVE_FAILURES", "3")
+                os.environ.get("ALERTS_TASK_MAX_CONSECUTIVE_FAILURES", "5")
             )
         except ValueError:
-            max_consecutive_failures = 3
+            max_consecutive_failures = 5
 
     specs: List[_SupervisedTask] = [
         _SupervisedTask(
@@ -489,6 +573,7 @@ async def supervise(
 
     live: Dict[asyncio.Task, _SupervisedTask] = {}
     failures: Dict[str, int] = {spec.name: 0 for spec in specs}
+    failure_times: Dict[str, List[float]] = {spec.name: [] for spec in specs}
     exit_reasons: Dict[str, Any] = {}
 
     def _launch(spec: _SupervisedTask) -> None:
@@ -531,7 +616,14 @@ async def supervise(
                         f"{type(exc).__name__}: {exc}" if exc else "ended unexpectedly"
                     )
                 exit_reasons[spec.name] = reason
-                failures[spec.name] += 1
+                failed_at = time.monotonic()
+                recent = [
+                    item for item in failure_times[spec.name]
+                    if failed_at - item <= crash_window_s
+                ]
+                recent.append(failed_at)
+                failure_times[spec.name] = recent
+                failures[spec.name] = len(recent)
                 logger.error(
                     "worker task %s ended (%s); failure %d of %d",
                     spec.name, reason, failures[spec.name], max_consecutive_failures,
@@ -555,7 +647,7 @@ async def supervise(
                         logger.warning(
                             "teardown for %s failed", spec.name, exc_info=True
                         )
-                if failures[spec.name] > max_consecutive_failures:
+                if failures[spec.name] >= max_consecutive_failures:
                     logger.error(
                         "worker task %s exceeded %d consecutive failures; not restarting",
                         spec.name, max_consecutive_failures,
@@ -566,9 +658,26 @@ async def supervise(
                         restarts=failures[spec.name],
                         last_exit_reason=reason,
                     )
+                    try:
+                        if owner_alert is None:
+                            from backend.platform.owner_alerts import alert_owner_nowait
+
+                            alert = alert_owner_nowait
+                        else:
+                            alert = owner_alert
+                        alert(
+                            key=f"alerts-component-down:{spec.name}",
+                            title="Alerts component stopped",
+                            message=(
+                                f"{spec.name} crashed {failures[spec.name]} times "
+                                f"within {int(crash_window_s)} seconds and remains stopped: {reason}"
+                            ),
+                        )
+                    except Exception:
+                        logger.warning("owner alert for %s failed", spec.name, exc_info=True)
                     continue
                 backoff = min(
-                    restart_backoff_s * (2 ** (failures[spec.name] - 1)), 300.0
+                    restart_backoff_s * (2 ** (failures[spec.name] - 1)), 60.0
                 )
                 _schedule_liveness(
                     worker, spec.name,
@@ -589,6 +698,17 @@ async def supervise(
                     pass
                 except asyncio.CancelledError:
                     raise
+                if spec.name == "evaluation-worker" and start_owner is not None:
+                    try:
+                        result = start_owner()
+                        if inspect.isawaitable(result):
+                            await result
+                    except Exception:
+                        logger.warning(
+                            "market-runtime owner restore for %s failed",
+                            spec.name,
+                            exc_info=True,
+                        )
                 _launch(spec)
     finally:
         watcher.cancel()
@@ -678,21 +798,21 @@ async def _log_market_runtime_cache_generation() -> None:
         logger.debug("market-runtime instrument health check unavailable", exc_info=True)
 
 
-async def main(extra_tokens: Optional[Dict[str, int]] = None) -> int:
-    logging.basicConfig(
-        level=os.environ.get("LOG_LEVEL", "INFO"),
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
-
-    try:
-        database_url = resolve_database_url()
-    except ValueError as exc:
-        logger.error("invalid alerts database configuration: %s", exc)
-        return 2
+async def build_alerts_components(
+    *,
+    engine: Any = None,
+    session_factory: Any = None,
+    tick_source: Any = None,
+    extra_tokens: Optional[Dict[str, int]] = None,
+    embedded: bool = False,
+    activity_tracker: Any = None,
+) -> AlertsComponents:
+    """Assemble alerts runtime components without process-level side effects."""
+    owns_engine = engine is None
+    database_url = resolve_database_url() if owns_engine else None
     redis_url = os.environ.get("REDIS_URL")
     if not redis_url:
-        logger.error("REDIS_URL is required (tick + completed-candle pub/sub)")
-        return 2
+        raise RuntimeError("REDIS_URL is required (tick + completed-candle pub/sub)")
     market_runtime_url = os.environ.get("MARKET_RUNTIME_URL", "").strip()
     if market_runtime_url:
         # Bridge onto the variable the market-runtime client actually reads.
@@ -712,6 +832,8 @@ async def main(extra_tokens: Optional[Dict[str, int]] = None) -> int:
     from backend.workflows.repository import SqlAlchemyWorkflowRepository
     from backend.workflows.runtime import (
         EvaluationWorker,
+        EmbeddedTickFanout,
+        EmbeddedTickSource,
         MARKET_RUNTIME_OWNER_LEASE_TTL_S,
         PgCandleHistory,
         RedisCandleSource,
@@ -719,8 +841,10 @@ async def main(extra_tokens: Optional[Dict[str, int]] = None) -> int:
         build_market_session_provider,
     )
 
-    engine = create_engine(database_url, pool_pre_ping=True)
-    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    if engine is None:
+        engine = create_engine(database_url, pool_pre_ping=True)
+    if session_factory is None:
+        session_factory = sessionmaker(bind=engine, expire_on_commit=False)
     workflow_repo = SqlAlchemyWorkflowRepository(session_factory)
     notification_repo = SqlAlchemyNotificationRepository(session_factory)
     configured_tokens = build_instrument_tokens()
@@ -764,18 +888,28 @@ async def main(extra_tokens: Optional[Dict[str, int]] = None) -> int:
         redis_client = aioredis.from_url(redis_url, decode_responses=True)
         await redis_client.ping()
     except Exception:
-        logger.error("cannot reach Redis at %s", redis_url, exc_info=True)
-        engine.dispose()
-        return 2
+        if owns_engine:
+            engine.dispose()
+        raise RuntimeError(f"cannot reach Redis at {redis_url}")
 
-    runtime_owner_id = f"alerts-worker:{uuid.uuid4()}"
+    runtime_owner_id = f"{'finance-app-alerts' if embedded else 'alerts-worker'}:{uuid.uuid4()}"
+    embedded_runtime = tick_source if hasattr(tick_source, "subscribe_ticks") else None
+    embedded_fanout = (
+        EmbeddedTickFanout(embedded_runtime) if embedded_runtime is not None else None
+    )
 
     async def sync_market_runtime_snapshot(_change: Any = None) -> None:
         """Best-effort (re)registration of the CURRENT binding snapshot."""
-        await _sync_market_runtime_subscriptions(runtime_owner_id, bindings.snapshot())
+        if embedded_runtime is not None and hasattr(
+            embedded_runtime, "set_owner_subscriptions"
+        ):
+            await embedded_runtime.set_owner_subscriptions(
+                runtime_owner_id,
+                {int(token): "full" for token in bindings.snapshot().values()},
+            )
+        else:
+            await _sync_market_runtime_subscriptions(runtime_owner_id, bindings.snapshot())
         await _log_market_runtime_cache_generation()
-
-    await sync_market_runtime_snapshot()
 
     # Phase 6 6A.0 LTP freshness bounds. Defaults live HERE (not in the source)
     # so a directly-constructed RedisTickSource keeps its historical behavior,
@@ -809,13 +943,15 @@ async def main(extra_tokens: Optional[Dict[str, int]] = None) -> int:
     def _stats_extras() -> Dict[str, Any]:
         return {"tick_lag": tick_lag.snapshot()}
 
-    def tick_source_factory(instrument_key: str) -> RedisTickSource:
+    def tick_source_factory(instrument_key: str):
         token = bindings.get(instrument_key)
         mapping = {token: instrument_key} if token is not None else {}
         # each call returns a NEW source (fresh uuid epoch): the worker
         # relies on that to re-initialize ltp rules after a feed outage (D2)
-        return RedisTickSource(
-            redis_client,
+        source_class = EmbeddedTickSource if embedded_fanout is not None else RedisTickSource
+        transport = embedded_fanout if embedded_fanout is not None else redis_client
+        return source_class(
+            transport,
             mapping,
             max_tick_age_s=ltp_max_tick_age_s or None,
             max_future_skew_s=ltp_max_future_skew_s or None,
@@ -841,6 +977,8 @@ async def main(extra_tokens: Optional[Dict[str, int]] = None) -> int:
 
     renewal = None
     try:
+        if embedded_runtime is not None:
+            raise RuntimeError("finance-app runtime renews its registered owners")
         from backend.broker_api.orders.market_runtime_client import (
             get_market_runtime_client,
         )
@@ -848,10 +986,30 @@ async def main(extra_tokens: Optional[Dict[str, int]] = None) -> int:
         market_client = await get_market_runtime_client()
         renewal = build_renewal(market_client, runtime_owner_id, bindings)
     except Exception:
-        logger.warning(
-            "market-runtime renewal client unavailable; ownership "
-            "renewal disabled", exc_info=True,
-        )
+        if embedded_runtime is not None:
+            pass
+        else:
+            logger.warning(
+                "market-runtime renewal client unavailable; ownership "
+                "renewal disabled", exc_info=True,
+            )
+
+    health_sink = None
+    if embedded:
+        from backend.app.monitor import set_component_status
+
+        def health_sink(snapshot: Dict[str, Any]) -> None:
+            tasks = snapshot.get("tasks") or {}
+            failed = [name for name, state in tasks.items() if not state.get("alive")]
+            set_component_status(
+                "alerts",
+                "degraded" if failed else "healthy",
+                detail=(
+                    "Embedded alerts components degraded: " + ", ".join(failed)
+                    if failed else "Embedded alerts runtime healthy"
+                ),
+                meta=snapshot,
+            )
 
     worker = EvaluationWorker(
         workflow_repo,
@@ -889,6 +1047,8 @@ async def main(extra_tokens: Optional[Dict[str, int]] = None) -> int:
         # silence-gap continuity invalidation).
         ltp_freshness_enabled=ltp_freshness_enabled,
         ltp_max_gap_s=ltp_max_gap_s,
+        health_sink=health_sink,
+        activity_tracker=activity_tracker,
     )
 
     # Phase 2 (F7): universe membership resolution wired into the refresh
@@ -949,6 +1109,7 @@ async def main(extra_tokens: Optional[Dict[str, int]] = None) -> int:
             max_events_per_attachment=int(
                 os.environ.get("ALERTS_SCREENER_MAX_ATTACHMENT_EVENTS", "100")
             ),
+            activity_tracker=activity_tracker,
         )
     except Exception:
         logger.warning("screener scheduler unavailable; screeners inert", exc_info=True)
@@ -982,47 +1143,156 @@ async def main(extra_tokens: Optional[Dict[str, int]] = None) -> int:
     else:
         logger.warning("ALERTS_DELIVERY_ENABLED is off: pending deliveries will NOT be sent")
 
+    async def release_runtime_owner() -> None:
+        if embedded_runtime is not None and hasattr(embedded_runtime, "delete_owner"):
+            try:
+                await embedded_runtime.delete_owner(runtime_owner_id)
+            except Exception:
+                logger.warning("embedded market-runtime owner cleanup failed", exc_info=True)
+        else:
+            await _sync_market_runtime_subscriptions_runtime_cleanup(runtime_owner_id)
+
+    return AlertsComponents(
+        worker=worker,
+        delivery_worker=delivery_worker,
+        screener_scheduler=screener_scheduler,
+        engine=engine,
+        owns_engine=owns_engine,
+        redis_client=redis_client,
+        owner_lock=AlertsEngineOwnerLock(redis_client),
+        start_owner=sync_market_runtime_snapshot,
+        release_owner=release_runtime_owner,
+        stats_extras=_stats_extras,
+        embedded=embedded,
+    )
+
+
+async def run_alerts(components: AlertsComponents, stop: asyncio.Event) -> list:
+    """Run assembled components under lock and crash-isolating supervision."""
+    set_component_status = None
+    if components.embedded:
+        from backend.app.monitor import set_component_status as _set_component_status
+
+        set_component_status = _set_component_status
+
+    try:
+        acquired = await components.owner_lock.acquire()
+    except Exception as exc:
+        logger.error("alerts engine owner lock unavailable", exc_info=True)
+        if set_component_status is not None:
+            set_component_status("alerts", "degraded", detail=str(exc))
+        await components.release_owner()
+        if components.owns_engine:
+            components.engine.dispose()
+        return [("engine-lock", f"{type(exc).__name__}: {exc}")]
+    if not acquired:
+        detail = "alerts engine owner lock is held by another process"
+        logger.error(detail)
+        if set_component_status is not None:
+            set_component_status("alerts", "blocked", detail=detail)
+        await components.release_owner()
+        if components.owns_engine:
+            components.engine.dispose()
+        return [("engine-lock", detail)]
+
+    try:
+        await components.start_owner()
+    except Exception as exc:
+        logger.error("alerts market-runtime owner registration failed", exc_info=True)
+        try:
+            await components.owner_lock.release()
+        except Exception:
+            logger.warning("alerts engine owner lock release failed", exc_info=True)
+        await components.release_owner()
+        if components.owns_engine:
+            components.engine.dispose()
+        return [("market-runtime-owner", f"{type(exc).__name__}: {exc}")]
+
+    if set_component_status is not None:
+        set_component_status(
+            "alerts", "starting", detail="Embedded alerts runtime starting"
+        )
+    internal_stop = asyncio.Event()
+
+    async def mirror_stop() -> None:
+        await stop.wait()
+        internal_stop.set()
+
+    stop_task = asyncio.create_task(mirror_stop(), name="alerts-stop-bridge")
+    lock_task = asyncio.create_task(
+        components.owner_lock.keepalive(internal_stop),
+        name="alerts-engine-owner-lock",
+    )
+    stats_task = asyncio.create_task(
+        run_stats_sampler(
+            logger,
+            interval_s=float(os.environ.get("ALERTS_STATS_INTERVAL_S", "60")),
+            stop=internal_stop,
+            extras=components.stats_extras,
+            component="alerts-embedded" if components.embedded else "alerts-worker",
+        ),
+        name="alerts-runtime-stats-sampler",
+    )
+    try:
+        results = await supervise(
+            components.worker,
+            components.delivery_worker,
+            stop=internal_stop,
+            delivery_poll_interval_s=float(
+                os.environ.get("ALERTS_DELIVERY_POLL_INTERVAL_S", "2.0")
+            ),
+            screener_scheduler=components.screener_scheduler,
+            release_owner=(None if components.embedded else components.release_owner),
+            start_owner=(None if components.embedded else components.start_owner),
+        )
+        lost_reason = getattr(components.owner_lock, "lost_reason", None)
+        if lost_reason:
+            results.append(("engine-lock", lost_reason))
+    except Exception:
+        logger.error("alerts supervisor failed", exc_info=True)
+        results = [("supervisor", "unexpected supervisor failure")]
+    finally:
+        internal_stop.set()
+        for task in (stop_task, lock_task, stats_task):
+            task.cancel()
+        await asyncio.gather(stop_task, lock_task, stats_task, return_exceptions=True)
+        try:
+            await components.owner_lock.release()
+        except Exception:
+            logger.warning("alerts engine owner lock release failed", exc_info=True)
+        await components.release_owner()
+        if components.owns_engine:
+            components.engine.dispose()
+        if set_component_status is not None:
+            lost_reason = getattr(components.owner_lock, "lost_reason", None)
+            if lost_reason:
+                set_component_status(
+                    "alerts", "degraded", detail=lost_reason
+                )
+            else:
+                set_component_status("alerts", "stopped", detail="Embedded alerts runtime stopped")
+    return results
+
+
+async def main(extra_tokens: Optional[Dict[str, int]] = None) -> int:
+    logging.basicConfig(
+        level=os.environ.get("LOG_LEVEL", "INFO"),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    try:
+        components = await build_alerts_components(extra_tokens=extra_tokens)
+    except (ValueError, RuntimeError) as exc:
+        logger.error("cannot build alerts runtime: %s", exc)
+        return 2
+
     loop = asyncio.get_running_loop()
     stop_signal = asyncio.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
             loop.add_signal_handler(sig, stop_signal.set)
         except (NotImplementedError, RuntimeError):
-            pass  # non-main loop / platform without signal handlers
-
-    stats_task = asyncio.create_task(
-        run_stats_sampler(
-            logger,
-            interval_s=float(os.environ.get("ALERTS_STATS_INTERVAL_S", "60")),
-            stop=stop_signal,
-            extras=_stats_extras,
-            component="alerts-worker",
-        ),
-        name="runtime-stats-sampler",
-    )
-    results = await supervise(
-        worker,
-        delivery_worker,
-        stop=stop_signal,
-        delivery_poll_interval_s=float(os.environ.get("ALERTS_DELIVERY_POLL_INTERVAL_S", "2.0")),
-        screener_scheduler=screener_scheduler,
-        # A restart must release this worker's market-runtime owner before the
-        # replacement subscribes: otherwise the old owner keeps streaming the
-        # same tokens until its lease expires (~90 s), doubling feed load.
-        release_owner=lambda: _sync_market_runtime_subscriptions_runtime_cleanup(
-            runtime_owner_id
-        ),
-    )
-    stats_task.cancel()
-    try:
-        await stats_task
-    except asyncio.CancelledError:
-        pass
-    await _sync_market_runtime_subscriptions_runtime_cleanup(runtime_owner_id)
-    engine.dispose()
-    # Phase 6 6A.0: a task that ended in failure must NOT look like a clean
-    # shutdown. Exiting 0 here is what let a crash-looping worker be reported as
-    # healthy by an orchestrator that only inspects the exit code.
+            pass
+    results = await run_alerts(components, stop_signal)
     failed = task_failures(results)
     if failed:
         logger.error("evaluation worker stopped with failed task(s): %s", ", ".join(failed))

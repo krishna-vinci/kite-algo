@@ -215,6 +215,14 @@ class PlatformRiskStatus(BaseModel):
     cap_reached: bool = False
 
 
+class PlatformRuntimeStatus(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    loop_lag_ms: Dict[str, float] = Field(
+        default_factory=lambda: {"p50": 0.0, "p99": 0.0}
+    )
+
+
 class PlatformStatusResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -224,6 +232,7 @@ class PlatformStatusResponse(BaseModel):
     strategy_runner: PlatformStrategyRunnerStatus
     live: PlatformLiveStatus
     risk: PlatformRiskStatus
+    runtime: PlatformRuntimeStatus
 
 
 class PendingApprovalRow(BaseModel):

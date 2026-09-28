@@ -35,7 +35,7 @@ import asyncio
 import logging
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 from uuid import uuid4
 
 from sqlalchemy import select
@@ -86,6 +86,7 @@ class ScreenerScheduler:
         window_bars: int = 120,
         max_events_per_attachment: int = 100,
         health: Optional[dict] = None,
+        activity_tracker: Any = None,
     ) -> None:
         self._sessions = session_factory
         self.workflow_repo = workflow_repo
@@ -101,6 +102,7 @@ class ScreenerScheduler:
         self.poll_interval_s = max(5.0, float(poll_interval_s))
         self.lease_ttl_s = max(30.0, float(lease_ttl_s))
         self.max_events_per_attachment = int(max_events_per_attachment)
+        self.activity_tracker = activity_tracker
         self.health = health if health is not None else {
             "runs_executed": 0,
             "runs_failed": 0,
@@ -110,13 +112,15 @@ class ScreenerScheduler:
             "last_error": None,
         }
         self._running = False
+        self._paused_until = 0.0
 
     # ------------------------------------------------------------------
     async def run(self) -> None:
         self._running = True
         while self._running:
             try:
-                await asyncio.get_event_loop().run_in_executor(None, self.poll_once)
+                if time.monotonic() >= self._paused_until:
+                    await asyncio.to_thread(self._tracked_poll_once)
             except Exception:
                 self.health["last_error"] = "poll_failed"
                 logger.exception("screener scheduler pass failed")
@@ -124,6 +128,18 @@ class ScreenerScheduler:
 
     def stop(self) -> None:
         self._running = False
+
+    def pause_for(self, seconds: float) -> None:
+        self._paused_until = max(
+            self._paused_until, time.monotonic() + max(0.0, float(seconds))
+        )
+        self.health["paused_until_monotonic"] = self._paused_until
+
+    def _tracked_poll_once(self) -> int:
+        if self.activity_tracker is None:
+            return self.poll_once()
+        with self.activity_tracker.track("alerts-screener"):
+            return self.poll_once()
 
     # ------------------------------------------------------------------
     def poll_once(self, *, now: Optional[datetime] = None) -> int:

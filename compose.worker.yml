@@ -1,4 +1,5 @@
-# Alerts evaluation/delivery worker.
+# Standalone alerts evaluation/delivery mode. finance-app embeds alerts by
+# default; use this profile with ALERTS_EMBEDDED=false for process isolation.
 #
 # Deliberately a separate file: compose.yml / compose.dev.yml have in-flight
 # changes; this adds one service without touching them. Run with:
@@ -9,6 +10,7 @@
 # the API is healthy so alembic never races.
 services:
   alerts-worker:
+    profiles: ["alerts-standalone"]
     build:
       context: .
       dockerfile: Dockerfile
@@ -29,6 +31,7 @@ services:
       MARKET_RUNTIME_URL: http://market-runtime:8780
       MARKET_RUNTIME_HTTP_URL: http://market-runtime:8780
       ALERTS_INSTRUMENT_TOKENS: ${ALERTS_INSTRUMENT_TOKENS:-{}}
+      ALERTS_EMBEDDED: "false"
       # Written to a shared volume so the API container (finance-app) can read
       # it; the default would be a path private to this container, leaving the
       # operator runtime panel permanently unknown.

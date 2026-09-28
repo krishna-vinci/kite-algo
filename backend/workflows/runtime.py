@@ -73,7 +73,8 @@ import logging
 import math
 import os
 import uuid
-from collections import Counter
+from collections import Counter, OrderedDict
+from contextlib import nullcontext
 from datetime import datetime, time, timedelta, timezone
 from typing import (
     Any,
@@ -90,7 +91,6 @@ from zoneinfo import ZoneInfo
 from backend.alerts.predicates import Observation, pair_operand_id
 from backend.workflows.feature_engine import FeatureEngine, FeatureSpec  # noqa: F401 (re-export)
 from backend.workflows.feature_planner import (
-    SubscriptionPlan,
     build_subscription_plan,
     stage_chain,
 )
@@ -110,6 +110,8 @@ __all__ = [
     "CandleHistory",
     "RedisTickSource",
     "SharedTickFanout",
+    "EmbeddedTickFanout",
+    "EmbeddedTickSource",
     "RedisCandleSource",
     "PgCandleHistory",
     "build_nse_session_provider",
@@ -135,6 +137,45 @@ CANDLE_EPOCH_ID = "candle"
 # (market-runtime/internal/config/config.go: MARKET_RUNTIME_OWNER_LEASE_TTL_SEC).
 # The worker renews at TTL/3 so one missed renewal never expires the lease.
 MARKET_RUNTIME_OWNER_LEASE_TTL_S = 90.0
+DEFAULT_RUNTIME_CACHE_MAX_ENTRIES = 4096
+
+
+class _BoundedLRU(OrderedDict):
+    """Small LRU used for worker metadata caches with explicit memory bounds."""
+
+    def __init__(self, max_entries: int) -> None:
+        super().__init__()
+        self.max_entries = max(1, int(max_entries))
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        if key in self:
+            super().move_to_end(key)
+        super().__setitem__(key, value)
+        while len(self) > self.max_entries:
+            self.popitem(last=False)
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        value = super().get(key, default)
+        if key in self:
+            super().move_to_end(key)
+        return value
+
+
+class _BoundedSet:
+    def __init__(self, max_entries: int) -> None:
+        self._items = _BoundedLRU(max_entries)
+
+    def add(self, item: Any) -> None:
+        self._items[item] = True
+
+    def discard(self, item: Any) -> None:
+        self._items.pop(item, None)
+
+    def __contains__(self, item: Any) -> bool:
+        return item in self._items
+
+    def __iter__(self):
+        return iter(self._items)
 
 
 def _utcnow() -> datetime:
@@ -355,45 +396,49 @@ class RedisTickSource:
                 except (TypeError, ValueError):
                     logger.warning("discarding malformed tick payload")
                     continue
-            if not isinstance(payload, dict):
-                continue
-            token = payload.get("instrument_token", payload.get("token"))
-            try:
-                token = int(token)
-            except (TypeError, ValueError):
-                continue
-            instrument_key = self._tokens.get(token)
-            if instrument_key is None:
-                continue  # not in this worker's monitored set
-            ltp = payload.get("last_price", payload.get("ltp"))
-            if ltp is None:
-                continue
-            ts = _parse_ts(payload.get("exchange_timestamp", payload.get("ts")))
-            received_at = _parse_ts(payload.get("received_at"))
-            last_trade_time = _parse_ts(payload.get("last_trade_time"))
-            try:
-                ltp_value = float(ltp)
-            except (TypeError, ValueError):
-                continue
-            if ts is None or not math.isfinite(ltp_value):
-                self.rejected["untimed"] += 1
-                logger.warning("discarding tick with missing/invalid exchange timestamp or ltp")
-                continue
-            reason = self._freshness_reject(ts, received_at)
-            if reason is not None:
-                self.rejected[reason] += 1
-                continue
-            if self._lag_recorder is not None and received_at is not None:
-                self._lag_recorder.record(
-                    (self._clock() - received_at).total_seconds()
-                )
-            return Observation(
-                ts=ts,
-                epoch_id=self._epoch_id,
-                ltp=ltp_value,
-                received_at=received_at,
-                last_trade_time=last_trade_time,
-            )
+            observation = self._observation_from_payload(payload)
+            if observation is not None:
+                return observation
+
+    def _observation_from_payload(self, payload: Any) -> Optional[Observation]:
+        """Decode one normalized tick; shared by Redis and embedded transports."""
+        if not isinstance(payload, dict):
+            return None
+        token = payload.get("instrument_token", payload.get("token"))
+        try:
+            token = int(token)
+        except (TypeError, ValueError):
+            return None
+        instrument_key = self._tokens.get(token)
+        if instrument_key is None:
+            return None
+        ltp = payload.get("last_price", payload.get("ltp"))
+        if ltp is None:
+            return None
+        ts = _parse_ts(payload.get("exchange_timestamp", payload.get("ts")))
+        received_at = _parse_ts(payload.get("received_at"))
+        last_trade_time = _parse_ts(payload.get("last_trade_time"))
+        try:
+            ltp_value = float(ltp)
+        except (TypeError, ValueError):
+            return None
+        if ts is None or not math.isfinite(ltp_value):
+            self.rejected["untimed"] += 1
+            logger.warning("discarding tick with missing/invalid exchange timestamp or ltp")
+            return None
+        reason = self._freshness_reject(ts, received_at)
+        if reason is not None:
+            self.rejected[reason] += 1
+            return None
+        if self._lag_recorder is not None and received_at is not None:
+            self._lag_recorder.record((self._clock() - received_at).total_seconds())
+        return Observation(
+            ts=ts,
+            epoch_id=self._epoch_id,
+            ltp=ltp_value,
+            received_at=received_at,
+            last_trade_time=last_trade_time,
+        )
 
     async def stop(self) -> None:
         fanout = self._fanout
@@ -508,6 +553,115 @@ class SharedTickFanout:
             except Exception:
                 pass
         self._queues.clear()
+
+
+class EmbeddedTickFanout:
+    """One finance-app tick subscription shared by all alert tick sources."""
+
+    def __init__(self, market_data_runtime: Any, *, maxsize: int = 10000) -> None:
+        self._runtime = market_data_runtime
+        self._maxsize = max(1, int(maxsize))
+        self._queues: set[asyncio.Queue] = set()
+        self._subscription: Any = None
+        self._task: Optional[asyncio.Task] = None
+
+    async def register(self) -> asyncio.Queue:
+        if self._task is None or self._task.done():
+            self._subscription = self._runtime.subscribe_ticks(
+                maxsize=self._maxsize, name="alerts_workflows"
+            )
+            self._task = asyncio.create_task(
+                self._run(), name="alerts-workflows-tick-fanout"
+            )
+        queue: asyncio.Queue = asyncio.Queue(maxsize=self._maxsize)
+        self._queues.add(queue)
+        return queue
+
+    async def unregister(self, queue: asyncio.Queue) -> None:
+        self._queues.discard(queue)
+        if not self._queues:
+            await self.stop()
+
+    async def _run(self) -> None:
+        try:
+            while self._subscription is not None:
+                payload = await self._subscription.get()
+                for queue in list(self._queues):
+                    try:
+                        queue.put_nowait(payload)
+                    except asyncio.QueueFull:
+                        try:
+                            queue.get_nowait()
+                            queue.put_nowait(payload)
+                        except (asyncio.QueueEmpty, asyncio.QueueFull):
+                            continue
+        except asyncio.CancelledError:
+            raise
+        finally:
+            subscription, self._subscription = self._subscription, None
+            if subscription is not None:
+                subscription.close()
+
+    async def stop(self) -> None:
+        task, self._task = self._task, None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        subscription, self._subscription = self._subscription, None
+        if subscription is not None:
+            subscription.close()
+        self._queues.clear()
+
+
+class EmbeddedTickSource(RedisTickSource):
+    """RedisTickSource semantics over finance-app's in-process tick bus."""
+
+    def __init__(
+        self,
+        fanout: EmbeddedTickFanout,
+        token_to_instrument: Optional[Dict[int, str]] = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(object(), token_to_instrument, **kwargs)
+        self._embedded_fanout = fanout
+
+    async def start(self) -> None:
+        if self._started:
+            return
+        self._queue = await self._embedded_fanout.register()
+        self._started = True
+
+    async def next_observation(self) -> Optional[Observation]:
+        if not self._started or self._queue is None:
+            return None
+        deadline = asyncio.get_running_loop().time() + 1.0
+        while True:
+            fanout_task = self._embedded_fanout._task
+            if fanout_task is not None and fanout_task.done() and not fanout_task.cancelled():
+                error = fanout_task.exception()
+                if error is not None:
+                    raise error
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return None
+            try:
+                payload = await asyncio.wait_for(self._queue.get(), timeout=remaining)
+            except asyncio.TimeoutError:
+                fanout_task = self._embedded_fanout._task
+                if fanout_task is not None and fanout_task.done() and not fanout_task.cancelled():
+                    error = fanout_task.exception()
+                    if error is not None:
+                        raise error
+                return None
+            observation = self._observation_from_payload(payload)
+            if observation is not None:
+                return observation
+
+    async def stop(self) -> None:
+        queue, self._queue = self._queue, None
+        self._started = False
+        if queue is not None:
+            await self._embedded_fanout.unregister(queue)
 
 
 _shared_tick_fanout: Optional[SharedTickFanout] = None
@@ -776,7 +930,7 @@ def build_nse_session_provider(engine: Any):
     weekend/holiday as an open market.
     """
     ist = ZoneInfo("Asia/Kolkata")
-    cache: Dict[Any, Tuple[Optional[int], Optional[dict]]] = {}
+    cache: "OrderedDict[Any, Tuple[Optional[int], Optional[dict]]]" = OrderedDict()
 
     def resolve(at: datetime) -> Tuple[bool, str]:
         moment = (at if at.tzinfo is not None else at.replace(tzinfo=timezone.utc)).astimezone(ist)
@@ -810,6 +964,9 @@ def build_nse_session_provider(engine: Any):
                             {"version": version, "day": day},
                         ).mappings().first()
                     cache[day] = (version, dict(row) if row is not None else None)
+                    cache.move_to_end(day)
+                    while len(cache) > 400:
+                        cache.popitem(last=False)
         except Exception:
             logger.warning("NSE session calendar lookup failed", exc_info=True)
             return False, f"{session_id}:calendar_unavailable"
@@ -897,6 +1054,8 @@ class EvaluationWorker:
         health_interval_s: float = 30.0,
         health_file: Optional[str] = None,
         health_extra: Optional[Callable[[], Dict[str, Any]]] = None,
+        health_sink: Optional[Callable[[Dict[str, Any]], Any]] = None,
+        activity_tracker: Any = None,
         source_rebuild_backoff_s: float = 5.0,
         session_provider: Optional[Callable[..., Optional[Tuple[bool, str]]]] = None,
         owner_id: Optional[str] = None,
@@ -926,6 +1085,8 @@ class EvaluationWorker:
         self.health_interval_s = float(health_interval_s)
         self.health_file = health_file
         self.health_extra = health_extra
+        self.health_sink = health_sink
+        self.activity_tracker = activity_tracker
         self.source_rebuild_backoff_s = max(0.0, float(source_rebuild_backoff_s))
         self.owner_id = owner_id or f"evaluation-worker:{uuid.uuid4()}"
         self.session_provider = session_provider
@@ -948,9 +1109,20 @@ class EvaluationWorker:
         # Phase 4 F10: external producer values and cross-instrument pairs.
         self.external_loader = external_loader
         self.pair_max_bar_age_s = max(0.0, float(pair_max_bar_age_s))
-        self._stage_fundamentals_cache: Dict[Tuple[str, str], bool] = {}
-        self._stage_external_cache: Dict[Tuple[str, str, str], list] = {}
-        self._stage_pair_cache: Dict[Tuple[str, str, str], list] = {}
+        try:
+            cache_max_entries = max(
+                1,
+                int(os.environ.get(
+                    "ALERTS_RUNTIME_CACHE_MAX_ENTRIES",
+                    str(DEFAULT_RUNTIME_CACHE_MAX_ENTRIES),
+                )),
+            )
+        except ValueError:
+            cache_max_entries = DEFAULT_RUNTIME_CACHE_MAX_ENTRIES
+        self.runtime_cache_max_entries = cache_max_entries
+        self._stage_fundamentals_cache = _BoundedLRU(cache_max_entries)
+        self._stage_external_cache = _BoundedLRU(cache_max_entries)
+        self._stage_pair_cache = _BoundedLRU(cache_max_entries)
 
         self.health: Dict[str, Any] = {
             "started_at": None,
@@ -1001,23 +1173,23 @@ class EvaluationWorker:
         self._candle_sources: Dict[Tuple[str, str], TickSource] = {}
         # Phase 2 (F8): shared feature computation + layered plans.
         self.feature_engine = FeatureEngine()
-        self._sub_plans: Dict[str, SubscriptionPlan] = {}
+        self._sub_plans = _BoundedLRU(cache_max_entries)
         self._feature_sources: Dict[Tuple[str, str], TickSource] = {}
-        self._feature_warmed: set = set()
+        self._feature_warmed = _BoundedSet(cache_max_entries)
         # Phase 2 (F7): universe membership resolution state.
         self.universe_service = None  # optional UniverseService, wired by entry
         self.universe_resolve_interval_s = 300.0
-        self._universe_cache: Dict[str, Tuple[float, set]] = {}
+        self._universe_cache = _BoundedLRU(cache_max_entries)
         self._universe_health = {"stale_universes": 0, "resolution_failures": 0}
         # Phase 6 6A.0: last ACCEPTED LTP tick receipt per instrument, used by
         # the health loop to age staleness with no tick arriving. Seeded from
         # durable checkpoints at startup so a restart does not look like a
         # fleet-wide feed outage.
-        self._last_accepted_tick: Dict[str, datetime] = {}
+        self._last_accepted_tick = _BoundedLRU(cache_max_entries)
         # Phase 6 6A.0: per-subscription failure accounting + quarantine, and
         # the supervisor's task-liveness view.
-        self._sub_failures: Dict[str, Dict[str, Any]] = {}
-        self._quarantined: Dict[str, datetime] = {}
+        self._sub_failures = _BoundedLRU(cache_max_entries)
+        self._quarantined = _BoundedLRU(cache_max_entries)
         self._task_state: Dict[str, Any] = {}
         try:
             self.workflow_quarantine_after = max(
@@ -1031,8 +1203,8 @@ class EvaluationWorker:
             )
         except ValueError:
             self.workflow_quarantine_cooldown_s = 300.0
-        self._document_cache: Dict[str, Optional[WorkflowDocument]] = {}
-        self._pending_rebuilds: Dict[Tuple[str, Any], datetime] = {}
+        self._document_cache = _BoundedLRU(cache_max_entries)
+        self._pending_rebuilds = _BoundedLRU(cache_max_entries)
         self._bg_tasks: List[asyncio.Task] = []
         self._running = False
         self._allow_emit_supported: Optional[bool] = None
@@ -1469,9 +1641,9 @@ class EvaluationWorker:
                 if old is not None:
                     await self._safe_stop_source(old)
             self.feature_engine.release(key)
-            self._feature_warmed = {
-                wk for wk in self._feature_warmed if wk[0] != key
-            }
+            for window_key in list(self._feature_warmed):
+                if window_key[0] == key:
+                    self._feature_warmed.discard(window_key)
 
         logger.info(
             "instrument bindings updated: %d added, %d replaced, %d removed (revision %d)",
@@ -2099,6 +2271,11 @@ class EvaluationWorker:
         # persistent container filesystem (Phase 6 6A.0).
         snapshot["last_health_at"] = _utcnow().isoformat()
         logger.info("worker health: %s", json.dumps(snapshot, default=str))
+        if self.health_sink is not None:
+            try:
+                self.health_sink(dict(snapshot))
+            except Exception:
+                logger.warning("health sink failed", exc_info=True)
         path = self._resolved_health_file
         if not path:
             return
@@ -2490,19 +2667,25 @@ class EvaluationWorker:
             return
         self.health["evaluations"] += 1
         self.health["last_evaluated_at"] = _utcnow().isoformat()
-        try:
-            self._dispatch_inner(
-                sub, obs, allow_emit=allow_emit, features=features, layers=layers
-            )
-        except Exception as exc:
-            # Phase 6 6A.0: evaluation-time failures are contained and counted.
-            # Previously the pre-call resolution (pairs/external/breadth) sat
-            # OUTSIDE this guard, so a raising resolver escaped dispatch — and
-            # during startup warmup it escaped start() entirely and crash-looped
-            # the whole worker.
-            self.health["evaluation_errors"] += 1
-            self._note_subscription_failure(sub, "dispatch", exc)
-            return
+        activity = (
+            self.activity_tracker.track("alerts-evaluation")
+            if self.activity_tracker is not None
+            else nullcontext()
+        )
+        with activity:
+            try:
+                self._dispatch_inner(
+                    sub, obs, allow_emit=allow_emit, features=features, layers=layers
+                )
+            except Exception as exc:
+                # Phase 6 6A.0: evaluation-time failures are contained and counted.
+                # Previously the pre-call resolution (pairs/external/breadth) sat
+                # OUTSIDE this guard, so a raising resolver escaped dispatch — and
+                # during startup warmup it escaped start() entirely and crash-looped
+                # the whole worker.
+                self.health["evaluation_errors"] += 1
+                self._note_subscription_failure(sub, "dispatch", exc)
+                return
         # A completed dispatch means the subscription is working again.
         self._note_subscription_success(sub)
 

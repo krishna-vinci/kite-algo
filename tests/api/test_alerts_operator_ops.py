@@ -287,8 +287,29 @@ def test_runtime_health_is_merged_when_the_file_is_readable(session_factory, mon
     assert row["last_error"] == "boom"
 
 
+def test_embedded_runtime_health_prefers_in_process_status(monkeypatch):
+    from backend.app.monitor import set_component_status
+
+    monkeypatch.setenv("ALERTS_EMBEDDED", "true")
+    set_component_status(
+        "alerts",
+        "healthy",
+        meta={
+            "last_health_at": NOW.isoformat(),
+            "tasks": {"evaluation-worker": {"alive": True}},
+        },
+    )
+
+    view = runtime_health.runtime_health_view(path="/definitely/missing.json")
+
+    assert view["available"] is True
+    assert view["source"] == "in_process"
+    assert view["tasks"]["evaluation-worker"]["alive"] is True
+
+
 def test_platform_health_rejects_an_invalid_health_file(tmp_path, monkeypatch):
     """Malformed JSON is 'unavailable', never a crash or a partial read."""
+    monkeypatch.setenv("ALERTS_EMBEDDED", "false")
     bad = tmp_path / "bad.json"
     bad.write_text("{not json")
     monkeypatch.setenv(runtime_health.ALERTS_WORKER_HEALTH_FILE_ENV, str(bad))

@@ -20,8 +20,9 @@ import logging
 import math
 import threading
 import time
+from collections import OrderedDict
 from datetime import datetime, timezone
-from typing import Any, Mapping, Optional
+from typing import Any, Optional
 
 from backend.workflows.registry import (
     FUNDAMENTALS_COLUMN_MAP,
@@ -83,14 +84,16 @@ class FundamentalsLoader:
         ttl_seconds: float = 6 * 3600,
         error_ttl_seconds: float = 300,
         statement_scope: str = "consolidated",
+        max_entries: int = 2048,
     ) -> None:
         self._session_factory = session_factory
         self._ttl = float(ttl_seconds)
         self._error_ttl = float(error_ttl_seconds)
         self._statement_scope = statement_scope
+        self._max_entries = max(1, int(max_entries))
         self._lock = threading.Lock()
         # symbol -> (monotonic_ts, context_dict_or_None)
-        self._cache: dict[str, tuple[float, Optional[dict]]] = {}
+        self._cache: "OrderedDict[str, tuple[float, Optional[dict]]]" = OrderedDict()
 
     # ------------------------------------------------------------------
     def context_for(self, instrument_key: str, *, now: Optional[float] = None) -> Optional[dict]:
@@ -108,6 +111,7 @@ class FundamentalsLoader:
         with self._lock:
             cached = self._cache.get(symbol)
             if cached is not None:
+                self._cache.move_to_end(symbol)
                 ts, payload = cached
                 ttl = self._ttl if payload is not None else self._error_ttl
                 if current - ts < ttl:
@@ -115,6 +119,9 @@ class FundamentalsLoader:
         payload = self._fetch(symbol)
         with self._lock:
             self._cache[symbol] = (current, payload)
+            self._cache.move_to_end(symbol)
+            while len(self._cache) > self._max_entries:
+                self._cache.popitem(last=False)
         return dict(payload) if payload is not None else None
 
     # ------------------------------------------------------------------

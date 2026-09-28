@@ -30,7 +30,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 __all__ = [
     "ALERTS_WORKER_HEALTH_FILE_ENV",
@@ -157,7 +157,31 @@ def read_worker_health(path: Optional[str] = None) -> Dict[str, Any]:
 
 def runtime_health_view(path: Optional[str] = None) -> Dict[str, Any]:
     """``read_worker_health`` plus a plain-language note on what it means."""
-    view = read_worker_health(path)
+    embedded = os.environ.get("ALERTS_EMBEDDED", "true").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    view: Dict[str, Any]
+    if embedded:
+        from backend.app.monitor import get_components
+
+        component = get_components().get("alerts") or {}
+        meta = component.get("meta")
+        if isinstance(meta, dict) and meta.get("last_health_at"):
+            view = {"available": True, "source": "in_process"}
+            for key in _RUNTIME_SECTIONS:
+                if key in meta:
+                    view[key] = meta[key]
+        elif component:
+            view = {
+                "available": False,
+                "source": "in_process",
+                "reason": "in_process_health_not_published",
+                "status": component.get("status"),
+            }
+        else:
+            view = read_worker_health(path)
+    else:
+        view = read_worker_health(path)
     if view.get("available"):
         view["note"] = (
             "quarantine, per-subscription failure counts and task liveness are "
@@ -165,11 +189,17 @@ def runtime_health_view(path: Optional[str] = None) -> Dict[str, Any]:
             "there and reset on restart"
         )
     else:
-        view["note"] = (
-            "the API could not read the evaluation worker's health file, so "
-            "quarantine, failure counts and task liveness are UNKNOWN — this is "
-            "not a report that they are zero or healthy"
-        )
+        if view.get("source") == "in_process":
+            view["note"] = (
+                "embedded alerts have not published their first in-process health "
+                "snapshot; quarantine, failure counts and task liveness are UNKNOWN"
+            )
+        else:
+            view["note"] = (
+                "the API could not read the evaluation worker's health file, so "
+                "quarantine, failure counts and task liveness are UNKNOWN — this is "
+                "not a report that they are zero or healthy"
+            )
     return view
 
 

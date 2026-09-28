@@ -1368,3 +1368,165 @@ def test_warmup_skips_bars_already_processed(session_factory, notif_repo, channe
     assert _events(session_factory) == []
 
     asyncio.run(worker.stop())
+
+
+class _EmbeddedSubscription:
+    def __init__(self):
+        self.queue = asyncio.Queue()
+        self.closed = False
+
+    async def get(self):
+        return await self.queue.get()
+
+    def close(self):
+        self.closed = True
+
+
+class _EmbeddedRuntime:
+    def __init__(self):
+        self.subscription = None
+        self.subscription_name = None
+        self.owners = {}
+
+    def subscribe_ticks(self, maxsize=10000, *, name="unnamed"):
+        self.subscription_name = name
+        self.subscription = _EmbeddedSubscription()
+        return self.subscription
+
+    async def set_owner_subscriptions(self, owner_id, subscriptions):
+        self.owners[owner_id] = dict(subscriptions)
+        return {}
+
+    async def delete_owner(self, owner_id):
+        self.owners.pop(owner_id, None)
+        return {}
+
+    async def publish(self, price, timestamp):
+        await self.subscription.queue.put({
+            "instrument_token": 738561,
+            "last_price": price,
+            "exchange_timestamp": timestamp,
+            "received_at": timestamp,
+        })
+
+
+class _LockRedis:
+    def __init__(self):
+        self.value = None
+
+    async def ping(self):
+        return True
+
+    async def set(self, key, value, *, nx=False, ex=None):
+        if nx and self.value is not None:
+            return False
+        self.value = value
+        return True
+
+    async def eval(self, script, _keys, key, token, *args):
+        if self.value != token:
+            return 0
+        if "del" in script:
+            self.value = None
+        return 1
+
+
+def test_embedded_assembly_processes_runtime_tick_end_to_end(
+    monkeypatch, session_factory, notif_repo, channel_id
+):
+    import redis.asyncio as aioredis
+    import backend.workflows.worker_entry as entry
+
+    repo = SqlAlchemyWorkflowRepository(session_factory)
+    service = _service(session_factory, repo, notif_repo)
+    _workflow, revision = _activate(repo, _fixture_document())
+    service.ensure_subscriptions(revision)
+
+    redis_client = _LockRedis()
+    runtime = _EmbeddedRuntime()
+    monkeypatch.setattr(aioredis, "from_url", lambda *args, **kwargs: redis_client)
+    monkeypatch.setattr(
+        entry,
+        "resolve_catalog_instrument_tokens",
+        lambda keys, session_factory, fallback_tokens=None: (
+            {key: 738561 for key in keys},
+            {},
+        ),
+    )
+    monkeypatch.setenv("REDIS_URL", "redis://embedded-test")
+    monkeypatch.setenv("ALERTS_DELIVERY_ENABLED", "false")
+    monkeypatch.setenv("ALERTS_POLL_INTERVAL_S", "0.01")
+    monkeypatch.setenv("ALERTS_HEALTH_INTERVAL_S", "3600")
+
+    async def scenario():
+        components = await entry.build_alerts_components(
+            engine=session_factory.kw["bind"],
+            session_factory=session_factory,
+            tick_source=runtime,
+            embedded=True,
+        )
+        # The production assembly correctly wires the PostgreSQL exchange
+        # calendar; this SQLite harness has no public calendar tables.
+        components.worker.session_provider = None
+        components.worker.service.session_provider = None
+        components.worker.service._session_provider_with_context = False
+        stop = asyncio.Event()
+        task = asyncio.create_task(entry.run_alerts(components, stop))
+        for _ in range(100):
+            if runtime.subscription is not None:
+                break
+            await asyncio.sleep(0.01)
+        now = datetime.now(timezone.utc)
+        await runtime.publish(2999.0, now)
+        await asyncio.sleep(0.05)
+        await runtime.publish(3001.0, now + timedelta(seconds=1))
+        for _ in range(100):
+            if _events(session_factory):
+                break
+            await asyncio.sleep(0.01)
+        stop.set()
+        results = await asyncio.wait_for(task, timeout=2.0)
+        return results
+
+    results = asyncio.run(scenario())
+
+    assert entry.task_failures(results) == []
+    assert runtime.subscription_name == "alerts_workflows"
+    assert len(_events(session_factory)) == 1
+
+
+def test_alerts_engine_owner_lock_rejects_second_instance():
+    import backend.workflows.worker_entry as entry
+
+    async def scenario():
+        redis_client = _LockRedis()
+        first = entry.AlertsEngineOwnerLock(redis_client, token="first")
+        second = entry.AlertsEngineOwnerLock(redis_client, token="second")
+        assert await first.acquire() is True
+        assert await second.acquire() is False
+        await first.release()
+        assert await second.acquire() is True
+
+    asyncio.run(scenario())
+
+
+def test_standalone_main_delegates_to_build_and_run(monkeypatch):
+    import backend.workflows.worker_entry as entry
+
+    calls = []
+    components = SimpleNamespace()
+
+    async def fake_build(**kwargs):
+        calls.append(("build", kwargs))
+        return components
+
+    async def fake_run(received, stop):
+        calls.append(("run", received, stop.is_set()))
+        return []
+
+    monkeypatch.setattr(entry, "build_alerts_components", fake_build)
+    monkeypatch.setattr(entry, "run_alerts", fake_run)
+
+    assert asyncio.run(entry.main(extra_tokens={"NSE:RELIANCE": 738561})) == 0
+    assert calls[0] == ("build", {"extra_tokens": {"NSE:RELIANCE": 738561}})
+    assert calls[1][0:2] == ("run", components)

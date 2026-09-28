@@ -64,9 +64,9 @@ plans.
 | postgres 16 | `compose.yml:2-30` | primary database | 15432:5432 |
 | redis 7 (AOF) | `compose.yml:32-45` | tick and candle pub/sub, caches | 16379:6379 |
 | market-runtime (Go) | `compose.yml:47-86` | the **only** Kite websocket owner; Redis fan-out; instrument lookup | 18780:8780 |
-| finance-app (FastAPI) | `compose.yml:88-142` | API plus **all** in-process background loops | 18777:8777 |
+| finance-app (FastAPI) | `compose.yml:88-142` | API plus **all** in-process background loops, including alerts by default | 18777:8777 |
 | frontend-next (Next.js) | `compose.yml:144-177` | UI; rewrites `/api/*` to the backend and `/ws/*` to market-runtime (`frontend-next/next.config.ts:13-26`) | 13000:3000 |
-| alerts-worker | `compose.worker.yml:11-58` | workflow, screener and universe evaluation, plus notification delivery | — |
+| alerts-worker | `compose.worker.yml` profile `alerts-standalone` | optional isolated workflow, screener and universe evaluation, plus notification delivery | — |
 | strategy-runner | `compose.supervisor.yml:13-67`, `Dockerfile.supervisor` | hosted-strategy supervisor; has **no DB credentials** and talks only to the lifecycle API | — |
 | mcp-go | `compose.mcp-go.yml:8-34` (profile `mcp`) | Go MCP adapter, 73 tools | 18789:8788 |
 
@@ -95,6 +95,8 @@ plans.
 | live outcome consumer (ingestion, release, LIMIT timeout sweep) | 15 s | strategies/live_ingestion.py:122 |
 | candle aggregator (1m–60m and day) | continuous | bootstrap.py:556-579 |
 | journal runtime | 60 s | journaling/runtime.py:22-29 |
+| embedded alerts evaluation, delivery and screeners | continuous / configured polls | workflows/worker_entry.py, bootstrap.py |
+| event-loop lag watchdog | 1 s; rolling one-minute p50/p99 | app/loop_lag.py |
 
 **Daily jobs (IST):**
 
@@ -121,9 +123,10 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
   cache, and exposes `subscribe_ticks()` for in-process consumers; candle aggregation, algo live triggers, paper
   execution, operator market streams and worker quote SSE use that subscription when wired at bootstrap
   (`backend/broker_api/orders/market_runtime_client.py`, `backend/app/bootstrap.py:461-463,659-754`).
-- **Alerts-worker tick fan-out: EXISTS.** Per-instrument `RedisTickSource` instances register bounded queues on a
-  process-local `SharedTickFanout`, so one Redis `market:ticks` pub/sub reader decodes each payload once while each
-  source retains its own fresh LTP epoch (`backend/workflows/runtime.py:220-500`).
+- **Alerts tick fan-out: EXISTS.** Embedded alerts use one bounded subscription to finance-app's
+  `MarketDataRuntime.subscribe_ticks(name="alerts_workflows")`; per-instrument sources retain the same epoch,
+  timestamp freshness and lag semantics as `RedisTickSource`. Standalone mode keeps the process-local
+  `SharedTickFanout` and one Redis `market:ticks` reader (`backend/workflows/runtime.py`).
 - **Candles: EXISTS.** `backend/broker_api/market/candle_aggregator.py` consumes ticks and writes
   `candle:{token}:{interval}:current|latest`, then publishes `realtime_candles:*` (`:242,365-415`).
 - **Option chain and Greeks: EXISTS, hybrid always-on/on-demand lifecycle.**
@@ -643,6 +646,12 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
 ## 8. Other features
 
 - **Alerts and workflows: EXISTS** (`backend/workflows`).
+  - They run inside finance-app by default (`ALERTS_EMBEDDED=true`) and share its SQLAlchemy engine and tick bus.
+    The standalone worker remains available through the `alerts-standalone` Compose profile. Both modes contend
+    for the same refreshed Redis lease `alerts:engine:owner`, so evaluation and delivery cannot overlap.
+  - Component crashes restart with 1–60 s exponential back-off; five crashes in ten minutes stop that component
+    and alert the owner. Finance-app publishes one-minute event-loop lag p50/p99 and pauses only screeners for ten
+    minutes when sustained lag coincides with an alerts evaluation/screener run.
   - Clocks: `ltp` or `candle_close`.
   - Operators: gt/lt, crosses, within, rises/falls %, breaks previous high/low.
   - Indicators: sma, ema, wma, rsi, macd, atr, bollinger, supertrend, vwap_session, volume.
@@ -728,6 +737,7 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
 | `ACCOUNT_INGEST_*` | — |
 | `KITE_WRITE_OPS_PER_SEC` | 9 |
 | `HOSTED_SUPERVISOR_*` | — |
+| `ALERTS_EMBEDDED` | true |
 
 - **Hard-coded:** quote max age 5 s; approval and reservation validity 900 s.
 - **Settings stored in the DB or UI:** option-chain always-on/cadence/tick/idle settings, marketwatch subscriptions,

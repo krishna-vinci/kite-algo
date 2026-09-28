@@ -524,6 +524,75 @@ def test_repeated_crashes_give_up_and_report_failure():
     assert worker_entry.task_failures(results) == ["evaluation-worker"]
 
 
+def test_five_crashes_within_ten_minutes_stop_and_alert_owner():
+    worker = _StubWorker(["crash"] * 5)
+    alerts = []
+
+    async def scenario():
+        return await worker_entry.supervise(
+            worker,
+            None,
+            stop=_fake_stop(0.5),
+            restart_backoff_s=0.001,
+            max_consecutive_failures=5,
+            crash_window_s=600,
+            owner_alert=lambda **payload: alerts.append(payload),
+        )
+
+    results = asyncio.run(scenario())
+
+    assert worker_entry.task_failures(results) == ["evaluation-worker"]
+    assert worker._task_state["evaluation-worker"]["restarts"] == 5
+    assert alerts[0]["key"] == "alerts-component-down:evaluation-worker"
+
+
+def test_run_alerts_contains_component_failure(monkeypatch):
+    class FailingWorker(_StubWorker):
+        pass
+
+    class Lock:
+        async def acquire(self):
+            return True
+
+        async def keepalive(self, stop):
+            await stop.wait()
+
+        async def release(self):
+            return None
+
+    released = []
+
+    async def release_owner():
+        released.append(True)
+
+    async def start_owner():
+        return None
+
+    components = worker_entry.AlertsComponents(
+        worker=FailingWorker(["crash"]),
+        delivery_worker=None,
+        screener_scheduler=None,
+        engine=None,
+        owns_engine=False,
+        redis_client=None,
+        owner_lock=Lock(),
+        start_owner=start_owner,
+        release_owner=release_owner,
+        stats_extras=lambda: {},
+        embedded=True,
+    )
+    monkeypatch.setenv("ALERTS_TASK_RESTART_BACKOFF_S", "0")
+    monkeypatch.setenv("ALERTS_TASK_MAX_CONSECUTIVE_FAILURES", "1")
+    monkeypatch.setattr(
+        "backend.platform.owner_alerts.alert_owner_nowait", lambda **kwargs: None
+    )
+
+    results = asyncio.run(worker_entry.run_alerts(components, asyncio.Event()))
+
+    assert worker_entry.task_failures(results) == ["evaluation-worker"]
+    assert released == [True]
+
+
 def test_clean_stop_reports_no_task_failures():
     worker = _StubWorker([])
 

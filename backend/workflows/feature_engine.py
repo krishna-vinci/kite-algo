@@ -22,16 +22,24 @@ import math
 import threading
 from collections import OrderedDict, deque
 from dataclasses import dataclass
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 from backend.alerts import features as feature_functions
 from backend.alerts.predicates import Observation
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["FeatureSpec", "FeatureEngine", "DEFAULT_MAX_WINDOW"]
+__all__ = [
+    "FeatureSpec",
+    "FeatureEngine",
+    "DEFAULT_MAX_WINDOW",
+    "DEFAULT_MAX_WINDOWS",
+    "DEFAULT_MAX_SPECS_PER_WINDOW",
+]
 
 DEFAULT_MAX_WINDOW = 400  # bounded warmup/computation window per feature
+DEFAULT_MAX_WINDOWS = 4096  # bounded instrument/timeframe entries per worker
+DEFAULT_MAX_SPECS_PER_WINDOW = 512
 
 # Multi-output functions and their default output key.
 _MULTI_OUTPUT = {
@@ -112,12 +120,30 @@ class _Window:
 class FeatureEngine:
     """Compute declared features once per market event, fan out to rules."""
 
-    def __init__(self, *, max_window: int = DEFAULT_MAX_WINDOW) -> None:
+    def __init__(
+        self,
+        *,
+        max_window: int = DEFAULT_MAX_WINDOW,
+        max_windows: int = DEFAULT_MAX_WINDOWS,
+        max_specs_per_window: int = DEFAULT_MAX_SPECS_PER_WINDOW,
+    ) -> None:
         self._max_window = max(50, int(max_window))
+        self._max_windows = max(1, int(max_windows))
+        self._max_specs_per_window = max(1, int(max_specs_per_window))
         self._lock = threading.Lock()
         self._windows: Dict[Tuple[str, str], _Window] = {}
         self._specs: Dict[Tuple[str, str], "OrderedDict[str, FeatureSpec]"] = {}
         self._latest: Dict[Tuple[str, str], Dict[str, Optional[float]]] = {}
+        self._window_lru: "OrderedDict[Tuple[str, str], None]" = OrderedDict()
+
+    def _touch(self, window_key: Tuple[str, str]) -> None:
+        self._window_lru[window_key] = None
+        self._window_lru.move_to_end(window_key)
+        while len(self._window_lru) > self._max_windows:
+            oldest, _ = self._window_lru.popitem(last=False)
+            self._windows.pop(oldest, None)
+            self._specs.pop(oldest, None)
+            self._latest.pop(oldest, None)
 
     # -- declaration -------------------------------------------------------
 
@@ -125,8 +151,12 @@ class FeatureEngine:
         """Register a feature dependency (idempotent per feature id)."""
         window_key = (instrument_key, timeframe)
         with self._lock:
+            self._touch(window_key)
             self._specs.setdefault(window_key, OrderedDict())
             self._specs[window_key][spec.feature_id] = spec
+            self._specs[window_key].move_to_end(spec.feature_id)
+            while len(self._specs[window_key]) > self._max_specs_per_window:
+                self._specs[window_key].popitem(last=False)
 
     def declared_timeframes(self, instrument_key: str) -> Tuple[str, ...]:
         with self._lock:
@@ -151,6 +181,7 @@ class FeatureEngine:
                 self._windows.pop(window_key, None)
                 self._specs.pop(window_key, None)
                 self._latest.pop(window_key, None)
+                self._window_lru.pop(window_key, None)
 
     def has_declarations(self, instrument_key: str, timeframe: str) -> bool:
         with self._lock:
@@ -164,7 +195,10 @@ class FeatureEngine:
         Silent by contract: warming never emits; it only gives the indicator
         windows enough completed history for the first live event.
         """
-        window = self._windows.setdefault((instrument_key, timeframe), _Window(self._max_window))
+        window_key = (instrument_key, timeframe)
+        with self._lock:
+            self._touch(window_key)
+            window = self._windows.setdefault(window_key, _Window(self._max_window))
         if len(window.bars()) >= self._max_window:
             return 0
         try:
@@ -200,7 +234,10 @@ class FeatureEngine:
 
     def on_bar(self, instrument_key: str, timeframe: str, obs: Observation) -> Dict[str, Optional[float]]:
         """Update the window with one completed bar and recompute once."""
-        window = self._windows.setdefault((instrument_key, timeframe), _Window(self._max_window))
+        window_key = (instrument_key, timeframe)
+        with self._lock:
+            self._touch(window_key)
+            window = self._windows.setdefault(window_key, _Window(self._max_window))
         window.upsert(
             {
                 "ts": obs.ts,

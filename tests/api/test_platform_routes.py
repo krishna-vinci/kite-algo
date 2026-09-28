@@ -577,6 +577,30 @@ async def test_status_says_unknown_rather_than_guessing(
     # No cap is configured (the settings store is unreadable), so the risk axis
     # is inert rather than invented.
     assert body["risk"] == {"day_pnl_inr": None, "cap_inr": None, "cap_reached": False}
+    assert body["runtime"] == {"loop_lag_ms": {"p50": 0.0, "p99": 0.0}}
+
+
+@pytest.mark.asyncio
+async def test_status_exposes_app_loop_lag(client, monkeypatch, gate_session):
+    from backend.app.monitor import set_component_status
+
+    async def _no_runtime_status():
+        return None
+
+    monkeypatch.setattr(platform_status, "redis_market_status", _no_runtime_status)
+    set_component_status(
+        "app",
+        "healthy",
+        meta={"loop_lag_ms": {"p50": 12.5, "p99": 275.0}},
+    )
+
+    response = await client.get(f"{BASE}/status")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["runtime"]["loop_lag_ms"] == {
+        "p50": 12.5,
+        "p99": 275.0,
+    }
 
 
 def _leased_job(session, *, lease_until, updated_at) -> None:

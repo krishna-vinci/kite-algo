@@ -37,9 +37,9 @@ Production runs the same images for every lane. Compose service names:
 | `postgres` | `compose.yml:2` | durable plans, reservations, runs, trail |
 | `redis` | `compose.yml:32` | runtime coordination |
 | `market-runtime` | `compose.yml:47` | quotes/ticks |
-| `finance-app` | `compose.yml:88` | API + Alembic entrypoint + background loops |
+| `finance-app` | `compose.yml:88` | API + Alembic entrypoint + background loops, including alerts by default |
 | `frontend-next` | `compose.yml:144` | owner UI (`/strategies/[strategyId]`) |
-| `alerts-worker` | `compose.worker.yml:11` | worker runtime |
+| `alerts-worker` | `compose.worker.yml` profile `alerts-standalone` | optional isolated alerts runtime |
 | `strategy-runner` | `compose.supervisor.yml:13` | job supervisor (`python -m backend.strategies.supervisor`) |
 
 The API owns migrations: its entrypoint runs the Alembic chain
@@ -69,11 +69,26 @@ adapter's quote bound, which is a constructor parameter.
 | `ADMISSION_RISK_MAX_LOSS_INR`, `ADMISSION_RISK_NOTIONAL_LIMIT_INR`, `ADMISSION_RISK_MARGIN_LIMIT_INR`, `ADMISSION_RISK_ALLOWED_STRUCTURE_FAMILIES`, `ADMISSION_RISK_EXPIRY_POLICIES`, `ADMISSION_RISK_NAKED_PERMITTED`, `ADMISSION_RISK_STOP_REQUIRED` | absent = no ceiling | platform risk ceilings; only ever tighten a strategy version's declared policy | `backend/strategies/risk_policy.py:89-99,232-264` |
 | `HOSTED_SUPERVISOR_CREDENTIAL` | required (`:?`) | supervisor auth to the lifecycle API | `compose.supervisor.yml:24` |
 | `HOSTED_SUPERVISOR_*` (lease, heartbeat, grace, health) | see file | supervisor timing/health windows | `compose.supervisor.yml:23-49`; reader `backend/strategies/supervisor.py:190-205` |
+| `ALERTS_EMBEDDED` | `true` | runs workflow evaluation, notification delivery and screeners inside finance-app; set false only when using the standalone profile | `backend/app/bootstrap.py`; `compose.worker.yml` |
 
 The adapter's **quote** bound is not an env var: it is the module constant
 `QUOTE_MAX_AGE_SECONDS = 5.0` (`backend/strategies/live_adapter.py:93`), passed
 into the executor at `backend/strategies/live_adapter.py:539` and enforced at
 `backend/strategies/live_adapter.py:1196-1201`.
+
+Alerts have two mutually exclusive modes. The default is embedded in
+`finance-app`. For one-step rollback to the previous isolated layout, set
+`ALERTS_EMBEDDED=false` in the deployment environment used by finance-app,
+then run:
+
+```bash
+docker compose -f compose.yml -f compose.worker.yml \
+  --profile alerts-standalone up -d alerts-worker
+```
+
+The embedded and standalone runtimes take the same 30-second Redis owner lease
+(`alerts:engine:owner`, refreshed every 10 seconds), so evaluation and delivery
+never run in both modes during a switch.
 
 ## Deployment order (shared C2 procedure)
 
@@ -92,7 +107,8 @@ the recorded procedure in `documents/hosted-strategies-live-deployment.md:99-129
 4. Recreate `finance-app` first (it owns Alembic), wait for migration + health.
    Owner approval: yes. Command shape:
    `documents/hosted-strategies-live-deployment.md:118-122`.
-5. Recreate `alerts-worker`, `strategy-runner`, `frontend-next`. Owner approval: yes.
+5. Recreate `strategy-runner` and `frontend-next`; recreate `alerts-worker` only
+   when operating the `alerts-standalone` profile. Owner approval: yes.
 6. Verify migration head, service health, deployed source hashes, auth
    boundaries, startup logs, and that no unintended jobs/orders/notifications
    were created

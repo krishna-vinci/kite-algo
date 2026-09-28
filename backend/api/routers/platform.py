@@ -52,6 +52,7 @@ from backend.api.schemas.platform import (
     PlatformOptionsSettingsResponse,
     PlatformOptionsSettingsUpdateRequest,
     PlatformRiskStatus,
+    PlatformRuntimeStatus,
     PlatformStatusResponse,
     PlatformStrategyRunnerStatus,
 )
@@ -239,6 +240,9 @@ async def get_platform_status(
 ):
     """Broker, market-data and runner state, plus the derived live/paper mode."""
     body = await platform_status_view(session_factory=session_factory)
+    from backend.app.monitor import get_components
+
+    app_meta = (get_components().get("app") or {}).get("meta") or {}
     return PlatformStatusResponse(
         mode=body["mode"],
         broker=PlatformBrokerStatus(**body["broker"]),
@@ -246,6 +250,9 @@ async def get_platform_status(
         strategy_runner=PlatformStrategyRunnerStatus(**body["strategy_runner"]),
         live=PlatformLiveStatus(**body["live"]),
         risk=PlatformRiskStatus(**body["risk"]),
+        runtime=PlatformRuntimeStatus(
+            loop_lag_ms=app_meta.get("loop_lag_ms") or {"p50": 0.0, "p99": 0.0}
+        ),
     )
 
 

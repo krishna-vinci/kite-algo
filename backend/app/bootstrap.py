@@ -365,6 +365,11 @@ async def combined_lifespan(app: FastAPI):
     worker_runtime_exiting_recovery_task = None
     bracket_executor_task = None
     journal_runtime_worker = None
+    alerts_components = None
+    alerts_stop = None
+    alerts_task = None
+    loop_lag_stop = None
+    loop_lag_task = None
     set_component_status("app", "starting", detail="Application startup in progress")
     try:
         # Ensure the schema is applied before any other database operations
@@ -484,6 +489,57 @@ async def combined_lifespan(app: FastAPI):
                 **market_data_runtime.tick_status_meta(),
             },
         )
+
+        from backend.app.loop_lag import ActivityTracker, LoopLagWatchdog
+
+        alerts_activity = ActivityTracker()
+        embedded_alerts = os.environ.get("ALERTS_EMBEDDED", "true").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        if embedded_alerts:
+            try:
+                from backend.app.database import engine as app_engine
+                from backend.workflows.worker_entry import (
+                    build_alerts_components,
+                    run_alerts,
+                )
+
+                alerts_components = await build_alerts_components(
+                    engine=app_engine,
+                    session_factory=SessionLocal,
+                    tick_source=market_data_runtime,
+                    embedded=True,
+                    activity_tracker=alerts_activity,
+                )
+                alerts_stop = asyncio.Event()
+                alerts_task = asyncio.create_task(
+                    run_alerts(alerts_components, alerts_stop),
+                    name="embedded-alerts-runtime",
+                )
+                app.state.alerts_components = alerts_components
+                app.state.alerts_task = alerts_task
+            except Exception as exc:  # noqa: BLE001 - alerts never breaks app startup
+                logging.error("Embedded alerts startup failed: %s", exc, exc_info=True)
+                set_component_status("alerts", "degraded", detail=str(exc))
+        else:
+            set_component_status(
+                "alerts", "disabled", detail="ALERTS_EMBEDDED is false"
+            )
+
+        def _pause_alert_screeners(seconds: float) -> None:
+            scheduler = getattr(alerts_components, "screener_scheduler", None)
+            if scheduler is not None:
+                scheduler.pause_for(seconds)
+
+        loop_lag_stop = asyncio.Event()
+        loop_lag_task = asyncio.create_task(
+            LoopLagWatchdog(
+                activity_tracker=alerts_activity,
+                pause_screeners=_pause_alert_screeners,
+            ).run(loop_lag_stop),
+            name="app-loop-lag-watchdog",
+        )
+        app.state.loop_lag_task = loop_lag_task
 
         # Option-chain sessions are created eagerly and the configured
         # underlyings auto-started, so a live option plan has a chain to freeze
@@ -864,6 +920,23 @@ async def combined_lifespan(app: FastAPI):
     # Cleanup on shutdown
     # Cancel token watcher first
     set_component_status("app", "stopping", detail="Application shutdown in progress")
+    if loop_lag_stop is not None:
+        loop_lag_stop.set()
+    if loop_lag_task is not None:
+        try:
+            await asyncio.wait_for(loop_lag_task, timeout=2.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            loop_lag_task.cancel()
+            await asyncio.gather(loop_lag_task, return_exceptions=True)
+    if alerts_stop is not None:
+        alerts_stop.set()
+    if alerts_task is not None:
+        try:
+            await asyncio.wait_for(alerts_task, timeout=10.0)
+        except asyncio.TimeoutError:
+            logging.warning("Embedded alerts shutdown exceeded 10 seconds; cancelling")
+            alerts_task.cancel()
+            await asyncio.gather(alerts_task, return_exceptions=True)
     try:
         if 'stats_sampler_task' in locals() and stats_sampler_task:
             stats_sampler_task.cancel()
