@@ -1530,3 +1530,30 @@ def test_standalone_main_delegates_to_build_and_run(monkeypatch):
     assert asyncio.run(entry.main(extra_tokens={"NSE:RELIANCE": 738561})) == 0
     assert calls[0] == ("build", {"extra_tokens": {"NSE:RELIANCE": 738561}})
     assert calls[1][0:2] == ("run", components)
+
+
+def test_alerts_engine_owner_lock_waits_for_previous_holder():
+    """A redeploy starts while the old lease is live: wait, then take over."""
+    import backend.workflows.worker_entry as entry
+
+    async def scenario():
+        redis_client = _LockRedis()
+        old = entry.AlertsEngineOwnerLock(redis_client, token="old")
+        new = entry.AlertsEngineOwnerLock(redis_client, token="new")
+        assert await old.acquire() is True
+        stop = asyncio.Event()
+        waiter = asyncio.create_task(new.wait_acquire(stop, retry_s=0.01))
+        await asyncio.sleep(0.05)
+        assert not waiter.done()
+        await old.release()
+        assert await asyncio.wait_for(waiter, timeout=1.0) is True
+        assert redis_client.value == "new"
+
+        other = entry.AlertsEngineOwnerLock(redis_client, token="other")
+        stop2 = asyncio.Event()
+        blocked = asyncio.create_task(other.wait_acquire(stop2, retry_s=0.01))
+        await asyncio.sleep(0.03)
+        stop2.set()
+        assert await asyncio.wait_for(blocked, timeout=1.0) is False
+
+    asyncio.run(scenario())

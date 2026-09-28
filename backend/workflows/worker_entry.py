@@ -457,6 +457,26 @@ class AlertsEngineOwnerLock:
             await self.redis.set(self.KEY, self.token, nx=True, ex=self.ttl_s)
         )
 
+    async def wait_acquire(self, stop: asyncio.Event, retry_s: float = 5.0) -> bool:
+        """Retry until the lease is ours or ``stop`` is set.
+
+        On a redeploy the new process can start while the old lease is still
+        live (up to ``ttl_s``), and a standalone worker may hold it on purpose.
+        Waiting instead of giving up means the engine takes over as soon as the
+        other holder is gone. Returns False only when stopped.
+        """
+        while not stop.is_set():
+            try:
+                if await self.acquire():
+                    return True
+            except Exception:
+                logger.debug("alerts engine owner lock retry failed", exc_info=True)
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=retry_s)
+            except asyncio.TimeoutError:
+                pass
+        return False
+
     async def refresh(self) -> bool:
         result = await self.redis.eval(
             "if redis.call('get', KEYS[1]) == ARGV[1] then "
@@ -1192,10 +1212,15 @@ async def run_alerts(components: AlertsComponents, stop: asyncio.Event) -> list:
             components.engine.dispose()
         return [("engine-lock", f"{type(exc).__name__}: {exc}")]
     if not acquired:
-        detail = "alerts engine owner lock is held by another process"
-        logger.error(detail)
+        detail = "alerts engine owner lock is held by another process; waiting for it"
+        logger.warning(detail)
         if set_component_status is not None:
             set_component_status("alerts", "blocked", detail=detail)
+        acquired = await components.owner_lock.wait_acquire(stop)
+        if acquired:
+            logger.info("alerts engine owner lock acquired after waiting")
+    if not acquired:
+        detail = "alerts engine stopped before its owner lock was free"
         await components.release_owner()
         if components.owns_engine:
             components.engine.dispose()
