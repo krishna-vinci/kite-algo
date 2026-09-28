@@ -4,7 +4,7 @@ import asyncio
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from backend.broker_api.instruments.instruments_repository import InstrumentsRepository
 from backend.broker_api.core.redis_events import publish_event
@@ -31,6 +31,12 @@ from .repository import SqlAlchemyPaperRepository
 from .run_state import PaperRunStateService
 
 
+#: Upper bound on the injected broker-LTP fallback. A hosted paper order must
+#: never block on a slow broker call: past this the order is rejected with the
+#: same "no reference price" outcome it has when the tick cache is empty.
+LTP_FALLBACK_TIMEOUT_SECONDS = 2.0
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -55,6 +61,7 @@ class PaperTradingService:
         repository: SqlAlchemyPaperRepository | None = None,
         instruments_repository: InstrumentsRepository | None = None,
         market_data_runtime: Any | None = None,
+        ltp_fallback: Callable[[str, str], Awaitable[Optional[float]]] | None = None,
         margin_engine: PaperMarginEngine | None = None,
         charges_calculator: PaperChargesCalculator | None = None,
         journal_service: Any | None = None,
@@ -63,6 +70,7 @@ class PaperTradingService:
         self.repository = repository or SqlAlchemyPaperRepository()
         self.instruments_repository = instruments_repository or InstrumentsRepository()
         self.market_data_runtime = market_data_runtime
+        self.ltp_fallback = ltp_fallback
         self.margin_engine = margin_engine or PaperMarginEngine()
         self.charges_calculator = charges_calculator or PaperChargesCalculator()
         self.journal_service = journal_service
@@ -123,7 +131,11 @@ class PaperTradingService:
             int(instrument["instrument_token"]),
             request["product"],
         )
-        market_snapshot = await self._market_snapshot(int(instrument["instrument_token"]))
+        market_snapshot = await self._market_snapshot(
+            int(instrument["instrument_token"]),
+            exchange=request["exchange"],
+            tradingsymbol=request["tradingsymbol"],
+        )
         reference_price = self._reference_price(request=request, instrument=instrument, market_snapshot=market_snapshot)
         if reference_price <= 0:
             return await self._reject_order(account_scope, request, attribution, reason="No reference price available for paper execution")
@@ -168,6 +180,7 @@ class PaperTradingService:
                 "cost_contract": cost_contract.journal_payload(),
                 "instrument_type": str(instrument.get("instrument_type") or ""),
                 "lot_size": lot_size,
+                "price_source": self._reference_price_source(request=request, instrument=instrument, market_snapshot=market_snapshot),
             },
         )
         order = await asyncio.to_thread(self.repository.insert_order, order)
@@ -229,7 +242,11 @@ class PaperTradingService:
                     reason=f"Instrument not found for {request['exchange']}:{request['tradingsymbol']}",
                 )
                 return {"mode": "paper", "status": "failed", "results": [], "errors": [rejected]}
-            market_snapshot = await self._market_snapshot(int(instrument["instrument_token"]))
+            market_snapshot = await self._market_snapshot(
+                int(instrument["instrument_token"]),
+                exchange=request["exchange"],
+                tradingsymbol=request["tradingsymbol"],
+            )
             prepared.append((request, instrument, market_snapshot, order_attribution))
 
         staged_events: List[Tuple[str, Dict[str, Any]]] = []
@@ -932,14 +949,63 @@ class PaperTradingService:
             payload=metadata,
         )
 
-    async def _market_snapshot(self, instrument_token: int) -> Dict[str, Any]:
-        if self.market_data_runtime is None:
-            return {}
-        tick = await self.market_data_runtime.get_tick(instrument_token)
-        if tick:
-            return dict(tick)
-        last_price = await self.market_data_runtime.get_last_price(instrument_token)
-        return {"last_price": last_price} if last_price is not None else {}
+    async def _market_snapshot(
+        self,
+        instrument_token: int,
+        *,
+        exchange: Optional[str] = None,
+        tradingsymbol: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if self.market_data_runtime is not None:
+            tick = await self.market_data_runtime.get_tick(instrument_token)
+            if tick:
+                return {**dict(tick), "price_source": "tick"}
+            last_price = await self.market_data_runtime.get_last_price(instrument_token)
+            if last_price is not None:
+                return {"last_price": last_price, "price_source": "cached_last_price"}
+        # No live tick and no cached last price (or no runtime at all): fall back
+        # to a fresh broker LTP so a hosted paper MARKET order can still price,
+        # exactly as the worker/SDK quotes route does when its tick lookup misses.
+        fallback_price = await self._broker_ltp_price(exchange=exchange, tradingsymbol=tradingsymbol)
+        if fallback_price is not None:
+            return {"last_price": fallback_price, "price_source": "broker_ltp"}
+        return {}
+
+    async def _broker_ltp_price(self, *, exchange: Optional[str], tradingsymbol: Optional[str]) -> Optional[float]:
+        """Bounded broker-LTP fallback; any error/timeout behaves as "no price"."""
+        if self.ltp_fallback is None:
+            return None
+        market = str(exchange or "").strip()
+        symbol = str(tradingsymbol or "").strip()
+        if not market or not symbol:
+            return None
+        try:
+            price = await asyncio.wait_for(
+                self.ltp_fallback(market, symbol),
+                timeout=LTP_FALLBACK_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            return None
+        if price is None:
+            return None
+        try:
+            value = float(price)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    def _reference_price_source(self, *, request: Dict[str, Any], instrument: Dict[str, Any], market_snapshot: Dict[str, Any]) -> str:
+        """Which branch :meth:`_reference_price` priced from (for order metadata)."""
+        order_type = str(request["order_type"]).upper()
+        if order_type in {"LIMIT", "SL"} and request.get("price") is not None:
+            return "limit_price"
+        if order_type == "SL-M" and request.get("trigger_price") is not None:
+            return "trigger_price"
+        if market_snapshot.get("last_price") is not None:
+            return str(market_snapshot.get("price_source") or "tick")
+        if instrument.get("last_price") is not None:
+            return "instrument_last_price"
+        return "unavailable"
 
     def _reference_price(self, *, request: Dict[str, Any], instrument: Dict[str, Any], market_snapshot: Dict[str, Any]) -> Decimal:
         if str(request["order_type"]).upper() in {"LIMIT", "SL"} and request.get("price") is not None:
@@ -1324,6 +1390,7 @@ class PaperTradingService:
                 "cost_contract": cost_contract.journal_payload(),
                 "instrument_type": str(instrument.get("instrument_type") or ""),
                 "lot_size": lot_size,
+                "price_source": self._reference_price_source(request=request, instrument=instrument, market_snapshot=market_snapshot),
             },
         )
         order = uow.insert_order(order)
@@ -2081,7 +2148,11 @@ class PaperTradingService:
                     int(instrument["instrument_token"]),
                     request["product"],
                 )
-            market_snapshot = await self._market_snapshot(int(instrument["instrument_token"]))
+            market_snapshot = await self._market_snapshot(
+                int(instrument["instrument_token"]),
+                exchange=request["exchange"],
+                tradingsymbol=request["tradingsymbol"],
+            )
             reference_price = self._reference_price(request=request, instrument=instrument, market_snapshot=market_snapshot)
             if reference_price <= 0:
                 return {"status": "rejected", "reason": f"Basket preflight failed at leg {index}: no reference price available"}

@@ -349,6 +349,37 @@ async def autostart_option_sessions(
     return {"started": started, "failed": failed}
 
 
+async def _paper_broker_ltp_fallback(exchange: str, tradingsymbol: str) -> Optional[float]:
+    """Fresh broker LTP for a paper order with no tick and no cached price.
+
+    Reuses the same system Kite session and LTP path as the worker/SDK quotes
+    route (``WorkerMarketDataService._get_broker_quotes``, which falls through to
+    ``kite.quote``) so a hosted paper MARKET order still prices when the tick
+    cache has nothing. Blocking work runs off the event loop; the paper service
+    bounds the whole call with ``LTP_FALLBACK_TIMEOUT_SECONDS``.
+    """
+
+    def _fetch() -> Optional[float]:
+        db = SessionLocal()
+        try:
+            access_token = get_system_access_token(db)
+        finally:
+            db.close()
+        if not access_token:
+            return None
+        kite = build_kite_client(access_token, session_id="system")
+        instrument = f"{str(exchange).strip()}:{str(tradingsymbol).strip()}"
+        payload = (kite.quote([instrument]) or {}).get(instrument) or {}
+        price = payload.get("last_price")
+        return float(price) if price is not None else None
+
+    try:
+        return await asyncio.to_thread(_fetch)
+    except Exception:
+        logger.warning("Paper LTP fallback failed for %s:%s", exchange, tradingsymbol, exc_info=True)
+        return None
+
+
 async def combined_lifespan(app: FastAPI):
     global market_data_runtime
     # Perform headless login at startup and store the KiteConnect instance
@@ -800,6 +831,7 @@ async def combined_lifespan(app: FastAPI):
             )
             paper_runtime_service = PaperTradingService(
                 market_data_runtime=market_data_runtime,
+                ltp_fallback=_paper_broker_ltp_fallback,
                 journal_service=getattr(app.state, "journal_service", None),
             )
             app.state.paper_runtime_service = paper_runtime_service

@@ -2327,8 +2327,11 @@ class JournalService:
                 metadata={"created_by": "paper_runtime", "paper_attribution": _serialize_decimal(attribution)},
             ),
         )
-        run_id = str(run.get("id") or "") if isinstance(run, dict) else ""
+        # create_run returns the run DETAIL ({"run": {...}, ...}), not the bare run.
+        run_row = run.get("run") if isinstance(run, dict) else None
+        run_id = str((run_row or {}).get("id") or "")
         if not run_id:
+            logger.warning("Paper journal run for %s was created without an id", strategy_run_id)
             return None
         self.link_source(
             run_id,

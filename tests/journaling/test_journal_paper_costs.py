@@ -115,3 +115,23 @@ class JournalPaperCostTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EnsurePaperStrategyRunTests(unittest.TestCase):
+    def test_new_run_is_linked_and_its_id_returned(self):
+        """create_run returns the run detail ({"run": {...}}); the id must come from it."""
+        run_id = "22222222-2222-4222-8222-222222222222"
+        repository = Mock()
+        repository.find_source_link.return_value = None
+        service = JournalService(repository=repository)
+        service.create_run = Mock(return_value={"run": {"id": run_id}, "linked_sources_count": 0})
+        service.link_source = Mock()
+
+        result = service.ensure_paper_strategy_run(
+            attribution={"strategy_run_id": "run_abc", "account_ref": "kite:paper-a"}
+        )
+
+        self.assertEqual(result, run_id)
+        service.link_source.assert_called_once()
+        link = service.link_source.call_args.args[1]
+        self.assertEqual((link.source_key, link.source_key_2), ("run_abc", "kite:paper-a"))

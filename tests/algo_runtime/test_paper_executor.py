@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from contextlib import contextmanager
 from copy import deepcopy
@@ -144,15 +145,37 @@ class FakeInstrumentsRepository:
 
 
 class FakeMarketRuntime:
-    def __init__(self, ticks=None):
+    def __init__(self, ticks=None, last_prices=None):
         self.ticks = ticks or {}
+        #: Cached prices the runtime can serve without a live tick.
+        self.last_prices = last_prices or {}
 
     async def get_tick(self, token):
         return self.ticks.get(token)
 
     async def get_last_price(self, token):
         tick = self.ticks.get(token) or {}
-        return tick.get("last_price")
+        if tick.get("last_price") is not None:
+            return tick.get("last_price")
+        return self.last_prices.get(token)
+
+
+class FakeNoLtpInstrumentsRepository:
+    """Production-shaped lookup: the catalog row carries no broker last_price.
+
+    The real ``InstrumentsRepository`` returns only token/exchange/symbol/lot/
+    instrument_type, so an order with no tick and no cached price genuinely has
+    no reference price unless the broker-LTP fallback supplies one.
+    """
+
+    def get_instrument_by_exchange_symbol(self, exchange, tradingsymbol):
+        return {
+            "instrument_token": 256265,
+            "exchange": exchange,
+            "tradingsymbol": tradingsymbol,
+            "lot_size": 1,
+            "instrument_type": "EQ",
+        }
 
 
 class PaperExecutorTests(unittest.IsolatedAsyncioTestCase):
@@ -202,6 +225,216 @@ class PaperExecutorTests(unittest.IsolatedAsyncioTestCase):
         position = next(iter(self.repository.positions.values()))
         self.assertEqual(position.net_quantity, 2)
         self.assertEqual(position.metadata["last_price"], "150.1")
+
+    async def test_market_order_falls_back_to_broker_ltp_when_no_tick(self):
+        calls = []
+
+        async def ltp_fallback(exchange, tradingsymbol):
+            calls.append((exchange, tradingsymbol))
+            return 266.45
+
+        repository = FakePaperRepository()
+        service = PaperTradingService(
+            repository=repository,
+            instruments_repository=FakeNoLtpInstrumentsRepository(),
+            market_data_runtime=FakeMarketRuntime({}),
+            ltp_fallback=ltp_fallback,
+            default_starting_balance=Decimal("100000.00"),
+        )
+
+        result = await service.place_order(
+            account_scope="kite:test-paper",
+            order_payload={
+                "exchange": "NSE",
+                "tradingsymbol": "ITC",
+                "transaction_type": "BUY",
+                "variety": "regular",
+                "product": "MIS",
+                "order_type": "MARKET",
+                "quantity": 1,
+            },
+            attribution={"algo_instance_id": "algo-1", "strategy_tag": "index_stoploss"},
+        )
+
+        self.assertEqual(calls, [("NSE", "ITC")])
+        self.assertEqual(result["status"], "filled")
+        order = next(iter(repository.orders.values()))
+        self.assertEqual(order.metadata["price_source"], "broker_ltp")
+        trade = next(iter(repository.trades.values()))
+        self.assertEqual(Decimal(trade.price), Decimal("266.45"))
+
+    async def test_market_order_rejects_when_broker_ltp_fallback_fails(self):
+        async def ltp_fallback(exchange, tradingsymbol):
+            raise RuntimeError("broker unavailable")
+
+        repository = FakePaperRepository()
+        service = PaperTradingService(
+            repository=repository,
+            instruments_repository=FakeNoLtpInstrumentsRepository(),
+            market_data_runtime=FakeMarketRuntime({}),
+            ltp_fallback=ltp_fallback,
+            default_starting_balance=Decimal("100000.00"),
+        )
+
+        result = await service.place_order(
+            account_scope="kite:test-paper",
+            order_payload={
+                "exchange": "NSE",
+                "tradingsymbol": "ITC",
+                "transaction_type": "BUY",
+                "variety": "regular",
+                "product": "MIS",
+                "order_type": "MARKET",
+                "quantity": 1,
+            },
+            attribution={"algo_instance_id": "algo-1", "strategy_tag": "index_stoploss"},
+        )
+
+        self.assertEqual(result["status"], "rejected")
+        self.assertEqual(result["reason"], "No reference price available for paper execution")
+        self.assertEqual(len(repository.trades), 0)
+
+    async def test_market_order_falls_back_to_broker_ltp_when_market_runtime_absent(self):
+        calls = []
+
+        async def ltp_fallback(exchange, tradingsymbol):
+            calls.append((exchange, tradingsymbol))
+            return 266.45
+
+        repository = FakePaperRepository()
+        service = PaperTradingService(
+            repository=repository,
+            instruments_repository=FakeNoLtpInstrumentsRepository(),
+            market_data_runtime=None,
+            ltp_fallback=ltp_fallback,
+            default_starting_balance=Decimal("100000.00"),
+        )
+
+        result = await service.place_order(
+            account_scope="kite:test-paper",
+            order_payload={
+                "exchange": "NSE",
+                "tradingsymbol": "ITC",
+                "transaction_type": "BUY",
+                "variety": "regular",
+                "product": "MIS",
+                "order_type": "MARKET",
+                "quantity": 1,
+            },
+            attribution={"algo_instance_id": "algo-1", "strategy_tag": "index_stoploss"},
+        )
+
+        self.assertEqual(calls, [("NSE", "ITC")])
+        self.assertEqual(result["status"], "filled")
+        order = next(iter(repository.orders.values()))
+        self.assertEqual(order.metadata["price_source"], "broker_ltp")
+        trade = next(iter(repository.trades.values()))
+        self.assertEqual(Decimal(trade.price), Decimal("266.45"))
+
+    async def test_tick_present_does_not_call_broker_ltp_fallback(self):
+        calls = []
+
+        async def ltp_fallback(exchange, tradingsymbol):
+            calls.append((exchange, tradingsymbol))
+            return 266.45
+
+        repository = FakePaperRepository()
+        service = PaperTradingService(
+            repository=repository,
+            instruments_repository=FakeInstrumentsRepository(),
+            market_data_runtime=self.market_runtime,
+            ltp_fallback=ltp_fallback,
+            default_starting_balance=Decimal("100000.00"),
+        )
+
+        result = await service.place_order(
+            account_scope="kite:test-paper",
+            order_payload={
+                "exchange": "NSE",
+                "tradingsymbol": "INFY",
+                "transaction_type": "BUY",
+                "variety": "regular",
+                "product": "MIS",
+                "order_type": "MARKET",
+                "quantity": 1,
+            },
+            attribution={"algo_instance_id": "algo-1", "strategy_tag": "index_stoploss"},
+        )
+
+        self.assertEqual(calls, [])
+        self.assertEqual(result["status"], "filled")
+        order = next(iter(repository.orders.values()))
+        self.assertEqual(order.metadata["price_source"], "tick")
+
+    async def test_cached_last_price_is_used_without_calling_broker_ltp_fallback(self):
+        calls = []
+
+        async def ltp_fallback(exchange, tradingsymbol):
+            calls.append((exchange, tradingsymbol))
+            return 266.45
+
+        repository = FakePaperRepository()
+        service = PaperTradingService(
+            repository=repository,
+            instruments_repository=FakeNoLtpInstrumentsRepository(),
+            market_data_runtime=FakeMarketRuntime({}, last_prices={256265: 151.25}),
+            ltp_fallback=ltp_fallback,
+            default_starting_balance=Decimal("100000.00"),
+        )
+
+        result = await service.place_order(
+            account_scope="kite:test-paper",
+            order_payload={
+                "exchange": "NSE",
+                "tradingsymbol": "ITC",
+                "transaction_type": "BUY",
+                "variety": "regular",
+                "product": "MIS",
+                "order_type": "MARKET",
+                "quantity": 1,
+            },
+            attribution={"algo_instance_id": "algo-1", "strategy_tag": "index_stoploss"},
+        )
+
+        self.assertEqual(calls, [])
+        self.assertEqual(result["status"], "filled")
+        order = next(iter(repository.orders.values()))
+        self.assertEqual(order.metadata["price_source"], "cached_last_price")
+        trade = next(iter(repository.trades.values()))
+        self.assertEqual(Decimal(trade.price), Decimal("151.25"))
+
+    async def test_market_order_rejects_when_broker_ltp_fallback_times_out(self):
+        async def hanging_ltp_fallback(exchange, tradingsymbol):
+            await asyncio.sleep(5)
+            return 266.45
+
+        repository = FakePaperRepository()
+        service = PaperTradingService(
+            repository=repository,
+            instruments_repository=FakeNoLtpInstrumentsRepository(),
+            market_data_runtime=FakeMarketRuntime({}),
+            ltp_fallback=hanging_ltp_fallback,
+            default_starting_balance=Decimal("100000.00"),
+        )
+
+        with patch("paper_runtime.service.LTP_FALLBACK_TIMEOUT_SECONDS", 0.01):
+            result = await service.place_order(
+                account_scope="kite:test-paper",
+                order_payload={
+                    "exchange": "NSE",
+                    "tradingsymbol": "ITC",
+                    "transaction_type": "BUY",
+                    "variety": "regular",
+                    "product": "MIS",
+                    "order_type": "MARKET",
+                    "quantity": 1,
+                },
+                attribution={"algo_instance_id": "algo-1", "strategy_tag": "index_stoploss"},
+            )
+
+        self.assertEqual(result["status"], "rejected")
+        self.assertEqual(result["reason"], "No reference price available for paper execution")
+        self.assertEqual(len(repository.trades), 0)
 
     async def test_rejects_when_quantity_violates_lot_size(self):
         result = await self.service.place_order(
