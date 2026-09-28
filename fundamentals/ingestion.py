@@ -14,8 +14,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-import pandas as pd
-
 from backend.app.database import get_db_connection
 from fundamentals.features import compute_features_from_rows
 from fundamentals.index_scopes import resolve_index_symbols
@@ -78,6 +76,8 @@ def _load_symbol_state(symbol: str, statement_scope: str) -> dict[str, Any]:
 
 
 def _should_fetch(state: dict[str, Any], config: SyncConfig) -> bool:
+    import pandas as pd
+
     if config.mode == "full" or not state:
         return True
     if state.get("status") == "failed":
@@ -89,6 +89,8 @@ def _should_fetch(state: dict[str, Any], config: SyncConfig) -> bool:
 
 
 def _fingerprint(parsed: dict[str, pd.DataFrame]) -> str:
+    import pandas as pd
+
     payload: dict[str, Any] = {}
     for name, frame in parsed.items():
         stable = frame.copy()
@@ -102,6 +104,8 @@ def _fingerprint(parsed: dict[str, pd.DataFrame]) -> str:
 
 
 def _validate_parsed_datasets(parsed: dict[str, pd.DataFrame]) -> None:
+    import pandas as pd
+
     """Reject block/error pages before they can replace stored features."""
     if any(
         isinstance(parsed.get(name), pd.DataFrame) and not parsed[name].empty
@@ -112,6 +116,7 @@ def _validate_parsed_datasets(parsed: dict[str, pd.DataFrame]) -> None:
 
 
 def _upsert_symbol(symbol: str, statement_scope: str, parsed: dict[str, pd.DataFrame], scraped_at: str) -> None:
+    import pandas as pd
     import psycopg2.extras
 
     company_name = None

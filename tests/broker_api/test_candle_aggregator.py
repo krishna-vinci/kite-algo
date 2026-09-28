@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call
 from datetime import datetime, timezone
 
 from tests.support.test_support import install_dependency_stubs
@@ -98,6 +98,68 @@ class CandleAggregatorRuntimeTests(unittest.IsolatedAsyncioTestCase):
         bucket = aggregator._get_bucket_start(tick_ts, "day")
 
         self.assertEqual(bucket, datetime.fromisoformat("2026-09-03T18:30:00+00:00"))
+
+    async def test_zero_token_persistence_and_lease_steps_do_no_work(self):
+        aggregator = CandleAggregator("test-key")
+        aggregator.running = True
+        aggregator.owner_id = "candles:all:test"
+        aggregator._persist_pending_candles = AsyncMock()
+        aggregator._sync_market_runtime_subscriptions = AsyncMock()
+
+        for _ in range(3):
+            await aggregator._persist_step()
+            await aggregator._lease_step()
+
+        self.assertEqual(aggregator._persist_pending_candles.await_count, 0)
+        self.assertEqual(aggregator._sync_market_runtime_subscriptions.await_count, 0)
+
+    async def test_token_persistence_and_lease_steps_continue_to_work(self):
+        aggregator = CandleAggregator("test-key")
+        aggregator.running = True
+        aggregator.owner_id = "candles:all:test"
+        aggregator.subscribed_tokens = {256265}
+        aggregator._persist_pending_candles = AsyncMock()
+        aggregator._sync_market_runtime_subscriptions = AsyncMock()
+
+        for _ in range(3):
+            await aggregator._persist_step()
+            await aggregator._lease_step()
+
+        self.assertEqual(aggregator._persist_pending_candles.await_count, 3)
+        self.assertEqual(
+            aggregator._sync_market_runtime_subscriptions.await_args_list,
+            [call({256265})] * 3,
+        )
+
+    async def test_empty_refresh_skips_runtime_and_tokens_resume_later(self):
+        aggregator = CandleAggregator("test-key")
+        aggregator.running = True
+        aggregator.owner_id = "candles:all:test"
+        synced = []
+        alert_tokens = set()
+
+        async def _watchlist():
+            return set()
+
+        async def _alerts():
+            return set(alert_tokens)
+
+        async def _capture(desired):
+            synced.append(set(desired))
+
+        aggregator._get_watchlist_tokens = _watchlist
+        aggregator._get_alert_tokens = _alerts
+        aggregator._sync_market_runtime_subscriptions = _capture
+
+        for _ in range(3):
+            await aggregator._refresh_subscriptions()
+        self.assertEqual(synced, [])
+        self.assertEqual(aggregator.subscribed_tokens, set())
+
+        alert_tokens.add(999001)
+        await aggregator._refresh_subscriptions()
+        self.assertEqual(synced, [{999001}])
+        self.assertEqual(aggregator.subscribed_tokens, {999001})
 
 
 if __name__ == "__main__":

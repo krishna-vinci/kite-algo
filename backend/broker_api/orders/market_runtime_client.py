@@ -1,5 +1,4 @@
 import asyncio
-import json
 import logging
 import os
 import time
@@ -13,6 +12,7 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from backend.broker_api.orders.order_runtime import order_event_runtime
 from backend.broker_api.core.redis_events import get_redis, publish_event
 from backend.app.monitor import heartbeat
+from backend.shared import fastjson
 
 
 logger = logging.getLogger(__name__)
@@ -350,7 +350,7 @@ class MarketDataRuntime:
             if not raw_value:
                 continue
             try:
-                payload = json.loads(raw_value)
+                payload = fastjson.loads(raw_value)
             except Exception:
                 continue
             tick = self._normalize_tick_payload(payload)
@@ -427,7 +427,7 @@ class MarketDataRuntime:
                     if not message or message.get("type") != "message":
                         continue
                     raw_payload = message.get("data")
-                    payload = json.loads(raw_payload) if isinstance(raw_payload, str) else raw_payload
+                    payload = fastjson.loads(raw_payload) if isinstance(raw_payload, str) else raw_payload
                     await on_message(payload)
                 except RedisConnectionError:
                     logger.warning("Market runtime %s loop lost Redis pubsub; retrying in %.1fs", loop_name, retry_delay)

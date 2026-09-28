@@ -17,11 +17,6 @@ except ImportError:  # Keep options math usable in lean/dev environments without
 
         return decorator
 
-try:
-    import mibian
-except ImportError:  # Legacy calculator only; keep Black-76 engine importable without mibian.
-    mibian = None
-
 # --- New Vectorized Engine Configuration ---
 OPTIONS_ENGINE_USE_VECTORIZED = True
 
@@ -381,45 +376,6 @@ def prewarm_options_engine() -> bool:
             print(f"Numba kernel pre-warming failed: {e}")
             return False
     return True
-
-# --- Original Mibian Implementation (Legacy) ---
-
-def days_to_expiry(expiry_date_str: str, today_str: Optional[str] = None) -> int:
-    expiry_date = datetime.strptime(expiry_date_str, '%Y-%m-%d').date()
-    today = datetime.strptime(today_str, '%Y-%m-%d').date() if today_str else datetime.now(timezone.utc).date()
-    return max(0, (expiry_date - today).days)
-
-class OptionGreeksCalculator:
-    def __init__(self, risk_free_rate: float = 0.0):
-        self.risk_free_rate = risk_free_rate
-
-    def calculate_greeks(
-        self, option_type: str, underlying_price: float, strike_price: float,
-        expiry_date_str: str, option_ltp: float, today_str: Optional[str] = None
-    ) -> Dict[str, Any]:
-        days = days_to_expiry(expiry_date_str, today_str)
-        if days == 0:
-            return {"implied_volatility": 0.0, "delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0, "model_price": option_ltp}
-
-        mibian_risk_free_rate = self.risk_free_rate * 100
-        bs_inputs = [underlying_price, strike_price, mibian_risk_free_rate, days]
-
-        try:
-            if option_type.upper() == "CE":
-                bs = mibian.BS(bs_inputs, callPrice=option_ltp)
-                iv = bs.impliedVolatility
-                greeks = mibian.BS(bs_inputs, volatility=iv)
-                return {"implied_volatility": iv, "delta": greeks.callDelta, "gamma": greeks.gamma, "theta": greeks.callTheta, "vega": greeks.vega, "model_price": greeks.callPrice}
-            elif option_type.upper() == "PE":
-                bs = mibian.BS(bs_inputs, putPrice=option_ltp)
-                iv = bs.impliedVolatility
-                greeks = mibian.BS(bs_inputs, volatility=iv)
-                return {"implied_volatility": iv, "delta": greeks.putDelta, "gamma": greeks.gamma, "theta": greeks.putTheta, "vega": greeks.vega, "model_price": greeks.putPrice}
-            else:
-                raise ValueError("option_type must be 'CE' or 'PE'")
-        except Exception as e:
-            print(f"Error calculating Mibian Greeks for {option_type} {strike_price}: {e}")
-            return {"implied_volatility": 0.0, "delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0, "model_price": 0.0}
 
 def ewma(prev: Optional[float], new: float, alpha: float = 0.2) -> float:
     if prev is None:

@@ -109,6 +109,7 @@ services:
       # operator API would report the entire runtime section as unknown no
       # matter how healthy the worker is.
       ALERTS_WORKER_HEALTH_FILE: /health/alerts-health.json
+      MALLOC_ARENA_MAX: "2"
       PYTHONUNBUFFERED: "1"
     ports:
       - "18777:8777"

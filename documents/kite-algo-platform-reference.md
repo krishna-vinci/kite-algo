@@ -111,6 +111,11 @@ plans.
 
 Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalization.py:346`.
 
+**Runtime efficiency (finance-app):** Rare-path heavy libraries stay lazy (`mibian` and the fundamentals/pandas
+chain), while the tick and option-snapshot JSON paths use `orjson` through `backend/shared/fastjson.py`.
+Uvicorn runs with its standard extras (uvloop and httptools), compose caps glibc at two arenas via
+`MALLOC_ARENA_MAX=2`, and startup performs `gc.collect()` followed by `gc.freeze()` before serving.
+
 ## 2. Market data
 
 - **market-runtime (Go): EXISTS.** Uses `gokiteconnect/v4` (`market-runtime/go.mod:8`).

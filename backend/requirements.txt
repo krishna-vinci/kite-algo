@@ -18,7 +18,8 @@ pytz
 scipy
 SQLAlchemy
 starlette
-uvicorn
+uvicorn[standard]
+orjson
 yfinance
 python-multipart
 asyncpg
@@ -26,7 +27,6 @@ alembic
 kiteconnect
 indexed-gzip
 redis
-mibian
 numba
 PyJWT
 pytest

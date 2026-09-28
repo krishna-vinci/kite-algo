@@ -5,8 +5,6 @@ from io import StringIO
 import re
 from typing import Any
 
-import pandas as pd
-
 SUMMARY_METRIC_PATTERN = re.compile(
     r'<li class="flex flex-space-between" data-source="default">.*?<span class="name">(.*?)</span>.*?<span class="nowrap value">(.*?)</span>',
     re.DOTALL,
@@ -24,6 +22,8 @@ SECTION_MATCHERS: dict[str, tuple[str, ...]] = {
 
 
 def parse_screener_company_page(fetch_result: Any) -> dict[str, pd.DataFrame]:
+    import pandas as pd
+
     html = fetch_result.html
     company_name = _extract_company_name(html) or fetch_result.company_slug
     nse_symbol = _extract_code(html, "NSE")
@@ -142,6 +142,8 @@ def _table_to_long_frame(
     source_url: str,
     scraped_at: str,
 ) -> pd.DataFrame:
+    import pandas as pd
+
     frame = table.copy()
     frame.columns = [_clean_text(column) for column in frame.columns]
     metric_column = frame.columns[0]
@@ -184,6 +186,8 @@ def _parse_summary_metrics(
     source_url: str,
     scraped_at: str,
 ) -> pd.DataFrame:
+    import pandas as pd
+
     records: list[dict[str, Any]] = []
     for metric_name_html, value_html in SUMMARY_METRIC_PATTERN.findall(html):
         metric_name = _clean_text(metric_name_html)
@@ -206,6 +210,8 @@ def _parse_summary_metrics(
 
 
 def _read_tables(html: str) -> list[pd.DataFrame]:
+    import pandas as pd
+
     errors: list[Exception] = []
     for flavor in ("lxml", "bs4"):
         try:
@@ -274,6 +280,8 @@ def _parse_numeric_value(value_text: str) -> float | None:
 
 
 def _parse_period_label(label: str) -> str | None:
+    import pandas as pd
+
     parsed = pd.to_datetime(label, format="%b %Y", errors="coerce")
     if pd.isna(parsed):
         return None
@@ -281,6 +289,8 @@ def _parse_period_label(label: str) -> str | None:
 
 
 def _empty_statement_frame() -> pd.DataFrame:
+    import pandas as pd
+
     return pd.DataFrame(
         columns=[
             "tradingsymbol",

@@ -28,6 +28,7 @@ from backend.options.market.analytics.max_pain import compute_bounded_max_pain
 from backend.options.market.analytics.pcr import compute_put_call_ratio
 from backend.options.market.snapshots import build_bounded_strike_window
 from backend.platform.options_settings import AVAILABLE_OPTION_UNDERLYINGS
+from backend.strategies.market_session import _default_trading_day_reader, session_state
 
 
 # Configure logging
@@ -73,11 +74,9 @@ EXPIRY_CLOSE_HOUR_IST = 15
 EXPIRY_CLOSE_MINUTE_IST = 30
 
 
-def _after_nfo_close() -> bool:
+def _after_nfo_close(trading_day_reader: Optional[Callable] = None) -> bool:
     """Whether the NFO session is past the chain shutdown grace period."""
-    from backend.strategies.market_session import session_state
-
-    market = session_state("NFO")
+    market = session_state("NFO", trading_day_reader=trading_day_reader)
     local_time = datetime.now(IST).time().replace(tzinfo=None)
     return (
         market.get("reason") == "after_close"
@@ -985,6 +984,8 @@ class OptionsSessionManager:
         self.always_on: set[str] = set()
         self.pins: Dict[str, set[str]] = {}
         self._session_factory = session_factory
+        self._trading_day_reader = _default_trading_day_reader
+        self._trading_day_cache: Dict[date, bool] = {}
         self.cadence_sec = 5
         self.tick_driven = True
         self.min_interval_sec = max(
@@ -1019,6 +1020,15 @@ class OptionsSessionManager:
             return
         self._reaper_task = loop.create_task(self._reaper_loop())
 
+    def _cached_trading_day_reader(self, exchange: str, trading_day: date) -> bool:
+        if exchange != "NFO":
+            return self._trading_day_reader(exchange, trading_day)
+        if trading_day in self._trading_day_cache:
+            return self._trading_day_cache[trading_day]
+        answer = self._trading_day_reader(exchange, trading_day)
+        self._trading_day_cache[trading_day] = answer
+        return answer
+
     async def _reaper_loop(self) -> None:
         try:
             while True:
@@ -1049,7 +1059,7 @@ class OptionsSessionManager:
             for underlying, reasons in pins.items()
             if str(underlying).strip()
         }
-        after_market_close = _after_nfo_close()
+        after_market_close = _after_nfo_close(self._cached_trading_day_reader)
         if after_market_close:
             for reasons in refreshed.values():
                 reasons.discard("strategy")
@@ -1067,7 +1077,7 @@ class OptionsSessionManager:
     ) -> None:
         """Stop idle on-demand sessions, and all on-demand sessions after close."""
         now_value = time.monotonic() if now_monotonic is None else now_monotonic
-        after_market_close = _after_nfo_close()
+        after_market_close = _after_nfo_close(self._cached_trading_day_reader)
         for underlying in list(self.sessions):
             if underlying in self.always_on:
                 continue

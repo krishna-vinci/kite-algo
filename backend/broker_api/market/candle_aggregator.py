@@ -78,6 +78,10 @@ class CandleAggregator:
         # State
         self.running: bool = False
         self.subscribed_tokens: Set[int] = set()
+        self._runtime_has_subscriptions = False
+        self._last_logged_subscription_count: Optional[int] = None
+        self._candles_since_summary = 0
+        self._persisted_since_summary = 0
         self.external_token_sources: Dict[str, Set[int]] = {}
         self._subscription_lock = asyncio.Lock()
         self.candle_states: Dict[Tuple[int, str], CandleState] = {}  # (token, interval) -> state
@@ -309,11 +313,17 @@ class CandleAggregator:
         while self.running and self.owner_id:
             try:
                 await asyncio.sleep(25)
-                await self._sync_market_runtime_subscriptions(self.subscribed_tokens)
+                await self._lease_step()
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.warning("Candle aggregator runtime lease refresh failed: %s", e, exc_info=True)
+
+    async def _lease_step(self) -> None:
+        """Refresh the lease only while the runtime owner has tokens."""
+        if not self.subscribed_tokens:
+            return
+        await self._sync_market_runtime_subscriptions(self.subscribed_tokens)
     
     async def _update_candle(self, token: int, tick: Dict, tick_ts: datetime, interval: str):
         """Update candle state for a specific token and interval."""
@@ -436,9 +446,10 @@ class CandleAggregator:
             await self.redis.publish(channel, json.dumps(payload))
             
             self.stats['candles_completed'] += 1
+            self._candles_since_summary += 1
             self.stats['last_candle_time'] = datetime.now(timezone.utc).isoformat()
             
-            logger.info(f"Finalized candle for {token}|{interval} at {state.bucket_start_ts.isoformat()}")
+            logger.debug(f"Finalized candle for {token}|{interval} at {state.bucket_start_ts.isoformat()}")
             
         except Exception as e:
             logger.error(f"Failed to finalize candle for {token}|{interval}: {e}", exc_info=True)
@@ -450,12 +461,30 @@ class CandleAggregator:
         while self.running:
             try:
                 await asyncio.sleep(60)  # Persist every minute
-                await self._persist_pending_candles()
+                self._log_candle_summary()
+                await self._persist_step()
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Error in persist loop: {e}", exc_info=True)
                 await asyncio.sleep(60)
+
+    async def _persist_step(self) -> None:
+        """Persist completed candles only when a token needs them."""
+        if not self.subscribed_tokens:
+            return
+        await self._persist_pending_candles()
+
+    def _log_candle_summary(self) -> None:
+        logger.info(
+            "Candle aggregator minute summary: finalized=%d persisted=%d subscribed_tokens=%d active_candles=%d",
+            self._candles_since_summary,
+            self._persisted_since_summary,
+            len(self.subscribed_tokens),
+            len(self.candle_states),
+        )
+        self._candles_since_summary = 0
+        self._persisted_since_summary = 0
     
     async def _persist_pending_candles(self):
         """
@@ -523,8 +552,9 @@ class CandleAggregator:
                             # Already persisted
                             continue
                         
-                        CandleStorage.upsert_candles(token, interval, [candle_dict])
+                        inserted, updated = CandleStorage.upsert_candles(token, interval, [candle_dict])
                         self.stats['candles_persisted'] += 1
+                        self._persisted_since_summary += inserted + updated
                         
                     except Exception as e:
                         logger.error(f"Failed to persist candle for {token}|{interval}: {e}", exc_info=True)
@@ -555,7 +585,8 @@ class CandleAggregator:
                 desired_tokens = await self._get_watchlist_tokens()
                 desired_tokens.update(await self._get_alert_tokens())
                 desired_tokens.update(self._external_tokens())
-                await self._sync_market_runtime_subscriptions(desired_tokens)
+                if desired_tokens or self._runtime_has_subscriptions:
+                    await self._sync_market_runtime_subscriptions(desired_tokens)
                 self.subscribed_tokens = desired_tokens
                 self.stats['last_subscription_refresh'] = datetime.now(timezone.utc).isoformat()
 
@@ -566,11 +597,17 @@ class CandleAggregator:
         """Sync current desired tokens to the market-runtime using full mode."""
         if not self.owner_id:
             return
+        if not desired_tokens and not self._runtime_has_subscriptions:
+            return
         client = await get_market_runtime_client()
         payload = {int(token): "full" for token in desired_tokens}
         try:
             await client.set_owner_subscriptions(self.owner_id, payload)
-            logger.info("Runtime candle subscriptions synced: %s tokens", len(desired_tokens))
+            self._runtime_has_subscriptions = bool(desired_tokens)
+            token_count = len(desired_tokens)
+            if self._last_logged_subscription_count != token_count:
+                logger.info("Runtime candle subscriptions synced: %s tokens", token_count)
+                self._last_logged_subscription_count = token_count
         except httpx.HTTPError as e:
             logger.error("Failed to sync candle subscriptions to market-runtime: %s", e, exc_info=True)
             raise

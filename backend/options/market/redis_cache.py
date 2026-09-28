@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import json
 from typing import Any, Mapping
+
+from backend.shared import fastjson
 
 
 OPTION_SNAPSHOT_SCHEMA_VERSION = 1
@@ -41,7 +42,7 @@ def build_option_snapshot_v1_payload(snapshot: Mapping[str, Any], underlying: st
 
 def serialize_option_snapshot_v1(snapshot: Mapping[str, Any], underlying: str) -> str:
     payload = build_option_snapshot_v1_payload(snapshot, underlying)
-    return json.dumps(payload, default=str)
+    return fastjson.dumps_str(payload, default=str)
 
 
 async def read_option_snapshot_from_redis(redis_client: Any, underlying: str) -> dict[str, Any] | None:
@@ -50,8 +51,8 @@ async def read_option_snapshot_from_redis(redis_client: Any, underlying: str) ->
         return None
 
     try:
-        payload = json.loads(raw)
-    except (TypeError, json.JSONDecodeError):
+        payload = fastjson.loads(raw)
+    except (TypeError, ValueError):
         return None
 
     if not isinstance(payload, dict):

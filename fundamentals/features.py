@@ -9,8 +9,6 @@ from __future__ import annotations
 
 from typing import Iterable
 
-import pandas as pd
-
 SUMMARY_METRIC_FEATURES = {
     "market_cap_cr": "market cap",
     "current_price": "current price",
@@ -22,6 +20,8 @@ SUMMARY_METRIC_FEATURES = {
 
 def compute_features_from_rows(rows: pd.DataFrame, *, scraped_at: str, company_name: str | None = None) -> dict:
     """Compute the derived feature dict for one symbol's stored metric rows."""
+    import pandas as pd
+
     if rows is None or rows.empty:
         features: dict = {
             "company_name": company_name,

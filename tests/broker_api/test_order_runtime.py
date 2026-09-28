@@ -1,6 +1,8 @@
 import json
+import os
 import unittest
 from contextlib import nullcontext
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -15,6 +17,7 @@ from backend.broker_api.orders.order_runtime import (
     _acquire_advisory_lock_session,
     _close_locked_session,
     ensure_order_runtime_schema_compatibility,
+    order_loop_interval,
 )
 from backend.broker_api.orders.autoslice import (
     autoslice_parent_id,
@@ -216,6 +219,37 @@ class FakeCompatDB:
 
 
 class OrderRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    def test_order_loop_interval_uses_fast_cadence_for_session_windows(self):
+        now = datetime(2026, 9, 29, 10, 0, tzinfo=timezone.utc)
+        active = lambda _exchange, moment: moment is now
+
+        for window in ("in-session", "pre-open", "after-close"):
+            with self.subTest(window=window):
+                self.assertEqual(
+                    order_loop_interval(now, session_open_fn=active),
+                    (1.0, 30.0),
+                )
+
+    def test_order_loop_interval_uses_offhours_cadence_outside_session_windows(self):
+        now = datetime(2026, 9, 27, 10, 0, tzinfo=timezone.utc)
+        inactive = lambda _exchange, _moment: False
+
+        self.assertEqual(order_loop_interval(now, session_open_fn=inactive), (15.0, 600.0))
+
+    def test_order_loop_interval_offhours_values_are_env_overridable(self):
+        now = datetime(2026, 9, 27, 10, 0, tzinfo=timezone.utc)
+        inactive = lambda _exchange, _moment: False
+        overrides = {
+            "ORDER_WORKER_OFFHOURS_INTERVAL_S": "7",
+            "POSITIONS_RECONCILE_OFFHOURS_INTERVAL_S": "70",
+        }
+
+        with patch.dict(os.environ, overrides, clear=True):
+            self.assertEqual(
+                order_loop_interval(now, session_open_fn=inactive),
+                (7.0, 70.0),
+            )
+
     def test_autoslice_parent_is_read_from_kite_child_tags(self):
         self.assertEqual(
             autoslice_parent_id({"tags": ["autoslice", "autoslice:240001"]}),

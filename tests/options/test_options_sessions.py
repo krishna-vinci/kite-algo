@@ -12,7 +12,6 @@ from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-sys.modules.setdefault("mibian", types.ModuleType("mibian"))
 if "numba" not in sys.modules:
     numba_stub: Any = types.ModuleType("numba")
 
@@ -520,7 +519,7 @@ def test_reaper_never_stops_an_idle_pinned_session(monkeypatch):
         stopped.append(underlying)
 
     monkeypatch.setattr(manager, "stop_session", _stop)
-    monkeypatch.setattr(sessions_module, "_after_nfo_close", lambda: False)
+    monkeypatch.setattr(sessions_module, "_after_nfo_close", lambda _reader=None: False)
 
     asyncio.run(manager._reap_idle_sessions(now_monotonic=901.0))
 
@@ -543,7 +542,7 @@ def test_after_close_releases_strategy_pin_but_not_position_pin(monkeypatch):
         stopped.append(underlying)
 
     monkeypatch.setattr(manager, "stop_session", _stop)
-    monkeypatch.setattr(sessions_module, "_after_nfo_close", lambda: True)
+    monkeypatch.setattr(sessions_module, "_after_nfo_close", lambda _reader=None: True)
 
     asyncio.run(manager._reap_idle_sessions(now_monotonic=100_000.0))
 
@@ -588,7 +587,7 @@ def test_pin_refresh_releases_strategy_at_close_and_starts_position(
             "BANKNIFTY": {"strategy"},
         },
     )
-    monkeypatch.setattr(sessions_module, "_after_nfo_close", lambda: True)
+    monkeypatch.setattr(sessions_module, "_after_nfo_close", lambda _reader=None: True)
     monkeypatch.setattr(manager, "ensure_session", _ensure)
 
     asyncio.run(manager._refresh_pins())
@@ -874,3 +873,25 @@ def test_a_tick_for_a_stopped_session_is_ignored():
     manager._token_sessions = {10: {"NIFTY"}}
     manager.sessions = {}
     market.callback(10, {"last_price": 1.0})  # must not raise
+
+
+def test_reaper_caches_nfo_trading_day_reads_per_ist_date(monkeypatch):
+    manager = OptionsSessionManager(cast(Any, _FakeMarketData({})), cast(Any, object()))
+    reads: list[date] = []
+
+    def _reader(_exchange: str, trading_day: date) -> bool:
+        reads.append(trading_day)
+        return True
+
+    manager._trading_day_reader = _reader
+
+    def _session_state(_exchange: str, *, trading_day_reader):
+        assert trading_day_reader("NFO", date(2026, 9, 29)) is True
+        return {"reason": "after_close"}
+
+    monkeypatch.setattr(sessions_module, "session_state", _session_state)
+
+    for _ in range(3):
+        asyncio.run(manager._reap_idle_sessions(now_monotonic=100.0))
+
+    assert reads == [date(2026, 9, 29)]

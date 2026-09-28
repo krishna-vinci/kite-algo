@@ -2,8 +2,9 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import (
     Any,
     AsyncGenerator,
@@ -15,6 +16,7 @@ from typing import (
     Sequence,
     Set,
     Tuple,
+    Callable,
 )
 
 from kiteconnect import KiteConnect
@@ -31,6 +33,13 @@ from .basket_execution import BasketExecutionStore, basket_execution_store
 from .bracket_runtime import BracketRuntimeStore, bracket_runtime_store
 from backend.broker_api.orders.worker_execution_links import WorkerExecutionLinksStore, worker_execution_links_store
 from backend.broker_api.orders.autoslice import EVENT_PROCESSOR_LOCK_ID, autoslice_parent_id
+from backend.strategies.market_session import (
+    IST,
+    _default_mcx_day_reader,
+    _default_trading_day_reader,
+    session_state,
+    session_window,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -46,6 +55,84 @@ TERMINAL_ORDER_STATUSES = {
 
 POSITION_RECONCILE_LOCK_ID = 87234102
 _ORDER_RUNTIME_SCHEMA_COMPAT_READY = False
+_order_trading_day_cache: dict[tuple[str, date], bool] = {}
+_order_mcx_day_cache: dict[date, Any] = {}
+
+
+def _cached_order_trading_day_reader(exchange: str, trading_day: date) -> bool:
+    key = (exchange, trading_day)
+    if key not in _order_trading_day_cache:
+        _order_trading_day_cache[key] = _default_trading_day_reader(exchange, trading_day)
+    return _order_trading_day_cache[key]
+
+
+def _cached_order_mcx_day_reader(trading_day: date) -> Any:
+    if trading_day not in _order_mcx_day_cache:
+        _order_mcx_day_cache[trading_day] = _default_mcx_day_reader(trading_day)
+    return _order_mcx_day_cache[trading_day]
+
+
+def order_session_open(exchange: str, now: datetime) -> bool:
+    """Whether an exchange is open or inside its 30-minute edge windows."""
+    state = session_state(
+        exchange,
+        now,
+        trading_day_reader=_cached_order_trading_day_reader,
+        mcx_day_reader=_cached_order_mcx_day_reader,
+    )
+    reason = state.get("reason")
+    if reason == "open":
+        return True
+
+    if reason == "before_open":
+        local_now = now.astimezone(IST)
+        previous_day = local_now.date() - timedelta(days=1)
+        _, previous_close = session_window(exchange, previous_day)
+        close_cutoff = datetime.combine(previous_day, previous_close, tzinfo=IST) + timedelta(minutes=30)
+        if local_now <= close_cutoff:
+            probe = datetime.combine(previous_day, previous_close, tzinfo=IST) - timedelta(seconds=1)
+            previous_state = session_state(
+                exchange,
+                probe,
+                trading_day_reader=_cached_order_trading_day_reader,
+                mcx_day_reader=_cached_order_mcx_day_reader,
+            )
+            return previous_state.get("reason") in {"open", "after_close"}
+
+        next_open = state.get("next_open")
+        if next_open:
+            opening = datetime.fromisoformat(str(next_open).replace("Z", "+00:00"))
+            if opening.tzinfo is None:
+                opening = opening.replace(tzinfo=timezone.utc)
+            return opening.astimezone(IST) - now.astimezone(IST) <= timedelta(minutes=30)
+        return False
+
+    if reason != "after_close":
+        return False
+
+    session_date = date.fromisoformat(str(state.get("session_date") or now.astimezone(IST).date()))
+    _, close_at = session_window(exchange, session_date)
+    close_cutoff = datetime.combine(session_date, close_at, tzinfo=IST) + timedelta(minutes=30)
+    return now.astimezone(IST) <= close_cutoff
+
+
+def _env_seconds(name: str, default: float, *, minimum: float) -> float:
+    return max(minimum, float(os.getenv(name, str(default))))
+
+
+def order_loop_interval(
+    now: datetime, *, session_open_fn: Callable[[str, datetime], bool]
+) -> Tuple[float, float]:
+    """Order poll/reconcile cadence, slowing down outside NSE/NFO/MCX windows."""
+    if session_open_fn("NSE", now) or session_open_fn("MCX", now):
+        return (
+            _env_seconds("ORDER_RUNTIME_POLL_SECONDS", 1.0, minimum=1.0),
+            _env_seconds("POSITIONS_RECONCILE_SECONDS", 30.0, minimum=15.0),
+        )
+    return (
+        _env_seconds("ORDER_WORKER_OFFHOURS_INTERVAL_S", 15.0, minimum=1.0),
+        _env_seconds("POSITIONS_RECONCILE_OFFHOURS_INTERVAL_S", 600.0, minimum=1.0),
+    )
 
 
 def _parse_timestamp(value: Any) -> datetime:

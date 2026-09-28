@@ -9,7 +9,6 @@ from typing import Any, cast
 
 import pytest
 
-sys.modules.setdefault("mibian", types.ModuleType("mibian"))
 if "numba" not in sys.modules:
     numba_stub: Any = types.ModuleType("numba")
 

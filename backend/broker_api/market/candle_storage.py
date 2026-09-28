@@ -88,7 +88,7 @@ class CandleStorage:
                 inserted_count = sum(1 for r in results if r[0])
                 updated_count = len(results) - inserted_count
                 
-                logger.info(
+                logger.debug(
                     f"Upserted {len(candles)} candles for {instrument_token}|{interval}: "
                     f"inserted={inserted_count}, updated={updated_count}"
                 )

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI
@@ -32,6 +33,7 @@ from backend.broker_api.broker_api import (
 from backend.broker_api.instruments.index_ingestion import refresh_live_metrics_for_indices
 from backend.broker_api.instruments.instruments_repository import InstrumentsRepository
 from backend.broker_api.orders import order_event_runtime, realtime_positions_service, refresh_processing_stuck_rows
+from backend.broker_api.orders.order_runtime import order_loop_interval, order_session_open
 from backend.broker_api.session.kite_auth import API_KEY, login_headless
 from backend.broker_api.session.kite_session import KiteSession, build_kite_client, get_system_access_token, make_account_id, rotate_broker_access_token
 from backend.broker_api.orders.market_runtime_client import MarketDataRuntime, market_runtime_enabled
@@ -565,8 +567,6 @@ async def combined_lifespan(app: FastAPI):
             set_component_status("options_sessions", "degraded", detail=str(exc))
 
         async def _order_runtime_worker():
-            poll_seconds = max(1.0, float(os.getenv("ORDER_RUNTIME_POLL_SECONDS", "1.0")))
-            reconcile_seconds = max(15.0, float(os.getenv("POSITIONS_RECONCILE_SECONDS", "30")))
             last_reconcile_monotonic = 0.0
             startup_recovered = False
             cached_token = at
@@ -577,6 +577,9 @@ async def combined_lifespan(app: FastAPI):
                     if not startup_recovered:
                         await refresh_processing_stuck_rows()
                         startup_recovered = True
+                    poll_seconds, reconcile_seconds = order_loop_interval(
+                        datetime.now(timezone.utc), session_open_fn=order_session_open
+                    )
                     await asyncio.sleep(poll_seconds)
                     db = SessionLocal()
                     try:
@@ -914,6 +917,10 @@ async def combined_lifespan(app: FastAPI):
             component="finance-app",
         )
     )
+
+    # Keep long-lived startup objects out of future GC collections.
+    gc.collect()
+    gc.freeze()
 
     yield
     

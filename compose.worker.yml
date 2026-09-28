@@ -37,6 +37,7 @@ services:
       # operator runtime panel permanently unknown.
       ALERTS_HEALTH_FILE: /health/alerts-health.json
       ALERTS_HEALTH_INTERVAL_S: ${ALERTS_HEALTH_INTERVAL_S:-30}
+      MALLOC_ARENA_MAX: "2"
       PYTHONUNBUFFERED: "1"
     volumes:
       - alerts_health:/health
