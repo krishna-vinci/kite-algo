@@ -117,6 +117,13 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
   - Shards: up to 3, with 2800 tokens each. Owner subscriptions have a 90 s lease. The access token is polled from
     Postgres every 30 s (`internal/config/config.go:34-42`).
   - **No auth** on its HTTP or websocket endpoints (`internal/service/http.go:16-113`, `marketwatch_ws.go:20`).
+- **Finance-app tick fan-out: EXISTS.** `MarketDataRuntime` decodes each Redis tick once, updates its normalized
+  cache, and exposes `subscribe_ticks()` for in-process consumers; candle aggregation, algo live triggers, paper
+  execution, operator market streams and worker quote SSE use that subscription when wired at bootstrap
+  (`backend/broker_api/orders/market_runtime_client.py`, `backend/app/bootstrap.py:461-463,659-754`).
+- **Alerts-worker tick fan-out: EXISTS.** Per-instrument `RedisTickSource` instances register bounded queues on a
+  process-local `SharedTickFanout`, so one Redis `market:ticks` pub/sub reader decodes each payload once while each
+  source retains its own fresh LTP epoch (`backend/workflows/runtime.py:220-500`).
 - **Candles: EXISTS.** `backend/broker_api/market/candle_aggregator.py` consumes ticks and writes
   `candle:{token}:{interval}:current|latest`, then publishes `realtime_candles:*` (`:242,365-415`).
 - **Option chain and Greeks: EXISTS, started lazily.**

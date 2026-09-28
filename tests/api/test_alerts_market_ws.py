@@ -118,6 +118,32 @@ class FakeRuntimeClient:
         return {"status": "ok"}
 
 
+class FakeTickSubscription:
+    def __init__(self, ticks):
+        self._ticks = iter(ticks)
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self._ticks)
+        except StopIteration:
+            raise StopAsyncIteration
+
+    def close(self):
+        self.closed = True
+
+
+class FakeTickSource:
+    def __init__(self, ticks):
+        self.subscription = FakeTickSubscription(ticks)
+
+    def subscribe_ticks(self):
+        return self.subscription
+
+
 class FakeWebSocket:
     """Just enough socket for the connection object."""
 
@@ -206,6 +232,31 @@ def lim(**kwargs) -> StreamLimits:
     )
     base.update(kwargs)
     return StreamLimits(**base)
+
+
+@pytest.mark.asyncio
+async def test_hub_tick_source_dispatches_two_ticks_without_redis_pubsub():
+    class NoPubSubRedis:
+        def pubsub(self):
+            raise AssertionError("Redis pubsub used")
+
+    source = FakeTickSource([tick_payload(111, 100.0), tick_payload(111, 101.0)])
+    hub = MarketStreamHub(redis_client=NoPubSubRedis(), tick_source=source, limits=lim())
+    class Connection:
+        def tokens(self):
+            return {111}
+
+        def offer_tick(self, token, payload):
+            return None
+
+    connection = Connection()
+    hub.add_connection(connection)
+    hub._running = True
+
+    await hub._ticks_loop()
+
+    assert hub.health["ticks_seen"] == 2
+    assert source.subscription.closed
 
 
 async def pump(stream: OperatorMarketStream, socket: FakeWebSocket) -> List[Dict[str, Any]]:

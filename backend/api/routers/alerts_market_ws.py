@@ -91,7 +91,11 @@ async def alerts_market_ws(
         return
 
     await websocket.accept()
-    hub = await get_market_stream_hub()
+    market_data_runtime = getattr(websocket.app.state, "market_data_runtime", None)
+    if market_data_runtime is not None:
+        hub = await get_market_stream_hub(tick_source=market_data_runtime)
+    else:
+        hub = await get_market_stream_hub()
     stream = OperatorMarketStream(websocket, hub=hub, scope=authorized_scope)
     try:
         await stream.run()

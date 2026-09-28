@@ -39,6 +39,7 @@ class AlgoRuntimeLiveWorker:
         *,
         service: Any,
         market_data_runtime: Any | None = None,
+        tick_source: Any | None = None,
         candle_aggregator: Any | None = None,
         redis_client: Any | None = None,
         queue_maxsize: int = 2000,
@@ -46,6 +47,7 @@ class AlgoRuntimeLiveWorker:
     ) -> None:
         self.service = service
         self.market_data_runtime = market_data_runtime
+        self.tick_source = tick_source
         self.candle_aggregator = candle_aggregator
         self.redis = redis_client or get_redis()
         self.component_name = component_name
@@ -86,9 +88,7 @@ class AlgoRuntimeLiveWorker:
         self._running = True
         await self.sync_dependencies()
         self._tasks["dispatcher"] = asyncio.create_task(self._dispatch_loop())
-        self._tasks["ticks"] = asyncio.create_task(
-            self._pubsub_loop(channels=["market:ticks"], on_message=self._handle_tick_message, loop_name="ticks")
-        )
+        self._tasks["ticks"] = asyncio.create_task(self._ticks_loop())
         self._tasks["candles"] = asyncio.create_task(
             self._pubsub_loop(patterns=["realtime_candles:*:*"], on_message=self._handle_candle_message, loop_name="candles")
         )
@@ -120,6 +120,23 @@ class AlgoRuntimeLiveWorker:
             except Exception:
                 logger.warning("Failed to clear algo runtime candle tokens", exc_info=True)
         set_component_status(self.component_name, "stopped", detail="Algo runtime live trigger worker stopped", meta=self.status())
+
+    async def _ticks_loop(self) -> None:
+        if self.tick_source is not None:
+            subscription = self.tick_source.subscribe_ticks()
+            try:
+                async for payload in subscription:
+                    if not self._running:
+                        break
+                    await self._handle_tick_message(payload, {})
+            finally:
+                subscription.close()
+            return
+        await self._pubsub_loop(
+            channels=["market:ticks"],
+            on_message=self._handle_tick_message,
+            loop_name="ticks",
+        )
 
     async def sync_dependencies(self) -> Dict[str, Any]:
         active_statuses = {AlgoLifecycleState.ENABLED, AlgoLifecycleState.RUNNING}

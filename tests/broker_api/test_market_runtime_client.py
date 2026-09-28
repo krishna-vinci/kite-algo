@@ -85,6 +85,46 @@ class MarketDataRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(len(seen), 1)
 
+    def test_tick_subscriptions_deliver_in_order_and_close_removes_listener(self):
+        previous_count = self.runtime.tick_listener_count
+        subscription = self.runtime.subscribe_ticks(maxsize=4)
+        asyncio.run(
+            self.runtime._handle_tick_message(
+                {"instrument_token": 256265, "last_price": 25000.5}
+            )
+        )
+        asyncio.run(
+            self.runtime._handle_tick_message(
+                {"instrument_token": 256265, "last_price": 25001.0}
+            )
+        )
+        self.assertEqual(subscription.get_nowait()["last_price"], 25000.5)
+        self.assertEqual(subscription.get_nowait()["last_price"], 25001.0)
+        subscription.close()
+        self.assertEqual(self.runtime.tick_listener_count, previous_count)
+        asyncio.run(
+            self.runtime._handle_tick_message(
+                {"instrument_token": 256265, "last_price": 25002.0}
+            )
+        )
+        self.assertIsNone(subscription.get_nowait())
+
+    def test_tick_subscription_drops_oldest_and_counts(self):
+        subscription = self.runtime.subscribe_ticks(maxsize=2)
+        for price in (25000.5, 25001.0, 25002.0):
+            asyncio.run(
+                self.runtime._handle_tick_message(
+                    {"instrument_token": 256265, "last_price": price}
+                )
+            )
+        self.assertEqual(subscription.dropped, 1)
+        self.assertEqual(subscription.get_nowait()["last_price"], 25001.0)
+        self.assertEqual(subscription.get_nowait()["last_price"], 25002.0)
+        self.assertEqual(self.runtime.dropped, 1)
+        self.assertEqual(self.runtime.tick_status_meta()["tick_listener_count"], 1)
+        subscription.close()
+        self.assertEqual(self.runtime.dropped, 1)
+
     def test_order_update_listeners_are_called(self):
         seen = []
         self.runtime.add_order_update_listener(

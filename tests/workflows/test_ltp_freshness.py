@@ -196,6 +196,110 @@ def test_no_bounds_configured_preserves_historical_behavior():
     assert sum(source.rejected.values()) == 0
 
 
+@pytest.mark.asyncio
+async def test_sources_share_one_tick_pubsub_and_new_source_gets_fresh_epoch():
+    class SharedPubSub:
+        def __init__(self, messages, owner):
+            self.messages = list(messages)
+            self.owner = owner
+            self.closed = False
+
+        async def subscribe(self, channel):
+            self.owner.subscribe_calls += 1
+
+        async def unsubscribe(self, channel):
+            return None
+
+        async def aclose(self):
+            self.closed = True
+            self.owner.closed_count += 1
+
+        async def get_message(self, ignore_subscribe_messages=True, timeout=1.0):
+            if self.messages:
+                return {"type": "message", "data": json.dumps(self.messages.pop(0))}
+            await asyncio.sleep(0)
+            return None
+
+    class SharedRedis:
+        def __init__(self):
+            self.subscribe_calls = 0
+            self.closed_count = 0
+            self.pubsubs = []
+
+        def pubsub(self):
+            pubsub = SharedPubSub(
+                [
+                    _tick(exchange_ts=T0, ltp=100.0),
+                    _tick(exchange_ts=T0 + timedelta(seconds=1), ltp=101.0),
+                ],
+                self,
+            )
+            self.pubsubs.append(pubsub)
+            return pubsub
+
+    redis = SharedRedis()
+    first = RedisTickSource(redis, {TOKEN: INSTRUMENT})
+    second = RedisTickSource(redis, {TOKEN: INSTRUMENT})
+    await first.start()
+    await second.start()
+    assert redis.subscribe_calls == 1
+
+    first_observations = [await first.next_observation(), await first.next_observation()]
+    second_observations = [await second.next_observation(), await second.next_observation()]
+    assert [observation.ltp for observation in first_observations if observation] == [100.0, 101.0]
+    assert [observation.ltp for observation in second_observations if observation] == [100.0, 101.0]
+
+    first_epoch = first.epoch_id
+    await first.stop()
+    assert redis.closed_count == 0
+    await second.stop()
+    assert redis.closed_count == 1
+
+    replacement = RedisTickSource(redis, {TOKEN: INSTRUMENT})
+    await replacement.start()
+    assert replacement.epoch_id != first_epoch
+    await replacement.stop()
+    assert redis.closed_count == 2
+
+
+@pytest.mark.asyncio
+async def test_fanout_outage_propagates_and_rebuilt_source_has_new_epoch():
+    class FailingPubSub:
+        async def subscribe(self, channel):
+            return None
+
+        async def unsubscribe(self, channel):
+            return None
+
+        async def aclose(self):
+            return None
+
+        async def get_message(self, ignore_subscribe_messages=True, timeout=1.0):
+            raise RuntimeError("redis outage")
+
+    class Redis:
+        def __init__(self):
+            self.pubsubs = []
+
+        def pubsub(self):
+            pubsub = FailingPubSub()
+            self.pubsubs.append(pubsub)
+            return pubsub
+
+    redis = Redis()
+    source = RedisTickSource(redis, {TOKEN: INSTRUMENT})
+    await source.start()
+    with pytest.raises(RuntimeError, match="redis outage"):
+        await source.next_observation()
+    first_epoch = source.epoch_id
+    await source.stop()
+
+    replacement = RedisTickSource(redis, {TOKEN: INSTRUMENT})
+    await replacement.start()
+    assert replacement.epoch_id != first_epoch
+    await replacement.stop()
+
+
 # ---------------------------------------------------------------------------
 # service harness (silence gap + persistence + health)
 # ---------------------------------------------------------------------------

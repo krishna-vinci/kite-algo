@@ -109,6 +109,7 @@ __all__ = [
     "TickSource",
     "CandleHistory",
     "RedisTickSource",
+    "SharedTickFanout",
     "RedisCandleSource",
     "PgCandleHistory",
     "build_nse_session_provider",
@@ -255,6 +256,8 @@ class RedisTickSource:
         }
         self._channel = channel
         self._epoch_id = str(uuid.uuid4())
+        self._fanout: Optional[SharedTickFanout] = None
+        self._queue: Optional[asyncio.Queue] = None
         self._pubsub: Any = None
         self._started = False
         self._max_tick_age_s = (
@@ -285,8 +288,13 @@ class RedisTickSource:
     async def start(self) -> None:
         if self._started:
             return
-        self._pubsub = self._redis.pubsub()
-        await self._pubsub.subscribe(self._channel)
+        if self._channel != MARKET_TICKS_CHANNEL:
+            self._pubsub = self._redis.pubsub()
+            await self._pubsub.subscribe(self._channel)
+            self._started = True
+            return
+        self._fanout = await _get_shared_tick_fanout(self._redis, self._channel)
+        self._queue = await self._fanout.register()
         self._started = True
 
     def _freshness_reject(
@@ -319,18 +327,35 @@ class RedisTickSource:
         return None
 
     async def next_observation(self) -> Optional[Observation]:
-        if not self._started or self._pubsub is None:
+        if not self._started or (self._queue is None and self._pubsub is None):
             return None
         while True:
-            message = await self._pubsub.get_message(
-                ignore_subscribe_messages=True, timeout=1.0
-            )
-            if not message or message.get("type") != "message":
-                return None
-            try:
-                payload = json.loads(message.get("data"))
-            except (TypeError, ValueError):
-                logger.warning("discarding malformed tick payload")
+            if self._queue is not None:
+                fanout_task = self._fanout._task if self._fanout is not None else None
+                if fanout_task is not None and fanout_task.done() and not fanout_task.cancelled():
+                    error = fanout_task.exception()
+                    if error is not None:
+                        raise error
+                try:
+                    payload = await asyncio.wait_for(self._queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    if fanout_task is not None and fanout_task.done() and not fanout_task.cancelled():
+                        error = fanout_task.exception()
+                        if error is not None:
+                            raise error
+                    return None
+            else:
+                message = await self._pubsub.get_message(
+                    ignore_subscribe_messages=True, timeout=1.0
+                )
+                if not message or message.get("type") != "message":
+                    return None
+                try:
+                    payload = json.loads(message.get("data"))
+                except (TypeError, ValueError):
+                    logger.warning("discarding malformed tick payload")
+                    continue
+            if not isinstance(payload, dict):
                 continue
             token = payload.get("instrument_token", payload.get("token"))
             try:
@@ -371,17 +396,133 @@ class RedisTickSource:
             )
 
     async def stop(self) -> None:
-        if self._pubsub is not None:
-            try:
-                await self._pubsub.unsubscribe(self._channel)
-            except Exception:
-                pass
-            try:
-                await self._pubsub.aclose()
-            except Exception:
-                pass
-            self._pubsub = None
+        fanout = self._fanout
+        queue = self._queue
+        self._fanout = None
+        self._queue = None
+        pubsub = self._pubsub
+        self._pubsub = None
         self._started = False
+        if fanout is not None and queue is not None:
+            await fanout.unregister(queue)
+        if pubsub is not None:
+            try:
+                await pubsub.unsubscribe(self._channel)
+            except Exception:
+                pass
+            try:
+                await pubsub.aclose()
+            except Exception:
+                pass
+
+
+class SharedTickFanout:
+    """One process-local Redis tick reader with one bounded queue per source."""
+
+    def __init__(self, redis_client: Any, *, channel: str = MARKET_TICKS_CHANNEL, maxsize: int = 10000):
+        self._redis = redis_client
+        self._channel = channel
+        self._maxsize = max(1, int(maxsize))
+        self._queues: set[asyncio.Queue] = set()
+        self._pubsub: Any = None
+        self._task: Optional[asyncio.Task] = None
+        self._running = False
+        self._loop = None
+
+    async def start(self) -> None:
+        if self._running:
+            return
+        self._loop = asyncio.get_running_loop()
+        self._pubsub = self._redis.pubsub()
+        await self._pubsub.subscribe(self._channel)
+        self._running = True
+        self._task = asyncio.create_task(self._run())
+
+    async def register(self) -> asyncio.Queue:
+        if not self._running:
+            await self.start()
+        queue: asyncio.Queue = asyncio.Queue(maxsize=self._maxsize)
+        self._queues.add(queue)
+        return queue
+
+    async def unregister(self, queue: asyncio.Queue) -> None:
+        self._queues.discard(queue)
+        if not self._queues:
+            await self.stop()
+
+    async def _run(self) -> None:
+        try:
+            while self._running:
+                try:
+                    message = await self._pubsub.get_message(
+                        ignore_subscribe_messages=True, timeout=1.0
+                    )
+                    if not message or message.get("type") != "message":
+                        await asyncio.sleep(0)
+                        continue
+                    raw_payload = message.get("data")
+                    try:
+                        payload = json.loads(raw_payload) if isinstance(raw_payload, (str, bytes, bytearray)) else raw_payload
+                    except (TypeError, ValueError):
+                        logger.warning("discarding malformed tick payload")
+                        continue
+                    if not isinstance(payload, dict):
+                        continue
+                    for queue in list(self._queues):
+                        try:
+                            queue.put_nowait(payload)
+                        except asyncio.QueueFull:
+                            try:
+                                queue.get_nowait()
+                            except asyncio.QueueEmpty:
+                                continue
+                            try:
+                                queue.put_nowait(payload)
+                            except asyncio.QueueFull:
+                                continue
+                except asyncio.CancelledError:
+                    break
+                except Exception:
+                    logger.warning("Shared market tick fan-out reader failed", exc_info=True)
+                    self._running = False
+                    raise
+        finally:
+            self._running = False
+
+    async def stop(self) -> None:
+        self._running = False
+        task = self._task
+        self._task = None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        pubsub = self._pubsub
+        self._pubsub = None
+        if pubsub is not None:
+            try:
+                await pubsub.unsubscribe(self._channel)
+            except Exception:
+                pass
+            try:
+                await pubsub.aclose()
+            except Exception:
+                pass
+        self._queues.clear()
+
+
+_shared_tick_fanout: Optional[SharedTickFanout] = None
+
+
+async def _get_shared_tick_fanout(redis_client: Any, channel: str) -> SharedTickFanout:
+    global _shared_tick_fanout
+    loop = asyncio.get_running_loop()
+    if _shared_tick_fanout is not None:
+        if _shared_tick_fanout._loop is not loop or _shared_tick_fanout._task is None or _shared_tick_fanout._task.done():
+            _shared_tick_fanout = None
+    if _shared_tick_fanout is None:
+        _shared_tick_fanout = SharedTickFanout(redis_client, channel=channel)
+        await _shared_tick_fanout.start()
+    return _shared_tick_fanout
 
 
 class RedisCandleSource:

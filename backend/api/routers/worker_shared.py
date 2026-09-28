@@ -163,6 +163,7 @@ def _market_data_service(request: Any) -> WorkerMarketDataService:
             candle_reader = None
     return WorkerMarketDataService(
         market_data_runtime=getattr(request.app.state, "market_data_runtime", None),
+        tick_source=getattr(request.app.state, "market_data_runtime", None),
         redis=getattr(getattr(request.app.state, "market_data_runtime", None), "redis", None),
         candle_reader=candle_reader,
     )

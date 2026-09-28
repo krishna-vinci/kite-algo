@@ -63,8 +63,9 @@ class CandleAggregator:
     5. Automatically persists completed candles to PostgreSQL
     """
     
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, tick_source=None):
         self.api_key = api_key
+        self.tick_source = tick_source
         self.access_token: Optional[str] = None
         self.redis = None
         self.owner_id: Optional[str] = None
@@ -232,6 +233,26 @@ class CandleAggregator:
 
     async def _market_runtime_tick_loop(self):
         """Consume normalized ticks from the market-runtime Redis channel."""
+        if self.tick_source is not None:
+            subscription = self.tick_source.subscribe_ticks()
+            try:
+                async for payload in subscription:
+                    if not self.running:
+                        break
+                    token = payload.get("instrument_token")
+                    if token is None:
+                        continue
+                    try:
+                        token = int(token)
+                    except (TypeError, ValueError):
+                        continue
+                    if token not in self.subscribed_tokens:
+                        continue
+                    await self._process_ticks([payload])
+            finally:
+                subscription.close()
+            return
+
         pubsub = None
         retry_delay = 1.0
         try:
@@ -691,9 +712,11 @@ class CandleAggregator:
 _aggregator_instance: Optional[CandleAggregator] = None
 
 
-def get_aggregator(api_key: str) -> CandleAggregator:
+def get_aggregator(api_key: str, tick_source=None) -> CandleAggregator:
     """Get or create the global aggregator instance."""
     global _aggregator_instance
     if _aggregator_instance is None:
-        _aggregator_instance = CandleAggregator(api_key)
+        _aggregator_instance = CandleAggregator(api_key, tick_source=tick_source)
+    elif tick_source is not None:
+        _aggregator_instance.tick_source = tick_source
     return _aggregator_instance

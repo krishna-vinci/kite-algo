@@ -20,11 +20,13 @@ class PaperMarketEngine:
         *,
         service: Any,
         market_data_runtime: Any | None = None,
+        tick_source: Any | None = None,
         redis_client: Any | None = None,
         component_name: str = "paper_runtime_market_engine",
     ) -> None:
         self.service = service
         self.market_data_runtime = market_data_runtime
+        self.tick_source = tick_source
         self.redis = redis_client or get_redis()
         self.component_name = component_name
         self.owner_id = f"backend:paper-runtime:{uuid4()}"
@@ -78,6 +80,30 @@ class PaperMarketEngine:
         heartbeat(self.component_name, detail="Paper market engine healthy", meta=self.status())
 
     async def _run(self) -> None:
+        if self.tick_source is not None:
+            subscription = self.tick_source.subscribe_ticks()
+            try:
+                while self._running:
+                    try:
+                        tick = await asyncio.wait_for(subscription.get(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        tick = None
+                    if monotonic() - self._last_sync_at >= 5.0:
+                        await self.sync_subscriptions()
+                    if tick is None:
+                        continue
+                    try:
+                        await self.process_tick(tick)
+                    except Exception as exc:
+                        logger.error("Paper market engine tick handling failed: %s", exc, exc_info=True)
+                        self._stats["last_error"] = str(exc)
+                        set_component_status(self.component_name, "degraded", detail=str(exc), meta=self.status())
+            except asyncio.CancelledError:
+                pass
+            finally:
+                subscription.close()
+            return
+
         pubsub = self.redis.pubsub()
         try:
             await pubsub.subscribe("market:ticks")

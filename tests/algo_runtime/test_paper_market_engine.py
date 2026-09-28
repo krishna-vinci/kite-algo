@@ -1,5 +1,7 @@
 import unittest
+import asyncio
 from decimal import Decimal
+from time import monotonic
 from unittest.mock import patch
 
 from tests.support.test_support import install_dependency_stubs
@@ -74,3 +76,42 @@ class PaperMarketEngineTests(unittest.IsolatedAsyncioTestCase):
 
         position = next(iter(self.repository.positions.values()))
         self.assertEqual(position.unrealized_pnl, Decimal("9.8"))
+
+    async def test_tick_source_processes_ticks_without_redis_pubsub(self):
+        class FakeSubscription:
+            def __init__(self):
+                self.ticks = asyncio.Queue()
+                self.closed = False
+
+            async def get(self):
+                return await self.ticks.get()
+
+            def close(self):
+                self.closed = True
+
+        class FakeTickSource:
+            def __init__(self, subscription):
+                self.subscription = subscription
+
+            def subscribe_ticks(self):
+                return self.subscription
+
+        subscription = FakeSubscription()
+        await subscription.ticks.put({"instrument_token": 256265, "last_price": 151.0})
+        await subscription.ticks.put({"instrument_token": 256265, "last_price": 152.0})
+        engine = PaperMarketEngine(
+            service=self.service,
+            market_data_runtime=self.market_runtime,
+            tick_source=FakeTickSource(subscription),
+            redis_client=type("NoPubSubRedis", (), {"pubsub": lambda self: (_ for _ in ()).throw(AssertionError("Redis pubsub used"))})(),
+        )
+        engine._running = True
+        engine._last_sync_at = monotonic()
+        task = asyncio.create_task(engine._run())
+        await asyncio.sleep(0.05)
+        engine._running = False
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+        self.assertEqual(engine._stats["processed_ticks"], 2)
+        self.assertTrue(subscription.closed)

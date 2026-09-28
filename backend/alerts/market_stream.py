@@ -402,10 +402,12 @@ class MarketStreamHub:
         self,
         *,
         redis_client: Any = None,
+        tick_source: Any = None,
         limits: Optional[StreamLimits] = None,
         clock: Callable[[], datetime] = _utcnow,
     ) -> None:
         self._redis = redis_client
+        self._tick_source = tick_source
         self.limits = limits or _LIMITS
         self._clock = clock
         self._connections: Set[Any] = set()
@@ -472,6 +474,17 @@ class MarketStreamHub:
     # -- ticks -----------------------------------------------------------
 
     async def _ticks_loop(self) -> None:
+        if self._tick_source is not None:
+            subscription = self._tick_source.subscribe_ticks()
+            try:
+                async for payload in subscription:
+                    if not self._running:
+                        break
+                    self.dispatch_tick(payload)
+            finally:
+                subscription.close()
+            return
+
         pubsub = None
         retry_delay = 1.0
         while self._running:
@@ -1100,14 +1113,16 @@ _hub: Optional[MarketStreamHub] = None
 _hub_lock = asyncio.Lock()
 
 
-async def get_market_stream_hub() -> MarketStreamHub:
+async def get_market_stream_hub(tick_source: Any = None) -> MarketStreamHub:
     """The process-wide hub (one Redis subscription, many connections)."""
     global _hub
     if _hub is not None:
+        if tick_source is not None:
+            _hub._tick_source = tick_source
         return _hub
     async with _hub_lock:
         if _hub is None:
-            _hub = MarketStreamHub(limits=StreamLimits.from_env())
+            _hub = MarketStreamHub(limits=StreamLimits.from_env(), tick_source=tick_source)
             set_limits(_hub.limits)
             await _hub.start()
     return _hub

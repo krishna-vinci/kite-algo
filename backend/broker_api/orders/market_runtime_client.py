@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import quote
@@ -11,6 +12,7 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 
 from backend.broker_api.orders.order_runtime import order_event_runtime
 from backend.broker_api.core.redis_events import get_redis, publish_event
+from backend.app.monitor import heartbeat
 
 
 logger = logging.getLogger(__name__)
@@ -102,6 +104,72 @@ class MarketRuntimeClient:
         await self._client.aclose()
 
 
+class TickSubscription:
+    """A bounded, non-blocking view of the market runtime tick feed."""
+
+    def __init__(
+        self,
+        *,
+        maxsize: int,
+        on_close: Callable[[], None],
+        on_drop: Optional[Callable[[], None]] = None,
+    ):
+        self._queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue(maxsize=maxsize)
+        self._on_close = on_close
+        self._on_drop = on_drop
+        self._closed = False
+        self.dropped = 0
+        self._last_drop_warning_at: Optional[float] = None
+
+    async def get(self) -> Dict[str, Any]:
+        return await self._queue.get()
+
+    def get_nowait(self) -> Optional[Dict[str, Any]]:
+        try:
+            return self._queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return None
+
+    def _put_nowait(self, tick: Dict[str, Any]) -> None:
+        if self._closed:
+            return
+        try:
+            self._queue.put_nowait(tick)
+            return
+        except asyncio.QueueFull:
+            pass
+
+        try:
+            self._queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return
+        self.dropped += 1
+        if self._on_drop is not None:
+            self._on_drop()
+        try:
+            self._queue.put_nowait(tick)
+        except asyncio.QueueFull:
+            return
+        now = time.monotonic()
+        if self._last_drop_warning_at is None or now - self._last_drop_warning_at >= 60.0:
+            self._last_drop_warning_at = now
+            logger.warning("Market tick subscription queue full; dropped=%d", self.dropped)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._on_close()
+
+    def __aiter__(self) -> "TickSubscription":
+        return self
+
+    async def __anext__(self) -> Dict[str, Any]:
+        if self._closed and self._queue.empty():
+            raise StopAsyncIteration
+        return await self.get()
+
+
 class MarketDataRuntime:
     def __init__(self, *, realtime_positions_service=None, tick_flush_ms: int = 100):
         self.redis = get_redis()
@@ -120,6 +188,8 @@ class MarketDataRuntime:
         self._pending_position_ticks: Dict[int, Dict[str, Any]] = {}
         self._tick_lock = asyncio.Lock()
         self._tick_listeners: List[Callable[[int, Dict[str, Any]], None]] = []
+        self._tick_subscriptions: List[TickSubscription] = []
+        self._dropped_tick_total = 0
         self._order_update_listeners: List[Callable[[Dict[str, Any]], None]] = []
 
     def add_tick_listener(
@@ -132,6 +202,45 @@ class MarketDataRuntime:
         """
         self._tick_listeners.append(callback)
         return lambda: self._tick_listeners.remove(callback) if callback in self._tick_listeners else None
+
+    def subscribe_ticks(self, maxsize: int = 10000) -> TickSubscription:
+        if maxsize <= 0:
+            raise ValueError("maxsize must be positive")
+        subscription: TickSubscription
+
+        def remove_subscription() -> None:
+            if subscription in self._tick_subscriptions:
+                self._tick_subscriptions.remove(subscription)
+            unsubscribe()
+
+        subscription = TickSubscription(
+            maxsize=maxsize,
+            on_close=remove_subscription,
+            on_drop=lambda: setattr(self, "_dropped_tick_total", self._dropped_tick_total + 1),
+        )
+        unsubscribe = self.add_tick_listener(
+            lambda _token, tick: subscription._put_nowait(tick)
+        )
+        self._tick_subscriptions.append(subscription)
+        return subscription
+
+    @property
+    def tick_listener_count(self) -> int:
+        return len(self._tick_listeners)
+
+    @property
+    def total_dropped_ticks(self) -> int:
+        return self._dropped_tick_total
+
+    @property
+    def dropped(self) -> int:
+        return self.total_dropped_ticks
+
+    def tick_status_meta(self) -> Dict[str, int]:
+        return {
+            "tick_listener_count": self.tick_listener_count,
+            "dropped": self.dropped,
+        }
 
     def add_order_update_listener(
         self, callback: Callable[[Dict[str, Any]], None]
@@ -371,6 +480,7 @@ class MarketDataRuntime:
     async def _handle_status_message(self, payload: Dict[str, Any]) -> None:
         if isinstance(payload, dict):
             self.runtime_status = payload
+            heartbeat("market_runtime", detail="Market runtime status received", meta=self.tick_status_meta())
 
     async def _handle_order_update_message(self, payload: Dict[str, Any]) -> None:
         if not isinstance(payload, dict):

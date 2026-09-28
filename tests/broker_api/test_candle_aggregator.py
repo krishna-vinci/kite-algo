@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import AsyncMock
 from datetime import datetime, timezone
 
 from tests.support.test_support import install_dependency_stubs
@@ -23,6 +24,43 @@ class _FakeRedis:
 
 
 class CandleAggregatorRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_runtime_tick_source_processes_ticks_without_redis_pubsub(self):
+        class FakeSubscription:
+            def __init__(self, ticks):
+                self.ticks = iter(ticks)
+                self.closed = False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                try:
+                    return next(self.ticks)
+                except StopIteration:
+                    raise StopAsyncIteration
+
+            def close(self):
+                self.closed = True
+
+        subscription = FakeSubscription(
+            [
+                {"instrument_token": 256265, "last_price": 22450.5},
+                {"instrument_token": 256265, "last_price": 22451.5},
+            ]
+        )
+        source = type("FakeTickSource", (), {"subscribe_ticks": lambda self: subscription})()
+        aggregator = CandleAggregator("test-key", tick_source=source)
+        aggregator.redis = _FakeRedis()
+        aggregator.intervals = ["minute"]
+        aggregator.subscribed_tokens = {256265}
+        aggregator.running = True
+        aggregator._process_ticks = AsyncMock()
+
+        await aggregator._market_runtime_tick_loop()
+
+        self.assertEqual(aggregator._process_ticks.await_count, 2)
+        self.assertTrue(subscription.closed)
+
     async def test_runtime_tick_processes_iso_exchange_timestamp(self):
         aggregator = CandleAggregator("test-key")
         aggregator.redis = _FakeRedis()

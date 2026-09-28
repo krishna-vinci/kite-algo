@@ -307,11 +307,13 @@ class WorkerMarketDataService:
         *,
         instruments_repository: Optional[InstrumentsRepository] = None,
         market_data_runtime: Any = None,
+        tick_source: Any = None,
         redis: Any = None,
         candle_reader: Any = None,
     ) -> None:
         self.instruments = instruments_repository or InstrumentsRepository()
         self.market_data_runtime = market_data_runtime
+        self.tick_source = tick_source
         self.redis = redis
         self.candle_reader = candle_reader
 
@@ -1060,7 +1062,9 @@ class WorkerMarketDataService:
         token_map = {int(item["instrument_token"]): item for item in resolved["instruments"]}
         owner_id = f"worker:{getattr(token, 'token_id', 'unknown')}:market:{uuid.uuid4()}"
         runtime = self.market_data_runtime
+        tick_source = self.tick_source
         pubsub = None
+        subscription = None
         owner_registered = False
         authority = _HostedStreamAuthority(request, token)
 
@@ -1085,17 +1089,20 @@ class WorkerMarketDataService:
             )
             yield self._sse_event("snapshot", snapshot)
 
-            redis = self.redis or getattr(runtime, "redis", None)
-            if redis is None:
-                yield self._sse_event("error", {"detail": "Redis runtime channel is not available"})
-                return
+            if tick_source is not None:
+                subscription = tick_source.subscribe_ticks()
+            else:
+                redis = self.redis or getattr(runtime, "redis", None)
+                if redis is None:
+                    yield self._sse_event("error", {"detail": "Redis runtime channel is not available"})
+                    return
 
-            try:
-                pubsub = redis.pubsub()
-                await pubsub.subscribe(RUNTIME_TICKS_CHANNEL)
-            except Exception as exc:
-                yield self._sse_event("error", {"detail": f"Unable to subscribe to runtime ticks: {exc}"})
-                return
+                try:
+                    pubsub = redis.pubsub()
+                    await pubsub.subscribe(RUNTIME_TICKS_CHANNEL)
+                except Exception as exc:
+                    yield self._sse_event("error", {"detail": f"Unable to subscribe to runtime ticks: {exc}"})
+                    return
 
             idle_cycles = 0
             while True:
@@ -1108,16 +1115,26 @@ class WorkerMarketDataService:
                     # continuing to deliver market data.
                     yield self._sse_event("stream_closed", {"reason": reason})
                     break
-                try:
-                    message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
-                except Exception as exc:
-                    detail = f"Runtime tick stream failed: {exc}"
-                    if exc.__class__.__name__ == "ConnectionError":
-                        detail = f"Runtime tick stream lost Redis connection: {exc}"
-                    yield self._sse_event("error", {"detail": detail})
-                    break
+                if subscription is not None:
+                    try:
+                        payload = await asyncio.wait_for(subscription.get(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        payload = None
+                else:
+                    try:
+                        message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                    except Exception as exc:
+                        detail = f"Runtime tick stream failed: {exc}"
+                        if exc.__class__.__name__ == "ConnectionError":
+                            detail = f"Runtime tick stream lost Redis connection: {exc}"
+                        yield self._sse_event("error", {"detail": detail})
+                        break
 
-                if not message or message.get("type") != "message":
+                    if not message or message.get("type") != "message":
+                        payload = None
+                    else:
+                        payload = self._decode_pubsub_payload(message.get("data"))
+                if payload is None:
                     idle_cycles += 1
                     if idle_cycles >= 15:
                         yield ": heartbeat\n\n"
@@ -1125,9 +1142,6 @@ class WorkerMarketDataService:
                     continue
 
                 idle_cycles = 0
-                payload = self._decode_pubsub_payload(message.get("data"))
-                if payload is None:
-                    continue
 
                 payloads = payload if isinstance(payload, list) else [payload]
                 ticks: List[Dict[str, Any]] = []
@@ -1146,6 +1160,11 @@ class WorkerMarketDataService:
                 if ticks:
                     yield self._sse_event("ticks", {"ticks": ticks})
         finally:
+            if subscription is not None:
+                try:
+                    subscription.close()
+                except Exception:
+                    pass
             if pubsub is not None:
                 try:
                     await pubsub.unsubscribe(RUNTIME_TICKS_CHANNEL)

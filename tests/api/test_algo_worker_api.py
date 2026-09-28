@@ -629,6 +629,66 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
         fake_db.rollback.assert_called_once_with()
         fake_db.close.assert_called_once_with()
 
+    async def test_market_tick_source_streams_two_ticks_without_redis_pubsub(self):
+        class FakeSubscription:
+            def __init__(self, ticks):
+                self._ticks = iter(ticks)
+                self.closed = False
+
+            async def get(self):
+                try:
+                    return next(self._ticks)
+                except StopIteration:
+                    await asyncio.sleep(3600)
+
+            def close(self):
+                self.closed = True
+
+        class FakeTickSource:
+            def __init__(self, subscription):
+                self.subscription = subscription
+
+            def subscribe_ticks(self):
+                return self.subscription
+
+        ticks = [
+            {"instrument_token": 408065, "last_price": 1525.5, "received_at": "2026-04-25T08:00:00+00:00"},
+            {"instrument_token": 408065, "last_price": 1526.5, "received_at": "2026-04-25T08:00:01+00:00"},
+        ]
+        subscription = FakeSubscription(ticks)
+        runtime = SimpleNamespace(
+            get_tick=AsyncMock(return_value=ticks[0]),
+            set_owner_subscriptions=AsyncMock(return_value={}),
+            delete_owner=AsyncMock(return_value={}),
+        )
+        service = WorkerMarketDataService(
+            instruments_repository=SimpleNamespace(
+                resolve_market_symbol=lambda symbol: {
+                    "instrument_token": 408065,
+                    "exchange": "NSE",
+                    "tradingsymbol": "INFY",
+                }
+            ),
+            market_data_runtime=runtime,
+            tick_source=FakeTickSource(subscription),
+            redis=SimpleNamespace(pubsub=lambda: (_ for _ in ()).throw(AssertionError("Redis pubsub used"))),
+        )
+        request = SimpleNamespace(is_disconnected=AsyncMock(side_effect=[False, False, True]))
+
+        events = [event async for event in service.stream_ticks(
+            request,
+            None,
+            symbols=["NSE:INFY"],
+            instrument_tokens=[],
+            mode="quote",
+        )]
+
+        tick_events = [event for event in events if event.startswith("event: ticks")]
+        assert len(tick_events) == 2
+        assert "1525.5" in tick_events[0]
+        assert "1526.5" in tick_events[1]
+        assert subscription.closed
+
     def _request(self, repo, *, paper_runtime=None, raw_token="secret-token"):
         return SimpleNamespace(
             headers={"authorization": f"Bearer {raw_token}"},

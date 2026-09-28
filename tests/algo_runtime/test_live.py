@@ -31,6 +31,38 @@ class FakeMarketRuntime:
         return {"status": "ok"}
 
 
+class FakeTickSubscription:
+    def __init__(self, ticks):
+        self._ticks = iter(ticks)
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self._ticks)
+        except StopIteration:
+            raise StopAsyncIteration
+
+    def close(self):
+        self.closed = True
+
+
+class FakeTickSource:
+    def __init__(self, ticks):
+        self.subscription = FakeTickSubscription(ticks)
+
+    def subscribe_ticks(self):
+        return self.subscription
+
+    async def set_owner_subscriptions(self, owner_id, subscriptions):
+        return {"status": "ok"}
+
+    async def delete_owner(self, owner_id):
+        return {"status": "ok"}
+
+
 class FakeCandleAggregator:
     def __init__(self):
         self.calls = []
@@ -107,6 +139,29 @@ class AlgoRuntimeLiveWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["routing"]["market_tokens"], [256265])
         self.assertEqual(status["routing"]["candle_pairs"], ["256265:5minute"])
         self.assertEqual(status["routing"]["account_scopes"], ["kite:AB1234"])
+
+    async def test_tick_source_feeds_two_ticks_without_redis_pubsub(self):
+        tick_source = FakeTickSource(
+            [
+                {"instrument_token": 256265, "last_price": 24000.0},
+                {"instrument_token": 256265, "last_price": 24001.0},
+            ]
+        )
+        worker = AlgoRuntimeLiveWorker(
+            service=self.service,
+            market_data_runtime=self.market_runtime,
+            tick_source=tick_source,
+            candle_aggregator=self.candle_aggregator,
+            redis_client=type("NoPubSubRedis", (), {"pubsub": lambda self: (_ for _ in ()).throw(AssertionError("Redis pubsub used"))})(),
+        )
+        await worker.sync_dependencies()
+        worker._running = True
+
+        await worker._ticks_loop()
+
+        self.assertEqual(worker._stats["received"]["tick"], 2)
+        self.assertEqual(worker._queue.qsize(), 2)
+        self.assertTrue(tick_source.subscription.closed)
 
     async def test_handlers_enqueue_and_dispatch_matching_live_triggers(self):
         await self.worker.sync_dependencies()

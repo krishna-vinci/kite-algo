@@ -469,6 +469,7 @@ async def combined_lifespan(app: FastAPI):
             meta={
                 "active_shards": runtime_status.get("active_shards"),
                 "effective_tokens": runtime_status.get("effective_tokens"),
+                **market_data_runtime.tick_status_meta(),
             },
         )
 
@@ -658,7 +659,7 @@ async def combined_lifespan(app: FastAPI):
         try:
             from backend.broker_api.market.candle_aggregator import get_aggregator
             logging.info("Starting Candle Aggregator...")
-            aggregator = get_aggregator(API_KEY)
+            aggregator = get_aggregator(API_KEY, tick_source=market_data_runtime)
             
             if not aggregator.running:
                 # Start with ALL supported intervals including 3minute, 30minute, and day
@@ -741,6 +742,7 @@ async def combined_lifespan(app: FastAPI):
             algo_runtime_live_worker = AlgoRuntimeLiveWorker(
                 service=algo_runtime_service,
                 market_data_runtime=market_data_runtime,
+                tick_source=market_data_runtime,
                 candle_aggregator=getattr(app.state, "candle_aggregator", None),
             )
             await algo_runtime_live_worker.start()
@@ -748,6 +750,7 @@ async def combined_lifespan(app: FastAPI):
             paper_market_engine = PaperMarketEngine(
                 service=paper_runtime_service,
                 market_data_runtime=market_data_runtime,
+                tick_source=market_data_runtime,
                 redis_client=get_redis(),
             )
             await paper_market_engine.start()
