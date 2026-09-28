@@ -671,6 +671,12 @@ Uvicorn runs with its standard extras (uvloop and httptools), compose caps glibc
   alerts-worker, for protection exits/triggers, unknown order outcomes, approvals, blocked kill-switch targets
   and repeated broker-login failures. Alerts deduplicate per stable key for 300 s by default
   (`OWNER_ALERT_COOLDOWN_SECONDS`).
+  - Live order outcomes also push: one synchronous listener on `MarketDataRuntime.add_order_update_listener`
+    (`backend/app/bootstrap.py:483-491`, `backend/platform/order_alerts.py`) alerts on `COMPLETE`, `REJECTED`,
+    `LAPSED`, and on `CANCELLED`/`CANCELED` only when `filled_quantity > 0`; every other status (OPEN, UPDATE,
+    unfilled cancels) is ignored. It dedupes `(order_id, status)` in memory (bounded at 5000) and passes
+    `key=order:<order_id>:<status>` to `alert_owner_nowait`. Set `ORDER_ALERTS_ENABLED` to `0/false/no/off` to
+    disable (default on). Paper orders never reach the broker, so they never alert.
 - **Journal and analytics: EXISTS.** Daily, weekly and monthly journal; episodes with notes; analytics for
   summary, strategy, equity, costs and paper-vs-live; the live journal projector (`backend/journaling`,
   `api/routers/{journal,analytics}.py`). Hosted strategies: paper and live fills land on a journal run keyed by

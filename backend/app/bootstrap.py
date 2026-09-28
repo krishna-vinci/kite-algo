@@ -37,6 +37,7 @@ from backend.broker_api.orders.order_runtime import order_loop_interval, order_s
 from backend.broker_api.session.kite_auth import API_KEY, login_headless
 from backend.broker_api.session.kite_session import KiteSession, build_kite_client, get_system_access_token, make_account_id, rotate_broker_access_token
 from backend.broker_api.orders.market_runtime_client import MarketDataRuntime, market_runtime_enabled
+from backend.platform.order_alerts import OrderAlertListener, order_alerts_enabled
 from backend.broker_api.options.options_greeks import prewarm_options_engine
 from backend.shared.runtime_stats import run_stats_sampler
 from backend.app.database import SessionLocal, database as async_db, get_db_connection
@@ -480,6 +481,14 @@ async def combined_lifespan(app: FastAPI):
         market_data_runtime = MarketDataRuntime(realtime_positions_service=realtime_positions_service)
         await market_data_runtime.start()
         app.state.market_data_runtime = market_data_runtime
+        if order_alerts_enabled():
+            order_alert_listener = OrderAlertListener()
+            app.state.order_alert_listener = order_alert_listener
+            app.state.order_alert_unsubscribe = market_data_runtime.add_order_update_listener(
+                order_alert_listener
+            )
+        else:
+            app.state.order_alert_unsubscribe = None
         runtime_status = dict(getattr(market_data_runtime, "runtime_status", {}) or {})
         set_component_status(
             "market_runtime",
@@ -1151,6 +1160,13 @@ async def combined_lifespan(app: FastAPI):
         options_session_manager.close()
 
     if market_data_runtime:
+        unsubscribe_order_alerts = getattr(app.state, "order_alert_unsubscribe", None)
+        if unsubscribe_order_alerts is not None:
+            try:
+                unsubscribe_order_alerts()
+            except Exception:
+                pass
+            app.state.order_alert_unsubscribe = None
         logging.info("Stopping Go market runtime bridge...")
         await market_data_runtime.stop()
         logging.info("Go market runtime bridge stopped.")
