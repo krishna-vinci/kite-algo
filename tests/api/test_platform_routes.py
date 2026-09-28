@@ -392,6 +392,34 @@ async def test_options_settings_get_returns_defaults(client, session_factory, mo
 
 
 @pytest.mark.asyncio
+async def test_options_settings_reports_session_reasons(client, app, monkeypatch):
+    monkeypatch.delenv("OPTIONS_AUTOSTART_UNDERLYINGS", raising=False)
+
+    class _Manager:
+        @staticmethod
+        def get_session_status():
+            return [
+                {
+                    "underlying": "NIFTY",
+                    "running": True,
+                    "always_on": True,
+                    "last_used_age_s": 3.0,
+                    "updated_age_s": 1.0,
+                    "desired_tokens": 250,
+                    "cadence_sec": 5,
+                    "reasons": ["always_on", "position"],
+                }
+            ]
+
+    app.state.options_session_manager = _Manager()
+
+    response = await client.get(f"{BASE}/options-settings")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["sessions"][0]["reasons"] == ["always_on", "position"]
+
+
+@pytest.mark.asyncio
 async def test_options_settings_put_round_trips_and_appends_audit(
     client, session_factory, monkeypatch
 ):

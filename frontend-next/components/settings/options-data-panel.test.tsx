@@ -52,6 +52,7 @@ const baseSettings = {
       updated_age_s: 0.8,
       desired_tokens: 250,
       cadence_sec: 5,
+      reasons: ["always_on", "position"],
     },
     {
       underlying: "BANKNIFTY",
@@ -61,6 +62,7 @@ const baseSettings = {
       updated_age_s: 90,
       desired_tokens: 0,
       cadence_sec: 5,
+      reasons: ["recent_use"],
     },
   ],
 };
@@ -82,6 +84,7 @@ describe("OptionsDataPanel", () => {
     const niftyRow = screen.getByRole("cell", { name: "NIFTY" }).closest("tr");
     expect(niftyRow).not.toBeNull();
     expect(within(niftyRow as HTMLElement).getByText("running")).toBeInTheDocument();
+    expect(within(niftyRow as HTMLElement).getByText("always_on, position")).toBeInTheDocument();
     expect(within(niftyRow as HTMLElement).getByText("250")).toBeInTheDocument();
 
     const bankniftyRow = screen.getByRole("cell", { name: "BANKNIFTY" }).closest("tr");

@@ -70,6 +70,9 @@ class PlatformOptionsSessionStatus(BaseModel):
     updated_age_s: Optional[float] = None
     desired_tokens: int
     cadence_sec: int
+    reasons: List[Literal["always_on", "position", "strategy", "recent_use"]] = Field(
+        default_factory=list
+    )
 
 
 class PlatformOptionsSettingsResponse(BaseModel):

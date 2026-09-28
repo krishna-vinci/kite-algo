@@ -29,6 +29,7 @@ export type OptionsSession = {
   updated_age_s: number | null;
   desired_tokens: number;
   cadence_sec: number;
+  reasons?: string[];
 };
 
 export type OptionsSettings = {

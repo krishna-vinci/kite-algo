@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import types
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, cast
 
 import pytest
+from sqlalchemy import create_engine, event, text
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 sys.modules.setdefault("mibian", types.ModuleType("mibian"))
 if "numba" not in sys.modules:
@@ -24,6 +28,7 @@ if "numba" not in sys.modules:
 from backend.broker_api.options.options_greeks import black76_greeks, black76_price
 from backend.broker_api.options import options_sessions as sessions_module
 from backend.broker_api.options.options_sessions import OptionsSession, OptionsSessionManager
+from backend.options.market import session_pins
 from backend.platform.options_settings import OptionsSettings
 
 
@@ -247,6 +252,121 @@ class _SessionRepo:
         return value.strip().upper(), value.strip().upper()
 
 
+@pytest.fixture()
+def pin_session_factory():
+    engine = create_engine(
+        "sqlite+pysqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+
+    @event.listens_for(engine, "connect")
+    def _attach_public(dbapi_connection, connection_record):
+        _ = connection_record
+        cursor = dbapi_connection.cursor()
+        cursor.execute("ATTACH DATABASE ':memory:' AS public")
+        cursor.executescript(
+            """
+            CREATE TABLE public.option_protection_owners (
+                option_run_id TEXT PRIMARY KEY, state TEXT NOT NULL
+            );
+            CREATE TABLE public.option_run_states (
+                strategy_run_id TEXT PRIMARY KEY, legs TEXT NOT NULL
+            );
+            CREATE TABLE public.strategy_plan_option_runs (
+                plan_id TEXT PRIMARY KEY, option_run_id TEXT NOT NULL, phase TEXT NOT NULL
+            );
+            CREATE TABLE public.strategy_jobs (
+                id TEXT PRIMARY KEY, status TEXT NOT NULL
+            );
+            CREATE TABLE public.strategy_proposals (
+                proposal_id TEXT PRIMARY KEY, job_id TEXT
+            );
+            CREATE TABLE public.strategy_plans (
+                plan_id TEXT PRIMARY KEY, proposal_id TEXT NOT NULL,
+                plan_kind TEXT NOT NULL, resolved_plan TEXT NOT NULL,
+                created_at TIMESTAMP NOT NULL
+            );
+            """
+        )
+        dbapi_connection.commit()
+
+    yield sessionmaker(bind=engine, expire_on_commit=False)
+    engine.dispose()
+
+
+def test_required_underlyings_pins_active_position_from_frozen_plan(
+    pin_session_factory,
+):
+    with pin_session_factory() as session:
+        session.execute(
+            text(
+                "INSERT INTO public.option_run_states (strategy_run_id, legs) "
+                "VALUES ('opt-1', :legs)"
+            ),
+            {"legs": json.dumps([{"tradingsymbol": "NIFTY26OCT25000CE"}])},
+        )
+        session.execute(
+            text(
+                "INSERT INTO public.option_protection_owners (option_run_id, state) "
+                "VALUES ('opt-1', 'active')"
+            )
+        )
+        session.execute(
+            text(
+                "INSERT INTO public.strategy_plans "
+                "(plan_id, proposal_id, plan_kind, resolved_plan, created_at) "
+                "VALUES ('plan-1', 'proposal-1', 'option_structure', :plan, :created_at)"
+            ),
+            {
+                "plan": json.dumps({"underlying": "NIFTY"}),
+                "created_at": datetime.now(timezone.utc),
+            },
+        )
+        session.execute(
+            text(
+                "INSERT INTO public.strategy_plan_option_runs "
+                "(plan_id, option_run_id, phase) VALUES ('plan-1', 'opt-1', 'entry')"
+            )
+        )
+        session.commit()
+
+    assert session_pins.required_underlyings(pin_session_factory) == {
+        "NIFTY": {"position"}
+    }
+
+
+def test_required_underlyings_pins_recent_option_plan_for_running_job(
+    pin_session_factory,
+):
+    with pin_session_factory() as session:
+        session.execute(
+            text("INSERT INTO public.strategy_jobs (id, status) VALUES ('job-1', 'running')")
+        )
+        session.execute(
+            text(
+                "INSERT INTO public.strategy_proposals (proposal_id, job_id) "
+                "VALUES ('proposal-1', 'job-1')"
+            )
+        )
+        session.execute(
+            text(
+                "INSERT INTO public.strategy_plans "
+                "(plan_id, proposal_id, plan_kind, resolved_plan, created_at) "
+                "VALUES ('plan-1', 'proposal-1', 'option_structure', :plan, :created_at)"
+            ),
+            {
+                "plan": json.dumps({"underlying": "BANKNIFTY"}),
+                "created_at": datetime.now(timezone.utc) - timedelta(hours=1),
+            },
+        )
+        session.commit()
+
+    assert session_pins.required_underlyings(pin_session_factory) == {
+        "BANKNIFTY": {"strategy"}
+    }
+
+
 def _counting_manager(monkeypatch, *, starts: list, fail: bool = False):
     manager = OptionsSessionManager(cast(Any, object()), cast(Any, _SessionRepo()))
 
@@ -386,6 +506,95 @@ def test_reaper_stops_idle_on_demand_but_never_always_on(monkeypatch):
     asyncio.run(manager._reap_idle_sessions(now_monotonic=901.0))
     assert stopped == ["FINNIFTY"]
     assert "NIFTY" in manager.sessions
+
+
+def test_reaper_never_stops_an_idle_pinned_session(monkeypatch):
+    manager = OptionsSessionManager(cast(Any, object()), cast(Any, _SessionRepo()))
+    manager.sessions = {"NIFTY": cast(Any, object())}
+    manager.pins = {"NIFTY": {"strategy"}}
+    manager.idle_stop_minutes = 15
+    manager.last_used = {"NIFTY": 0.0}
+    stopped = []
+
+    async def _stop(underlying):
+        stopped.append(underlying)
+
+    monkeypatch.setattr(manager, "stop_session", _stop)
+    monkeypatch.setattr(sessions_module, "_after_nfo_close", lambda: False)
+
+    asyncio.run(manager._reap_idle_sessions(now_monotonic=901.0))
+
+    assert stopped == []
+
+
+def test_after_close_releases_strategy_pin_but_not_position_pin(monkeypatch):
+    manager = OptionsSessionManager(cast(Any, object()), cast(Any, _SessionRepo()))
+    manager.sessions = {
+        "NIFTY": cast(Any, object()),
+        "BANKNIFTY": cast(Any, object()),
+    }
+    manager.pins = {
+        "NIFTY": {"position"},
+        "BANKNIFTY": {"strategy"},
+    }
+    stopped = []
+
+    async def _stop(underlying):
+        stopped.append(underlying)
+
+    monkeypatch.setattr(manager, "stop_session", _stop)
+    monkeypatch.setattr(sessions_module, "_after_nfo_close", lambda: True)
+
+    asyncio.run(manager._reap_idle_sessions(now_monotonic=100_000.0))
+
+    assert stopped == ["BANKNIFTY"]
+
+
+def test_pin_read_error_keeps_previous_pins():
+    def _broken_factory():
+        raise RuntimeError("pin store unavailable")
+
+    manager = OptionsSessionManager(
+        cast(Any, object()),
+        cast(Any, _SessionRepo()),
+        session_factory=_broken_factory,
+    )
+    manager.pins = {"NIFTY": {"position"}}
+
+    asyncio.run(manager._refresh_pins())
+
+    assert manager.pins == {"NIFTY": {"position"}}
+
+
+def test_pin_refresh_releases_strategy_at_close_and_starts_position(
+    monkeypatch,
+):
+    manager = OptionsSessionManager(
+        cast(Any, object()),
+        cast(Any, _SessionRepo()),
+        session_factory=cast(Any, object()),
+    )
+    ensured = []
+
+    async def _ensure(underlying, window_size=12, cadence_sec=None):
+        ensured.append((underlying, window_size, cadence_sec))
+        return True
+
+    monkeypatch.setattr(
+        session_pins,
+        "required_underlyings",
+        lambda _factory: {
+            "NIFTY": {"position", "strategy"},
+            "BANKNIFTY": {"strategy"},
+        },
+    )
+    monkeypatch.setattr(sessions_module, "_after_nfo_close", lambda: True)
+    monkeypatch.setattr(manager, "ensure_session", _ensure)
+
+    asyncio.run(manager._refresh_pins())
+
+    assert manager.pins == {"NIFTY": {"position"}}
+    assert ensured == [("NIFTY", 12, 5)]
 
 
 def test_zero_idle_minutes_never_reaps_during_market_hours(monkeypatch):

@@ -23,6 +23,7 @@ from backend.options.market.redis_cache import (
     option_snapshot_v1_updates_channel,
     serialize_option_snapshot_v1,
 )
+from backend.options.market import session_pins
 from backend.options.market.analytics.max_pain import compute_bounded_max_pain
 from backend.options.market.analytics.pcr import compute_put_call_ratio
 from backend.options.market.snapshots import build_bounded_strike_window
@@ -70,6 +71,18 @@ MIN_T = 1e-6  # Min time to expiry to avoid zero division
 IST = ZoneInfo("Asia/Kolkata")
 EXPIRY_CLOSE_HOUR_IST = 15
 EXPIRY_CLOSE_MINUTE_IST = 30
+
+
+def _after_nfo_close() -> bool:
+    """Whether the NFO session is past the chain shutdown grace period."""
+    from backend.strategies.market_session import session_state
+
+    market = session_state("NFO")
+    local_time = datetime.now(IST).time().replace(tzinfo=None)
+    return (
+        market.get("reason") == "after_close"
+        and local_time.hour * 60 + local_time.minute >= 15 * 60 + 35
+    )
 
 
 def rank_tokens(ranks: Mapping[int, tuple], cap: int) -> tuple[List[int], List[int]]:
@@ -955,7 +968,10 @@ class OptionsSessionManager:
     """
 
     def __init__(
-        self, market_data: MarketDataRuntime, instrument_repo: InstrumentsRepository
+        self,
+        market_data: MarketDataRuntime,
+        instrument_repo: InstrumentsRepository,
+        session_factory: Any = None,
     ):
         self.market_data = market_data
         self.instrument_repo = instrument_repo
@@ -967,6 +983,8 @@ class OptionsSessionManager:
         self._last_publish_digest: Dict[str, tuple] = {}
         self._last_redis_set_monotonic: Dict[str, float] = {}
         self.always_on: set[str] = set()
+        self.pins: Dict[str, set[str]] = {}
+        self._session_factory = session_factory
         self.cadence_sec = 5
         self.tick_driven = True
         self.min_interval_sec = max(
@@ -1005,25 +1023,58 @@ class OptionsSessionManager:
         try:
             while True:
                 await asyncio.sleep(60)
+                await self._refresh_pins()
                 await self._reap_idle_sessions()
         except asyncio.CancelledError:
             return
+
+    async def _refresh_pins(self) -> None:
+        """Refresh durable chain pins without discarding the last good read."""
+        session_factory = self._session_factory
+        if session_factory is None:
+            from backend.app.database import SessionLocal
+
+            session_factory = SessionLocal
+        try:
+            pins = await asyncio.to_thread(
+                session_pins.required_underlyings, session_factory
+            )
+        except Exception as exc:  # noqa: BLE001 - keep the last known-safe pins
+            logger.warning("Unable to refresh option session pins: %s", exc, exc_info=True)
+            return
+        if getattr(pins, "read_failed", False):
+            return
+        refreshed = {
+            str(underlying).strip().upper(): set(reasons)
+            for underlying, reasons in pins.items()
+            if str(underlying).strip()
+        }
+        after_market_close = _after_nfo_close()
+        if after_market_close:
+            for reasons in refreshed.values():
+                reasons.discard("strategy")
+            refreshed = {
+                underlying: reasons
+                for underlying, reasons in refreshed.items()
+                if reasons
+            }
+        self.pins = refreshed
+        for underlying in self.pins:
+            await self.ensure_session(underlying, cadence_sec=self.cadence_sec)
 
     async def _reap_idle_sessions(
         self, *, now_monotonic: Optional[float] = None
     ) -> None:
         """Stop idle on-demand sessions, and all on-demand sessions after close."""
-        from backend.strategies.market_session import session_state
-
         now_value = time.monotonic() if now_monotonic is None else now_monotonic
-        market = session_state("NFO")
-        local_time = datetime.now(IST).time().replace(tzinfo=None)
-        after_market_close = (
-            market.get("reason") == "after_close"
-            and local_time.hour * 60 + local_time.minute >= 15 * 60 + 35
-        )
+        after_market_close = _after_nfo_close()
         for underlying in list(self.sessions):
             if underlying in self.always_on:
+                continue
+            pin_reasons = self.pins.get(underlying, set())
+            if "position" in pin_reasons:
+                continue
+            if not after_market_close and pin_reasons:
                 continue
             last_used = self.last_used.get(underlying, now_value)
             idle = (
@@ -1229,9 +1280,22 @@ class OptionsSessionManager:
                     "updated_age_s": updated_age,
                     "desired_tokens": len(session.desired_tokens),
                     "cadence_sec": int(session.cadence_sec),
+                    "reasons": self._session_reasons(underlying),
                 }
             )
         return result
+
+    def _session_reasons(self, underlying: str) -> List[str]:
+        reasons: List[str] = []
+        if underlying in self.always_on:
+            reasons.append("always_on")
+        pin_reasons = self.pins.get(underlying, set())
+        reasons.extend(
+            reason for reason in ("position", "strategy") if reason in pin_reasons
+        )
+        if not reasons:
+            reasons.append("recent_use")
+        return reasons
 
     async def on_session_update(self, session: OptionsSession):
         """

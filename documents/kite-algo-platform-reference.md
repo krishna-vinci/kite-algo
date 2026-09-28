@@ -134,9 +134,12 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
     capped at 30 strikes per side (`backend/options/api/market_router.py:19-20`). Expiries refresh every 60 s.
   - Owner-chosen `always_on` sessions start at boot (default `NIFTY`). Any of NIFTY, BANKNIFTY, SENSEX, FINNIFTY,
     MIDCPNIFTY and BANKEX starts non-blockingly on its first read; the first read remains unavailable until its first
-    snapshot. On-demand sessions stop after 15 idle minutes by default, and after the NSE close, while always-on
-    sessions remain. `idle_stop_minutes=0` disables intraday idle stopping. When no DB row exists,
-    `OPTIONS_AUTOSTART_UNDERLYINGS` remains the always-on fallback (`options_sessions.py`, `platform/options_settings.py`).
+    snapshot. A session is also started and pinned while an active option-protection owner depends on its underlying,
+    or while a queued/starting/running hosted job has proposed an option structure on it in the last 24 hours.
+    On-demand sessions stop after 15 idle minutes by default. At the NSE close, strategy pins release and their
+    sessions stop, while active-position pins and always-on sessions remain. `idle_stop_minutes=0` disables intraday
+    idle stopping. When no DB row exists, `OPTIONS_AUTOSTART_UNDERLYINGS` remains the always-on fallback
+    (`options_sessions.py`, `backend/options/market/session_pins.py`, `platform/options_settings.py`).
   - Instrument discovery reads the active published catalog, using NFO for NIFTY, BANKNIFTY, FINNIFTY and
     MIDCPNIFTY and BFO for SENSEX and BANKEX. NIFTY/SENSEX select weekly plus monthly expiries;
     BANKNIFTY/FINNIFTY select monthlies (`backend/broker_api/instruments/instruments_repository.py`).
@@ -155,7 +158,8 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
     The 5 s limit remains the session cadence ceiling, so expect occasional stale refusals when contracts are quiet.
   - **Endpoints:** expiries, chain, mini-chain, greeks, selection/resolve, PCR, max-pain, SSE stream
     (`market_router.py:78-160`). Worker mirrors are in `backend/options/api/worker_options_router.py:159-252`.
-    Owner runtime settings are `GET/PUT /api/platform/options-settings`; each PUT is audited and applied live.
+    Owner runtime settings are `GET/PUT /api/platform/options-settings`; each PUT is audited and applied live, and
+    each session row reports its running reasons (`always_on`, `position`, `strategy`, or `recent_use`).
 - **Calendar: PARTIAL.** Covers NSE CM holidays only (`backend/broker_api/market/nse_calendar_source.py`,
   `exchange_calendar.py`). There are no imported MCX or CDS calendars; MCX is gated on its own clock instead (§5.3,
   `backend/strategies/market_session.py`), and its holidays stay unverified.
@@ -541,8 +545,8 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
 - **Owner chain settings: EXISTS.** `GET/PUT /api/platform/options-settings` persists the always-on set, cadence,
   tick-driven mode, minimum compute interval and idle stop time in the singleton `platform_options_settings` row;
   writes append `platform_options_settings_audit` and update running sessions without a restart. The response also
-  reports available underlyings and current session age/token state (`backend/api/routers/platform.py`,
-  `backend/platform/options_settings.py`).
+  reports available underlyings, current session age/token state and why each session runs (`always_on`, `position`,
+  `strategy`, or `recent_use`) (`backend/api/routers/platform.py`, `backend/platform/options_settings.py`).
 - **Expiry selectors: EXISTS.** `nearest`, `current_week`, `next_week`, `current_month` (the last expiry of the
   month), `next_month` (the last expiry of the following month) or an explicit date
   (`backend/options/market/expiry_selectors.py`). SENSEX/BANKEX selector legs resolve on BFO.

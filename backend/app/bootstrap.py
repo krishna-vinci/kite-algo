@@ -316,7 +316,9 @@ async def autostart_option_sessions(
 
     if manager is None:
         manager = OptionsSessionManager(
-            market_data_runtime, InstrumentsRepository(db=SessionLocal)
+            market_data_runtime,
+            InstrumentsRepository(db=SessionLocal),
+            session_factory=SessionLocal,
         )
     app.state.options_session_manager = manager
 

@@ -341,6 +341,7 @@ export function OptionsDataPanel() {
                 <th className="px-3 py-2 font-medium">Underlying</th>
                 <th className="px-3 py-2 font-medium">Running</th>
                 <th className="px-3 py-2 font-medium">Always-on</th>
+                <th className="px-3 py-2 font-medium">Reasons</th>
                 <th className="px-3 py-2 font-medium">Last used</th>
                 <th className="px-3 py-2 font-medium">Last update</th>
                 <th className="px-3 py-2 font-medium text-right">Tokens</th>
@@ -356,6 +357,7 @@ export function OptionsDataPanel() {
                     </StatusBadge>
                   </td>
                   <td className="px-3 py-2 text-foreground/70">{session.always_on ? "Yes" : "No"}</td>
+                  <td className="px-3 py-2 text-foreground/70">{session.reasons?.join(", ") || "—"}</td>
                   <td className="px-3 py-2 font-mono text-foreground/60">{formatAge(session.last_used_age_s)}</td>
                   <td className="px-3 py-2 font-mono text-foreground/60">{formatAge(session.updated_age_s)}</td>
                   <td className="px-3 py-2 text-right font-mono text-foreground/60">{session.desired_tokens}</td>
@@ -363,7 +365,7 @@ export function OptionsDataPanel() {
               ))}
               {data.sessions.length === 0 && (
                 <tr>
-                  <td colSpan={6} className="px-3 py-4 text-center text-foreground/40">
+                  <td colSpan={7} className="px-3 py-4 text-center text-foreground/40">
                     No sessions running.
                   </td>
                 </tr>
