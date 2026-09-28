@@ -13,9 +13,10 @@ from backend.broker_api.instruments.instruments_repository import InstrumentsRep
 from backend.broker_api.orders.market_runtime_client import MarketDataRuntime
 from backend.broker_api.options.options_greeks import (
     black76_greeks,
+    black76_greeks_arrays,
     implied_vol_from_price_black76,
 )
-from backend.broker_api.core.redis_events import get_redis, publish_event
+from backend.broker_api.core.redis_events import get_redis
 from backend.options.market.redis_cache import (
     OPTION_SNAPSHOT_TTL_SECONDS,
     option_snapshot_v1_key,
@@ -25,6 +26,7 @@ from backend.options.market.redis_cache import (
 from backend.options.market.analytics.max_pain import compute_bounded_max_pain
 from backend.options.market.analytics.pcr import compute_put_call_ratio
 from backend.options.market.snapshots import build_bounded_strike_window
+from backend.platform.options_settings import AVAILABLE_OPTION_UNDERLYINGS
 
 
 # Configure logging
@@ -38,7 +40,7 @@ OPTIONS_SESSIONS_USE_VECTORIZED = True
 # Underlyings whose option-chain sessions start automatically at boot and that an
 # admission/read path is allowed to start on demand. The CSV env var keeps the
 # set operator-controlled; names outside it are ignored rather than guessed.
-DEFAULT_AUTOSTART_UNDERLYINGS = ("NIFTY", "BANKNIFTY", "SENSEX")
+DEFAULT_AUTOSTART_UNDERLYINGS = ("NIFTY",)
 
 
 def autostart_underlyings() -> List[str]:
@@ -80,6 +82,27 @@ def rank_tokens(ranks: Mapping[int, tuple], cap: int) -> tuple[List[int], List[i
     return ordered[:cap], ordered[cap:]
 
 
+def _snapshot_market_digest(snapshot: Mapping[str, Any]) -> tuple:
+    """Return the cheap market-value subset that warrants a Redis publish."""
+    expiries = []
+    for expiry_key, expiry_data in sorted((snapshot.get("per_expiry") or {}).items()):
+        rows = []
+        for row in expiry_data.get("rows") or []:
+            sides = []
+            for option_type in ("CE", "PE"):
+                contract = row.get(option_type) or row.get(option_type.lower()) or {}
+                sides.append(
+                    (
+                        contract.get("ltp"),
+                        contract.get("iv"),
+                        contract.get("oi"),
+                    )
+                )
+            rows.append((row.get("strike"), *sides))
+        expiries.append((expiry_key, expiry_data.get("forward"), tuple(rows)))
+    return tuple(expiries)
+
+
 class OptionsSession:
     """
     Manages the state and computation for a single underlying's options session.
@@ -106,6 +129,14 @@ class OptionsSession:
         else:
             self._dirty = asyncio.Event()
         self._last_compute_monotonic = 0.0
+        self.tick_driven = bool(getattr(manager, "tick_driven", True))
+        self.min_interval_sec = float(
+            getattr(
+                manager,
+                "min_interval_sec",
+                max(0.25, float(os.getenv("OPTIONS_CHAIN_MIN_INTERVAL_S", "1.0"))),
+            )
+        )
 
         # Session state
         self.spot_token: Optional[int] = None
@@ -121,9 +152,10 @@ class OptionsSession:
         self.last_expiry_refresh_ts: Optional[datetime] = None
         
         # Instrument cache
-        self._instrument_cache: Dict[str, Dict[str, Any]] = {}
-        self._cache_ts: Dict[str, datetime] = {}
+        self._instrument_cache: Dict[Any, Any] = {}
+        self._cache_ts: Dict[Any, datetime] = {}
         self._cache_ttl = timedelta(seconds=60)
+        self._max_pain_cache: Dict[str, tuple[float, Optional[float]]] = {}
 
     def _dirty_event(self) -> asyncio.Event:
         if self._dirty is None:
@@ -223,7 +255,7 @@ class OptionsSession:
         # Initial expiry selection
         await self._refresh_expiries()
 
-    def _get_cached_instruments(self, cache_key: str, fetch_func) -> Dict[str, Any]:
+    def _get_cached_instruments(self, cache_key: Any, fetch_func) -> Any:
         """
         Retrieves data from the in-memory cache or executes the fetch function
         if the cache is stale or the key does not exist.
@@ -285,12 +317,17 @@ class OptionsSession:
                 ):
                     await self._refresh_expiries()
 
-                try:
-                    await asyncio.wait_for(self._dirty_event().wait(), timeout=self.cadence_sec)
-                except asyncio.TimeoutError:
-                    pass
+                if self.tick_driven:
+                    try:
+                        await asyncio.wait_for(
+                            self._dirty_event().wait(), timeout=self.cadence_sec
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+                else:
+                    await asyncio.sleep(self.cadence_sec)
                 self._dirty_event().clear()
-                min_gap = max(0.25, float(os.getenv("OPTIONS_CHAIN_MIN_INTERVAL_S", "1.0")))
+                min_gap = max(0.25, float(self.min_interval_sec))
                 wait = min_gap - (time.monotonic() - self._last_compute_monotonic)
                 if wait > 0:
                     await asyncio.sleep(wait)
@@ -453,6 +490,44 @@ class OptionsSession:
                     sorted_strikes, atm_strike, forward, T, sigma_expiry, inst_by_strike
                 )
 
+                greeks_by_contract: Dict[tuple[float, str], Dict[str, float]] = {}
+                greeks_contracts = [
+                    (strike, option_type, float(per_strike_sigma[i]))
+                    for i, strike in enumerate(sorted_strikes)
+                    if forward
+                    and T > MIN_T
+                    and per_strike_sigma[i] is not None
+                    and not np.isnan(per_strike_sigma[i])
+                    for option_type in ("CE", "PE")
+                    if inst_by_strike.get(strike, {}).get(option_type)
+                ]
+                if greeks_contracts:
+                    try:
+                        delta, gamma, theta, vega = black76_greeks_arrays(
+                            np.array(
+                                [option_type == "CE" for _, option_type, _ in greeks_contracts],
+                                dtype=np.bool_,
+                            ),
+                            float(forward),
+                            np.array([strike for strike, _, _ in greeks_contracts], dtype=np.float64),
+                            T,
+                            np.array([sigma for _, _, sigma in greeks_contracts], dtype=np.float64),
+                        )
+                        for index, (strike, option_type, _) in enumerate(greeks_contracts):
+                            greeks_by_contract[(strike, option_type)] = {
+                                "delta": float(delta[index]),
+                                "gamma": float(gamma[index]),
+                                "theta": float(theta[index]) / 365.0,
+                                "vega": float(vega[index]) / 100.0,
+                                "rho": 0.0,
+                            }
+                    except Exception as e:
+                        logger.error(
+                            f"[{self.underlying}] Expiry Greeks computation failed for "
+                            f"{expiry_str}: {e}",
+                            exc_info=True,
+                        )
+
                 rows = []
                 for i, strike in enumerate(sorted_strikes):
                     row = {"strike": strike, "CE": None, "PE": None}
@@ -466,35 +541,7 @@ class OptionsSession:
                         tick = self.manager.market_data.latest_ticks.get(inst["instrument_token"])
                         ltp = tick.get("last_price") if tick else None
 
-                        greeks = {}
-                        if (
-                            forward
-                            and T > MIN_T
-                            and strike_sigma is not None
-                            and not np.isnan(strike_sigma)
-                        ):
-                            try:
-                                greeks_unit = black76_greeks(
-                                    option_type, forward, strike, T, float(strike_sigma)
-                                )
-                                greeks = {
-                                    "delta": greeks_unit.get("delta"),
-                                    "gamma": greeks_unit.get("gamma"),
-                                    "theta": greeks_unit.get("theta", 0.0) / 365.0
-                                    if greeks_unit.get("theta") is not None
-                                    else None,
-                                    "vega": greeks_unit.get("vega", 0.0) / 100.0
-                                    if greeks_unit.get("vega") is not None
-                                    else None,
-                                    "rho": greeks_unit.get("rho"),
-                                }
-                            except Exception as e:
-                                logger.error(
-                                    f"[{self.underlying}] Per-strike Greeks computation failed for "
-                                    f"{expiry_str} strike={strike}: {e}",
-                                    exc_info=True,
-                                )
-                                greeks = {}
+                        greeks = greeks_by_contract.get((strike, option_type), {})
 
                         exchange_ts = tick.get("exchange_timestamp") if tick else None
                         stale_age_sec = None
@@ -522,7 +569,7 @@ class OptionsSession:
                     rows.append(row)
 
                 pcr = compute_put_call_ratio(rows)
-                max_pain = compute_bounded_max_pain(rows)
+                max_pain = self._cached_max_pain(expiry_str, rows)
 
                 per_expiry_data[expiry_str] = {
                     "forward": forward,
@@ -659,7 +706,7 @@ class OptionsSession:
                     rows.append(row)
 
                 pcr = compute_put_call_ratio(rows)
-                max_pain = compute_bounded_max_pain(rows)
+                max_pain = self._cached_max_pain(expiry_str, rows)
 
                 per_expiry_data[expiry_str] = {
                     "forward": forward,
@@ -675,6 +722,20 @@ class OptionsSession:
             token_ranks = {int(t): (1, 0, 0) for t in new_desired_tokens}
 
         return per_expiry_data, new_desired_tokens, spot_ltp, token_ranks
+
+    def _cached_max_pain(
+        self, expiry_key: str, rows: Sequence[Mapping[str, Any]]
+    ) -> Optional[float]:
+        now = time.monotonic()
+        refresh_seconds = max(
+            0.0, float(os.getenv("OPTIONS_MAX_PAIN_REFRESH_S", "30"))
+        )
+        cached = self._max_pain_cache.get(expiry_key)
+        if cached is not None and now - cached[0] < refresh_seconds:
+            return cached[1]
+        value = compute_bounded_max_pain(rows)
+        self._max_pain_cache[expiry_key] = (now, value)
+        return value
 
     def _expiry_window(
         self,
@@ -812,7 +873,13 @@ class OptionsSession:
         )[:3]
         if float(atm_strike) not in candidates:
             candidates.append(float(atm_strike))
-        instruments = repo.get_option_instruments_for_strikes(self.underlying, expiry, candidates)
+        cache_key = (self.underlying, expiry, tuple(candidates))
+        instruments = self._get_cached_instruments(
+            cache_key,
+            lambda: repo.get_option_instruments_for_strikes(
+                self.underlying, expiry, candidates
+            ),
+        )
         prices: Dict[float, Dict[str, Optional[float]]] = {}
         for inst in instruments:
             tick = ticks.get(inst["instrument_token"])
@@ -897,14 +964,74 @@ class OptionsSessionManager:
         self.owner_id = "backend:options-sessions"
         self.dropped_tokens: Dict[str, int] = {}
         self._token_sessions: Dict[int, set[str]] = {}
+        self._last_publish_digest: Dict[str, tuple] = {}
+        self._last_redis_set_monotonic: Dict[str, float] = {}
+        self.always_on: set[str] = set()
+        self.cadence_sec = 5
+        self.tick_driven = True
+        self.min_interval_sec = max(
+            0.25, float(os.getenv("OPTIONS_CHAIN_MIN_INTERVAL_S", "1.0"))
+        )
+        self.idle_stop_minutes = 15
+        self.last_used: Dict[str, float] = {}
+        self._ensure_tasks: Dict[str, asyncio.Task] = {}
+        self._reaper_task: Optional[asyncio.Task] = None
         self._unsubscribe_tick_listener: Optional[Callable[[], None]] = None
         if hasattr(self.market_data, "add_tick_listener"):
             self._unsubscribe_tick_listener = self.market_data.add_tick_listener(self._on_tick)
+        self._ensure_reaper_started()
 
     def close(self) -> None:
+        if self._reaper_task is not None:
+            self._reaper_task.cancel()
+            self._reaper_task = None
+        for task in self._ensure_tasks.values():
+            task.cancel()
+        self._ensure_tasks.clear()
         if self._unsubscribe_tick_listener:
             self._unsubscribe_tick_listener()
             self._unsubscribe_tick_listener = None
+
+    def _ensure_reaper_started(self) -> None:
+        if self._reaper_task is not None and not self._reaper_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._reaper_task = loop.create_task(self._reaper_loop())
+
+    async def _reaper_loop(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(60)
+                await self._reap_idle_sessions()
+        except asyncio.CancelledError:
+            return
+
+    async def _reap_idle_sessions(
+        self, *, now_monotonic: Optional[float] = None
+    ) -> None:
+        """Stop idle on-demand sessions, and all on-demand sessions after close."""
+        from backend.strategies.market_session import session_state
+
+        now_value = time.monotonic() if now_monotonic is None else now_monotonic
+        market = session_state("NFO")
+        local_time = datetime.now(IST).time().replace(tzinfo=None)
+        after_market_close = (
+            market.get("reason") == "after_close"
+            and local_time.hour * 60 + local_time.minute >= 15 * 60 + 35
+        )
+        for underlying in list(self.sessions):
+            if underlying in self.always_on:
+                continue
+            last_used = self.last_used.get(underlying, now_value)
+            idle = (
+                self.idle_stop_minutes > 0
+                and now_value - last_used > self.idle_stop_minutes * 60
+            )
+            if after_market_close or idle:
+                await self.stop_session(underlying)
 
     def _on_tick(self, token: int, tick: Dict[str, Any]) -> None:
         for underlying in tuple(self._token_sessions.get(int(token), ())):
@@ -955,10 +1082,35 @@ class OptionsSessionManager:
 
         session = OptionsSession(underlying, self, window_size, cadence_sec)
         self.sessions[underlying] = session
+        self.last_used.setdefault(underlying, time.monotonic())
+        self._ensure_reaper_started()
         await session.start()
 
+    async def apply_settings(self, settings: Any) -> Dict[str, bool]:
+        """Apply persisted settings to running sessions without a restart."""
+        self.always_on = set(settings.always_on)
+        self.cadence_sec = int(settings.cadence_sec)
+        self.tick_driven = bool(settings.tick_driven)
+        self.min_interval_sec = float(settings.min_interval_sec)
+        self.idle_stop_minutes = int(settings.idle_stop_minutes)
+
+        for session in list(self.sessions.values()):
+            session.tick_driven = self.tick_driven
+            session.min_interval_sec = self.min_interval_sec
+            await session.update_config(session.window_size, self.cadence_sec)
+
+        results: Dict[str, bool] = {}
+        for underlying in settings.always_on:
+            results[underlying] = await self.ensure_session(
+                underlying, cadence_sec=self.cadence_sec
+            )
+        return results
+
     async def ensure_session(
-        self, underlying: str, window_size: int = 12, cadence_sec: int = 5
+        self,
+        underlying: str,
+        window_size: int = 12,
+        cadence_sec: Optional[int] = None,
     ) -> bool:
         """Start ``underlying``'s session if it is missing; idempotent and bounded.
 
@@ -970,12 +1122,16 @@ class OptionsSessionManager:
         """
         normalized, _ = self.instrument_repo.normalize_underlying_symbol(underlying)
         normalized = str(normalized or "").strip().upper()
-        if not normalized or normalized not in autostart_underlyings():
+        if not normalized or normalized not in AVAILABLE_OPTION_UNDERLYINGS:
             return False
         if normalized in self.sessions:
             return True
         try:
-            await self.start_session(normalized, window_size, cadence_sec)
+            await self.start_session(
+                normalized,
+                window_size,
+                self.cadence_sec if cadence_sec is None else cadence_sec,
+            )
             await self._converge_subscriptions()
         except Exception as exc:  # noqa: BLE001 - a failed start is a False, not a crash
             self.sessions.pop(normalized, None)
@@ -998,8 +1154,37 @@ class OptionsSessionManager:
         """
         Returns the latest snapshot for an underlying.
         """
-        session = self.sessions.get(underlying)
+        normalized, _ = self.instrument_repo.normalize_underlying_symbol(underlying)
+        normalized = str(normalized or "").strip().upper()
+        self.touch(normalized)
+        session = self.sessions.get(normalized)
+        if session is None:
+            self._schedule_ensure(normalized)
         return session.snapshot if session else None
+
+    def touch(self, underlying: str) -> None:
+        normalized = str(underlying or "").strip().upper()
+        if normalized:
+            self.last_used[normalized] = time.monotonic()
+
+    def _schedule_ensure(self, underlying: str) -> None:
+        if underlying not in AVAILABLE_OPTION_UNDERLYINGS:
+            return
+        existing = self._ensure_tasks.get(underlying)
+        if existing is not None and not existing.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(self.ensure_session(underlying))
+        self._ensure_tasks[underlying] = task
+
+        def _finished(done: asyncio.Task, symbol: str = underlying) -> None:
+            if self._ensure_tasks.get(symbol) is done:
+                self._ensure_tasks.pop(symbol, None)
+
+        task.add_done_callback(_finished)
 
     def get_watchlist(self) -> List[Dict[str, Any]]:
         """
@@ -1014,6 +1199,40 @@ class OptionsSessionManager:
             for s in self.sessions.values()
         ]
 
+    def get_session_status(self) -> List[Dict[str, Any]]:
+        """Current session state for the owner settings response."""
+        now_monotonic = time.monotonic()
+        now_utc = datetime.now(timezone.utc)
+        result: List[Dict[str, Any]] = []
+        for underlying, session in sorted(self.sessions.items()):
+            last_used = self.last_used.get(underlying)
+            updated_age = None
+            updated_at = (getattr(session, "snapshot", {}) or {}).get("updated_at")
+            if updated_at:
+                try:
+                    stamp = datetime.fromisoformat(str(updated_at).replace("Z", "+00:00"))
+                    if stamp.tzinfo is None:
+                        stamp = stamp.replace(tzinfo=timezone.utc)
+                    updated_age = max(0.0, (now_utc - stamp).total_seconds())
+                except (TypeError, ValueError):
+                    updated_age = None
+            result.append(
+                {
+                    "underlying": underlying,
+                    "running": bool(session.is_running),
+                    "always_on": underlying in self.always_on,
+                    "last_used_age_s": (
+                        max(0.0, now_monotonic - last_used)
+                        if last_used is not None
+                        else None
+                    ),
+                    "updated_age_s": updated_age,
+                    "desired_tokens": len(session.desired_tokens),
+                    "cadence_sec": int(session.cadence_sec),
+                }
+            )
+        return result
+
     async def on_session_update(self, session: OptionsSession):
         """
         Callback from a session when it has a new snapshot.
@@ -1023,13 +1242,24 @@ class OptionsSessionManager:
             redis_client = get_redis()
             v1_snapshot_key = option_snapshot_v1_key(session.underlying)
             v1_pub_channel = option_snapshot_v1_updates_channel(session.underlying)
-            pub_channel = f"options:updates:{session.underlying}"
-
-            v1_payload_json = serialize_option_snapshot_v1(session.snapshot, session.underlying)
-            await redis_client.set(v1_snapshot_key, v1_payload_json, ex=OPTION_SNAPSHOT_TTL_SECONDS)
-            await redis_client.publish(v1_pub_channel, v1_payload_json)
-
-            await publish_event(pub_channel, session.snapshot)
+            digest = _snapshot_market_digest(session.snapshot)
+            previous_digest = self._last_publish_digest.get(session.underlying)
+            changed = previous_digest != digest
+            now = time.monotonic()
+            last_set = self._last_redis_set_monotonic.get(session.underlying, 0.0)
+            if changed or now - last_set >= 5.0:
+                v1_payload_json = serialize_option_snapshot_v1(
+                    session.snapshot, session.underlying
+                )
+                await redis_client.set(
+                    v1_snapshot_key,
+                    v1_payload_json,
+                    ex=OPTION_SNAPSHOT_TTL_SECONDS,
+                )
+                self._last_redis_set_monotonic[session.underlying] = now
+                if changed:
+                    await redis_client.publish(v1_pub_channel, v1_payload_json)
+                    self._last_publish_digest[session.underlying] = digest
         except Exception as e:
             logger.warning(f"Redis operation failed: {e}")
 

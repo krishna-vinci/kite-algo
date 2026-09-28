@@ -1,3 +1,5 @@
+import random
+
 from backend.options.market.analytics.max_pain import compute_bounded_max_pain
 from backend.options.market.analytics.pcr import compute_put_call_ratio
 from backend.options.market.snapshots import build_bounded_strike_window, build_mini_chain_view
@@ -46,3 +48,40 @@ def test_compute_bounded_max_pain_returns_minimum_pain_strike():
         ]
     )
     assert strike == 110.0
+
+
+def _legacy_max_pain(rows):
+    pains = {}
+    for candidate in [float(row["strike"]) for row in rows]:
+        pain = 0.0
+        for row in rows:
+            row_strike = float(row["strike"])
+            ce = row.get("ce") or row.get("CE") or {}
+            pe = row.get("pe") or row.get("PE") or {}
+            pain += max(0.0, candidate - row_strike) * float(ce.get("oi") or 0.0)
+            pain += max(0.0, row_strike - candidate) * float(pe.get("oi") or 0.0)
+        pains[candidate] = pain
+    return min(sorted(pains), key=lambda strike: pains[strike])
+
+
+def test_vectorized_max_pain_matches_legacy_oracle_on_randomized_oi():
+    randomizer = random.Random(20260928)
+    strikes = [18000 + 50 * index for index in range(61)]
+    for _ in range(5):
+        rows = [
+            {
+                "strike": strike,
+                "CE": {"oi": randomizer.randint(0, 100_000)},
+                "PE": {"oi": randomizer.randint(0, 100_000)},
+            }
+            for strike in strikes
+        ]
+        assert compute_bounded_max_pain(rows) == _legacy_max_pain(rows)
+
+
+def test_vectorized_max_pain_uses_lowest_strike_tie_break():
+    rows = [
+        {"strike": 100, "CE": {"oi": 0}, "PE": {"oi": 0}},
+        {"strike": 110, "CE": {"oi": 0}, "PE": {"oi": 0}},
+    ]
+    assert compute_bounded_max_pain(rows) == 100.0

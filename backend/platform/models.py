@@ -14,6 +14,7 @@ a convention two callers can disagree about.
 from __future__ import annotations
 
 from sqlalchemy import (
+    Boolean,
     Column,
     CheckConstraint,
     DateTime,
@@ -29,6 +30,7 @@ from backend.workflows.repository import Base
 
 #: The only ``settings_id`` the singleton row may carry.
 LIVE_SETTINGS_SINGLETON_ID = 1
+OPTIONS_SETTINGS_SINGLETON_ID = 1
 
 
 class PlatformLiveSetting(Base):
@@ -85,8 +87,62 @@ class PlatformLiveSettingAudit(Base):
     __table_args__ = (Index("idx_platform_live_settings_audit_created", "created_at"),)
 
 
+class PlatformOptionsSetting(Base):
+    """The single DB-backed option-chain runtime configuration row."""
+
+    __tablename__ = "platform_options_settings"
+
+    settings_id = Column(Integer, primary_key=True, default=OPTIONS_SETTINGS_SINGLETON_ID)
+    always_on = Column(JSON, nullable=False, default=list)
+    cadence_sec = Column(Integer, nullable=False)
+    tick_driven = Column(Boolean, nullable=False)
+    min_interval_sec = Column(Numeric(6, 2), nullable=False)
+    idle_stop_minutes = Column(Integer, nullable=False)
+    updated_by = Column(Text, nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            f"settings_id = {OPTIONS_SETTINGS_SINGLETON_ID}",
+            name="ck_platform_options_settings_singleton",
+        ),
+    )
+
+
+class PlatformOptionsSettingAudit(Base):
+    """Append-only old-to-new audit trail for option-chain settings."""
+
+    __tablename__ = "platform_options_settings_audit"
+
+    audit_id = Column(Integer, primary_key=True, autoincrement=True)
+    actor_id = Column(Text, nullable=False)
+    reason = Column(Text, nullable=True)
+    previous_always_on = Column(JSON, nullable=False, default=list)
+    always_on = Column(JSON, nullable=False, default=list)
+    previous_cadence_sec = Column(Integer, nullable=False)
+    cadence_sec = Column(Integer, nullable=False)
+    previous_tick_driven = Column(Boolean, nullable=False)
+    tick_driven = Column(Boolean, nullable=False)
+    previous_min_interval_sec = Column(Numeric(6, 2), nullable=False)
+    min_interval_sec = Column(Numeric(6, 2), nullable=False)
+    previous_idle_stop_minutes = Column(Integer, nullable=False)
+    idle_stop_minutes = Column(Integer, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index("idx_platform_options_settings_audit_created", "created_at"),
+    )
+
+
 __all__ = [
     "LIVE_SETTINGS_SINGLETON_ID",
+    "OPTIONS_SETTINGS_SINGLETON_ID",
     "PlatformLiveSetting",
     "PlatformLiveSettingAudit",
+    "PlatformOptionsSetting",
+    "PlatformOptionsSettingAudit",
 ]

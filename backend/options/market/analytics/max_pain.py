@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Sequence
 
+import numpy as np
+
 
 def _extract_numeric(value: Any) -> float:
     try:
@@ -32,30 +34,33 @@ def compute_bounded_max_pain(rows: Sequence[Mapping[str, Any]]) -> float | None:
     if not strikes:
         return None
 
-    pains: dict[float, float] = {}
-    for candidate in strikes:
-        pain = 0.0
-        for row in rows:
-            strike_raw = row.get("strike")
-            if strike_raw is None:
-                continue
-            try:
-                row_strike = float(strike_raw)
-            except (TypeError, ValueError):
-                continue
+    valid_rows = []
+    for row in rows:
+        strike_raw = row.get("strike")
+        if strike_raw is None:
+            continue
+        try:
+            row_strike = float(strike_raw)
+        except (TypeError, ValueError):
+            continue
+        ce = row.get("ce") or row.get("CE") or {}
+        pe = row.get("pe") or row.get("PE") or {}
+        valid_rows.append(
+            (
+                row_strike,
+                _extract_numeric((ce or {}).get("oi")),
+                _extract_numeric((pe or {}).get("oi")),
+            )
+        )
 
-            ce = row.get("ce") or row.get("CE") or {}
-            pe = row.get("pe") or row.get("PE") or {}
-            ce_oi = _extract_numeric((ce or {}).get("oi"))
-            pe_oi = _extract_numeric((pe or {}).get("oi"))
-
-            # CE writers lose when settlement is above their strike.
-            call_pain = max(0.0, candidate - row_strike) * ce_oi
-            # PE writers lose when settlement is below their strike.
-            put_pain = max(0.0, row_strike - candidate) * pe_oi
-            pain += call_pain + put_pain
-
-        pains[candidate] = pain
+    row_strikes = np.asarray([row[0] for row in valid_rows], dtype=np.float64)
+    ce_oi = np.asarray([row[1] for row in valid_rows], dtype=np.float64)
+    pe_oi = np.asarray([row[2] for row in valid_rows], dtype=np.float64)
+    candidates = np.asarray(strikes, dtype=np.float64)
+    call_pain = np.maximum(candidates[:, None] - row_strikes[None, :], 0.0) * ce_oi
+    put_pain = np.maximum(row_strikes[None, :] - candidates[:, None], 0.0) * pe_oi
+    pains = np.sum(call_pain + put_pain, axis=1)
 
     # Deterministic tie-break: lowest strike among minimal pain values.
-    return min(sorted(pains), key=lambda strike: pains[strike])
+    minimum = np.min(pains)
+    return float(np.min(candidates[pains == minimum]))

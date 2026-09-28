@@ -10,7 +10,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from backend.platform.options_settings import AVAILABLE_OPTION_UNDERLYINGS
 
 
 class PlatformLanes(BaseModel):
@@ -56,6 +58,61 @@ class PlatformLiveSettingsUpdateRequest(BaseModel):
     account_daily_loss_cap_inr: Optional[float] = Field(default=None, ge=0)
     #: Recorded in the audit row. Optional, never a caller identity.
     reason: Optional[str] = Field(default=None, max_length=1000)
+
+
+class PlatformOptionsSessionStatus(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    underlying: str
+    running: bool
+    always_on: bool
+    last_used_age_s: Optional[float] = None
+    updated_age_s: Optional[float] = None
+    desired_tokens: int
+    cadence_sec: int
+
+
+class PlatformOptionsSettingsResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    always_on: List[str]
+    available_underlyings: List[str]
+    cadence_sec: int
+    tick_driven: bool
+    min_interval_sec: float
+    idle_stop_minutes: int
+    source: Literal["db", "default"]
+    updated_at: Optional[datetime] = None
+    updated_by: Optional[str] = None
+    sessions: List[PlatformOptionsSessionStatus] = Field(default_factory=list)
+
+
+class PlatformOptionsSettingsUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    always_on: List[str] = Field(max_length=3)
+    cadence_sec: int = Field(ge=1, le=10, strict=True)
+    tick_driven: bool
+    min_interval_sec: float = Field(ge=0.25, le=10)
+    idle_stop_minutes: int = Field(ge=0, le=390, strict=True)
+    reason: Optional[str] = Field(default=None, max_length=1000)
+
+    @field_validator("always_on")
+    @classmethod
+    def validate_always_on(cls, value: List[str]) -> List[str]:
+        normalized = [str(item or "").strip().upper() for item in value]
+        unsupported = [item for item in normalized if item not in AVAILABLE_OPTION_UNDERLYINGS]
+        if unsupported:
+            raise ValueError(f"unsupported option underlyings: {', '.join(unsupported)}")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("always_on entries must be unique")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_minimum_interval(self):
+        if self.min_interval_sec > self.cadence_sec:
+            raise ValueError("min_interval_sec must be less than or equal to cadence_sec")
+        return self
 
 
 class KillSwitchRequest(BaseModel):
@@ -198,6 +255,9 @@ __all__ = [
     "PlatformLiveSettingsUpdateRequest",
     "PlatformLiveStatus",
     "PlatformMarketDataStatus",
+    "PlatformOptionsSessionStatus",
+    "PlatformOptionsSettingsResponse",
+    "PlatformOptionsSettingsUpdateRequest",
     "PlatformRiskStatus",
     "PlatformStatusResponse",
     "PlatformStrategyRunnerStatus",

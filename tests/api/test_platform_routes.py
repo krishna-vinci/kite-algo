@@ -44,9 +44,12 @@ from backend.app.auth import AppUser  # noqa: E402
 from backend.broker_api.session.kite_session import KiteSession  # noqa: E402,F401
 from backend.platform import settings as platform_settings  # noqa: E402
 from backend.platform import status as platform_status  # noqa: E402
+from backend.platform.options_settings import AVAILABLE_OPTION_UNDERLYINGS  # noqa: E402
 from backend.platform.models import (  # noqa: E402
     PlatformLiveSetting,
     PlatformLiveSettingAudit,
+    PlatformOptionsSetting,
+    PlatformOptionsSettingAudit,
 )
 from backend.strategies.attribution_models import StrategyPlan  # noqa: E402
 from backend.strategies.models import (  # noqa: E402
@@ -150,6 +153,24 @@ def _audit_rows(session_factory):
             session.execute(
                 select(PlatformLiveSettingAudit).order_by(
                     PlatformLiveSettingAudit.audit_id
+                )
+            ).scalars()
+        )
+
+
+def _options_session_row(session_factory):
+    with session_factory() as session:
+        return session.execute(
+            select(PlatformOptionsSetting).where(PlatformOptionsSetting.settings_id == 1)
+        ).scalar_one_or_none()
+
+
+def _options_audit_rows(session_factory):
+    with session_factory() as session:
+        return list(
+            session.execute(
+                select(PlatformOptionsSettingAudit).order_by(
+                    PlatformOptionsSettingAudit.audit_id
                 )
             ).scalars()
         )
@@ -344,6 +365,115 @@ async def test_a_lane_outside_the_contract_and_a_cross_origin_put_are_refused(
     assert _audit_rows(session_factory) == []
 
 
+# ---------------------------------------------------------------------------
+# option-chain settings
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_options_settings_get_returns_defaults(client, session_factory, monkeypatch):
+    monkeypatch.delenv("OPTIONS_AUTOSTART_UNDERLYINGS", raising=False)
+    response = await client.get(f"{BASE}/options-settings")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "always_on": ["NIFTY"],
+        "available_underlyings": list(AVAILABLE_OPTION_UNDERLYINGS),
+        "cadence_sec": 5,
+        "tick_driven": True,
+        "min_interval_sec": 1.0,
+        "idle_stop_minutes": 15,
+        "source": "default",
+        "updated_at": None,
+        "updated_by": None,
+        "sessions": [],
+    }
+    assert _options_session_row(session_factory) is None
+
+
+@pytest.mark.asyncio
+async def test_options_settings_put_round_trips_and_appends_audit(
+    client, session_factory, monkeypatch
+):
+    monkeypatch.delenv("OPTIONS_AUTOSTART_UNDERLYINGS", raising=False)
+    payload = {
+        "always_on": ["NIFTY", "SENSEX"],
+        "cadence_sec": 4,
+        "tick_driven": False,
+        "min_interval_sec": 0.5,
+        "idle_stop_minutes": 20,
+        "reason": "owner tuned chain load",
+    }
+    response = await client.put(f"{BASE}/options-settings", json=payload)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["always_on"] == ["NIFTY", "SENSEX"]
+    assert body["cadence_sec"] == 4
+    assert body["tick_driven"] is False
+    assert body["min_interval_sec"] == 0.5
+    assert body["idle_stop_minutes"] == 20
+    assert body["source"] == "db"
+    assert body["updated_by"] == OWNER
+    assert body["updated_at"] is not None
+    assert (await client.get(f"{BASE}/options-settings")).json() == body
+
+    row = _options_session_row(session_factory)
+    assert row.always_on == ["NIFTY", "SENSEX"]
+    audits = _options_audit_rows(session_factory)
+    assert len(audits) == 1
+    assert audits[0].actor_id == OWNER
+    assert audits[0].reason == "owner tuned chain load"
+    assert audits[0].previous_always_on == ["NIFTY"]
+    assert audits[0].always_on == ["NIFTY", "SENSEX"]
+    assert audits[0].previous_cadence_sec == 5
+    assert audits[0].cadence_sec == 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"always_on": ["NIFTY", "BANKNIFTY", "SENSEX", "FINNIFTY"]},
+        {"always_on": ["NIFTY", "UNKNOWN"]},
+        {"cadence_sec": 0},
+        {"min_interval_sec": 0.1},
+        {"cadence_sec": 1, "min_interval_sec": 2.0},
+        {"idle_stop_minutes": 391},
+    ],
+)
+async def test_options_settings_validation_returns_422(client, session_factory, patch):
+    payload = {
+        "always_on": ["NIFTY"],
+        "cadence_sec": 5,
+        "tick_driven": True,
+        "min_interval_sec": 1.0,
+        "idle_stop_minutes": 15,
+    }
+    payload.update(patch)
+    response = await client.put(f"{BASE}/options-settings", json=payload)
+    assert response.status_code == 422, response.text
+    assert _options_session_row(session_factory) is None
+    assert _options_audit_rows(session_factory) == []
+
+
+@pytest.mark.asyncio
+async def test_options_settings_put_enforces_same_origin(client, session_factory):
+    response = await client.put(
+        f"{BASE}/options-settings",
+        json={
+            "always_on": ["NIFTY"],
+            "cadence_sec": 5,
+            "tick_driven": True,
+            "min_interval_sec": 1.0,
+            "idle_stop_minutes": 15,
+        },
+        headers={"Origin": "https://evil.example"},
+    )
+    assert response.status_code == 403, response.text
+    assert _options_session_row(session_factory) is None
+
+
 @pytest.mark.asyncio
 async def test_the_platform_routes_require_an_app_session(session_factory, monkeypatch):
     from backend.app import auth as auth_module
@@ -358,11 +488,24 @@ async def test_the_platform_routes_require_an_app_session(session_factory, monke
         transport=httpx.ASGITransport(app=application), base_url="http://test"
     ) as anonymous:
         assert (await anonymous.get(f"{BASE}/live-settings")).status_code == 401
+        assert (await anonymous.get(f"{BASE}/options-settings")).status_code == 401
         assert (await anonymous.get(f"{BASE}/status")).status_code == 401
         assert (await anonymous.get(PENDING)).status_code == 401
         assert (
             await anonymous.put(
                 f"{BASE}/live-settings", json={"lanes": {}, "reason": "x"}
+            )
+        ).status_code == 401
+        assert (
+            await anonymous.put(
+                f"{BASE}/options-settings",
+                json={
+                    "always_on": ["NIFTY"],
+                    "cadence_sec": 5,
+                    "tick_driven": True,
+                    "min_interval_sec": 1.0,
+                    "idle_stop_minutes": 15,
+                },
             )
         ).status_code == 401
 

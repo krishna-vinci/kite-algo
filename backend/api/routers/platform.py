@@ -48,6 +48,9 @@ from backend.api.schemas.platform import (
     PlatformLiveSettingsUpdateRequest,
     PlatformLiveStatus,
     PlatformMarketDataStatus,
+    PlatformOptionsSessionStatus,
+    PlatformOptionsSettingsResponse,
+    PlatformOptionsSettingsUpdateRequest,
     PlatformRiskStatus,
     PlatformStatusResponse,
     PlatformStrategyRunnerStatus,
@@ -62,6 +65,12 @@ from backend.platform.settings import (
     UNSET,
     read_live_settings,
     update_live_settings,
+)
+from backend.platform.options_settings import (
+    AVAILABLE_OPTION_UNDERLYINGS,
+    OptionsSettings,
+    read_options_settings,
+    update_options_settings,
 )
 from backend.platform.status import broker_account_view, platform_status_view
 from backend.strategies.execution_requests import ExecutionRequestService
@@ -157,6 +166,70 @@ def update_live_settings_route(
         session_factory=session_factory,
     )
     return _settings_response(session_factory=session_factory)
+
+
+def _options_settings_response(
+    request: Request, settings: OptionsSettings
+) -> PlatformOptionsSettingsResponse:
+    manager = getattr(request.app.state, "options_session_manager", None)
+    sessions = []
+    if manager is not None:
+        status = getattr(manager, "get_session_status", None)
+        if callable(status):
+            sessions = [PlatformOptionsSessionStatus(**item) for item in status()]
+    return PlatformOptionsSettingsResponse(
+        always_on=settings.always_on,
+        available_underlyings=list(AVAILABLE_OPTION_UNDERLYINGS),
+        cadence_sec=settings.cadence_sec,
+        tick_driven=settings.tick_driven,
+        min_interval_sec=settings.min_interval_sec,
+        idle_stop_minutes=settings.idle_stop_minutes,
+        source=settings.source,
+        updated_at=settings.updated_at,
+        updated_by=settings.updated_by,
+        sessions=sessions,
+    )
+
+
+@router.get(
+    "/platform/options-settings", response_model=PlatformOptionsSettingsResponse
+)
+def get_options_settings(
+    request: Request,
+    owner: str = Depends(require_strategy_owner),
+    session_factory: Any = Depends(_platform_db),
+):
+    return _options_settings_response(
+        request, read_options_settings(session_factory=session_factory)
+    )
+
+
+@router.put(
+    "/platform/options-settings", response_model=PlatformOptionsSettingsResponse
+)
+async def update_options_settings_route(
+    request: Request,
+    payload: PlatformOptionsSettingsUpdateRequest,
+    owner: str = Depends(require_strategy_owner),
+    session_factory: Any = Depends(_platform_db),
+):
+    enforce_same_origin(request)
+    settings = update_options_settings(
+        always_on=payload.always_on,
+        cadence_sec=payload.cadence_sec,
+        tick_driven=payload.tick_driven,
+        min_interval_sec=payload.min_interval_sec,
+        idle_stop_minutes=payload.idle_stop_minutes,
+        actor_id=owner,
+        reason=payload.reason,
+        session_factory=session_factory,
+    )
+    manager = getattr(request.app.state, "options_session_manager", None)
+    if manager is not None:
+        apply_settings = getattr(manager, "apply_settings", None)
+        if callable(apply_settings):
+            await apply_settings(settings)
+    return _options_settings_response(request, settings)
 
 
 @router.get("/platform/status", response_model=PlatformStatusResponse)

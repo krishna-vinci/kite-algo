@@ -141,6 +141,65 @@ def _black76_greeks_kernel(is_call: bool, F: float, K: np.ndarray, T: float, sig
             
     return delta, gamma, theta, vega
 
+
+@njit(fastmath=True, nogil=True)
+def black76_greeks_arrays(
+    is_call: np.ndarray,
+    F: float,
+    K: np.ndarray,
+    T: float,
+    sigma: np.ndarray,
+):
+    """Calculate Black-76 Greeks for mixed call/put contract arrays."""
+    n = K.shape[0]
+    delta = np.empty(n, dtype=np.float64)
+    gamma = np.empty(n, dtype=np.float64)
+    theta = np.empty(n, dtype=np.float64)
+    vega = np.empty(n, dtype=np.float64)
+
+    for i in range(n):
+        sigma_val = sigma[i]
+        if np.isnan(sigma_val):
+            delta[i] = np.nan
+            gamma[i] = np.nan
+            theta[i] = np.nan
+            vega[i] = np.nan
+            continue
+
+        strike = K[i]
+        if T <= 1e-12 or sigma_val <= 1e-12:
+            if is_call[i]:
+                if F > strike:
+                    delta[i] = 1.0
+                elif F == strike:
+                    delta[i] = 0.5
+                else:
+                    delta[i] = 0.0
+            else:
+                if F < strike:
+                    delta[i] = -1.0
+                elif F == strike:
+                    delta[i] = -0.5
+                else:
+                    delta[i] = 0.0
+            gamma[i] = 0.0
+            theta[i] = 0.0
+            vega[i] = 0.0
+            continue
+
+        sqrt_t = sqrt(T)
+        d1 = (log(F / strike) + (0.5 * sigma_val**2) * T) / (sigma_val * sqrt_t)
+        pdf_d1 = _norm_pdf_scalar(d1)
+        gamma[i] = pdf_d1 / (F * sigma_val * sqrt_t)
+        vega[i] = F * pdf_d1 * sqrt_t
+        theta[i] = -(F * pdf_d1 * sigma_val) / (2 * sqrt_t)
+        if is_call[i]:
+            delta[i] = _norm_cdf_scalar(d1)
+        else:
+            delta[i] = _norm_cdf_scalar(d1) - 1.0
+
+    return delta, gamma, theta, vega
+
 @njit(fastmath=True, nogil=True)
 def _implied_vol_kernel(is_call: bool, F: float, K: float, T: float, price: float, max_iter: int = 50, tol: float = 1e-6) -> float:
     """
@@ -309,6 +368,13 @@ def prewarm_options_engine() -> bool:
         try:
             _black76_price_kernel(True, 100.0, np.array([100.0]), 0.1, 0.2)
             _black76_greeks_kernel(True, 100.0, np.array([100.0]), 0.1, 0.2)
+            black76_greeks_arrays(
+                np.array([True]),
+                100.0,
+                np.array([100.0]),
+                0.1,
+                np.array([0.2]),
+            )
             _implied_vol_kernel(True, 100.0, 100.0, 0.1, 5.0)
             return True
         except Exception as e:

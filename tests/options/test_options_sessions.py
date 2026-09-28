@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import types
+from datetime import date
 from typing import Any, Dict, cast
 
 import pytest
@@ -20,9 +21,10 @@ if "numba" not in sys.modules:
     numba_stub.njit = _njit
     sys.modules["numba"] = numba_stub
 
-from backend.broker_api.options.options_greeks import black76_price
+from backend.broker_api.options.options_greeks import black76_greeks, black76_price
 from backend.broker_api.options import options_sessions as sessions_module
 from backend.broker_api.options.options_sessions import OptionsSession, OptionsSessionManager
+from backend.platform.options_settings import OptionsSettings
 
 
 class _FakeMarketData:
@@ -143,6 +145,103 @@ def test_per_strike_iv_falls_back_to_expiry_sigma_when_solve_fails():
     assert iv_source[put_wing_idx] == "per_strike"
 
 
+def test_vectorized_session_greeks_match_per_contract_results(monkeypatch):
+    forward = 20030.0
+    spot = 20000.0
+    T = 0.05
+    sigma = 0.18
+    strikes = [19900.0, 19950.0, 20000.0, 20050.0, 20100.0]
+    inst_by_strike, ticks = _make_chain(strikes, forward, T, lambda _strike: sigma)
+    ticks[256265] = {"last_price": spot}
+
+    instruments = []
+    for strike, sides in inst_by_strike.items():
+        for option_type, inst in sides.items():
+            instruments.append(
+                {
+                    **inst,
+                    "strike": strike,
+                    "option_type": option_type,
+                    "tradingsymbol": f"NIFTY-{strike:g}-{option_type}",
+                    "lot_size": 50,
+                }
+            )
+
+    class _Repo:
+        @staticmethod
+        def nearest_strike(values, value):
+            return min(values, key=lambda strike: abs(strike - value))
+
+        @staticmethod
+        def get_option_instruments_for_strikes(_underlying, _expiry, requested):
+            requested_set = set(requested)
+            return [row for row in instruments if row["strike"] in requested_set]
+
+    manager = cast(Any, _ManagerStub(ticks))
+    manager.instrument_repo = _Repo()
+    manager.dropped_tokens = {}
+    session = OptionsSession("NIFTY", manager)
+    expiry = date(2026, 10, 6)
+    session.spot_token = 256265
+    session.expiries = [expiry]
+    session.strikes_by_expiry = {expiry: strikes}
+    monkeypatch.setattr(session, "_time_to_expiry", lambda _expiry: T)
+
+    # Force one wing's per-strike IV solve to fail. It should retain today's
+    # expiry-fallback IV and Greeks behavior.
+    ticks[inst_by_strike[20100.0]["CE"]["instrument_token"]]["last_price"] = 0.0
+    array_calls = 0
+    real_arrays = sessions_module.black76_greeks_arrays
+
+    def _count_arrays(*args, **kwargs):
+        nonlocal array_calls
+        array_calls += 1
+        return real_arrays(*args, **kwargs)
+
+    monkeypatch.setattr(sessions_module, "black76_greeks_arrays", _count_arrays)
+    per_expiry, _tokens, _spot, _ranks = session._run_computation()
+
+    rows = per_expiry[expiry.isoformat()]["rows"]
+    assert array_calls == 1
+    for row in rows:
+        for option_type in ("CE", "PE"):
+            contract = row[option_type]
+            assert contract is not None
+            expected = black76_greeks(option_type, forward, row["strike"], T, contract["iv"])
+            assert contract["delta"] == pytest.approx(expected["delta"], abs=1e-9)
+            assert contract["gamma"] == pytest.approx(expected["gamma"], abs=1e-9)
+            assert contract["theta"] == pytest.approx(expected["theta"] / 365.0, abs=1e-9)
+            assert contract["vega"] == pytest.approx(expected["vega"] / 100.0, abs=1e-9)
+            assert contract["rho"] == expected["rho"]
+
+    unsolved = next(row for row in rows if row["strike"] == 20100.0)["CE"]
+    assert unsolved["iv_source"] == "expiry_fallback"
+    assert unsolved["iv"] == pytest.approx(sigma, abs=1e-3)
+
+
+def test_max_pain_cache_refreshes_after_configured_interval(monkeypatch):
+    session = OptionsSession("NIFTY", cast(Any, _ManagerStub({})))
+    rows = [{"strike": 100, "CE": {"oi": 10}, "PE": {"oi": 20}}]
+    now = 100.0
+    calls = 0
+
+    monkeypatch.setenv("OPTIONS_MAX_PAIN_REFRESH_S", "30")
+    monkeypatch.setattr(sessions_module.time, "monotonic", lambda: now)
+
+    def _compute(_rows):
+        nonlocal calls
+        calls += 1
+        return float(calls * 100)
+
+    monkeypatch.setattr(sessions_module, "compute_bounded_max_pain", _compute)
+    assert session._cached_max_pain("2026-10-06", rows) == 100.0
+    now = 129.9
+    assert session._cached_max_pain("2026-10-06", rows) == 100.0
+    now = 130.0
+    assert session._cached_max_pain("2026-10-06", rows) == 200.0
+    assert calls == 2
+
+
 class _SessionRepo:
     def normalize_underlying_symbol(self, value: str):
         return value.strip().upper(), value.strip().upper()
@@ -165,7 +264,7 @@ def _counting_manager(monkeypatch, *, starts: list, fail: bool = False):
     return manager
 
 
-def test_ensure_session_starts_once_and_is_bounded(monkeypatch):
+def test_ensure_session_starts_once_and_is_bounded_to_available_underlyings(monkeypatch):
     monkeypatch.setenv("OPTIONS_AUTOSTART_UNDERLYINGS", "NIFTY,BANKNIFTY")
     starts: list = []
     manager = _counting_manager(monkeypatch, starts=starts)
@@ -175,9 +274,13 @@ def test_ensure_session_starts_once_and_is_bounded(monkeypatch):
     assert asyncio.run(manager.ensure_session("nifty")) is True
     assert starts == [("NIFTY", 12, 5)]
 
-    # Bounded: an underlying outside the configured set starts nothing.
-    assert asyncio.run(manager.ensure_session("FINNIFTY")) is False
-    assert starts == [("NIFTY", 12, 5)]
+    # On-demand reads may start any supported underlying, not only always-on.
+    assert asyncio.run(manager.ensure_session("FINNIFTY")) is True
+    assert starts == [("NIFTY", 12, 5), ("FINNIFTY", 12, 5)]
+
+    # The fixed available-underlyings contract remains the boundary.
+    assert asyncio.run(manager.ensure_session("UNKNOWN")) is False
+    assert starts == [("NIFTY", 12, 5), ("FINNIFTY", 12, 5)]
 
 
 def test_ensure_session_contains_a_failed_start(monkeypatch):
@@ -189,6 +292,119 @@ def test_ensure_session_contains_a_failed_start(monkeypatch):
     assert starts == [("NIFTY", 12, 5)]
     # A half-started session is not left behind, so a later attempt can retry.
     assert "NIFTY" not in manager.sessions
+
+
+def test_apply_settings_updates_running_sessions_and_starts_always_on(monkeypatch):
+    manager = OptionsSessionManager(cast(Any, object()), cast(Any, _SessionRepo()))
+
+    class _FakeSession:
+        def __init__(self):
+            self.underlying = "BANKNIFTY"
+            self.window_size = 17
+            self.cadence_sec = 5
+            self.tick_driven = True
+            self.min_interval_sec = 1.0
+            self.calls = []
+
+        async def update_config(self, window_size, cadence_sec):
+            self.calls.append((window_size, cadence_sec))
+            self.cadence_sec = cadence_sec
+
+    session = _FakeSession()
+    manager.sessions = {"BANKNIFTY": cast(Any, session)}
+    ensured = []
+
+    async def _ensure(underlying, window_size=12, cadence_sec=None):
+        ensured.append((underlying, window_size, cadence_sec))
+        return True
+
+    monkeypatch.setattr(manager, "ensure_session", _ensure)
+    settings = OptionsSettings(
+        always_on=["NIFTY"],
+        cadence_sec=3,
+        tick_driven=False,
+        min_interval_sec=0.5,
+        idle_stop_minutes=9,
+        source="db",
+        updated_at=None,
+        updated_by="app:admin",
+    )
+
+    result = asyncio.run(manager.apply_settings(settings))
+
+    assert result == {"NIFTY": True}
+    assert manager.always_on == {"NIFTY"}
+    assert manager.idle_stop_minutes == 9
+    assert session.calls == [(17, 3)]
+    assert session.tick_driven is False
+    assert session.min_interval_sec == 0.5
+    assert ensured == [("NIFTY", 12, 3)]
+
+
+def test_snapshot_read_touches_and_schedules_one_ensure(monkeypatch):
+    manager = OptionsSessionManager(cast(Any, object()), cast(Any, _SessionRepo()))
+    starts = 0
+
+    async def _ensure(_underlying):
+        nonlocal starts
+        starts += 1
+        await asyncio.sleep(0)
+        return True
+
+    monkeypatch.setattr(manager, "ensure_session", _ensure)
+
+    async def _exercise():
+        assert manager.get_snapshot("nifty") is None
+        touched = manager.last_used["NIFTY"]
+        assert manager.get_snapshot("NIFTY") is None
+        assert manager.last_used["NIFTY"] >= touched
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        manager.close()
+
+    asyncio.run(_exercise())
+    assert starts == 1
+
+
+def test_reaper_stops_idle_on_demand_but_never_always_on(monkeypatch):
+    manager = OptionsSessionManager(cast(Any, object()), cast(Any, _SessionRepo()))
+    manager.sessions = {"NIFTY": cast(Any, object()), "FINNIFTY": cast(Any, object())}
+    manager.always_on = {"NIFTY"}
+    manager.idle_stop_minutes = 15
+    manager.last_used = {"NIFTY": 0.0, "FINNIFTY": 0.0}
+    stopped = []
+
+    async def _stop(underlying):
+        stopped.append(underlying)
+        manager.sessions.pop(underlying, None)
+
+    monkeypatch.setattr(manager, "stop_session", _stop)
+    monkeypatch.setattr(
+        "backend.strategies.market_session.session_state",
+        lambda _exchange: {"open": True, "reason": "open"},
+    )
+    asyncio.run(manager._reap_idle_sessions(now_monotonic=901.0))
+    assert stopped == ["FINNIFTY"]
+    assert "NIFTY" in manager.sessions
+
+
+def test_zero_idle_minutes_never_reaps_during_market_hours(monkeypatch):
+    manager = OptionsSessionManager(cast(Any, object()), cast(Any, _SessionRepo()))
+    manager.sessions = {"FINNIFTY": cast(Any, object())}
+    manager.idle_stop_minutes = 0
+    manager.last_used = {"FINNIFTY": 0.0}
+    stopped = []
+
+    async def _stop(underlying):
+        stopped.append(underlying)
+
+    monkeypatch.setattr(manager, "stop_session", _stop)
+    monkeypatch.setattr(
+        "backend.strategies.market_session.session_state",
+        lambda _exchange: {"open": True, "reason": "open"},
+    )
+    asyncio.run(manager._reap_idle_sessions(now_monotonic=100_000.0))
+    assert stopped == []
 
 
 def test_tick_listener_routes_tokens_to_matching_sessions(monkeypatch):
@@ -204,14 +420,10 @@ def test_tick_listener_routes_tokens_to_matching_sessions(monkeypatch):
         async def publish(self, *_args, **_kwargs):
             return None
 
-    async def _noop_publish_event(*_args, **_kwargs):
-        return None
-
     async def _noop_converge():
         return None
 
     monkeypatch.setattr(sessions_module, "get_redis", lambda: _Redis())
-    monkeypatch.setattr(sessions_module, "publish_event", _noop_publish_event)
     monkeypatch.setattr(manager, "_converge_subscriptions", _noop_converge)
 
     async def _exercise():
@@ -343,8 +555,10 @@ def test_far_expiry_without_sigma_keeps_the_configured_window():
 class _ForwardRepo:
     def __init__(self, table):
         self.table = table  # strike -> (ce_token, pe_token)
+        self.calls = 0
 
     def get_option_instruments_for_strikes(self, underlying, expiry, strikes):
+        self.calls += 1
         rows = []
         for strike in strikes:
             if strike in self.table:
@@ -388,6 +602,30 @@ def test_forward_skips_strikes_with_a_zero_price():
         _date(2026, 10, 6), 20000.0, 20012.0, strikes=[20000.0, 20050.0]
     )
     assert forward == 20030.0
+
+
+def test_forward_instruments_are_cached_for_the_same_candidate_strikes():
+    table = {20000.0: (3, 4), 20050.0: (5, 6)}
+    ticks = {
+        3: {"last_price": 120.0},
+        4: {"last_price": 90.0},
+        5: {"last_price": 95.0},
+        6: {"last_price": 115.0},
+    }
+    manager = _ForwardManager(table, ticks)
+    session = OptionsSession("NIFTY", cast(Any, manager))
+    expiry = date(2026, 10, 6)
+
+    for _ in range(2):
+        forward, _ce, _pe = session._compute_forward(
+            expiry,
+            20000.0,
+            20012.0,
+            strikes=[20000.0, 20050.0],
+        )
+        assert forward == 20030.0
+
+    assert manager.instrument_repo.calls == 1
 
 
 def test_missing_spot_reuses_last_value_but_reports_not_live():

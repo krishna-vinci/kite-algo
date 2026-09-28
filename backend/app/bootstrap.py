@@ -311,8 +311,8 @@ async def autostart_option_sessions(
     """
     from backend.broker_api.options.options_sessions import (
         OptionsSessionManager,
-        autostart_underlyings,
     )
+    from backend.platform.options_settings import read_options_settings
 
     if manager is None:
         manager = OptionsSessionManager(
@@ -322,15 +322,25 @@ async def autostart_option_sessions(
 
     started: list[str] = []
     failed: list[str] = []
-    for underlying in autostart_underlyings():
-        try:
-            ok = await manager.ensure_session(underlying)
-        except Exception as exc:  # noqa: BLE001 - one bad underlying must not stop the rest
-            ok = False
-            logging.warning(
-                "Options session autostart failed for %s: %s", underlying, exc, exc_info=True
-            )
-        (started if ok else failed).append(underlying)
+    settings = read_options_settings()
+    apply_settings = getattr(manager, "apply_settings", None)
+    if callable(apply_settings):
+        outcomes = await apply_settings(settings)
+        for underlying in settings.always_on:
+            (started if outcomes.get(underlying) else failed).append(underlying)
+    else:
+        for underlying in settings.always_on:
+            try:
+                ok = await manager.ensure_session(underlying)
+            except Exception as exc:  # noqa: BLE001 - one bad underlying must not stop the rest
+                ok = False
+                logging.warning(
+                    "Options session autostart failed for %s: %s",
+                    underlying,
+                    exc,
+                    exc_info=True,
+                )
+            (started if ok else failed).append(underlying)
     return {"started": started, "failed": failed}
 
 
@@ -1053,6 +1063,10 @@ async def combined_lifespan(app: FastAPI):
             set_component_status("algo_runtime", "stopped", detail="Modular algo runtime stopped")
     except Exception:
         pass
+
+    options_session_manager = getattr(app.state, "options_session_manager", None)
+    if options_session_manager is not None:
+        options_session_manager.close()
 
     if market_data_runtime:
         logging.info("Stopping Go market runtime bridge...")

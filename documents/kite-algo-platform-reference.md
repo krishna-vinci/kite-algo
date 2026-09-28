@@ -71,7 +71,7 @@ plans.
 | mcp-go | `compose.mcp-go.yml:8-34` (profile `mcp`) | Go MCP adapter, 73 tools | 18789:8788 |
 
 - **Migrations.** `alembic upgrade head` runs before uvicorn (`compose.yml:123`, `Dockerfile:42`). The current head
-  is `20260926_000051_live_approval_binding`.
+  is `20260928_000057_platform_options_settings`.
   - **PARTIAL:** lifespan startup also executes `backend/schema.sql` (`backend/app/bootstrap.py:48-61,296`,
     `backend/app/database.py:26-33`). There are two schema paths.
 - **Deploy.** Build all images first, then recreate `finance-app` first so it migrates, then the rest. See
@@ -126,33 +126,36 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
   source retains its own fresh LTP epoch (`backend/workflows/runtime.py:220-500`).
 - **Candles: EXISTS.** `backend/broker_api/market/candle_aggregator.py` consumes ticks and writes
   `candle:{token}:{interval}:current|latest`, then publishes `realtime_candles:*` (`:242,365-415`).
-- **Option chain and Greeks: EXISTS, started lazily.**
-  - An `OptionsSession` per underlying recomputes on its contract ticks at least every
-    `OPTIONS_CHAIN_MIN_INTERVAL_S` (default **1 s**), with the **5 s** cadence as the ceiling
-    (`backend/broker_api/options/options_sessions.py:45-55`), with nearest expiry ATM±12 (recentered every cadence)
+- **Option chain and Greeks: EXISTS, hybrid always-on/on-demand lifecycle.**
+  - An `OptionsSession` per underlying recomputes on its contract ticks at least every configured minimum interval
+    (default **1 s**), with the configured cadence (default **5 s**) as the ceiling. Tick-driven computation can be
+    disabled live through the owner settings API. The nearest expiry keeps ATM±12 (recentered every cadence)
     and far expiries widened to roughly 10-delta,
     capped at 30 strikes per side (`backend/options/api/market_router.py:19-20`). Expiries refresh every 60 s.
-  - Sessions start from the configured auto-start set (`OPTIONS_AUTOSTART_UNDERLYINGS`, default
-    `NIFTY,BANKNIFTY,SENSEX`) at boot, on the worker's `GET .../session` (the SDK `ensure_session`), and once before a
-    live/paper option admission; `POST /api/options/sessions` still starts them explicitly. A missing session returns
-    `OPTION_SESSION_NOT_FOUND`.
+  - Owner-chosen `always_on` sessions start at boot (default `NIFTY`). Any of NIFTY, BANKNIFTY, SENSEX, FINNIFTY,
+    MIDCPNIFTY and BANKEX starts non-blockingly on its first read; the first read remains unavailable until its first
+    snapshot. On-demand sessions stop after 15 idle minutes by default, and after the NSE close, while always-on
+    sessions remain. `idle_stop_minutes=0` disables intraday idle stopping. When no DB row exists,
+    `OPTIONS_AUTOSTART_UNDERLYINGS` remains the always-on fallback (`options_sessions.py`, `platform/options_settings.py`).
   - Instrument discovery reads the active published catalog, using NFO for NIFTY, BANKNIFTY, FINNIFTY and
     MIDCPNIFTY and BFO for SENSEX and BANKEX. NIFTY/SENSEX select weekly plus monthly expiries;
     BANKNIFTY/FINNIFTY select monthlies (`backend/broker_api/instruments/instruments_repository.py`).
-  - Sessions start only via `POST /api/options/sessions` (`market_router.py:50`). There is no auto-start at boot. A
-    missing session returns `OPTION_SESSION_NOT_FOUND`.
   - **Model:** Black-76 on a synthetic forward `F = median(K + C_K − P_K)` from multi-strike parity (r = 0),
     with per-strike IV where solvable and an explicitly flagged expiry fallback (`options_sessions.py:324-395,604-640`).
-    Kernels are in `options_greeks.py:50-300`. Theta is per day; vega is per 1%.
+    Each expiry computes all contract Greeks in one Numba array kernel; forward instruments use the 60-second session
+    instrument cache, and max pain is NumPy-vectorized and refreshed at most every 30 seconds by default. Kernels are
+    in `options_greeks.py`. Theta is per day; vega is per 1%.
   - Token subscriptions use a rank-ordered cap (spot/ATM are never dropped); dropped counts are reported in
     `health.dropped_tokens`. Spot reuse is explicit in `health.spot_live` and `health.spot_age_sec`. The legacy
-    `options:snapshot:*` key is removed; the v1 JSON key and update channels remain.
+    `options:snapshot:*` key and unused `options:updates:*` publish are removed. The v1 JSON key refreshes at least
+    every five seconds, while unchanged market payloads skip redundant publishes.
   - Time to expiry is anchored at 15:30 **IST** (fixed in Phase 0, `391adf0`; it was UTC, which overstated T by
     about 5.5 hours).
   - **Freshness limits:** 10 s at plan freeze and **5 s** before a live send (`backend/options/market/freshness.py:17-18`).
     The 5 s limit remains the session cadence ceiling, so expect occasional stale refusals when contracts are quiet.
   - **Endpoints:** expiries, chain, mini-chain, greeks, selection/resolve, PCR, max-pain, SSE stream
     (`market_router.py:78-160`). Worker mirrors are in `backend/options/api/worker_options_router.py:159-252`.
+    Owner runtime settings are `GET/PUT /api/platform/options-settings`; each PUT is audited and applied live.
 - **Calendar: PARTIAL.** Covers NSE CM holidays only (`backend/broker_api/market/nse_calendar_source.py`,
   `exchange_calendar.py`). There are no imported MCX or CDS calendars; MCX is gated on its own clock instead (§5.3,
   `backend/strategies/market_session.py`), and its holidays stay unverified.
@@ -535,6 +538,11 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
 
 ## 6. Options subsystem
 
+- **Owner chain settings: EXISTS.** `GET/PUT /api/platform/options-settings` persists the always-on set, cadence,
+  tick-driven mode, minimum compute interval and idle stop time in the singleton `platform_options_settings` row;
+  writes append `platform_options_settings_audit` and update running sessions without a restart. The response also
+  reports available underlyings and current session age/token state (`backend/api/routers/platform.py`,
+  `backend/platform/options_settings.py`).
 - **Expiry selectors: EXISTS.** `nearest`, `current_week`, `next_week`, `current_month` (the last expiry of the
   month), `next_month` (the last expiry of the following month) or an explicit date
   (`backend/options/market/expiry_selectors.py`). SENSEX/BANKEX selector legs resolve on BFO.
@@ -692,7 +700,7 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
   MCP and the market-runtime URL.
   - Stale entries: `MEILI_*`, `VITE_*`, and `MARKET_RUNTIME_ENABLED=false`, which would crash the app if compose
     didn't override it.
-- **Trading behaviour is env-only and not in `.env.example`:**
+- **Most trading behaviour is env-only and not in `.env.example`; option-chain runtime settings are DB-backed:**
 
 | Setting | Default |
 | --- | --- |
@@ -718,8 +726,8 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
 | `HOSTED_SUPERVISOR_*` | — |
 
 - **Hard-coded:** quote max age 5 s; approval and reservation validity 900 s.
-- **Settings stored in the DB or UI:** marketwatch subscriptions, worker tokens, notification channels, paper
-  account balance and risk, admission policy, authorization mode and grants.
+- **Settings stored in the DB or UI:** option-chain always-on/cadence/tick/idle settings, marketwatch subscriptions,
+  worker tokens, notification channels, paper account balance and risk, admission policy, authorization mode and grants.
 - **Agents never edit `.env*`.**
 
 ---
@@ -763,7 +771,7 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
     - The MCP token is optional.
     - The manual order write routes are off by decision; read-only routes are restored.
 11. **UX:**
-    - Trading behaviour lives in env.
+    - Most trading behaviour lives in env; option-chain runtime behaviour is owner-configurable.
     - Risk policy is API-only.
     - No chain or payoff UI.
     - No inbound Telegram commands.

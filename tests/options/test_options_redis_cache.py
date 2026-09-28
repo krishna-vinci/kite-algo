@@ -98,15 +98,10 @@ def test_serialize_payload_is_valid_json_with_schema_v1_and_json_safe_dates():
     assert payload["expiries"] == ["2026-05-07"]
 
 
-def test_session_update_writes_v1_json_and_no_legacy_snapshot_key(monkeypatch):
+def test_session_update_writes_v1_json_and_no_legacy_snapshot_or_publish(monkeypatch):
     fake_redis = _FakeRedis()
-    published_legacy: list[tuple[str, dict]] = []
-
-    async def _fake_publish_event(channel: str, payload: dict):
-        published_legacy.append((channel, payload))
 
     monkeypatch.setattr("backend.broker_api.options.options_sessions.get_redis", lambda: fake_redis)
-    monkeypatch.setattr("backend.broker_api.options.options_sessions.publish_event", _fake_publish_event)
 
     manager = OptionsSessionManager(
         market_data=cast(Any, _FakeMarketData()),
@@ -139,8 +134,61 @@ def test_session_update_writes_v1_json_and_no_legacy_snapshot_key(monkeypatch):
     assert isinstance(stored_v1, str)
     assert json.loads(stored_v1)["schema_version"] == OPTION_SNAPSHOT_SCHEMA_VERSION
 
-    assert fake_redis.publish_calls[0][0] == "options:chain:v1:updates:NIFTY"
-    assert published_legacy[0][0] == "options:updates:nifty"
+    assert fake_redis.publish_calls == [
+        ("options:chain:v1:updates:NIFTY", stored_v1)
+    ]
+
+
+def test_session_update_skips_unchanged_market_payload_but_refreshes_set(monkeypatch):
+    fake_redis = _FakeRedis()
+    now = 100.0
+    monkeypatch.setattr("backend.broker_api.options.options_sessions.get_redis", lambda: fake_redis)
+    monkeypatch.setattr(options_sessions.time, "monotonic", lambda: now)
+    manager = OptionsSessionManager(
+        market_data=cast(Any, _FakeMarketData()),
+        instrument_repo=cast(Any, _FakeInstrumentRepo()),
+    )
+
+    async def _noop_converge():
+        return None
+
+    manager._converge_subscriptions = _noop_converge
+    snapshot = {
+        "updated_at": "2026-04-29T10:00:00Z",
+        "health": {"spot_age_sec": 1.0},
+        "per_expiry": {
+            "2026-05-07": {
+                "forward": 25010.0,
+                "rows": [
+                    {
+                        "strike": 25000.0,
+                        "CE": {"ltp": 100.0, "iv": 0.15, "oi": 1000},
+                        "PE": {"ltp": 90.0, "iv": 0.15, "oi": 900},
+                    }
+                ],
+            }
+        },
+    }
+    session = cast(Any, _SessionStub("NIFTY", snapshot))
+
+    asyncio.run(manager.on_session_update(session))
+    snapshot["updated_at"] = "2026-04-29T10:00:01Z"
+    snapshot["health"]["spot_age_sec"] = 2.0
+    now = 101.0
+    asyncio.run(manager.on_session_update(session))
+    assert len(fake_redis.set_calls) == 1
+    assert len(fake_redis.publish_calls) == 1
+
+    now = 105.0
+    asyncio.run(manager.on_session_update(session))
+    assert len(fake_redis.set_calls) == 2
+    assert len(fake_redis.publish_calls) == 1
+
+    snapshot["per_expiry"]["2026-05-07"]["rows"][0]["CE"]["ltp"] = 101.0
+    now = 105.1
+    asyncio.run(manager.on_session_update(session))
+    assert len(fake_redis.set_calls) == 3
+    assert len(fake_redis.publish_calls) == 2
 
 
 def test_reader_decodes_v1_json_and_rejects_invalid_json_or_schema():
