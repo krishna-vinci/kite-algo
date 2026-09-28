@@ -244,8 +244,10 @@ class ExecutionRequestService:
             "decision_actor": row.decision_actor,
             "decision_at": row.decision_at,
             "decision_evidence": dict(row.decision_evidence or {}),
-            "approval_id": row.approval_id,
-            "reservation_id": row.reservation_id,
+            # PostgreSQL stores these two as uuid (the model says Text), so the
+            # driver hands back UUID objects; the API contract is a string.
+            "approval_id": str(row.approval_id) if row.approval_id is not None else None,
+            "reservation_id": str(row.reservation_id) if row.reservation_id is not None else None,
             "execution_detail": dict(row.execution_detail or {}),
             "outcome_state": dict(row.execution_detail or {}).get("outcome_state"),
             "dispatch_claim_id": row.dispatch_claim_id,

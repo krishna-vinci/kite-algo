@@ -3124,3 +3124,31 @@ def test_a_non_finite_stated_basis_is_invalid_not_a_sizing_input(world):
 
     assert _weights_ledger_counts(world) == (0, 0)
     assert world["executor"].calls == []
+
+
+def test_view_stringifies_postgres_uuid_ids_for_the_response_schema():
+    """PostgreSQL returns approval_id/reservation_id as UUID objects (uuid columns)."""
+    from types import SimpleNamespace
+
+    from backend.api.schemas.strategies import ExecutionRequestRow
+    from backend.strategies.execution_requests import ExecutionRequestService
+
+    now = datetime.now(timezone.utc)
+    approval, reservation = uuid.uuid4(), uuid.uuid4()
+    fields = {name: "x" for name in (
+        "request_id", "owner_id", "strategy_id", "canonical_strategy_id", "account_id",
+        "execution_environment", "strategy_run_id", "job_id", "token_id", "version_id",
+        "source_sha", "source_sha256", "policy_hash", "evaluation_id", "plan_id", "plan_hash",
+        "authorization_mode", "idempotency_key",
+    )}
+    row = SimpleNamespace(
+        **fields, attempt=1, lease_epoch=1, version_number=1, status="executed", grant_id=None, refusal_code=None, refusal_detail={},
+        decision_kind=None, decision_actor=None, decision_at=None, decision_evidence={},
+        approval_id=approval, reservation_id=reservation, execution_detail={},
+        dispatch_claim_id=None, dispatch_claimed_at=None, dispatch_started_at=None,
+        dispatch_finished_at=None, created_at=now, updated_at=now,
+    )
+    view = ExecutionRequestService._view(row)
+    assert view["approval_id"] == str(approval)
+    assert view["reservation_id"] == str(reservation)
+    ExecutionRequestRow(**view)
