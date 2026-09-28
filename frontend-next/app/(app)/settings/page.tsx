@@ -4,6 +4,7 @@ import { useRef, useState } from "react";
 import { AlgoWorkerAccessPanel } from "@/components/settings/algo-worker-access-panel";
 import { IndexBaselinesPanel } from "@/components/settings/index-baselines-panel";
 import { LiveTradingPanel } from "@/components/settings/live-trading-panel";
+import { OptionsDataPanel } from "@/components/settings/options-data-panel";
 import { WorkspaceContextPanel } from "@/components/settings/workspace-context-panel";
 import { Panel } from "@/components/operator/panel";
 
@@ -11,7 +12,7 @@ import { Panel } from "@/components/operator/panel";
 // Tab definitions
 // ---------------------------------------------------------------------------
 
-type TabId = "reference-data" | "worker-access" | "live-trading" | "workspace" | "apis";
+type TabId = "reference-data" | "worker-access" | "live-trading" | "options-data" | "workspace" | "apis";
 
 const TABS: { id: TabId; label: string; description: string }[] = [
   {
@@ -28,6 +29,11 @@ const TABS: { id: TabId; label: string; description: string }[] = [
     id: "live-trading",
     label: "Live trading",
     description: "Master switch status, account scope, and lane controls.",
+  },
+  {
+    id: "options-data",
+    label: "Options data",
+    description: "Always-on option-chain underlyings, refresh cadence, and idle stop.",
   },
   {
     id: "workspace",
@@ -51,6 +57,7 @@ export default function SettingsPage() {
     "reference-data": null,
     "worker-access": null,
     "live-trading": null,
+    "options-data": null,
     workspace: null,
     apis: null,
   });
@@ -165,6 +172,16 @@ export default function SettingsPage() {
             aria-labelledby="tab-live-trading"
           >
             <LiveTradingPanel />
+          </div>
+        )}
+
+        {activeTab === "options-data" && (
+          <div
+            id="tabpanel-options-data"
+            role="tabpanel"
+            aria-labelledby="tab-options-data"
+          >
+            <OptionsDataPanel />
           </div>
         )}
 

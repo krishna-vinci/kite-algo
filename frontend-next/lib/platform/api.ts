@@ -6,6 +6,8 @@
 
 import { apiFetch } from "@/lib/api/client";
 import type {
+  OptionsSettings,
+  OptionsSettingsPayload,
   PlatformLiveSettings,
   PlatformLiveSettingsPayload,
   PlatformStatus,
@@ -25,6 +27,19 @@ export async function updatePlatformLiveSettings(
   payload: PlatformLiveSettingsPayload,
 ): Promise<PlatformLiveSettings> {
   return apiFetch<PlatformLiveSettings>(`${BASE}/live-settings`, {
+    method: "PUT",
+    json: payload,
+  });
+}
+
+export async function getOptionsSettings(): Promise<OptionsSettings> {
+  return apiFetch<OptionsSettings>(`${BASE}/options-settings`);
+}
+
+export async function updateOptionsSettings(
+  payload: OptionsSettingsPayload,
+): Promise<OptionsSettings> {
+  return apiFetch<OptionsSettings>(`${BASE}/options-settings`, {
     method: "PUT",
     json: payload,
   });
