@@ -35,6 +35,30 @@ class _ManagerStub:
         self.market_data = _FakeMarketData(ticks)
 
 
+class _TickListenerMarketData:
+    def __init__(self):
+        self.callback = None
+
+    def add_tick_listener(self, callback):
+        self.callback = callback
+
+        def _unsubscribe():
+            self.callback = None
+
+        return _unsubscribe
+
+
+class _DirtySession:
+    def __init__(self):
+        self.underlying = "NIFTY"
+        self.desired_tokens = {10, 11}
+        self.snapshot = {}
+        self.dirty_count = 0
+
+    def mark_dirty(self):
+        self.dirty_count += 1
+
+
 def _make_chain(strikes, forward, T, sigma_for_strike):
     """Builds inst_by_strike + ticks for a synthetic chain priced off given sigmas."""
     ticks: Dict[int, Dict[str, Any]] = {}
@@ -165,6 +189,90 @@ def test_ensure_session_contains_a_failed_start(monkeypatch):
     assert starts == [("NIFTY", 12, 5)]
     # A half-started session is not left behind, so a later attempt can retry.
     assert "NIFTY" not in manager.sessions
+
+
+def test_tick_listener_routes_tokens_to_matching_sessions(monkeypatch):
+    market = _TickListenerMarketData()
+    manager = OptionsSessionManager(cast(Any, market), cast(Any, object()))
+    session = _DirtySession()
+    manager.sessions[session.underlying] = cast(Any, session)
+
+    class _Redis:
+        async def set(self, *_args, **_kwargs):
+            return None
+
+        async def publish(self, *_args, **_kwargs):
+            return None
+
+    async def _noop_publish_event(*_args, **_kwargs):
+        return None
+
+    async def _noop_converge():
+        return None
+
+    monkeypatch.setattr(sessions_module, "get_redis", lambda: _Redis())
+    monkeypatch.setattr(sessions_module, "publish_event", _noop_publish_event)
+    monkeypatch.setattr(manager, "_converge_subscriptions", _noop_converge)
+
+    async def _exercise():
+        await manager.on_session_update(session)
+        market.callback(10, {})
+        market.callback(99, {})
+
+    asyncio.run(_exercise())
+    assert session.dirty_count == 1
+
+
+def test_cadence_coalesces_dirty_marks_and_respects_min_interval(monkeypatch):
+    monkeypatch.setenv("OPTIONS_CHAIN_MIN_INTERVAL_S", "0.25")
+    session = OptionsSession("NIFTY", cast(Any, _ManagerStub({})), cadence_sec=5)
+    session.is_running = True
+    monkeypatch.setattr(session, "_refresh_expiries", _async_noop)
+    compute_count = 0
+
+    async def _count_compute():
+        nonlocal compute_count
+        compute_count += 1
+
+    monkeypatch.setattr(session, "_compute_and_publish", _count_compute)
+
+    async def _exercise():
+        task = asyncio.create_task(session._run_cadence())
+        for _ in range(5):
+            session.mark_dirty()
+        await asyncio.sleep(0.5)
+        session.is_running = False
+        task.cancel()
+        await task
+
+    asyncio.run(_exercise())
+    assert compute_count == 1
+
+
+def test_cadence_timer_computes_without_dirty_mark(monkeypatch):
+    monkeypatch.setenv("OPTIONS_CHAIN_MIN_INTERVAL_S", "0.25")
+    session = OptionsSession("NIFTY", cast(Any, _ManagerStub({})), cadence_sec=0.3)
+    session.is_running = True
+    monkeypatch.setattr(session, "_refresh_expiries", _async_noop)
+    computed = asyncio.Event()
+
+    async def _count_compute():
+        computed.set()
+
+    monkeypatch.setattr(session, "_compute_and_publish", _count_compute)
+
+    async def _exercise():
+        task = asyncio.create_task(session._run_cadence())
+        await asyncio.wait_for(computed.wait(), timeout=0.4)
+        session.is_running = False
+        task.cancel()
+        await task
+
+    asyncio.run(_exercise())
+
+
+async def _async_noop():
+    return None
 
 
 def test_rank_tokens_keeps_spot_and_atm_before_far_wings():
@@ -306,3 +414,16 @@ def test_live_spot_reports_its_age():
     assert spot == 20010.0
     assert session.last_spot_live is True
     assert 2.0 <= session.last_spot_age_sec < 30.0
+
+
+def test_a_tick_for_a_stopped_session_is_ignored():
+    class _ListeningMarketData:
+        def add_tick_listener(self, callback):
+            self.callback = callback
+            return lambda: None
+
+    market = _ListeningMarketData()
+    manager = OptionsSessionManager(cast(Any, market), cast(Any, object()))
+    manager._token_sessions = {10: {"NIFTY"}}
+    manager.sessions = {}
+    market.callback(10, {"last_price": 1.0})  # must not raise

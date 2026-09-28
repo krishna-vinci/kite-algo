@@ -2,9 +2,10 @@ import asyncio
 import logging
 import math
 import os
+import time
 from datetime import date, datetime, timezone, timedelta
 from math import floor
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Set
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set
 from zoneinfo import ZoneInfo
 import numpy as np
 
@@ -98,6 +99,14 @@ class OptionsSession:
         self.task: Optional[asyncio.Task] = None
         self.is_running = False
 
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            self._dirty: Optional[asyncio.Event] = None
+        else:
+            self._dirty = asyncio.Event()
+        self._last_compute_monotonic = 0.0
+
         # Session state
         self.spot_token: Optional[int] = None
         self.expiries: List[date] = []
@@ -115,6 +124,14 @@ class OptionsSession:
         self._instrument_cache: Dict[str, Dict[str, Any]] = {}
         self._cache_ts: Dict[str, datetime] = {}
         self._cache_ttl = timedelta(seconds=60)
+
+    def _dirty_event(self) -> asyncio.Event:
+        if self._dirty is None:
+            self._dirty = asyncio.Event()
+        return self._dirty
+
+    def mark_dirty(self) -> None:
+        self._dirty_event().set()
 
     async def start(self):
         """
@@ -258,8 +275,6 @@ class OptionsSession:
         """
         while self.is_running:
             try:
-                start_time = asyncio.get_event_loop().time()
-
                 # Lightweight check to refresh expiries every 60 seconds
                 if (
                     not self.last_expiry_refresh_ts
@@ -270,13 +285,17 @@ class OptionsSession:
                 ):
                     await self._refresh_expiries()
 
+                try:
+                    await asyncio.wait_for(self._dirty_event().wait(), timeout=self.cadence_sec)
+                except asyncio.TimeoutError:
+                    pass
+                self._dirty_event().clear()
+                min_gap = max(0.25, float(os.getenv("OPTIONS_CHAIN_MIN_INTERVAL_S", "1.0")))
+                wait = min_gap - (time.monotonic() - self._last_compute_monotonic)
+                if wait > 0:
+                    await asyncio.sleep(wait)
                 await self._compute_and_publish()
-
-                # Dynamic sleep to maintain cadence
-                elapsed = asyncio.get_event_loop().time() - start_time
-                sleep_duration = max(0, self.cadence_sec - elapsed)
-                logger.info(f"[{self.underlying}] Computation took {elapsed:.2f}s, sleeping for {sleep_duration:.2f}s")
-                await asyncio.sleep(sleep_duration)
+                self._last_compute_monotonic = time.monotonic()
 
             except asyncio.CancelledError:
                 logger.info(f"Cadence task for {self.underlying} was cancelled.")
@@ -877,6 +896,22 @@ class OptionsSessionManager:
         self.client_queues: Dict[str, List[asyncio.Queue]] = {}
         self.owner_id = "backend:options-sessions"
         self.dropped_tokens: Dict[str, int] = {}
+        self._token_sessions: Dict[int, set[str]] = {}
+        self._unsubscribe_tick_listener: Optional[Callable[[], None]] = None
+        if hasattr(self.market_data, "add_tick_listener"):
+            self._unsubscribe_tick_listener = self.market_data.add_tick_listener(self._on_tick)
+
+    def close(self) -> None:
+        if self._unsubscribe_tick_listener:
+            self._unsubscribe_tick_listener()
+            self._unsubscribe_tick_listener = None
+
+    def _on_tick(self, token: int, tick: Dict[str, Any]) -> None:
+        for underlying in tuple(self._token_sessions.get(int(token), ())):
+            session = self.sessions.get(underlying)
+            if session is not None:
+                # A stopped session's tokens can linger until the next update.
+                session.mark_dirty()
 
     async def start_sessions(
         self, items: List[Dict[str, Any]], replace: bool = False
@@ -1002,6 +1037,16 @@ class OptionsSessionManager:
         if session.underlying in self.client_queues:
             for queue in self.client_queues[session.underlying]:
                 await queue.put(session.snapshot)
+
+        for sessions in self._token_sessions.values():
+            sessions.discard(session.underlying)
+        self._token_sessions = {
+            token: sessions
+            for token, sessions in self._token_sessions.items()
+            if sessions
+        }
+        for token in getattr(session, "desired_tokens", set()):
+            self._token_sessions.setdefault(int(token), set()).add(session.underlying)
 
         # Converge subscriptions
         await self._converge_subscriptions()

@@ -120,8 +120,10 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
 - **Candles: EXISTS.** `backend/broker_api/market/candle_aggregator.py` consumes ticks and writes
   `candle:{token}:{interval}:current|latest`, then publishes `realtime_candles:*` (`:242,365-415`).
 - **Option chain and Greeks: EXISTS, started lazily.**
-  - An `OptionsSession` per underlying recomputes every **5 s** (`backend/broker_api/options/options_sessions.py:45-55`)
-    with nearest expiry ATM±12 (recentered every cadence) and far expiries widened to roughly 10-delta,
+  - An `OptionsSession` per underlying recomputes on its contract ticks at least every
+    `OPTIONS_CHAIN_MIN_INTERVAL_S` (default **1 s**), with the **5 s** cadence as the ceiling
+    (`backend/broker_api/options/options_sessions.py:45-55`), with nearest expiry ATM±12 (recentered every cadence)
+    and far expiries widened to roughly 10-delta,
     capped at 30 strikes per side (`backend/options/api/market_router.py:19-20`). Expiries refresh every 60 s.
   - Sessions start from the configured auto-start set (`OPTIONS_AUTOSTART_UNDERLYINGS`, default
     `NIFTY,BANKNIFTY,SENSEX`) at boot, on the worker's `GET .../session` (the SDK `ensure_session`), and once before a
@@ -141,7 +143,7 @@ Sources: `schedulers.py:50-320`, `broker_api.py:1079`, `daily_candle_finalizatio
   - Time to expiry is anchored at 15:30 **IST** (fixed in Phase 0, `391adf0`; it was UTC, which overstated T by
     about 5.5 hours).
   - **Freshness limits:** 10 s at plan freeze and **5 s** before a live send (`backend/options/market/freshness.py:17-18`).
-    The 5 s limit equals the session cadence, so expect occasional stale refusals.
+    The 5 s limit remains the session cadence ceiling, so expect occasional stale refusals when contracts are quiet.
   - **Endpoints:** expiries, chain, mini-chain, greeks, selection/resolve, PCR, max-pain, SSE stream
     (`market_router.py:78-160`). Worker mirrors are in `backend/options/api/worker_options_router.py:159-252`.
 - **Calendar: PARTIAL.** Covers NSE CM holidays only (`backend/broker_api/market/nse_calendar_source.py`,
