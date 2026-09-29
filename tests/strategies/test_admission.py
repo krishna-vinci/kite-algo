@@ -94,10 +94,12 @@ class AdmissionTestCase(unittest.TestCase):
 
         from backend.strategies.attribution_models import (
             AccountReconciliationVersion,
+            LivePlanSubmission,
             Strategy,
             StrategyAdmissionPolicy,
             StrategyApproval,
             StrategyPlan,
+            StrategyPlanExecutionEvent,
             StrategyPlanOptionRun,
             StrategyPositionProjection,
             StrategyProjectionState,
@@ -122,6 +124,8 @@ class AdmissionTestCase(unittest.TestCase):
                 StrategyReservation.__table__,
                 StrategyReservationEvent.__table__,
                 StrategyApproval.__table__,
+                LivePlanSubmission.__table__,
+                StrategyPlanExecutionEvent.__table__,
                 AccountReconciliationVersion.__table__,
                 StrategyPositionProjection.__table__,
                 StrategyProjectionState.__table__,
@@ -136,6 +140,14 @@ class AdmissionTestCase(unittest.TestCase):
         self.service = self._service()
 
         with self.factory() as session:
+            session.execute(
+                text(
+                    "CREATE TABLE paper_orders ("
+                    " account_scope TEXT NOT NULL, order_id TEXT NOT NULL, "
+                    " metadata_json TEXT NOT NULL DEFAULT '{}', "
+                    " PRIMARY KEY (account_scope, order_id))"
+                )
+            )
             session.execute(
                 text(
                     "INSERT INTO public.instrument_catalog_generations (id, status, published_at) "
@@ -183,7 +195,7 @@ class AdmissionTestCase(unittest.TestCase):
     def tearDown(self):
         self.engine.dispose()
 
-    def _service(self, *, market_session=None):
+    def _service(self, *, market_session=None, ledger=None):
         from backend.strategies.admission import AdmissionService
         from backend.options.execution.store import OptionRunStore
 
@@ -191,6 +203,7 @@ class AdmissionTestCase(unittest.TestCase):
             session_factory=self.factory,
             option_run_store=OptionRunStore(),
             market_session_provider=market_session or _open_session,
+            ledger=ledger,
         )
 
     # -- fixtures -----------------------------------------------------------
@@ -326,9 +339,23 @@ class AdmissionTestCase(unittest.TestCase):
             )
             session.commit()
 
-    def reserve(self, notional, *, status="active", strategy_id="stg-A", plan_id="plan-old"):
+    def reserve(
+        self,
+        notional,
+        *,
+        status="active",
+        strategy_id="stg-A",
+        plan_id="plan-old",
+        valid_until=None,
+    ):
         self.seed_plan_row(plan_id, strategy_id=strategy_id)
-        return self._reserve(notional, status=status, strategy_id=strategy_id, plan_id=plan_id)
+        return self._reserve(
+            notional,
+            status=status,
+            strategy_id=strategy_id,
+            plan_id=plan_id,
+            valid_until=valid_until,
+        )
 
     # -- per-version risk policy fixtures (B2.5) ----------------------------
 
@@ -398,7 +425,16 @@ class AdmissionTestCase(unittest.TestCase):
             )
             session.commit()
 
-    def _reserve(self, notional, *, status, strategy_id, plan_id, consumed_at=None):
+    def _reserve(
+        self,
+        notional,
+        *,
+        status,
+        strategy_id,
+        plan_id,
+        consumed_at=None,
+        valid_until=None,
+    ):
         self.seed_plan_row(plan_id, strategy_id=strategy_id)
         with self.factory() as session:
             session.execute(
@@ -415,7 +451,7 @@ class AdmissionTestCase(unittest.TestCase):
                     "sid": strategy_id,
                     "status": status,
                     "notional": float(notional),
-                    "valid": NOW + timedelta(hours=1),
+                    "valid": valid_until or NOW + timedelta(hours=1),
                     "created": NOW - timedelta(seconds=30),
                 },
             )
@@ -454,6 +490,41 @@ class PolicyRequirementTests(AdmissionTestCase):
 
 
 class AllocationTests(AdmissionTestCase):
+    def test_admission_expires_a_lapsed_never_started_reservation_before_capacity(self):
+        self.policy(allocation_inr=1000.0)
+        self.reserve(
+            600.0,
+            status="active",
+            plan_id="plan-lapsed",
+            valid_until=NOW - timedelta(seconds=1),
+        )
+
+        verdict = self.service.evaluate(
+            self.plan(plan_id="plan-new", proposal_id="prop-new"),
+            now=NOW,
+            margin_evidence=self.margin(),
+        )
+
+        self.assertTrue(verdict.admitted, verdict.detail)
+        with self.factory() as session:
+            status = session.execute(
+                text("SELECT status FROM strategy_reservations WHERE reservation_id=:rid"),
+                {"rid": "res-plan-lapsed"},
+            ).scalar()
+        self.assertEqual(status, "expired")
+
+    def test_a_failed_lapsed_reservation_sweep_does_not_change_admission(self):
+        class _FailingLedger:
+            def expire_lapsed(self, **kwargs):
+                raise RuntimeError("sweep unavailable")
+
+        service = self._service(ledger=_FailingLedger())
+        self.policy(allocation_inr=1000.0)
+
+        verdict = service.evaluate(self.plan(), now=NOW, margin_evidence=self.margin())
+
+        self.assertTrue(verdict.admitted, verdict.detail)
+
     def test_allocation_admits_when_projection_fits(self):
         self.policy(allocation_inr=1000.0)
         verdict = self.service.evaluate(self.plan(), now=NOW, margin_evidence=self.margin())

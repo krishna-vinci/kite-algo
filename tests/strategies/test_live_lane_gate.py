@@ -160,14 +160,25 @@ def test_a_refusal_names_the_persisted_setting_when_the_owner_row_gates(monkeypa
 
 
 class _FakeLedger:
-    def __init__(self, reservation=None):
+    def __init__(self, reservation=None, release_error=None):
         self._reservation = reservation
+        self.release_error = release_error
+        self.release_calls = []
         self.releases = []
 
     def for_plan(self, plan_id):
         return self._reservation
 
     def release(self, reservation_id, *, actor_id=None, reason=None):
+        self.release_calls.append(
+            {
+                "reservation_id": reservation_id,
+                "actor_id": actor_id,
+                "reason": reason,
+            }
+        )
+        if self.release_error is not None:
+            raise self.release_error
         self.releases.append((reservation_id, reason))
 
 
@@ -206,6 +217,28 @@ class _FakeSubmissions:
         return self.rows.get((str(plan_id), int(step_no)))
 
 
+class _CountingSession:
+    def __init__(self, submissions):
+        self.submissions = int(submissions)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return False
+
+    def execute(self, query, params=None):
+        return SimpleNamespace(scalar=lambda: self.submissions)
+
+
+class _CountingSessionFactory:
+    def __init__(self, submissions):
+        self.session = _CountingSession(submissions)
+
+    def __call__(self):
+        return self.session
+
+
 class _FakeSequence:
     """The durable parent store, faked down to what the release pass reads."""
 
@@ -242,14 +275,22 @@ def _reservation(plan_id: str = "plan-1") -> dict:
     }
 
 
-def _executor(*, lanes=None, adapter=None, ledger=None, sequence=None, mis_clock=None):
+def _executor(
+    *,
+    lanes=None,
+    adapter=None,
+    ledger=None,
+    sequence=None,
+    mis_clock=None,
+    session_factory=None,
+):
     from backend.strategies.live_service import LivePlanExecutor
 
     environ = {"HOSTED_LIVE_ENABLED": "true"}
     if lanes is not None:
         environ["HOSTED_LIVE_LANES"] = lanes
     executor = LivePlanExecutor(
-        session_factory=lambda: None,
+        session_factory=session_factory or (lambda: None),
         adapter=adapter or _FakeAdapter(),
         ledger=ledger or _FakeLedger(),
         clock=lambda: NOW,
@@ -336,7 +377,13 @@ def _counts() -> dict:
 
 def test_a_new_plan_in_a_closed_lane_is_refused_by_name(monkeypatch):
     adapter = _FakeAdapter()
-    executor = _executor(lanes="cnc", adapter=adapter)
+    ledger = _FakeLedger(_reservation())
+    executor = _executor(
+        lanes="cnc",
+        adapter=adapter,
+        ledger=ledger,
+        session_factory=_CountingSessionFactory(0),
+    )
     _stub_authority(monkeypatch, executor)
     plan = _plan(
         plan_kind="option_structure",
@@ -352,6 +399,60 @@ def test_a_new_plan_in_a_closed_lane_is_refused_by_name(monkeypatch):
     assert refused.value.detail["setting"] == "HOSTED_LIVE_LANES"
     assert adapter.submissions == []
     assert executor._trail.events[0]["refusal_reason"] == "LIVE_LANE_NOT_ENABLED"
+    assert ledger.releases == [("res-1", "refused_before_submission")]
+    assert ledger.release_calls[0]["actor_id"] == "system"
+
+
+def test_a_refusal_with_a_live_submission_keeps_the_reservation(monkeypatch):
+    adapter = _FakeAdapter()
+    ledger = _FakeLedger(_reservation())
+    executor = _executor(
+        lanes="cnc",
+        adapter=adapter,
+        ledger=ledger,
+        session_factory=_CountingSessionFactory(1),
+    )
+    _stub_authority(monkeypatch, executor)
+    plan = _plan(
+        plan_kind="option_structure",
+        legs=[{"signed_quantity": 75, "_current_quantity": 0, "product": "NRML"}],
+    )
+
+    with pytest.raises(ExecutionRefusal) as refused:
+        asyncio.run(executor.execute(plan, actor="owner"))
+
+    assert refused.value.reason_code == "LIVE_LANE_NOT_ENABLED"
+    assert ledger.releases == []
+
+
+def test_a_forbidden_release_never_masks_the_refusal(monkeypatch):
+    from backend.strategies.reservations import ReleaseForbidden
+
+    adapter = _FakeAdapter()
+    reservation = _reservation()
+    reservation["status"] = "consumed"
+    ledger = _FakeLedger(
+        reservation,
+        release_error=ReleaseForbidden({"reservation_id": "res-1"}),
+    )
+    executor = _executor(
+        lanes="cnc,options",
+        adapter=adapter,
+        ledger=ledger,
+        session_factory=_CountingSessionFactory(0),
+    )
+    _stub_authority(monkeypatch, executor)
+    plan = _plan(
+        plan_kind="option_structure",
+        legs=[{"signed_quantity": 75, "_current_quantity": 0, "product": "NRML"}],
+    )
+
+    with pytest.raises(ExecutionRefusal) as refused:
+        asyncio.run(executor.execute(plan, actor="owner"))
+
+    assert refused.value.reason_code == "RESERVATION_REQUIRED"
+    assert ledger.releases == []
+    assert len(ledger.release_calls) == 1
 
 
 def test_the_same_plan_in_an_open_lane_is_admitted(monkeypatch):

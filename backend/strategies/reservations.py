@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -31,10 +32,14 @@ from sqlalchemy import func, select, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from backend.strategies.attribution_models import (
+    LivePlanSubmission,
     StrategyReservation,
     StrategyReservationEvent,
     StrategyPlan,
+    StrategyPlanExecutionEvent,
 )
+
+logger = logging.getLogger(__name__)
 
 #: Statuses that still hold capacity against the allocation.
 HOLDING_STATUSES = ("active", "renewed", "action_required")
@@ -833,6 +838,121 @@ class ReservationLedger:
             raise
         finally:
             session.close()
+
+    def expire_lapsed(
+        self,
+        *,
+        account_id: str,
+        strategy_id: str,
+        execution_environment: str,
+        now: Optional[datetime] = None,
+    ) -> list[str]:
+        """Expire lapsed unstarted reservations only when no work exists.
+
+        A missing ``live_plan_submissions`` row proves no live broker claim was
+        materialized. A missing submitted paper trail/runtime order proves no paper
+        work began. Anything less - including verified progress recorded by an
+        ``advanced`` event - keeps holding capacity.
+        """
+        moment = now or _utcnow()
+        session = self.session_factory()
+        expired: list[str] = []
+        try:
+            self._lock_account(session, str(account_id))
+            rows = (
+                session.execute(
+                    select(StrategyReservation)
+                    .where(
+                        StrategyReservation.account_id == str(account_id),
+                        StrategyReservation.strategy_id == str(strategy_id),
+                        StrategyReservation.execution_environment == str(execution_environment),
+                        StrategyReservation.status.in_(UNSTARTED_STATUSES),
+                        StrategyReservation.valid_until < moment,
+                    )
+                    .order_by(StrategyReservation.valid_until, StrategyReservation.reservation_id)
+                )
+                .scalars()
+                .all()
+            )
+            for row in rows:
+                reservation_id = str(row.reservation_id)
+                blockers: list[str] = []
+                if self._has_event(session, reservation_id, "advanced"):
+                    blockers.append("advanced")
+                if self._has_live_work(session, str(row.plan_id)):
+                    blockers.append("live_plan_submission")
+                if self._has_paper_work(session, str(row.plan_id)):
+                    blockers.append("paper_work")
+                if blockers:
+                    logger.info(
+                        "keeping lapsed reservation %s for plan %s: %s",
+                        reservation_id,
+                        row.plan_id,
+                        ",".join(blockers),
+                    )
+                    continue
+                row.status = "expired"
+                row.released_at = moment
+                row.release_reason = "validity_lapsed"
+                self._record(
+                    session,
+                    reservation_id=reservation_id,
+                    event="expired",
+                    actor_id="system",
+                    detail={},
+                    at=moment,
+                )
+                expired.append(reservation_id)
+            session.commit()
+            return expired
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    @staticmethod
+    def _has_live_work(session: Any, plan_id: str) -> bool:
+        return (
+            session.execute(
+                select(func.count())
+                .select_from(LivePlanSubmission)
+                .where(LivePlanSubmission.plan_id == str(plan_id))
+            ).scalar()
+            > 0
+        )
+
+    @staticmethod
+    def _has_paper_work(session: Any, plan_id: str) -> bool:
+        event_exists = (
+            session.execute(
+                select(func.count())
+                .select_from(StrategyPlanExecutionEvent)
+                .where(
+                    StrategyPlanExecutionEvent.plan_id == str(plan_id),
+                    StrategyPlanExecutionEvent.event == "submitted",
+                )
+            ).scalar()
+            > 0
+        )
+        if event_exists:
+            return True
+        json_predicate = (
+            "metadata_json->>'plan_id' = :plan_id"
+            if session.bind.dialect.name == "postgresql"
+            else "json_extract(metadata_json, '$.plan_id') = :plan_id"
+        )
+        runtime_orders = int(
+            session.execute(
+                text(
+                    "SELECT COUNT(*) FROM paper_orders "
+                    f"WHERE {json_predicate}"
+                ),
+                {"plan_id": str(plan_id)},
+            ).scalar()
+            or 0
+        )
+        return runtime_orders > 0
 
     def require_action(
         self,

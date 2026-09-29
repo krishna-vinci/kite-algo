@@ -632,6 +632,38 @@ class TestLifecycle(_PgTestCase):
         ledger.release(second["reservation_id"], reason="terminal_unfilled", actor_id="app:owner")
         assert ledger.held_notional(account_id="kite:A") == 0.0
 
+    def test_lapsed_never_started_reservation_expires_under_postgres(self):
+        sf, ledger = self._ledger()
+        reservation = claim(ledger, PLAN_A)
+        _exec(
+            sf,
+            "UPDATE public.strategy_reservations SET valid_until=:valid "
+            "WHERE reservation_id=:rid",
+            {
+                "valid": NOW - timedelta(seconds=1),
+                "rid": reservation["reservation_id"],
+            },
+        )
+
+        expired = ledger.expire_lapsed(
+            account_id="kite:A",
+            strategy_id="stg-A",
+            execution_environment="live",
+            now=NOW,
+        )
+
+        assert expired == [reservation["reservation_id"]]
+        assert _scalar(
+            sf,
+            "SELECT status FROM public.strategy_reservations "
+            "WHERE reservation_id=:rid",
+            {"rid": reservation["reservation_id"]},
+        ) == "expired"
+        assert [
+            row["event"] for row in ledger.events(reservation["reservation_id"])
+        ] == ["created", "expired"]
+        assert ledger.held_notional(account_id="kite:A") == 0.0
+
 
 # ---------------------------------------------------------------------------
 # 5/6. approvals: the partial index and the pin matrix

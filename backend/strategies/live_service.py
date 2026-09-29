@@ -60,7 +60,11 @@ from backend.strategies.live_sequence import (
     prerequisites_met,
     staged_funding_blocked_steps,
 )
-from backend.strategies.reservations import ReservationLedger
+from backend.strategies.reservations import (
+    ReleaseForbidden,
+    ReservationLedger,
+    ReservationStateError,
+)
 from backend.strategies.settlement import ExecutionBarrier
 
 LIVE_ENVIRONMENT = "live"
@@ -264,15 +268,21 @@ class LivePlanExecutor:
             if increasing or reservation is not None:
                 self._reservation_preconditions(reservation)
         except ExecutionRefusal as exc:
-            self._record_refusal(plan_id=plan_id, actor=actor, exc=exc)
+            self._record_refusal(
+                plan_id=plan_id, actor=actor, exc=exc, reservation=reservation
+            )
             raise
         except LiveAuthorityRefusal as exc:
             wrapped = ExecutionRefusal(exc.reason_code, exc.detail)
-            self._record_refusal(plan_id=plan_id, actor=actor, exc=wrapped)
+            self._record_refusal(
+                plan_id=plan_id, actor=actor, exc=wrapped, reservation=reservation
+            )
             raise wrapped from exc
         except LiveRefusal as exc:
             wrapped = ExecutionRefusal(exc.reason_code, exc.detail)
-            self._record_refusal(plan_id=plan_id, actor=actor, exc=wrapped)
+            self._record_refusal(
+                plan_id=plan_id, actor=actor, exc=wrapped, reservation=reservation
+            )
             raise wrapped from exc
 
         account_id = str(plan.get("account_id") or "")
@@ -323,23 +333,33 @@ class LivePlanExecutor:
                 quote_reader=quote_reader,
             )
         except ExecutionRefusal as exc:
-            self._record_refusal(plan_id=plan_id, actor=actor, exc=exc)
+            self._record_refusal(
+                plan_id=plan_id, actor=actor, exc=exc, reservation=reservation
+            )
             raise
         except LiveAuthorityRefusal as exc:
             wrapped = ExecutionRefusal(exc.reason_code, exc.detail)
-            self._record_refusal(plan_id=plan_id, actor=actor, exc=wrapped)
+            self._record_refusal(
+                plan_id=plan_id, actor=actor, exc=wrapped, reservation=reservation
+            )
             raise wrapped from exc
         except LiveEvidenceUnavailable as exc:
             wrapped = ExecutionRefusal(exc.reason_code, exc.detail)
-            self._record_refusal(plan_id=plan_id, actor=actor, exc=wrapped)
+            self._record_refusal(
+                plan_id=plan_id, actor=actor, exc=wrapped, reservation=reservation
+            )
             raise wrapped from exc
         except OptionMarginEvidenceRefusal as exc:
             wrapped = ExecutionRefusal(exc.reason_code, exc.detail)
-            self._record_refusal(plan_id=plan_id, actor=actor, exc=wrapped)
+            self._record_refusal(
+                plan_id=plan_id, actor=actor, exc=wrapped, reservation=reservation
+            )
             raise wrapped from exc
         except LiveRefusal as exc:
             wrapped = ExecutionRefusal(exc.reason_code, exc.detail)
-            self._record_refusal(plan_id=plan_id, actor=actor, exc=wrapped)
+            self._record_refusal(
+                plan_id=plan_id, actor=actor, exc=wrapped, reservation=reservation
+            )
             raise wrapped from exc
 
         return self._record_submission(plan=plan, actor=actor, submission=submission, reservation=reservation)
@@ -397,7 +417,14 @@ class LivePlanExecutor:
         if valid_until is not None and self._clock() >= valid_until:
             raise ExecutionRefusal("RESERVATION_EXPIRED", {"plan_id": plan_id})
 
-    def _record_refusal(self, *, plan_id: str, actor: str, exc: ExecutionRefusal) -> None:
+    def _record_refusal(
+        self,
+        *,
+        plan_id: str,
+        actor: str,
+        exc: ExecutionRefusal,
+        reservation: Optional[Dict[str, Any]] = None,
+    ) -> None:
         self._trail._record_event(
             plan_id,
             step_no=1,
@@ -407,6 +434,50 @@ class LivePlanExecutor:
             detail=exc.detail,
             at=self._clock(),
         )
+        self._release_refused_before_submission(plan_id, reservation)
+
+    def _release_refused_before_submission(
+        self, plan_id: str, reservation: Optional[Dict[str, Any]]
+    ) -> None:
+        reservation_id = str((reservation or {}).get("reservation_id") or "")
+        if not reservation_id:
+            return
+        try:
+            with self.session_factory() as session:
+                submissions = int(
+                    session.execute(
+                        text(
+                            "SELECT COUNT(*) FROM live_plan_submissions "
+                            "WHERE plan_id = :plan_id"
+                        ),
+                        {"plan_id": plan_id},
+                    ).scalar()
+                    or 0
+                )
+            if submissions:
+                logger.info(
+                    "keeping reservation %s after refusal: plan %s has a live submission",
+                    reservation_id,
+                    plan_id,
+                )
+                return
+            self.ledger.release(
+                reservation_id,
+                reason="refused_before_submission",
+                actor_id="system",
+            )
+        except (ReleaseForbidden, ReservationStateError) as exc:
+            logger.info(
+                "refusal retained reservation %s: %s",
+                reservation_id,
+                getattr(exc, "reason_code", type(exc).__name__),
+            )
+        except Exception:  # noqa: BLE001 - a release fault cannot mask the refusal
+            logger.warning(
+                "could not release refused-before-submission reservation %s",
+                reservation_id,
+                exc_info=True,
+            )
 
     def _record_submission(
         self,

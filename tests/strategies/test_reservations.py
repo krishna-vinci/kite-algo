@@ -46,10 +46,12 @@ class ReservationTestCase(unittest.TestCase):
 
         from backend.strategies.attribution_models import (
             AccountReconciliationVersion,
+            LivePlanSubmission,
             Strategy,
             StrategyAdmissionPolicy,
             StrategyApproval,
             StrategyPlan,
+            StrategyPlanExecutionEvent,
             StrategyPositionProjection,
             StrategyProjectionState,
             StrategyProposal,
@@ -67,6 +69,8 @@ class ReservationTestCase(unittest.TestCase):
                 StrategyReservation.__table__,
                 StrategyReservationEvent.__table__,
                 StrategyApproval.__table__,
+                LivePlanSubmission.__table__,
+                StrategyPlanExecutionEvent.__table__,
                 AccountReconciliationVersion.__table__,
                 # The ledger revalidates the strategy's POST-PLAN book under its
                 # lock, so the projection tables are part of its real dependency
@@ -77,6 +81,14 @@ class ReservationTestCase(unittest.TestCase):
         )
         self.factory = sessionmaker(bind=self.engine)
         with self.factory() as session:
+            session.execute(
+                text(
+                    "CREATE TABLE paper_orders ("
+                    " account_scope TEXT NOT NULL, order_id TEXT NOT NULL, "
+                    " metadata_json TEXT NOT NULL DEFAULT '{}', "
+                    " PRIMARY KEY (account_scope, order_id))"
+                )
+            )
             session.execute(
                 text(
                     "INSERT INTO strategies (id, owner_id, name, account_scope, status) "
@@ -139,6 +151,48 @@ class ReservationTestCase(unittest.TestCase):
 
     def events(self, reservation_id):
         return [row["event"] for row in self.ledger.events(reservation_id)]
+
+    def seed_live_submission(self, plan_id):
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT INTO live_plan_submissions "
+                    "(submission_id, plan_id, step_no, step_ref, strategy_id, account_id, "
+                    " execution_environment, state, broker_order_ids, delta_snapshot, detail) "
+                    "VALUES (:submission_id, :plan_id, 1, 'step-1', 'stg-A', 'kite:A', "
+                    " 'live', 'rejected', '[]', '{}', '{}')"
+                ),
+                {"submission_id": f"live-sub-{plan_id}", "plan_id": plan_id},
+            )
+            session.commit()
+
+    def seed_paper_order(self, plan_id, *, execution_trail=True):
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT INTO paper_orders "
+                    "(account_scope, order_id, metadata_json) "
+                    "VALUES ('kite:A', :order_id, :metadata)"
+                ),
+                {
+                    "order_id": f"order-{plan_id}",
+                    "metadata": __import__("json").dumps({"plan_id": plan_id}),
+                },
+            )
+            if execution_trail:
+                session.execute(
+                    text(
+                        "INSERT INTO strategy_plan_execution_events "
+                        "(id, plan_id, step_no, event, paper_order_id, actor_id, detail) "
+                        "VALUES (:event_id, :plan_id, 1, 'submitted', :order_id, 'worker:1', '{}')"
+                    ),
+                    {
+                        "event_id": f"event-{plan_id}",
+                        "plan_id": plan_id,
+                        "order_id": f"order-{plan_id}",
+                    },
+                )
+            session.commit()
 
 
 class CapacityClaimTests(ReservationTestCase):
@@ -405,6 +459,61 @@ class CapacityClaimTests(ReservationTestCase):
 
 
 class LifecycleTests(ReservationTestCase):
+    def test_expire_lapsed_expires_only_lapsed_never_started_without_work(self):
+        lapsed = self.claim(plan_id="plan-lapsed", valid_for=60)
+        current = self.claim(plan_id="plan-current", valid_for=7200)
+
+        expired = self.ledger.expire_lapsed(
+            account_id="kite:A",
+            strategy_id="stg-A",
+            execution_environment="live",
+            now=NOW + timedelta(hours=2),
+        )
+
+        self.assertEqual(expired, [lapsed["reservation_id"]])
+        self.assertEqual(self.ledger.get(lapsed["reservation_id"])["status"], "expired")
+        self.assertEqual(self.events(lapsed["reservation_id"]), ["created", "expired"])
+        self.assertEqual(self.ledger.get(current["reservation_id"])["status"], "active")
+        self.assertEqual(
+            self.ledger.held_notional(account_id="kite:A"),
+            current["reserved_notional_inr"],
+        )
+
+    def test_expire_lapsed_keeps_a_reservation_with_live_or_paper_work(self):
+        live = self.claim(plan_id="plan-live", valid_for=60)
+        paper = self.claim(plan_id="plan-paper", valid_for=60)
+        self.seed_live_submission("plan-live")
+        self.seed_paper_order("plan-paper", execution_trail=False)
+
+        expired = self.ledger.expire_lapsed(
+            account_id="kite:A",
+            strategy_id="stg-A",
+            execution_environment="live",
+            now=NOW + timedelta(hours=2),
+        )
+
+        self.assertEqual(expired, [])
+        self.assertEqual(self.ledger.get(live["reservation_id"])["status"], "active")
+        self.assertEqual(self.ledger.get(paper["reservation_id"])["status"], "active")
+        self.assertEqual(self.ledger.held_notional(account_id="kite:A"), 2000.0)
+
+    def test_expire_lapsed_keeps_verified_progress(self):
+        reservation = self.claim(plan_id="plan-started", valid_for=60)
+        self.ledger.advance(
+            reservation["reservation_id"], actor_id="worker:1", now=NOW
+        )
+
+        expired = self.ledger.expire_lapsed(
+            account_id="kite:A",
+            strategy_id="stg-A",
+            execution_environment="live",
+            now=NOW + timedelta(hours=2),
+        )
+
+        self.assertEqual(expired, [])
+        self.assertEqual(self.ledger.get(reservation["reservation_id"])["status"], "renewed")
+        self.assertEqual(self.ledger.held_notional(account_id="kite:A"), 1000.0)
+
     def test_unstarted_expires_with_validity_and_never_before(self):
         from backend.strategies.reservations import ReservationStateError
 

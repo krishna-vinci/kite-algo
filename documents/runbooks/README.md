@@ -244,6 +244,12 @@ primitives are:
   `abandon`, `backend/api/schemas/proposals.py:163`). Writes `residual_abandoned`
   to the append-only trail, never a fabricated fill
   (`backend/strategies/live_repair.py:1-32,78`).
+- **Live attribution unpublished after a pre-broker refusal** — when durable evidence
+  shows zero `live_plan_submissions` rows for the plan, rebuild the empty live book
+  with `POST /api/strategies/{strategy_id}/positions/rebuild?environment=live`, then
+  run `POST /api/strategies/{strategy_id}/jobs/{job_id}/reconciliation`. The rebuild
+  publishes evidence and places no broker order; never use it while a live submission
+  or broker order may exist.
 - **Staged dependent abandonment** — a `withheld` buy whose funding legs are all
   terminal-but-unfilled and whose authority is provably gone
   (`backend/strategies/live_repair.py:622-717`), disposition

@@ -404,6 +404,11 @@ Uvicorn runs with its standard extras (uvloop and httptools), compose caps glibc
 ### 5.3 Admission and risk (`backend/strategies/admission.py`)
 
 - **Operator policy (`StrategyAdmissionPolicy`).** Every field is optional: null means not enforced (`:175-187,1154-1226`).
+- **Lapsed-reservation sweep.** Before measuring capacity, admission expires lapsed
+  `active`/`renewed` reservations only when the plan has no `advanced` event, no
+  `live_plan_submissions` row and no submitted paper trail or runtime paper order.
+  A sweep failure is logged and admission continues with its existing held-capacity
+  figure.
 
 | Refusal | Condition |
 | --- | --- |
@@ -457,6 +462,11 @@ Uvicorn runs with its standard extras (uvloop and httptools), compose caps glibc
   - Postgres takes an account advisory lock.
   - Refusal: `CAPACITY_EXCEEDED`.
   - Valid for 900 s.
+  - A live execution refusal before any durable live submission releases the plan's
+    unstarted reservation with reason `refused_before_submission`; a submission row,
+    verified progress or a terminal state keeps it held.
+  - The admission sweep expires only proved never-started reservations. Live work,
+    paper trail/orders and `advanced` progress are explicit hold proofs.
 - **Approvals** (`approvals.py:356-600`):
   - An approval pins the plan hash, exposure snapshot, reconciliation version, catalog generation, version id,
     source hash, policy hash and the option run and generation.

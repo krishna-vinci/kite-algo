@@ -20,6 +20,7 @@ resizing is a non-goal, and this phase's verdict is consumed by nothing yet.
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 from dataclasses import dataclass, field
@@ -37,6 +38,9 @@ from backend.strategies.attribution_models import (
     StrategyProjectionState,
     StrategyReservation,
 )
+from backend.strategies.reservations import ReservationLedger
+
+logger = logging.getLogger(__name__)
 
 #: Refusal vocabulary, in evaluation order (D-2). The plan's list is verbatim
 #: except REFERENCE_PRICE_UNAVAILABLE, which names the case where the notional
@@ -150,7 +154,11 @@ def margin_max_age_seconds() -> float:
 
 
 class AdmissionService:
-    """Reads policies and evidence; produces verdicts. Writes only policies."""
+    """Reads policies and evidence; produces verdicts.
+
+    It also expires proof-gated lapsed reservations at the start of evaluation;
+    otherwise this service writes only policies.
+    """
 
     def __init__(
         self,
@@ -159,6 +167,7 @@ class AdmissionService:
         margin_engine: Any = None,
         option_run_store: Any = None,
         market_session_provider: Optional[Callable[[str, datetime], Mapping[str, Any]]] = None,
+        ledger: Any = None,
     ) -> None:
         if session_factory is None:
             from backend.app.database import SessionLocal
@@ -167,6 +176,7 @@ class AdmissionService:
         self.session_factory = session_factory
         self._margin_engine = margin_engine
         self._option_run_store = option_run_store
+        self._reservation_ledger = ledger or ReservationLedger(session_factory=session_factory)
         # Evidence is passed in, not fetched: the same plan and the same session
         # state must always produce the same verdict. The default is the real
         # imported-calendar read, which fails CLOSED when the calendar is
@@ -1073,6 +1083,21 @@ class AdmissionService:
         strategy_id = str(plan.get("strategy_id") or "")
         account_id = str(plan.get("account_id") or "")
         is_live = environment == "live"
+
+        try:
+            self._reservation_ledger.expire_lapsed(
+                account_id=account_id,
+                strategy_id=strategy_id,
+                execution_environment=environment,
+                now=moment,
+            )
+        except Exception:  # noqa: BLE001 - a sweep fault must not change admission
+            logger.warning(
+                "lapsed reservation sweep failed for strategy %s in %s",
+                strategy_id,
+                environment,
+                exc_info=True,
+            )
 
         policy = self.policy_for(strategy_id)
         if policy is None:
