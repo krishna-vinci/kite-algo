@@ -406,3 +406,28 @@ def test_compiler_accepts_fundamentals_stage_with_timeframe():
     doc = _fundamentals_doc()
     compiled = compile_document(parse_workflow_dict(doc))
     assert compiled.canonical_hash
+
+
+def test_loader_reads_through_a_real_sqlalchemy_session(session_factory):
+    """SQLAlchemy 2 rejects a bare SQL string; the fake session above hid that."""
+    from sqlalchemy import text
+
+    from backend.workflows.fundamentals_context import _SELECT_COLUMNS
+
+    columns = ", ".join(
+        f"{name} TEXT" if name in ("scraped_at", "as_of_date", "statement_scope") else f"{name} REAL"
+        for name in _SELECT_COLUMNS
+    )
+    with session_factory() as session:
+        session.execute(text(f"CREATE TABLE public.fundamentals_features (symbol TEXT, {columns})"))
+        session.execute(
+            text(
+                "INSERT INTO public.fundamentals_features (symbol, statement_scope, scraped_at) "
+                "VALUES ('INFY', 'consolidated', '2026-09-28T00:00:00+00:00')"
+            )
+        )
+        session.commit()
+
+    context = FundamentalsLoader(session_factory).context_for("NSE:INFY")
+
+    assert context is not None

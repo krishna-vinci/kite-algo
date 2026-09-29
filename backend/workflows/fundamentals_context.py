@@ -24,6 +24,8 @@ from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from sqlalchemy import text
+
 from backend.workflows.registry import (
     FUNDAMENTALS_COLUMN_MAP,
     FUNDAMENTALS_FIELDS,
@@ -157,7 +159,7 @@ class FundamentalsLoader:
             return None
         try:
             row = session.execute(
-                query, {"symbol": symbol, "scope": self._statement_scope}
+                text(query), {"symbol": symbol, "scope": self._statement_scope}
             ).mappings().first()
         except Exception:
             logger.warning(
