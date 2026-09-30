@@ -1334,6 +1334,11 @@ class LivePlanAdapter:
             now=self._clock(),
             margin_evidence=margin_evidence,
             catalog_state=catalog_state,
+            # This plan already holds its OWN reservation from reserve time. The
+            # send-time re-evaluation adds the requirement itself, so counting
+            # the plan's own reservation here would charge it twice (the live
+            # send-time double-count).
+            exclude_plan_id=plan_id,
             **evidence,
         )
         if not bool(verdict.admitted):

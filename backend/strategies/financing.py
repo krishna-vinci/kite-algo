@@ -459,6 +459,7 @@ def capacity_held(
     account_id: str,
     strategy_id: str,
     execution_environment: str,
+    exclude_plan_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Capacity held for ONE strategy in ONE environment, with its evidence.
 
@@ -477,6 +478,12 @@ def capacity_held(
 
     Anything else leaves the reservation holding capacity. The consumed history
     is always in the ledger for audit; it is simply still budget.
+
+    ``exclude_plan_id`` exists for the SEND-TIME re-evaluation of an already
+    reserved plan: the plan's own reservation was made for exactly this
+    requirement, so counting it here and then adding the requirement on top
+    charges the same money twice. Reserve-time admission passes nothing, since
+    there the plan has no reservation yet and every other reservation must count.
     """
     published = _publication(
         db,
@@ -484,18 +491,21 @@ def capacity_held(
         strategy_id=strategy_id,
         execution_environment=execution_environment,
     )
-    rows = db.execute(
-        select(
-            StrategyReservation.reservation_id,
-            StrategyReservation.status,
-            StrategyReservation.reserved_notional_inr,
-        ).where(
-            StrategyReservation.account_id == str(account_id),
-            StrategyReservation.strategy_id == str(strategy_id),
-            StrategyReservation.execution_environment == str(execution_environment),
-            StrategyReservation.status.in_(PENDING_COMMITMENT_STATUSES + ("consumed",)),
-        )
-    ).all()
+    statement = select(
+        StrategyReservation.reservation_id,
+        StrategyReservation.status,
+        StrategyReservation.reserved_notional_inr,
+    ).where(
+        StrategyReservation.account_id == str(account_id),
+        StrategyReservation.strategy_id == str(strategy_id),
+        StrategyReservation.execution_environment == str(execution_environment),
+        StrategyReservation.status.in_(PENDING_COMMITMENT_STATUSES + ("consumed",)),
+    )
+    if exclude_plan_id is not None:
+        # A plan's OWN reservation is not "capacity held beside" it: it is the
+        # claim this very plan made, and the caller adds the requirement itself.
+        statement = statement.where(StrategyReservation.plan_id != str(exclude_plan_id))
+    rows = db.execute(statement).all()
     consumed_ids = [str(row[0]) for row in rows if str(row[1]) == "consumed"]
     consumed_at = _consumption_times(db, reservation_ids=consumed_ids)
     unfilled = 0.0

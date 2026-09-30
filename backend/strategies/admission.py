@@ -330,11 +330,16 @@ class AdmissionService:
         account_id: str,
         strategy_id: str,
         execution_environment: str,
+        exclude_plan_id: Optional[str] = None,
     ) -> Dict[str, float]:
         """Capacity held for ONE strategy in ONE environment (shared rule).
 
         Delegates to :mod:`backend.strategies.financing` so admission and the
         reservation ledger can never drift: the rule is defined once.
+
+        ``exclude_plan_id`` is passed through for send-time re-evaluation: the
+        plan's own reservation is the claim being re-checked, so it must not be
+        counted as capacity held beside the plan.
         """
         from backend.strategies.financing import capacity_held
 
@@ -344,6 +349,7 @@ class AdmissionService:
                 account_id=account_id,
                 strategy_id=strategy_id,
                 execution_environment=execution_environment,
+                exclude_plan_id=exclude_plan_id,
             )
 
     def plan_exposure(
@@ -1064,6 +1070,7 @@ class AdmissionService:
         account_day_pnl_inr: Optional[float] = None,
         account_daily_loss_cap_inr: Optional[float] = None,
         catalog_state: Optional[Mapping[str, Any]] = None,
+        exclude_plan_id: Optional[str] = None,
     ) -> AdmissionVerdict:
         """Evaluate every control in order; the first refusal wins (D-2).
 
@@ -1077,6 +1084,12 @@ class AdmissionService:
         ``account_daily_loss_cap_inr``/``account_day_pnl_inr`` are the
         account-wide cap and the broker's own day P&L. Both controls refuse only
         an exposure-INCREASING plan; a reduction is never blocked by a loss.
+
+        ``exclude_plan_id`` is set by the SEND-TIME live re-evaluation, where the
+        plan has already claimed its own reservation: its own claim is not
+        capacity held BESIDE the plan, and the requirement is added separately.
+        Reserve-time admission (and every other caller) passes nothing, so every
+        existing reservation still counts.
         """
         moment = now or _utcnow()
         environment = str(execution_environment or "live").lower()
@@ -1153,6 +1166,7 @@ class AdmissionService:
             account_id=account_id,
             strategy_id=strategy_id,
             execution_environment=environment,
+            exclude_plan_id=exclude_plan_id,
         )
         # Capacity held is the strategy's OWN unfilled commitments plus any
         # consumed reservation whose exposure is not yet visible in the published

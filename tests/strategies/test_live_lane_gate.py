@@ -578,3 +578,48 @@ def test_mis_squareoff_still_releases_while_mis_is_closed(monkeypatch):
     assert (counts["released"], counts["blocked"]) == (1, 0)
     assert sequence.blockers == []
     assert adapter.releases[0]["spec"] is spec
+
+
+# -- send-time re-evaluation -------------------------------------------------
+
+
+class _CapturingAdmission:
+    """Records the exact keyword arguments the live send gate hands admission."""
+
+    def __init__(self):
+        self.calls = []
+
+    def evaluate(self, plan, **kwargs):
+        from backend.strategies.admission import AdmissionVerdict
+
+        self.calls.append({"plan": plan, **kwargs})
+        return AdmissionVerdict(True)
+
+
+def test_the_live_send_gate_excludes_the_plans_own_reservation():
+    """The send gate re-evaluates an already-reserved plan.
+
+    Its OWN reservation must be excluded, or the requirement is charged twice
+    (the live send-time double-count). The adapter passes the plan's own id, not
+    a constant.
+    """
+    from backend.strategies.live_adapter import LivePlanAdapter
+
+    admission = _CapturingAdmission()
+    adapter = LivePlanAdapter(
+        session_factory=lambda: None,
+        admission=admission,
+        clock=lambda: NOW,
+    )
+    plan = _plan(
+        plan_kind="single_instrument",
+        legs=[{"signed_quantity": 1, "_current_quantity": 0, "product": "CNC"}],
+        plan_id="plan-77",
+    )
+
+    result = adapter._check_admission(plan, margin_evidence=None, catalog_state=None)
+
+    assert result["admitted"] is True
+    assert len(admission.calls) == 1
+    assert admission.calls[0]["exclude_plan_id"] == "plan-77"
+    assert admission.calls[0]["execution_environment"] == "live"

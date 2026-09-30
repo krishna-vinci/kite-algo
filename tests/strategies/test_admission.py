@@ -1204,6 +1204,77 @@ class OptionalAxisTests(AdmissionTestCase):
         assert exposure["post_instruments"] == 1
 
 
+class SendTimeExclusionTests(AdmissionTestCase):
+    """The send-time re-evaluation must not double-count the plan's OWN claim.
+
+    A live plan claims a reservation at reserve time; the send gate re-runs
+    admission for the same plan. Counting that reservation as capacity held
+    BESIDE the plan - and then adding the plan's requirement on top - charges
+    the same money twice, refusing every order above half its own limit.
+    ``exclude_plan_id`` is the send gate's answer for exactly that.
+    """
+
+    def _reserved_plan(self):
+        """One ITC-like leg: 1 x 265.65 = 265.65, under a 500 gross limit."""
+        leg = {
+            **self._leg(),
+            "instrument_id": "inst-REL",
+            "signed_quantity": 1,
+            "reference_price": 265.65,
+        }
+        return self.plan(leg=leg)
+
+    def test_the_plans_own_reservation_is_not_counted_when_excluded(self):
+        # The incident shape: gross limit 500, the plan needs 265.65, and its
+        # own active 265.65 reservation is the ONLY claim on the book.
+        self.policy(allocation_inr=100000.0, gross_notional_inr=500.0)
+        self.reserve(265.65, status="active", plan_id="plan-1")
+
+        verdict = self.service.evaluate(
+            self._reserved_plan(),
+            now=NOW,
+            margin_evidence=self.margin(),
+            exclude_plan_id="plan-1",
+        )
+
+        self.assertTrue(verdict.admitted, verdict.detail)
+        self.assertEqual(verdict.detail["pending_commitments_inr"], 0.0)
+        self.assertEqual(verdict.detail["projected_gross_inr"], 265.65)
+
+    def test_without_exclusion_the_same_plan_is_refused(self):
+        # Documents today's behaviour the fix removes: the plan's own claim is
+        # summed into ``pending`` and then the requirement is added again, so
+        # 265.65 + 265.65 = 531.3 breaches the 500 gross limit.
+        self.policy(allocation_inr=100000.0, gross_notional_inr=500.0)
+        self.reserve(265.65, status="active", plan_id="plan-1")
+
+        verdict = self.service.evaluate(
+            self._reserved_plan(), now=NOW, margin_evidence=self.margin()
+        )
+
+        self.assertEqual(verdict.refusal_reason, "GROSS_NOTIONAL_EXCEEDED")
+        self.assertEqual(verdict.detail["active_reserved_inr"], 265.65)
+        self.assertEqual(verdict.detail["projected_gross_inr"], 531.3)
+
+    def test_another_plans_reservation_is_still_counted_with_exclusion_set(self):
+        # Exclusion is scoped to ONE plan id: a sibling plan's unfilled claim
+        # still holds capacity (the live lane must not admit two plans for the
+        # same money).
+        self.policy(allocation_inr=100000.0, gross_notional_inr=500.0)
+        self.reserve(265.65, status="active", plan_id="plan-other")
+
+        verdict = self.service.evaluate(
+            self._reserved_plan(),
+            now=NOW,
+            margin_evidence=self.margin(),
+            exclude_plan_id="plan-1",
+        )
+
+        self.assertEqual(verdict.refusal_reason, "GROSS_NOTIONAL_EXCEEDED")
+        self.assertEqual(verdict.detail["pending_commitments_inr"], 265.65)
+        self.assertEqual(verdict.detail["projected_gross_inr"], 531.3)
+
+
 class FailClosedTests(AdmissionTestCase):
     def test_live_daily_loss_budget_refuses_as_unavailable(self):
         # A caller that could not read today's realized P&L passes None, and a
