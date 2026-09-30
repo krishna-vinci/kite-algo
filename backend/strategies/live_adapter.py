@@ -3028,78 +3028,84 @@ class LivePlanAdapter:
             # exactly; every other movement is a NAMED refusal so the operator
             # re-approves instead of trading an approved delta against a book it no
             # longer describes.
-            approval, mismatched, pin_detail = self._approval_pin_state(plan)
+            # An owner_flatten release is the owner's explicit close of this book:
+            # like its first submit, it carries no run approval or reservation, and
+            # is re-checked as a pure target-zero reduction instead.
             exposure_proof: Dict[str, Any] = {}
-            if mismatched:
-                unexplained = sorted(
-                    set(mismatched) - set(SEQUENCE_TOLERATED_PIN_MISMATCHES)
-                )
-                # An option plan's approval carries a live reservation, and a
-                # released/expired capacity is its OWN named blocker rather than a
-                # generic approval failure: the owner is told to re-reserve, not
-                # to re-approve a plan whose pins all still hold.
-                if (
-                    self._is_option_plan(plan)
-                    and unexplained
-                    and set(unexplained) <= {"RESERVATION_NOT_ACTIVE"}
-                ):
+            if self._is_owner_flatten_authority(authority):
+                self._check_owner_flatten_reduction(plan, authority)
+            else:
+                approval, mismatched, pin_detail = self._approval_pin_state(plan)
+                if mismatched:
+                    unexplained = sorted(
+                        set(mismatched) - set(SEQUENCE_TOLERATED_PIN_MISMATCHES)
+                    )
+                    # An option plan's approval carries a live reservation, and a
+                    # released/expired capacity is its OWN named blocker rather than a
+                    # generic approval failure: the owner is told to re-reserve, not
+                    # to re-approve a plan whose pins all still hold.
+                    if (
+                        self._is_option_plan(plan)
+                        and unexplained
+                        and set(unexplained) <= {"RESERVATION_NOT_ACTIVE"}
+                    ):
+                        self._check_reservation(plan)
+                    # A moved catalog GENERATION is stricter for options than for any
+                    # other lane: every option leg is a pinned derivative contract, so
+                    # the named option refusal is reported instead of the general
+                    # "relevant listing changed" pin.
+                    if (
+                        self._is_option_plan(plan)
+                        and unexplained
+                        and set(unexplained) <= {"CATALOG_RELEVANT_CHANGE"}
+                    ):
+                        self._check_approval_binding(plan, approval)
+                    if unexplained or parent is None:
+                        raise LiveRefusal(
+                            "LIVE_APPROVAL_INVALID",
+                            {
+                                "plan_id": plan_id,
+                                "step_no": step_no,
+                                "approval_id": str(approval.get("approval_id") or ""),
+                                "mismatched_pins": mismatched,
+                                "explained_pins": sorted(
+                                    set(mismatched) & set(SEQUENCE_TOLERATED_PIN_MISMATCHES)
+                                ),
+                                "detail": pin_detail,
+                                "message": (
+                                    "no durable parent is available to prove an exposure "
+                                    "snapshot change against"
+                                    if parent is None
+                                    else "an approval pin other than the exposure snapshot moved"
+                                ),
+                            },
+                        )
+                    proved, exposure_proof = self._exposure_move_is_own_fills(
+                        plan, specs, parent
+                    )
+                    if not proved:
+                        raise LiveRefusal(
+                            "LIVE_SEQUENCE_BOOK_MOVED_BEYOND_OWN_FILLS",
+                            {
+                                "plan_id": plan_id,
+                                "step_no": step_no,
+                                "approval_id": str(approval.get("approval_id") or ""),
+                                **exposure_proof,
+                                "message": (
+                                    "the book moved by something other than this plan's own "
+                                    "confirmed fills, so the frozen delta no longer describes "
+                                    "it; re-approve the plan"
+                                ),
+                            },
+                        )
+                exposure_proof["pin"] = "EXPOSURE_SNAPSHOT_CHANGED"
+                # S3: the version/policy and option-generation pins are re-checked in
+                # the SAME release transaction, and an option plan's reservation is
+                # re-read here (never renewed) so a released or expired capacity is a
+                # named blocker rather than a silently released leg.
+                self._check_approval_binding(plan, approval)
+                if self._is_option_plan(plan):
                     self._check_reservation(plan)
-                # A moved catalog GENERATION is stricter for options than for any
-                # other lane: every option leg is a pinned derivative contract, so
-                # the named option refusal is reported instead of the general
-                # "relevant listing changed" pin.
-                if (
-                    self._is_option_plan(plan)
-                    and unexplained
-                    and set(unexplained) <= {"CATALOG_RELEVANT_CHANGE"}
-                ):
-                    self._check_approval_binding(plan, approval)
-                if unexplained or parent is None:
-                    raise LiveRefusal(
-                        "LIVE_APPROVAL_INVALID",
-                        {
-                            "plan_id": plan_id,
-                            "step_no": step_no,
-                            "approval_id": str(approval.get("approval_id") or ""),
-                            "mismatched_pins": mismatched,
-                            "explained_pins": sorted(
-                                set(mismatched) & set(SEQUENCE_TOLERATED_PIN_MISMATCHES)
-                            ),
-                            "detail": pin_detail,
-                            "message": (
-                                "no durable parent is available to prove an exposure "
-                                "snapshot change against"
-                                if parent is None
-                                else "an approval pin other than the exposure snapshot moved"
-                            ),
-                        },
-                    )
-                proved, exposure_proof = self._exposure_move_is_own_fills(
-                    plan, specs, parent
-                )
-                if not proved:
-                    raise LiveRefusal(
-                        "LIVE_SEQUENCE_BOOK_MOVED_BEYOND_OWN_FILLS",
-                        {
-                            "plan_id": plan_id,
-                            "step_no": step_no,
-                            "approval_id": str(approval.get("approval_id") or ""),
-                            **exposure_proof,
-                            "message": (
-                                "the book moved by something other than this plan's own "
-                                "confirmed fills, so the frozen delta no longer describes "
-                                "it; re-approve the plan"
-                            ),
-                        },
-                    )
-            exposure_proof["pin"] = "EXPOSURE_SNAPSHOT_CHANGED"
-            # S3: the version/policy and option-generation pins are re-checked in
-            # the SAME release transaction, and an option plan's reservation is
-            # re-read here (never renewed) so a released or expired capacity is a
-            # named blocker rather than a silently released leg.
-            self._check_approval_binding(plan, approval)
-            if self._is_option_plan(plan):
-                self._check_reservation(plan)
             staged_detail = None
             if str(getattr(spec, "release_rule", "")) == RULE_STAGED_FUNDING_GATE:
                 # STAGE 1 - sequencing and price evidence only: it reads no money,
