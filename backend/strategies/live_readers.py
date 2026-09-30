@@ -106,7 +106,11 @@ def attributed_position_reader(
     """Attributed CURRENT quantity for one leg, from the canonical projection.
 
     Unknown/unpublished attribution refuses: an empty projection is not a flat
-    account. Callers are expected to publish the book (full recompute) first.
+    account. When the book has NEVER been published, the reader publishes it
+    once through the rebuild route's own attribution service and re-reads; a
+    brand-new strategy's first live step is therefore not blocked on a manual
+    ``positions/rebuild``. A publish that fails keeps the refusal: unpublished
+    is never treated as flat without a publication.
     """
     factory = session_factory or SessionLocal
 
@@ -120,34 +124,61 @@ def attributed_position_reader(
                 "LIVE_POSITION_EVIDENCE_UNAVAILABLE",
                 {"plan_id": str(plan.get("plan_id") or ""), "reason": "missing attribution coordinates"},
             )
-        with factory() as session:
-            rows = session.execute(
-                text(
-                    """
-                    SELECT canonical_instrument_id, product, net_quantity, unresolved_reason
-                    FROM public.strategy_position_projection
-                    WHERE account_id = :account_id
-                      AND strategy_id = :strategy_id
-                      AND execution_environment = :environment
-                    """
-                ),
-                {"account_id": account_id, "strategy_id": strategy_id, "environment": environment},
-            ).fetchall()
-            published = session.execute(
-                text(
-                    """
-                    SELECT 1
-                    FROM public.strategy_projection_state
-                    WHERE account_id = :account_id
-                      AND strategy_id = :strategy_id
-                      AND execution_environment = :environment
-                    """
-                ),
-                {"account_id": account_id, "strategy_id": strategy_id, "environment": environment},
-            ).first()
-        if not rows and not published:
-            # Never published is UNKNOWN, not flat: publishing the book (full
-            # recompute) is the caller's job before it may size a live step.
+
+        def _read() -> tuple[list, bool]:
+            with factory() as session:
+                rows = session.execute(
+                    text(
+                        """
+                        SELECT canonical_instrument_id, product, net_quantity, unresolved_reason
+                        FROM public.strategy_position_projection
+                        WHERE account_id = :account_id
+                          AND strategy_id = :strategy_id
+                          AND execution_environment = :environment
+                        """
+                    ),
+                    {"account_id": account_id, "strategy_id": strategy_id, "environment": environment},
+                ).fetchall()
+                published = session.execute(
+                    text(
+                        """
+                        SELECT 1
+                        FROM public.strategy_projection_state
+                        WHERE account_id = :account_id
+                          AND strategy_id = :strategy_id
+                          AND execution_environment = :environment
+                        """
+                    ),
+                    {"account_id": account_id, "strategy_id": strategy_id, "environment": environment},
+                ).first()
+            return rows, published is not None
+
+        rows, published = _read()
+        if not published:
+            # Never published is UNKNOWN, not flat. Publish the book once through
+            # the SAME service the owner rebuild route uses, then re-read; only a
+            # publication may turn "unpublished" into a readable (possibly zero)
+            # book. A failed publish keeps today's refusal.
+            from backend.strategies.attribution import publish_book_now
+
+            try:
+                publish_book_now(
+                    factory,
+                    account_id=account_id,
+                    strategy_id=strategy_id,
+                    execution_environment=environment,
+                )
+            except Exception as exc:  # noqa: BLE001 - an unpublishable book is unknown
+                raise LiveEvidenceUnavailable(
+                    "LIVE_POSITION_EVIDENCE_UNAVAILABLE",
+                    {
+                        "plan_id": str(plan.get("plan_id") or ""),
+                        "message": "no published live attribution exists for this book",
+                        "publish_error": type(exc).__name__,
+                    },
+                ) from exc
+            rows, published = _read()
+        if not published:
             raise LiveEvidenceUnavailable(
                 "LIVE_POSITION_EVIDENCE_UNAVAILABLE",
                 {

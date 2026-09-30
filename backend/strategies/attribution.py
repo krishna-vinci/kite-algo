@@ -1249,7 +1249,21 @@ class StrategyAttributionService:
     async def publish(self, *, account_id: str, strategy_id: str, execution_environment: str) -> Dict[str, Any]:
         """Recompute and publish the book for one ``(account, strategy, env)``."""
         return await self._run_async(
-            self._publish_sync,
+            self.publish_now,
+            account_id=account_id,
+            strategy_id=strategy_id,
+            execution_environment=execution_environment,
+        )
+
+    def publish_now(self, *, account_id: str, strategy_id: str, execution_environment: str) -> Dict[str, Any]:
+        """The synchronous full recompute+publish that :meth:`publish` awaits.
+
+        ``publish`` runs this on a worker thread so an HTTP request never blocks
+        its event loop. The live evidence readers run synchronously on their own
+        thread already, so they call this directly to publish a never-published
+        book through the SAME computation (there is no second publisher).
+        """
+        return self._publish_sync(
             account_id=account_id,
             strategy_id=strategy_id,
             execution_environment=execution_environment,
@@ -1433,3 +1447,30 @@ def _content_sha256(rows: Sequence[Dict[str, Any]]) -> str:
     """
     payload = json.dumps(list(rows), sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def publish_book_now(
+    session_factory: Optional[Callable[[], Any]] = None,
+    *,
+    account_id: str,
+    strategy_id: str,
+    execution_environment: str,
+) -> Dict[str, Any]:
+    """Publish one book synchronously through the rebuild route's own service.
+
+    The live evidence readers (and the reconciliation collector) hold only a
+    session factory, never app state, so this is how a caller that finds NO
+    publication reaches the SAME ``StrategyAttributionService`` the
+    ``POST /positions/rebuild`` route uses. It is one implementation, not a
+    copy: the store and the recompute+publish body are identical.
+    """
+    if session_factory is None:
+        from backend.app.database import SessionLocal
+
+        session_factory = SessionLocal
+    service = StrategyAttributionService(SqlAttributionStore(session_factory=session_factory))
+    return service.publish_now(
+        account_id=account_id,
+        strategy_id=strategy_id,
+        execution_environment=execution_environment,
+    )
