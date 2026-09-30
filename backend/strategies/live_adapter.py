@@ -2262,6 +2262,32 @@ class LivePlanAdapter:
         try:
             result = await self.intent_handler.handle(intent, context={"plan_id": plan_id})
         except Exception as exc:  # noqa: BLE001 - transport uncertainty is not a retry
+            if getattr(exc, "definite_rejection", False):
+                # A DEFINITE broker refusal (Kite validation: HTTP 400, and the
+                # order was never created) is a rejection, not transport
+                # uncertainty. The broker boundary marks the exception
+                # explicitly; the message is never string-matched here.
+                self.barrier.record_work_event(
+                    account_id=account_id,
+                    strategy_id=strategy_id,
+                    execution_environment="live",
+                    event="work_resolved",
+                    ref=step_ref,
+                    detail={"plan_id": plan_id, "outcome": "rejected"},
+                )
+                stored = self.submissions.record_outcome(
+                    plan_id=plan_id,
+                    step_no=step_no,
+                    state="rejected",
+                    detail={
+                        "delta": delta,
+                        "error": str(exc),
+                        "broker_rejection": True,
+                        **release_evidence,
+                        **({"execution_order": execution_order} if execution_order else {}),
+                    },
+                )
+                return dict(stored or {})
             stored = self.submissions.record_outcome(
                 plan_id=plan_id,
                 step_no=step_no,

@@ -11,6 +11,12 @@ from typing import Any, Callable, Dict, List, Optional
 import requests
 from fastapi import HTTPException, Request, Response
 from kiteconnect import KiteConnect
+try:
+    from kiteconnect.exceptions import InputException as KiteInputException
+except ImportError:  # pragma: no cover - test stubs replace kiteconnect with a bare module
+
+    class KiteInputException(Exception):
+        """Stand-in so the module imports where kiteconnect is stubbed."""
 from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -41,6 +47,50 @@ def get_correlation_id(request: Request) -> str:
     if not corr_id:
         corr_id = str(uuid.uuid4())
     return corr_id
+
+
+def default_market_protection() -> int:
+    """The platform default market-protection value for a MARKET / SL-M order.
+
+    Kite refuses a MARKET order sent through the API without market protection
+    (``InputException``: "Market orders without market protection are not allowed
+    via API"), so the broker boundary supplies one when the caller did not choose
+    it. ``-1`` lets Kite pick the band automatically - the same value the
+    protection exits already use. An unparseable or out-of-range override is a
+    warning plus the ``-1`` default, never an error: a live entry must not fail
+    because an operator typed the env var wrong.
+    """
+    raw = os.getenv("KITE_DEFAULT_MARKET_PROTECTION")
+    if raw is None or str(raw).strip() == "":
+        return -1
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        logger.warning("Invalid KITE_DEFAULT_MARKET_PROTECTION %r; using -1", raw)
+        return -1
+    if not (-1 <= value <= 100):
+        logger.warning("Out-of-range KITE_DEFAULT_MARKET_PROTECTION %r; using -1", raw)
+        return -1
+    return value
+
+
+class BrokerOrderRejected(HTTPException):
+    """A DEFINITE broker refusal: the request never became an order.
+
+    Kite answers a validation failure (for example a MARKET order without market
+    protection) with HTTP 400 and names no order id. That is a rejection, not
+    transport uncertainty - the order was never created - so the live path may
+    settle the step instead of holding capacity against an order that does not
+    exist. The ``definite_rejection`` flag carries that meaning to the caller
+    explicitly; the broker's own message travels as ``detail`` and is never
+    string-matched to decide anything.
+    """
+
+    def __init__(self, detail: str, *, broker_code: Optional[str] = None) -> None:
+        super().__init__(status_code=400, detail=detail)
+        self.definite_rejection = True
+        self.broker_code = broker_code
+
 
 class KiteWriteThrottler:
     def __init__(self, rate_per_second: float):
@@ -356,6 +406,14 @@ class OrdersService:
                 )
             variety = params.pop('variety')
             variety_value = variety.value if isinstance(variety, Variety) else str(variety)
+            # Kite rejects a MARKET / SL-M order that carries no market protection,
+            # so the boundary supplies the platform default when the caller left it
+            # unset. An explicit value is kept exactly as given, and LIMIT / SL are
+            # never touched. This sits before BOTH send paths below so the plain
+            # ``kite.place_order`` and the autoslice ``order.place`` POST send the
+            # identical payload.
+            if req.order_type in (OrderType.MARKET, OrderType.SL_M) and req.market_protection is None:
+                params["market_protection"] = default_market_protection()
             if "autoslice" in params:
                 # Kite documents the value as the literal ``true``/``false``.
                 params["autoslice"] = "true" if params["autoslice"] else "false"
@@ -371,12 +429,23 @@ class OrdersService:
                 send_order = lambda: kite.place_order(
                     variety=variety_value, **params
                 )
-            order_id = await run_kite_write_action(
-                "place_order",
-                corr_id,
-                send_order,
-                meta=log_ctx,
-            )
+            try:
+                order_id = await run_kite_write_action(
+                    "place_order",
+                    corr_id,
+                    send_order,
+                    meta=log_ctx,
+                )
+            except KiteInputException as exc:
+                # The order was NEVER created: Kite refused the request itself.
+                # Raise the typed rejection so the caller can settle the step as
+                # ``rejected`` instead of reading a definite refusal as an unknown
+                # transport outcome.
+                logger.warning(
+                    "Kite rejected the order request",
+                    extra={**log_ctx, "error": str(exc)},
+                )
+                raise BrokerOrderRejected(str(exc)) from exc
             log_ctx["order_id"] = order_id
             if attribution and attribution.client_order_ref:
                 try:

@@ -656,3 +656,60 @@ class LimitTimeoutTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _RaisingBroker(_FakeBroker):
+    def __init__(self, exc):
+        super().__init__()
+        self.exc = exc
+
+    async def handle(self, intent, *, context=None):
+        self.intents.append((intent, dict(context or {})))
+        raise self.exc
+
+
+class _RecordingBarrier:
+    def __init__(self):
+        self.events = []
+
+    def record_work_event(self, **kwargs):
+        self.events.append(kwargs)
+
+
+class _DefiniteRejection(Exception):
+    definite_rejection = True
+
+
+class BrokerRejectionTests(unittest.TestCase):
+    """A definite broker refusal settles the step; any other failure stays uncertain."""
+
+    def _dispatch(self, exc):
+        submissions = _FakeSubmissions()
+        adapter = _adapter(broker=_RaisingBroker(exc), submissions=submissions)
+        barrier = _RecordingBarrier()
+        adapter.barrier = barrier
+        outcome = asyncio.run(
+            adapter.dispatch_step(
+                {"plan_id": "plan-1", "account_id": "kite:A", "plan_kind": "target_weights"},
+                _spec(),
+                binding={"strategy_run_id": "run-1"},
+                account_id="kite:A",
+                strategy_id="stg-A",
+                released_by="live-sequence",
+                quote=_quote(ask=100.2, bid=99.9, ltp=100.0),
+            )
+        )
+        return outcome, barrier
+
+    def test_a_definite_broker_rejection_is_rejected_not_uncertain(self):
+        outcome, barrier = self._dispatch(
+            _DefiniteRejection("Market orders without market protection are not allowed via API.")
+        )
+        self.assertEqual(outcome["state"], "rejected")
+        self.assertTrue(outcome["detail"]["broker_rejection"])
+        self.assertEqual([e["event"] for e in barrier.events], ["work_resolved"])
+
+    def test_a_transport_failure_stays_uncertain(self):
+        outcome, barrier = self._dispatch(RuntimeError("connection reset"))
+        self.assertEqual(outcome["state"], "uncertain")
+        self.assertEqual(barrier.events, [])

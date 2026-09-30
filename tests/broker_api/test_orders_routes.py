@@ -142,3 +142,84 @@ async def test_kite_place_payload_preserves_autoslice(monkeypatch) -> None:
     await OrdersService().place_order(_Kite(), equity, "corr")
     assert calls[0][0] == "place_order"
     assert "autoslice" not in calls[0][2]
+
+
+def _order(order_type: str, **extra):
+    from backend.broker_api.orders.models import PlaceOrderRequest
+
+    body = {
+        "exchange": "NSE",
+        "tradingsymbol": "ITC",
+        "transaction_type": "BUY",
+        "variety": "regular",
+        "product": "MIS",
+        "order_type": order_type,
+        "quantity": 1,
+    }
+    body.update(extra)
+    return PlaceOrderRequest.model_validate(body)
+
+
+def _recording_kite(calls, *, raise_exc=None):
+    class _Kite:
+        access_token = "test-token"
+
+        def _post(self, path, *, url_args, params):
+            calls.append((path, dict(params)))
+            return {"order_id": "PARENT-1"}
+
+        def place_order(self, **params):
+            if raise_exc is not None:
+                raise raise_exc
+            calls.append(("place_order", dict(params)))
+            return "ORDER-1"
+
+    return _Kite()
+
+
+@pytest.mark.asyncio
+async def test_market_orders_get_default_market_protection(monkeypatch) -> None:
+    """Kite refuses API MARKET orders without market protection (2026-09-30)."""
+    from backend.broker_api.orders.service import OrdersService
+
+    async def _immediate(_action, _corr_id, func, **_kwargs):
+        return func()
+
+    monkeypatch.setattr("backend.broker_api.orders.service.run_kite_write_action", _immediate)
+    monkeypatch.delenv("KITE_DEFAULT_MARKET_PROTECTION", raising=False)
+    calls = []
+
+    await OrdersService().place_order(_recording_kite(calls), _order("MARKET"), "corr")
+    await OrdersService().place_order(_recording_kite(calls), _order("MARKET", market_protection=5), "corr")
+    await OrdersService().place_order(_recording_kite(calls), _order("LIMIT", price=265.5), "corr")
+    monkeypatch.setenv("KITE_DEFAULT_MARKET_PROTECTION", "2")
+    await OrdersService().place_order(_recording_kite(calls), _order("MARKET"), "corr")
+    await OrdersService().place_order(
+        _recording_kite(calls),
+        _order("MARKET", exchange="NFO", tradingsymbol="NIFTY26OCTFUT", product="NRML", quantity=75, autoslice=True),
+        "corr",
+    )
+
+    assert calls[0][1]["market_protection"] == -1
+    assert calls[1][1]["market_protection"] == 5
+    assert calls[2][1].get("market_protection") is None
+    assert calls[3][1]["market_protection"] == 2
+    assert calls[4][0] == "order.place" and calls[4][1]["market_protection"] == 2
+
+
+@pytest.mark.asyncio
+async def test_kite_input_exception_is_a_definite_rejection(monkeypatch) -> None:
+    from backend.broker_api.orders.service import KiteInputException as InputException
+    from backend.broker_api.orders.service import OrdersService
+
+    async def _immediate(_action, _corr_id, func, **_kwargs):
+        return func()
+
+    monkeypatch.setattr("backend.broker_api.orders.service.run_kite_write_action", _immediate)
+    kite = _recording_kite([], raise_exc=InputException("Market orders without market protection are not allowed via API."))
+
+    with pytest.raises(Exception) as caught:
+        await OrdersService().place_order(kite, _order("MARKET"), "corr")
+
+    assert getattr(caught.value, "definite_rejection", False) is True
+    assert caught.value.status_code == 400
