@@ -185,6 +185,12 @@ LIVE_UNRESOLVED_STATES = frozenset(
 #: these, which is what makes the fold report the plan ``finished`` afterwards.
 FOLD_TERMINAL_EVENTS = frozenset({"filled", "rejected", "cancelled", "no_op"})
 
+#: The fold's own ``finished`` state (``PLAN_EXECUTION_FINISHED``): at least one
+#: committed submission and every order-backed pass proven terminal. An approval
+#: whose plan is FINISHED is not live evaluation authority - it cannot place new
+#: work, so it must not block a flatten.
+FOLD_PLAN_FINISHED = "finished"
+
 _LEG_ROLES = ("hedge", "short", "naked")
 
 
@@ -2209,25 +2215,45 @@ class OwnerActionsService:
                     if str(getattr(row, "status", "") or "") in ACTIVE_JOB_STATUSES
                 ]
         approvals: Optional[List[str]] = None
+        ignored_approvals: List[Dict[str, Any]] = []
         try:
             with self.session_factory() as session:
-                approvals = sorted(
-                    str(value)
-                    for value in session.execute(
-                        select(StrategyApproval.approval_id).where(
-                            StrategyApproval.strategy_id
-                            == str(scope["strategy_id"]),
-                            StrategyApproval.account_id
-                            == str(scope["account_id"]),
-                            StrategyApproval.status == "active",
-                        )
+                rows = session.execute(
+                    select(
+                        StrategyApproval.approval_id,
+                        StrategyApproval.plan_id,
+                    ).where(
+                        StrategyApproval.strategy_id == str(scope["strategy_id"]),
+                        StrategyApproval.account_id == str(scope["account_id"]),
+                        StrategyApproval.status == "active",
                     )
-                    .scalars()
-                    .all()
-                )
+                ).all()
+                blocking: List[str] = []
+                for approval_id, plan_id in rows:
+                    # An approval whose plan has already FINISHED (executed,
+                    # refused or rejected - the trail proves all its work is
+                    # answered) is not evaluation authority: it can no longer
+                    # place work, so it must not block a flatten. A plan still in
+                    # flight, or one never submitted, may.
+                    state = self._plan_execution_state(session, str(plan_id or ""))
+                    if str(state.get("state") or "") == FOLD_PLAN_FINISHED:
+                        ignored_approvals.append(
+                            {
+                                "approval_id": str(approval_id),
+                                "plan_id": str(plan_id or ""),
+                                "plan_execution_state": FOLD_PLAN_FINISHED,
+                            }
+                        )
+                        continue
+                    blocking.append(str(approval_id))
+                approvals = sorted(blocking)
         except Exception:  # noqa: BLE001 - unreadable authority is not absent
             approvals = None
-        return {"jobs": jobs, "approvals": approvals}
+        return {
+            "jobs": jobs,
+            "approvals": approvals,
+            "ignored_approvals": ignored_approvals,
+        }
 
     def stop_evaluator(
         self,
@@ -2324,6 +2350,21 @@ class OwnerActionsService:
             "requested_by": str(actor) if jobs else None,
             "reason": str(reason or ""),
         }
+        ignored_approvals = list(authority.get("ignored_approvals") or [])
+        if ignored_approvals:
+            # Approvals of already-finished plans are not authority and do not
+            # gate the flatten, but the owner can still see which stale
+            # approvals this stop deliberately stepped over.
+            self.record_audit(
+                scope,
+                action="flatten_ignored_approvals",
+                actor=str(actor),
+                evidence={
+                    "strategy_id": str(scope["strategy_id"]),
+                    "ignored_approvals": ignored_approvals,
+                    "reason": str(reason or ""),
+                },
+            )
         if unproven or approvals:
             # The stop itself is durable on the job row, and the refusal is
             # recorded on the strategy's own journal before it is returned: the

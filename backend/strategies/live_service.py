@@ -362,7 +362,13 @@ class LivePlanExecutor:
             )
             raise wrapped from exc
 
-        return self._record_submission(plan=plan, actor=actor, submission=submission, reservation=reservation)
+        return self._record_submission(
+            plan=plan,
+            actor=actor,
+            submission=submission,
+            reservation=reservation,
+            authority=self._authority_trail_note(authority),
+        )
 
     # ------------------------------------------------------------- internals
 
@@ -378,6 +384,27 @@ class LivePlanExecutor:
                 {"plan_id": str(plan.get("plan_id") or ""), "message": "no proposal envelope for this plan"},
             )
         return envelope
+
+    @staticmethod
+    def _authority_trail_note(
+        authority: Optional[Mapping[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """The compact authority note written into the plan's execution trail.
+
+        Only the OWNER's flatten authority is called out: every other live plan
+        is already explained by its run credential, so its trail stays as it was.
+        """
+        from backend.strategies.live_authority import OWNER_FLATTEN_AUTHORITY
+
+        if str((authority or {}).get("authority_kind") or "") != OWNER_FLATTEN_AUTHORITY:
+            return None
+        return {
+            "authority_kind": OWNER_FLATTEN_AUTHORITY,
+            "flatten_operation_id": str(
+                (authority or {}).get("flatten_operation_id") or ""
+            ),
+            "owner_actor_id": str((authority or {}).get("owner_actor_id") or ""),
+        }
 
     @staticmethod
     def _increases_exposure(leg: Mapping[str, Any]) -> bool:
@@ -486,6 +513,7 @@ class LivePlanExecutor:
         actor: str,
         submission: Any,
         reservation: Optional[Dict[str, Any]],
+        authority: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Write the per-step trail for a materialized plan, then report it.
 
@@ -493,6 +521,11 @@ class LivePlanExecutor:
         was sent, and the durable protocol (the parent row, its claim and the
         barrier ``work_created``) is the record. The release pass appends the
         ``submitted`` event when - and only when - it actually releases the step.
+
+        ``authority`` is the compact note of WHICH authority backed the order
+        (only present for an owner-flatten reduction): the plan's append-only
+        execution trail then says the owner's flatten act, not a worker token,
+        authorised the close.
         """
         plan_id = str(plan.get("plan_id") or "")
         entries = list(getattr(submission, "steps", None) or [])
@@ -528,6 +561,8 @@ class LivePlanExecutor:
                 detail = {**detail, "state": "uncertain", "recovery_required": True}
             elif state in ("pending", "releasing"):
                 detail = {**detail, "state": state}
+            if authority:
+                detail = {**detail, "authority": dict(authority)}
             if not entry.get("withheld"):
                 self._trail._record_event(
                     plan_id,

@@ -283,6 +283,46 @@ class ReconciliationEvidenceCollector:
         finally:
             session.close()
 
+        if publication is None:
+            # Never published is UNKNOWN, not flat. Publish the book once through
+            # the SAME attribution service the owner rebuild route uses and
+            # re-read, so a job refused before any broker call still reconciles
+            # without a manual ``positions/rebuild``. A publish that fails leaves
+            # the book unpublished, named below - never read as flat.
+            try:
+                from backend.strategies.attribution import publish_book_now
+
+                publish_book_now(
+                    self._session_factory,
+                    account_id=account_id,
+                    strategy_id=strategy_id,
+                    execution_environment="live",
+                )
+            except Exception:  # noqa: BLE001 - an unpublishable book stays unknown
+                pass
+            else:
+                with self._session_factory() as session:
+                    publication = session.execute(
+                        text(
+                            """
+                            SELECT projection_version FROM public.strategy_projection_state
+                            WHERE account_id = :account_id AND strategy_id = :strategy_id
+                              AND execution_environment = 'live'
+                            """
+                        ),
+                        {"account_id": account_id, "strategy_id": strategy_id},
+                    ).first()
+                    positions = session.execute(
+                        text(
+                            """
+                            SELECT net_quantity FROM public.strategy_position_projection
+                            WHERE account_id = :account_id AND strategy_id = :strategy_id
+                              AND execution_environment = 'live'
+                            """
+                        ),
+                        {"account_id": account_id, "strategy_id": strategy_id},
+                    ).fetchall()
+
         # Complete CURRENT account truth is required: a live book cannot be read
         # as flat (or as settled) unless the account's own ingest cycle finished
         # cleanly. The policy is the platform's existing one (``account_truth``):

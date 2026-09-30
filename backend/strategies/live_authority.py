@@ -50,6 +50,17 @@ RUN_AUTHORITY_STATUSES = ("open",)
 #: were being ignored.
 TOKEN_ORDER_ACTIONS = ("intents:submit",)
 
+#: The authority kind of a pure owner-flatten reduction. A flatten deliberately
+#: STOPS the evaluator before it closes books, so the run it is attributed to may
+#: already have a revoked worker token. For exactly those reductions the owner's
+#: flatten operation - not a run credential - is the honest authority to act.
+OWNER_FLATTEN_AUTHORITY = "owner_flatten"
+
+#: How long a derived owner-flatten authority is valid. It is re-derived at every
+#: validation and dispatch, so a horizon only bounds one derivation; the durable
+#: provenance is the flatten operation the authority names.
+OWNER_FLATTEN_AUTHORITY_SECONDS = 900.0
+
 
 def _as_datetime(value: Any) -> Optional[datetime]:
     if value is None:
@@ -129,6 +140,111 @@ def plan_binding(
     }
 
 
+#: The evaluation-id prefix the owner flatten planner freezes into every
+#: reduction proposal (``flatten:{operation_id}:...``). It is the plan's own
+#: explicit provenance: the operation id is the durable flatten record.
+_FLATTEN_EVALUATION_PREFIX = "flatten:"
+
+
+def is_target_zero_reduction(plan: Mapping[str, Any]) -> bool:
+    """Whether this frozen plan can ONLY reduce (every leg targets zero).
+
+    The flatten planner freezes ``single_instrument`` target-zero plans: the
+    target quantity IS the instruction, so a zero target closes the book and can
+    never open or grow it. A non-zero target or an unreadable leg is ``False`` -
+    the owner authority is never granted to a plan that could increase exposure.
+    """
+    resolved = plan.get("resolved_plan") or {}
+    if not isinstance(resolved, Mapping):
+        return False
+    if str(resolved.get("target_kind") or "") != "single_instrument":
+        return False
+    legs = resolved.get("legs")
+    if not isinstance(legs, list) or not legs:
+        return False
+    for leg in legs:
+        if not isinstance(leg, Mapping) or leg.get("signed_quantity") is None:
+            return False
+        try:
+            if int(leg.get("signed_quantity")) != 0:
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
+def _owner_flatten_authority(
+    session_factory: Callable[[], Any],
+    *,
+    plan: Mapping[str, Any],
+    binding: Mapping[str, Any],
+    moment: datetime,
+) -> Optional[Dict[str, Any]]:
+    """The owner's flatten authority for ONE pure reduction, or ``None``.
+
+    Granted only when ALL of the following hold, from persisted records:
+
+    * the plan is a pure target-zero reduction (``is_target_zero_reduction``);
+    * its proposal's evaluation id names a flatten operation
+      (``flatten:{operation_id}:...``);
+    * that operation exists and is scoped to this exact
+      (strategy, account, live) binding.
+
+    The operation can only be created by the owner flatten route
+    (``owner-actions/flatten``), which already enforced owner authorization, so
+    this is the owner's act - never a request parameter or a bare claim.
+    """
+    if not is_target_zero_reduction(plan):
+        return None
+    from backend.strategies.proposals import ProposalStore
+
+    envelope = ProposalStore(session_factory=session_factory).get_proposal(
+        str(plan.get("proposal_id") or "")
+    )
+    evaluation_id = str((envelope or {}).get("evaluation_id") or "")
+    if not evaluation_id.startswith(_FLATTEN_EVALUATION_PREFIX):
+        return None
+    operation_id = evaluation_id[len(_FLATTEN_EVALUATION_PREFIX):].split(":", 1)[0]
+    if not operation_id:
+        return None
+    with session_factory() as session:
+        row = session.execute(
+            text(
+                """
+                SELECT operation_id, strategy_id, account_id, execution_environment,
+                       status, actor_id
+                FROM public.strategy_flatten_operations
+                WHERE operation_id = :operation_id
+                """
+            ),
+            {"operation_id": operation_id},
+        ).mappings().first()
+    if row is None:
+        return None
+    if (
+        str(row["strategy_id"]) != str(binding["strategy_id"])
+        or str(row["account_id"]) != str(binding["account_id"])
+        or str(row["execution_environment"]) != LIVE_ENVIRONMENT
+    ):
+        return None
+    owner_actor = str(row["actor_id"] or "")
+    if not owner_actor or owner_actor != str(binding.get("owner_id") or ""):
+        # The flatten must have been requested by THIS book's owner: a row with
+        # no actor, or one from another owner, is not this owner's act.
+        return None
+    return {
+        "strategy_id": str(binding["strategy_id"]),
+        "account_id": str(binding["account_id"]),
+        "worker_run_id": str(binding["strategy_run_id"]),
+        "expires_at": (moment + timedelta(seconds=OWNER_FLATTEN_AUTHORITY_SECONDS)).isoformat(),
+        "authority_kind": OWNER_FLATTEN_AUTHORITY,
+        "flatten_operation_id": operation_id,
+        "flatten_operation_status": str(row["status"] or ""),
+        "owner_actor_id": str(row["actor_id"] or ""),
+        "execution_environment": LIVE_ENVIRONMENT,
+    }
+
+
 def derive_live_authority(
     session_factory: Optional[Callable[[], Any]] = None,
     *,
@@ -176,6 +292,23 @@ def derive_live_authority(
                     "expected": LIVE_ENVIRONMENT,
                 },
             )
+
+        # An OWNER FLATTEN reduction is the one plan whose authority is the
+        # owner's operation, not the run's worker credential: flatten stops the
+        # evaluator first, which revokes that credential, so a token check here
+        # would make an owner flatten of a live position impossible. The plan must
+        # be a PURE reduction created by a flatten operation for this exact
+        # (owner, strategy, account, environment); everything else still needs an
+        # active run token.
+        owner_authority = _owner_flatten_authority(
+            factory, plan=plan, binding=binding, moment=moment
+        )
+        if owner_authority is not None:
+            return {
+                "plan_id": plan_id,
+                "binding": binding,
+                "authority": owner_authority,
+            }
 
         run_row = (
             session.execute(

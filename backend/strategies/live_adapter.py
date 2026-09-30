@@ -927,6 +927,44 @@ class LivePlanAdapter:
             )
         return dict(binding)
 
+    @staticmethod
+    def _is_owner_flatten_authority(authority: Optional[Mapping[str, Any]]) -> bool:
+        """Whether this authority is the OWNER's flatten act, not a run token.
+
+        The kind is minted only by ``live_authority.derive_live_authority`` for a
+        pure target-zero reduction created by a real owner flatten operation, so
+        the adapter treats its presence as the owner's authorization for exactly
+        that shape of plan (and nothing else).
+        """
+        from .live_authority import OWNER_FLATTEN_AUTHORITY
+
+        return str((authority or {}).get("authority_kind") or "") == OWNER_FLATTEN_AUTHORITY
+
+    @staticmethod
+    def _check_owner_flatten_reduction(
+        plan: Mapping[str, Any], authority: Mapping[str, Any]
+    ) -> None:
+        """The owner authority only ever authorises a PURE reduction.
+
+        A reduction that could open or grow exposure would be exactly the
+        run-less authority the owner flatten must never grant, so it is refused
+        by name here even though ``derive_live_authority`` already screened it.
+        """
+        from .live_authority import is_target_zero_reduction
+
+        if not is_target_zero_reduction(plan):
+            raise LiveRefusal(
+                "LIVE_EVALUATION_AUTHORITY_MISMATCH",
+                {
+                    "plan_id": str(plan.get("plan_id") or ""),
+                    "message": (
+                        "the owner-flatten authority may only back a pure target-zero "
+                        "reduction"
+                    ),
+                    "authority_kind": str(authority.get("authority_kind") or ""),
+                },
+            )
+
     def _check_authority(
         self, plan: Mapping[str, Any], authority: Mapping[str, Any], binding: Mapping[str, Any]
     ) -> Dict[str, Any]:
@@ -1793,8 +1831,17 @@ class LivePlanAdapter:
             )
         binding = self._check_binding(plan, run_binding)
         self._check_authority(plan, evaluation_authority, binding)
-        self._check_approval(plan)
-        reservation = self._check_reservation(plan)
+        if self._is_owner_flatten_authority(evaluation_authority):
+            # A pure owner-flatten reduction acts on the OWNER's authority: the
+            # flatten stops the evaluator, so there is no run approval to hold and
+            # nothing to reserve (it can only close a book). The authority kind is
+            # only ever produced for that exact shape; every other plan still
+            # needs its run approval and an active reservation.
+            self._check_owner_flatten_reduction(plan, evaluation_authority)
+            reservation = None
+        else:
+            self._check_approval(plan)
+            reservation = self._check_reservation(plan)
         admission = self._check_admission(
             plan, margin_evidence=margin_evidence, catalog_state=catalog_state
         )
@@ -3386,8 +3433,10 @@ class LivePlanAdapter:
         revoked) between validation and dispatch refuses. With no reader wired the
         adapter cannot verify it and says so instead of implying a check.
         """
-        self._check_approval(plan)
-        self._check_reservation(plan)
+        owner_flatten = self._is_owner_flatten_authority(evaluation_authority)
+        if not owner_flatten:
+            self._check_approval(plan)
+            self._check_reservation(plan)
         if self.authority_reader is None:
             raise LiveRefusal(
                 "LIVE_AUTHORITY_EVIDENCE_UNAVAILABLE",
@@ -3417,7 +3466,25 @@ class LivePlanAdapter:
                 },
             )
         self._check_authority(plan, current, binding)
-        _ = evaluation_authority
+        if owner_flatten:
+            # The caller claimed the owner's flatten authority. The PLATFORM
+            # re-read must agree, or the run approval/reservation gates above
+            # were skipped on a claim the platform does not back.
+            if not self._is_owner_flatten_authority(current):
+                raise LiveRefusal(
+                    "LIVE_EVALUATION_AUTHORITY_MISMATCH",
+                    {
+                        "plan_id": str(plan.get("plan_id") or ""),
+                        "message": (
+                            "the owner-flatten authority did not survive the "
+                            "platform re-read at dispatch"
+                        ),
+                        "current_authority_kind": str(
+                            (current or {}).get("authority_kind") or ""
+                        ),
+                    },
+                )
+            self._check_owner_flatten_reduction(plan, current)
 
     #: State -> the trail event the plan's append-only audit records.
     _STEP_EVENT = {

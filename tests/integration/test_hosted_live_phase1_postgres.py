@@ -1626,3 +1626,364 @@ def test_residual_repair_disposition_is_bounded_and_audited(pg):
     with pytest.raises(LiveRepairRefusal) as ctx2:
         service.abandon_residual(plan_id=other.plan_id, actor=OWNER)
     assert ctx2.value.reason_code == "LIVE_REPAIR_NOT_REQUIRED"
+
+
+# ---------------------------------------------------------------------------
+# Live readiness gaps 2 & 3
+# ---------------------------------------------------------------------------
+
+
+def _clear_publication(factory, fixture) -> None:
+    """Make a fixture's live book look NEVER published (a brand-new strategy)."""
+    from sqlalchemy import text
+
+    with factory() as session:
+        session.execute(
+            text(
+                "DELETE FROM public.strategy_position_projection "
+                "WHERE account_id = :account AND strategy_id = :sid"
+            ),
+            {"account": fixture.account_id, "sid": fixture.strategy_id},
+        )
+        session.execute(
+            text(
+                "DELETE FROM public.strategy_projection_state "
+                "WHERE account_id = :account AND strategy_id = :sid"
+            ),
+            {"account": fixture.account_id, "sid": fixture.strategy_id},
+        )
+        session.commit()
+
+
+def _idle_ingest(factory, *, account_id: str, generation: int = 1) -> None:
+    from sqlalchemy import text
+
+    with factory() as session:
+        session.execute(
+            text(
+                "INSERT INTO public.account_ingest_state (account_id, last_complete_ingest_at, "
+                " ingest_generation, status) VALUES (:a, NOW(), :g, 'idle') "
+                "ON CONFLICT (account_id) DO UPDATE SET status = 'idle', "
+                " last_complete_ingest_at = NOW(), ingest_generation = :g"
+            ),
+            {"a": account_id, "g": int(generation)},
+        )
+        session.commit()
+
+
+def test_live_position_reader_publishes_a_never_published_book(pg):
+    """Task A: a brand-new strategy's first live read publishes the (empty) book.
+
+    Never published is UNKNOWN, so the reader publishes once through the rebuild
+    route's own service and re-reads 0 - the first live step is not blocked on a
+    manual ``positions/rebuild``.
+    """
+    from sqlalchemy import text
+
+    from backend.strategies.live_readers import attributed_position_reader
+
+    fixture = _LiveFixture(pg["factory"])
+    _clear_publication(pg["factory"], fixture)
+
+    reader = attributed_position_reader(pg["factory"])
+    quantity = reader(plan=fixture.plan(), leg=fixture.leg)
+    assert quantity == 0
+
+    with pg["factory"]() as session:
+        published = session.execute(
+            text(
+                "SELECT projection_version FROM public.strategy_projection_state "
+                "WHERE account_id = :account AND strategy_id = :sid "
+                "AND execution_environment = 'live'"
+            ),
+            {"account": fixture.account_id, "sid": fixture.strategy_id},
+        ).first()
+        rows = session.execute(
+            text(
+                "SELECT COUNT(*) FROM public.strategy_position_projection "
+                "WHERE account_id = :account AND strategy_id = :sid "
+                "AND execution_environment = 'live'"
+            ),
+            {"account": fixture.account_id, "sid": fixture.strategy_id},
+        ).scalar()
+    assert published is not None, "the reader must have PUBLISHED the book"
+    assert int(published[0]) >= 1
+    assert int(rows) == 0
+
+
+def test_live_position_reader_keeps_the_refusal_when_the_publish_fails(pg, monkeypatch):
+    """Task A: a failed publish keeps today's refusal; unpublished is not flat."""
+    import backend.strategies.attribution as attribution
+    from backend.strategies.live_readers import (
+        LiveEvidenceUnavailable,
+        attributed_position_reader,
+    )
+
+    fixture = _LiveFixture(pg["factory"])
+    _clear_publication(pg["factory"], fixture)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("attribution store unavailable")
+
+    monkeypatch.setattr(attribution, "publish_book_now", _boom)
+
+    reader = attributed_position_reader(pg["factory"])
+    with pytest.raises(LiveEvidenceUnavailable) as ctx:
+        reader(plan=fixture.plan(), leg=fixture.leg)
+    assert ctx.value.reason_code == "LIVE_POSITION_EVIDENCE_UNAVAILABLE"
+
+
+def test_live_settlement_publishes_a_never_published_book_before_reading_it(pg):
+    """Task A: a job refused before any broker call reconciles without a rebuild.
+
+    The live settlement evidence publishes the never-published book itself, so
+    the exposure axis is a real FLAT (published empty), not ``unknown`` - exactly
+    what lets a stopped, never-traded live job be assessed as settled flat.
+    """
+    from backend.strategies.reconciliation_service import ReconciliationEvidenceCollector
+    from backend.strategies.settlement import ExecutionBarrier
+
+    fixture = _LiveFixture(pg["factory"])
+    _clear_publication(pg["factory"], fixture)
+    _idle_ingest(pg["factory"], account_id=fixture.account_id)
+
+    class _Job:
+        id = "job-never-published"
+        strategy_id = ""
+        attempt = 1
+        run_id = ""
+        account_scope = ""
+        execution_mode = "live"
+        status = "stopped"
+        desired_state = "started"
+        token_id = None
+        capabilities_snapshot = {"trade": True}
+        process_cleanup_state = "confirmed"
+        process_cleanup_at = None
+        process_cleanup_actor = None
+        reconciled_at = None
+        handoff_at = None
+
+    job = _Job()
+    job.strategy_id = fixture.strategy_id
+    job.account_scope = fixture.account_id
+    job.run_id = fixture.run_id
+
+    collector = ReconciliationEvidenceCollector(
+        worker_repo=None,
+        settlement_barrier=ExecutionBarrier(session_factory=pg["factory"]),
+        session_factory=pg["factory"],
+    )
+    before = collector._live_settlement(job)
+    # The book began unpublished; after the collector's own publish it must read
+    # as settled and flat (not ``live_attribution_unpublished``/unknown).
+    assert "live_attribution_unpublished" not in before["unavailable"], before
+    assert before["unavailable"] == [], before
+    assert before["exposure_state"] == "flat", before
+    assert before["work_state"] == "settled", before
+
+
+def _seed_flatten_operation(factory, fixture, *, operation_id: str) -> None:
+    """The durable OWNER flatten operation the reduction's authority names."""
+    from sqlalchemy import text
+
+    with factory() as session:
+        session.execute(
+            text(
+                "INSERT INTO public.strategy_flatten_operations "
+                "(operation_id, strategy_id, account_id, execution_environment, status, "
+                " reason, actor_id, evidence_digest, stop, manifest) "
+                "VALUES (:oid, :sid, :account, 'live', 'in_progress', 'owner_flatten', "
+                " :actor, '', '{}'::jsonb, '{}'::jsonb)"
+            ),
+            {
+                "oid": operation_id,
+                "sid": fixture.strategy_id,
+                "account": fixture.account_id,
+                "actor": OWNER,
+            },
+        )
+        session.commit()
+
+
+def _seed_single_instrument_plan(
+    factory,
+    fixture,
+    *,
+    plan_id: str,
+    proposal_id: str,
+    evaluation_id: str,
+    leg: dict,
+) -> dict:
+    """One frozen ``single_instrument`` plan + its proposal envelope."""
+    from sqlalchemy import text
+
+    resolved = {"target_kind": "single_instrument", "catalog_generation": G1, "legs": [leg]}
+    with factory() as session:
+        session.execute(
+            text(
+                "INSERT INTO strategy_proposals (proposal_id, strategy_id, account_id, evaluation_id, "
+                " evaluation_kind, strategy_run_id, target_kind, payload, payload_sha256, status) "
+                "VALUES (:pid, :sid, :account, :eval, 'run_now', :run, 'single_instrument', '{}', 'sha', 'validated')"
+            ),
+            {
+                "pid": proposal_id,
+                "sid": fixture.strategy_id,
+                "account": fixture.account_id,
+                "eval": str(evaluation_id),
+                "run": fixture.run_id,
+            },
+        )
+        session.execute(
+            text(
+                "INSERT INTO strategy_plans (plan_id, proposal_id, strategy_id, account_id, plan_kind, "
+                " plan_hash, logical_plan, resolved_plan, pinned_catalog_generation, pinned_universe_revision_id, "
+                " pinned_member_hash) VALUES (:pid, :prop, :sid, :account, 'single_instrument', 'hashz', '{}', "
+                " :resolved, :gen, NULL, NULL)"
+            ),
+            {
+                "pid": plan_id,
+                "prop": proposal_id,
+                "sid": fixture.strategy_id,
+                "account": fixture.account_id,
+                "resolved": json.dumps(resolved),
+                "gen": G1,
+            },
+        )
+        session.commit()
+    return {
+        "plan_id": plan_id,
+        "proposal_id": proposal_id,
+        "strategy_id": fixture.strategy_id,
+        "strategy_name": fixture.strategy_id,
+        "account_id": fixture.account_id,
+        "plan_kind": "single_instrument",
+        "plan_hash": "hashz",
+        "logical_plan": {},
+        "resolved_plan": resolved,
+        "pinned_catalog_generation": G1,
+    }
+
+
+def _revoke_the_run_token(factory, fixture) -> None:
+    """The STOP act: the run's worker credential is revoked (the run stays open)."""
+    from sqlalchemy import text
+
+    with factory() as session:
+        session.execute(
+            text("UPDATE public.algo_worker_tokens SET status = 'revoked' WHERE token_id = :t"),
+            {"t": fixture.token_id},
+        )
+        session.commit()
+
+
+def test_owner_flatten_reduction_dispatches_after_the_run_token_is_revoked(pg):
+    """Task B: an owner flatten closes a live book whose run token was revoked.
+
+    The flatten stops the evaluator first, which revokes the run credential, so a
+    target-zero reduction created by a real flatten operation must act on the
+    OWNER's authority: the attributed long is sold, and the plan's trail records
+    which authority backed the order.
+    """
+    from sqlalchemy import text
+
+    fixture = _LiveFixture(pg["factory"])
+    fixture.publish_projection(net_quantity=10)
+    _revoke_the_run_token(pg["factory"], fixture)
+
+    operation_id = str(uuid.uuid4())
+    _seed_flatten_operation(pg["factory"], fixture, operation_id=operation_id)
+    plan_id = str(uuid.uuid4())
+    proposal_id = str(uuid.uuid4())
+    leg = dict(fixture.leg)
+    leg["signed_quantity"] = 0
+    view = _seed_single_instrument_plan(
+        pg["factory"],
+        fixture,
+        plan_id=plan_id,
+        proposal_id=proposal_id,
+        evaluation_id=f"flatten:{operation_id}:{fixture.instrument_id}:CNC",
+        leg=leg,
+    )
+
+    broker = _FakeBroker()
+    executor = _executor(pg, fixture, live_enabled=True, broker=broker)
+    result = asyncio.run(executor.execute(view, actor=OWNER))
+
+    assert result["status"] == "submitted", result
+    intent, _context = broker.calls[-1]
+    assert intent.payload["order"]["transaction_type"] == "SELL"
+    assert intent.payload["order"]["quantity"] == 10
+
+    with pg["factory"]() as session:
+        detail = session.execute(
+            text(
+                "SELECT detail FROM public.strategy_plan_execution_events "
+                "WHERE plan_id = :pid ORDER BY created_at DESC, id DESC LIMIT 1"
+            ),
+            {"pid": plan_id},
+        ).scalar()
+    if isinstance(detail, str):
+        detail = json.loads(detail)
+    assert (detail or {}).get("authority", {}).get("authority_kind") == "owner_flatten"
+    assert (detail or {}).get("authority", {}).get("flatten_operation_id") == operation_id
+
+
+def test_a_reduction_without_a_flatten_operation_still_needs_the_run_token(pg):
+    """Task B: everything that is not an owner flatten still needs a run token."""
+    from backend.strategies.execution import ExecutionRefusal
+
+    fixture = _LiveFixture(pg["factory"])
+    fixture.publish_projection(net_quantity=10)
+    _revoke_the_run_token(pg["factory"], fixture)
+
+    plan_id = str(uuid.uuid4())
+    proposal_id = str(uuid.uuid4())
+    leg = dict(fixture.leg)
+    leg["signed_quantity"] = 0
+    view = _seed_single_instrument_plan(
+        pg["factory"],
+        fixture,
+        plan_id=plan_id,
+        proposal_id=proposal_id,
+        evaluation_id=f"eval-{plan_id}",
+        leg=leg,
+    )
+
+    broker = _FakeBroker()
+    executor = _executor(pg, fixture, live_enabled=True, broker=broker)
+    with pytest.raises(ExecutionRefusal) as ctx:
+        asyncio.run(executor.execute(view, actor=OWNER))
+    assert ctx.value.reason_code == "TOKEN_NOT_ACTIVE"
+    assert broker.calls == []
+
+
+def test_a_flatten_plan_that_would_increase_exposure_gets_no_owner_authority(pg):
+    """Task B: the owner authority only ever backs a PURE reduction."""
+    from backend.strategies.execution import ExecutionRefusal
+
+    fixture = _LiveFixture(pg["factory"])
+    fixture.publish_projection(net_quantity=10)
+    _revoke_the_run_token(pg["factory"], fixture)
+
+    operation_id = str(uuid.uuid4())
+    _seed_flatten_operation(pg["factory"], fixture, operation_id=operation_id)
+    plan_id = str(uuid.uuid4())
+    proposal_id = str(uuid.uuid4())
+    leg = dict(fixture.leg)
+    leg["signed_quantity"] = 20  # would GROW the book, never a flatten close
+    view = _seed_single_instrument_plan(
+        pg["factory"],
+        fixture,
+        plan_id=plan_id,
+        proposal_id=proposal_id,
+        evaluation_id=f"flatten:{operation_id}:{fixture.instrument_id}:CNC",
+        leg=leg,
+    )
+
+    broker = _FakeBroker()
+    executor = _executor(pg, fixture, live_enabled=True, broker=broker)
+    with pytest.raises(ExecutionRefusal) as ctx:
+        asyncio.run(executor.execute(view, actor=OWNER))
+    assert ctx.value.reason_code == "TOKEN_NOT_ACTIVE"
+    assert broker.calls == []

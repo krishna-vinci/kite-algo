@@ -1248,24 +1248,51 @@ def _seed_job(
     return str(job.id)
 
 
-def _seed_approval(session_factory, *, strategy_id, approval_id="approval-1"):
+def _seed_approval(
+    session_factory,
+    *,
+    strategy_id,
+    approval_id="approval-1",
+    plan_id="plan-approved",
+):
+    """One durable ACTIVE owner approval, with the rows its FKs require."""
+    from backend.strategies.attribution_models import StrategyReservation
+
+    now = datetime.now(timezone.utc)
     session = session_factory()
     try:
         session.add(
-            StrategyApproval(
-                approval_id=approval_id,
-                plan_id="plan-approved",
+            StrategyReservation(
+                reservation_id=f"res-{approval_id}",
+                plan_id=str(plan_id),
                 strategy_id=str(strategy_id),
                 account_id=ACCOUNT,
+                evaluation_id=f"eval-{plan_id}",
+                execution_environment="paper",
+                status="active",
+                reserved_notional_inr=0.0,
+                valid_until=now + timedelta(hours=1),
+            )
+        )
+        # The approval's FK targets this reservation; flush it first so the
+        # insert order is explicit rather than depending on mapper sort.
+        session.flush()
+        session.add(
+            StrategyApproval(
+                approval_id=approval_id,
+                plan_id=str(plan_id),
+                strategy_id=str(strategy_id),
+                account_id=ACCOUNT,
+                reservation_id=f"res-{approval_id}",
+                plan_hash="hash-approved",
+                exposure_snapshot_version=1,
+                reconciliation_version=0,
+                catalog_generation=GEN,
                 actor_id="app:admin",
                 actor_kind="manual",
-                reservation_id="reservation-1",
-                execution_environment="live",
                 status="active",
-                plan_hash="hash-approved",
-                snapshot={},
-                evidence={},
-                validity_seconds=900,
+                valid_from=now,
+                valid_until=now + timedelta(minutes=15),
             )
         )
         session.commit()
@@ -2494,3 +2521,82 @@ async def test_job_stop_with_flatten_reports_a_refusal_without_hiding_the_stop(
         "SELECT desired_state FROM strategy_jobs WHERE id = :id",
         {"id": job_id},
     )[0]["desired_state"] == "stopped"
+
+
+# ---------------------------------------------------------------------------
+# flatten: stale approvals of already-finished plans (Live readiness gap 3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_flatten_ignores_approvals_of_finished_plans(session_factory, monkeypatch):
+    """An ACTIVE approval of an already-EXECUTED plan is not evaluation authority.
+
+    A plan whose own trail proves every step answered can place no new work, so
+    its lingering auto-approval must not gate an owner flatten.
+    """
+    async with _client(session_factory, monkeypatch) as client:
+        strategy_id = await _create(client)
+    _seed_plan(
+        session_factory,
+        strategy_id=strategy_id,
+        plan_id="plan-approved",
+        resolved=_resolved_plan(),
+    )
+    _seed_approval(session_factory, strategy_id=strategy_id, approval_id="approval-stale")
+    _seed_trail(
+        session_factory,
+        plan_id="plan-approved",
+        step_no=1,
+        # An orderless terminal trail: the fold reads ``filled`` with no runtime
+        # order to reconcile as FINISHED (the live trail's own shape).
+        rows=[("submitted", None, 0), ("filled", None, 150)],
+    )
+    _seed_catalog(session_factory)
+
+    async with _client(session_factory, monkeypatch) as client:
+        response = await _post_flatten(client, strategy_id)
+        assert response.status_code == 200, response.text
+        body = response.json()
+
+    assert body["stop"]["state"] == "confirmed", body["stop"]
+    assert body["stop"]["approvals"] == []
+    # The ignore is on the record, so the owner can see which stale approval the
+    # stop stepped over.
+    journal = _rows(
+        session_factory,
+        "SELECT reason_code FROM strategy_proposal_journal WHERE strategy_id = :strategy",
+        {"strategy": strategy_id},
+    )
+    assert "flatten_ignored_approvals" in [row["reason_code"] for row in journal]
+
+
+@pytest.mark.asyncio
+async def test_flatten_still_refuses_while_an_approved_plan_is_in_flight(
+    session_factory, monkeypatch
+):
+    """A genuinely ACTIVE approval - a plan still in flight - still gates flatten."""
+    async with _client(session_factory, monkeypatch) as client:
+        strategy_id = await _create(client)
+    _seed_plan(
+        session_factory,
+        strategy_id=strategy_id,
+        plan_id="plan-approved",
+        resolved=_resolved_plan(),
+    )
+    _seed_approval(session_factory, strategy_id=strategy_id, approval_id="approval-live")
+    # A committed submission with NO outcome yet: the broker may still take it.
+    _seed_trail(
+        session_factory,
+        plan_id="plan-approved",
+        step_no=1,
+        rows=[("submitted", ENTRY_ORDER, 0)],
+    )
+
+    async with _client(session_factory, monkeypatch) as client:
+        refused = await _post_flatten(client, strategy_id)
+        assert refused.status_code == 409, refused.text
+        detail = refused.json()["detail"]
+
+    assert detail["rejection_reason"] == "FLATTEN_EVALUATION_ACTIVE"
+    assert detail["stop"]["approvals"] == ["approval-live"]
