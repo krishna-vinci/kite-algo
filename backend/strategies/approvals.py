@@ -344,7 +344,30 @@ class ApprovalService:
                 {"message": "The reservation belongs to a different plan."}
             )
 
+        # A live approval must pin the PUBLISHED book. A strategy whose live book
+        # was never published would otherwise be pinned at version 0/null here,
+        # and the very first send-time read (`live_readers`) publishes it to
+        # version 1 as a side effect - turning every brand-new strategy's first
+        # live approval into an immediate EXPOSURE_SNAPSHOT_CHANGED refusal.
+        # Publish through the SAME service the owner rebuild route uses before
+        # pinning, so the approval and the first send-time read agree on one
+        # version. A failed publish leaves the snapshot as unpublished (0/null),
+        # same as before this fix; send-time publishing remains a fallback.
         snapshot = self.exposure_snapshot(account_id=account_id, strategy_id=strategy_id)
+        if not snapshot.get("published"):
+            from backend.strategies.attribution import publish_book_now
+
+            try:
+                publish_book_now(
+                    self.session_factory,
+                    account_id=account_id,
+                    strategy_id=strategy_id,
+                    execution_environment="live",
+                )
+            except Exception:  # noqa: BLE001 - an unpublishable book stays unpublished
+                pass
+            else:
+                snapshot = self.exposure_snapshot(account_id=account_id, strategy_id=strategy_id)
         catalogue = self._catalog_state(plan)
         # The version identity and the option target are resolved ONCE, before the
         # write, so the row records what the owner authorised rather than whatever

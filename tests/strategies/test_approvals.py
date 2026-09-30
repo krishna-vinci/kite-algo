@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest import mock
 
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import sessionmaker
@@ -402,6 +403,86 @@ class StructuralValidityTests(ApprovalTestCase):
         state = self._validity(approval)
         self.assertEqual(state["mismatched_pins"], ["EXPOSURE_SNAPSHOT_CHANGED"])
         self.assertFalse(state["valid"])
+
+    def _fake_publish_book_now(self, *, version=1, quantity=10):
+        """A stand-in for ``attribution.publish_book_now`` that behaves like the
+        real one for THIS test's purposes: it writes a published projection at
+        ``version`` and returns it, instead of running the full recompute (which
+        needs tables this minimal harness does not register)."""
+
+        def _publish(session_factory, *, account_id, strategy_id, execution_environment):
+            with self.factory() as session:
+                session.execute(
+                    text(
+                        "INSERT INTO strategy_position_projection "
+                        "(account_id, strategy_id, execution_environment, identity_kind, "
+                        " identity_key, canonical_instrument_id, product, instrument_token, "
+                        " exchange, tradingsymbol, net_quantity, projection_version) "
+                        "VALUES (:account, :strategy, :env, 'canonical', 'inst-REL', 'inst-REL', "
+                        " 'CNC', 738561, 'NSE', 'RELIANCE', :qty, :version)"
+                    ),
+                    {
+                        "account": account_id,
+                        "strategy": strategy_id,
+                        "env": execution_environment,
+                        "qty": int(quantity),
+                        "version": int(version),
+                    },
+                )
+                session.execute(
+                    text(
+                        "INSERT INTO strategy_projection_state "
+                        "(account_id, strategy_id, execution_environment, projection_version, "
+                        " content_sha256) VALUES (:account, :strategy, :env, :version, :sha)"
+                    ),
+                    {
+                        "account": account_id,
+                        "strategy": strategy_id,
+                        "env": execution_environment,
+                        "version": int(version),
+                        "sha": f"sha-v{version}",
+                    },
+                )
+                session.commit()
+            return {"projection_version": int(version), "content_sha256": f"sha-v{version}"}
+
+        return _publish
+
+    def test_a_never_published_book_is_published_and_pinned_at_approval(self):
+        """The brand-new-strategy bug: an approval used to pin version 0/null for
+        a never-published book, and the FIRST live read then published it to
+        version 1 as a side effect - so the very next structural validity check
+        (the one send-time runs) saw the pin move and refused
+        EXPOSURE_SNAPSHOT_CHANGED. ``approve`` must publish the book itself and
+        pin the PUBLISHED version, so the first send-time read agrees with it."""
+        with mock.patch(
+            "backend.strategies.attribution.publish_book_now",
+            side_effect=self._fake_publish_book_now(version=1),
+        ):
+            approval = self.approve()
+
+        self.assertEqual(approval["exposure_snapshot_version"], 1)
+        self.assertEqual(approval["exposure_snapshot_hash"], "sha-v1")
+
+        # The send-time check (structural_validity, as live_adapter's approval
+        # pin check runs it) must see no change: the pin already matches the
+        # published book approve() itself created.
+        state = self._validity(approval)
+        self.assertTrue(state["valid"], state)
+        self.assertNotIn("EXPOSURE_SNAPSHOT_CHANGED", state["mismatched_pins"])
+
+    def test_a_failed_publish_at_approval_falls_back_to_unpublished_pin(self):
+        """A publish that cannot succeed leaves the approval pinning version
+        0/null, exactly as before this fix - the live_readers publish at send
+        time remains the fallback that turns it into a real evidence read."""
+        with mock.patch(
+            "backend.strategies.attribution.publish_book_now",
+            side_effect=RuntimeError("boom"),
+        ):
+            approval = self.approve()
+
+        self.assertEqual(approval["exposure_snapshot_version"], 0)
+        self.assertIsNone(approval["exposure_snapshot_hash"])
 
     def test_reconciliation_version_change(self):
         approval = self.approve()

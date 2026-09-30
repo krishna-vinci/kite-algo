@@ -996,6 +996,20 @@ class LivePlanExecutor:
             return self._option_roll_release_rule(spec=spec, parent=parent)
         if rule != RULE_MIS_SQUAREOFF:
             return True, "", {}
+        from backend.strategies.live_authority import OWNER_FLATTEN_AUTHORITY
+
+        if str(authority.get("authority_kind") or "") == OWNER_FLATTEN_AUTHORITY:
+            # An owner_flatten plan is the owner's explicit close of THIS book,
+            # already authorised by `_owner_flatten_authority` (a pure
+            # target-zero reduction scoped to a real flatten operation of this
+            # owner/strategy/account). Waiting on the 15:20 square-off clock (or
+            # the stale-worker exit) here would strand the reduction forever once
+            # the run that owned the clock has stopped - the owner does not need
+            # to wait for a clock to close their own position.
+            return True, "", {
+                "authority_source": "owner_flatten",
+                "flatten_operation_id": str(authority.get("flatten_operation_id") or ""),
+            }
         from backend.strategies.mis_squareoff import scheduled_time_for, squareoff_schedule
         from backend.strategies.mis_stale_exit import (
             MisStaleExitPolicy,

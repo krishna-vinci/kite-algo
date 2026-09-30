@@ -40,6 +40,9 @@ from backend.strategies.live_sequence import (
 #: 2026-09-25 10:00 UTC == 15:30 IST: past the NSE MIS square-off (15:20 IST).
 NOW = datetime(2026, 9, 25, 10, 0, tzinfo=timezone.utc)
 
+#: 2026-09-25 09:00 UTC == 14:30 IST: BEFORE the NSE MIS square-off (15:20 IST).
+BEFORE_SQUAREOFF = datetime(2026, 9, 25, 9, 0, tzinfo=timezone.utc)
+
 
 # -- the reader --------------------------------------------------------------
 
@@ -578,6 +581,41 @@ def test_mis_squareoff_still_releases_while_mis_is_closed(monkeypatch):
     assert (counts["released"], counts["blocked"]) == (1, 0)
     assert sequence.blockers == []
     assert adapter.releases[0]["spec"] is spec
+
+
+def test_owner_flatten_mis_reduction_releases_immediately_before_squareoff():
+    """An owner_flatten MIS reduction is the owner's explicit close: it must not
+    wait for the 15:20 clock, the stale-worker exit or an operator stop of a
+    running job - a run that has already stopped has none of those left."""
+    executor = _executor(lanes="mis", mis_clock=lambda: BEFORE_SQUAREOFF)
+    spec = _spec(step_no=1, lane="mis", side="SELL", increases=False, rule=RULE_MIS_SQUAREOFF)
+    plan = _plan(plan_kind="single_instrument", legs=[{"product": "MIS"}])
+    authority = {"authority_kind": "owner_flatten", "flatten_operation_id": "op-1"}
+
+    allowed, reason, detail = executor._lane_release_rule(
+        plan=plan, spec=spec, binding={"strategy_run_id": "run-1"}, authority=authority
+    )
+
+    assert allowed is True
+    assert reason == ""
+    assert detail["authority_source"] == "owner_flatten"
+
+
+def test_ordinary_mis_reduction_stays_withheld_before_squareoff(monkeypatch):
+    """The control case: an ordinary (non owner_flatten) MIS reduction is still
+    governed by the platform's own conditions, not released on request."""
+    executor = _executor(lanes="mis", mis_clock=lambda: BEFORE_SQUAREOFF)
+    monkeypatch.setattr(executor, "_mis_context", lambda **kwargs: {})
+    spec = _spec(step_no=1, lane="mis", side="SELL", increases=False, rule=RULE_MIS_SQUAREOFF)
+    plan = _plan(plan_kind="single_instrument", legs=[{"product": "MIS"}])
+    authority = {"attempt": 1}
+
+    allowed, reason, detail = executor._lane_release_rule(
+        plan=plan, spec=spec, binding={"strategy_run_id": "run-1"}, authority=authority
+    )
+
+    assert allowed is False
+    assert reason == "MIS_SQUAREOFF_NOT_DUE"
 
 
 # -- send-time re-evaluation -------------------------------------------------

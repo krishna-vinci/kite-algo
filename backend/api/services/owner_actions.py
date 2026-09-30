@@ -59,6 +59,7 @@ from backend.strategies.attribution_models import (
     StrategyProposalJournal,
     StrategyRunBinding,
 )
+from backend.strategies.models import HostedExecutionRequest
 
 #: Coverage verdict. ``unknown`` means the list is NOT complete.
 COVERAGE_KNOWN = "known"
@@ -190,6 +191,16 @@ FOLD_TERMINAL_EVENTS = frozenset({"filled", "rejected", "cancelled", "no_op"})
 #: whose plan is FINISHED is not live evaluation authority - it cannot place new
 #: work, so it must not block a flatten.
 FOLD_PLAN_FINISHED = "finished"
+
+#: A plan's execution request in one of these statuses can no longer place new
+#: work: ``refused``/``rejected`` never submitted anything, and ``executed``
+#: already ran the plan's own dispatch to completion. An approval whose plan's
+#: request sits here is not evaluation authority - unlike the fold above, this
+#: also catches a plan REFUSED before any submission ever happened (the fold
+#: only recognises a plan that committed at least one submission).
+#: ``dispatch_unresolved`` is deliberately excluded: it is an unproven outcome,
+#: not proof the plan is done.
+EXECUTION_REQUEST_TERMINAL_STATUSES = frozenset({"refused", "rejected", "executed"})
 
 _LEG_ROLES = ("hedge", "short", "naked")
 
@@ -782,6 +793,65 @@ class OwnerActionsService:
             return dict(option_plan_execution_state(str(plan_id), session=session))
         except Exception:  # noqa: BLE001 - an unreadable fold is never "finished"
             return {"state": "unknown", "evidence": {"reason": "fold_read_failed"}}
+
+    @staticmethod
+    def _execution_request_terminal_status(session: Any, plan_id: str) -> Optional[str]:
+        """This plan's execution request status, if EVERY request row for it is
+        terminal (``refused``/``rejected``/``executed``); ``None`` otherwise.
+
+        ``None`` covers both "no request exists yet" (never submitted, still may
+        be) and "at least one row is still in flight" - either way the plan may
+        still place work, so the caller must keep treating it as authority. An
+        unreadable read is also ``None``: unreadable is never proof of done.
+        """
+        try:
+            rows = session.execute(
+                select(HostedExecutionRequest.status).where(
+                    HostedExecutionRequest.plan_id == str(plan_id)
+                )
+            ).all()
+        except Exception:  # noqa: BLE001 - an unreadable request is not terminal
+            return None
+        if not rows:
+            return None
+        statuses = [str(row[0] or "") for row in rows]
+        if not all(status in EXECUTION_REQUEST_TERMINAL_STATUSES for status in statuses):
+            return None
+        if "executed" in statuses:
+            # ``executed`` means the dispatch ran, not that every step is done: a
+            # withheld/partial live step can still release and trade later.
+            try:
+                pending = session.execute(
+                    select(LivePlanSubmission.state).where(
+                        LivePlanSubmission.plan_id == str(plan_id),
+                        LivePlanSubmission.state.in_(sorted(LIVE_UNRESOLVED_STATES)),
+                    )
+                ).first()
+            except Exception:  # noqa: BLE001 - unreadable is never proof of done
+                return None
+            if pending is not None:
+                return None
+        return statuses[-1]
+
+    @staticmethod
+    def _plan_live_submissions_all_resolved(session: Any, plan_id: str) -> bool:
+        """Whether this plan WAS submitted live and every claim is resolved now.
+
+        A plan with NO live submission rows at all returns ``False`` - it has
+        not been submitted yet and may still be, so it is never treated as
+        done from this read alone.
+        """
+        try:
+            rows = session.execute(
+                select(LivePlanSubmission.state).where(
+                    LivePlanSubmission.plan_id == str(plan_id)
+                )
+            ).all()
+        except Exception:  # noqa: BLE001 - an unreadable claim is not resolved
+            return False
+        if not rows:
+            return False
+        return not any(str(row[0] or "") in LIVE_UNRESOLVED_STATES for row in rows)
 
     # ------------------------------------------------------------- preview
 
@@ -2230,18 +2300,53 @@ class OwnerActionsService:
                 ).all()
                 blocking: List[str] = []
                 for approval_id, plan_id in rows:
+                    plan_id = str(plan_id or "")
                     # An approval whose plan has already FINISHED (executed,
                     # refused or rejected - the trail proves all its work is
                     # answered) is not evaluation authority: it can no longer
                     # place work, so it must not block a flatten. A plan still in
                     # flight, or one never submitted, may.
-                    state = self._plan_execution_state(session, str(plan_id or ""))
+                    state = self._plan_execution_state(session, plan_id)
                     if str(state.get("state") or "") == FOLD_PLAN_FINISHED:
                         ignored_approvals.append(
                             {
                                 "approval_id": str(approval_id),
-                                "plan_id": str(plan_id or ""),
+                                "plan_id": plan_id,
                                 "plan_execution_state": FOLD_PLAN_FINISHED,
+                            }
+                        )
+                        continue
+                    # The fold above only recognises a plan that committed at
+                    # least one submission - a plan REFUSED at execution before
+                    # any submission (e.g. LIVE_APPROVAL_INVALID) never reaches
+                    # ``finished``, it stays ``unknown`` forever. Its execution
+                    # request row is the durable, authoritative answer: once it
+                    # is refused/rejected/executed, this plan can never place new
+                    # work either, and the approval must not block a flatten.
+                    request_status = self._execution_request_terminal_status(
+                        session, plan_id
+                    )
+                    if request_status is not None:
+                        ignored_approvals.append(
+                            {
+                                "approval_id": str(approval_id),
+                                "plan_id": plan_id,
+                                "execution_request_status": request_status,
+                            }
+                        )
+                        continue
+                    # Belt-and-braces: a plan that WAS submitted (so it is past
+                    # "never submitted but still queued") and now has no live
+                    # claim left in an unresolved state is also done, even if
+                    # its execution request row lags behind. A plan with NO live
+                    # submissions at all is left blocking - it may still be about
+                    # to submit.
+                    if self._plan_live_submissions_all_resolved(session, plan_id):
+                        ignored_approvals.append(
+                            {
+                                "approval_id": str(approval_id),
+                                "plan_id": plan_id,
+                                "live_submissions": "all_resolved",
                             }
                         )
                         continue

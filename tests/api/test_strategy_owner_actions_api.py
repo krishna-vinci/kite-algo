@@ -46,6 +46,7 @@ from backend.app.auth import AppUser  # noqa: E402
 from backend.options.execution.models import OptionRunState  # noqa: E402
 from backend.strategies import models  # noqa: F401,E402  (table registration)
 from backend.strategies.attribution_models import (  # noqa: E402
+    LivePlanSubmission,
     PaperOrderFillProgress,
     StrategyApproval,
     StrategyPlan,
@@ -53,6 +54,7 @@ from backend.strategies.attribution_models import (  # noqa: E402
     StrategyPlanOptionRun,
     StrategyProposal,
 )
+from backend.strategies.models import HostedExecutionRequest  # noqa: E402
 from backend.workflows.repository import Base  # noqa: E402
 
 BASE = "/api/strategies"
@@ -1293,6 +1295,79 @@ def _seed_approval(
                 status="active",
                 valid_from=now,
                 valid_until=now + timedelta(minutes=15),
+            )
+        )
+        session.commit()
+    finally:
+        session.close()
+
+
+def _seed_execution_request(
+    session_factory,
+    *,
+    strategy_id,
+    plan_id,
+    status,
+    request_id=None,
+    refusal_code=None,
+):
+    """One durable execution request row for ``plan_id`` (Live readiness gap 3:
+    a plan refused/rejected/executed at execution is never evaluation
+    authority, even when its trail never committed a submission)."""
+    request_id = request_id or f"request-{plan_id}"
+    now = datetime.now(timezone.utc)
+    session = session_factory()
+    try:
+        session.add(
+            HostedExecutionRequest(
+                request_id=request_id,
+                owner_id="app:admin",
+                strategy_id=strategy_id,
+                canonical_strategy_id=strategy_id,
+                account_id=ACCOUNT,
+                execution_environment="live",
+                strategy_run_id="run-1",
+                version_id="version-1",
+                source_sha256="source-sha",
+                policy_hash="policy-hash",
+                plan_id=plan_id,
+                plan_hash=f"hash-{plan_id}",
+                authorization_mode="approval_based",
+                status=status,
+                refusal_code=refusal_code,
+                refusal_detail={},
+                idempotency_key=f"key-{request_id}",
+                request_hash=f"request-hash-{request_id}",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        session.commit()
+    finally:
+        session.close()
+
+
+def _seed_live_submission(
+    session_factory,
+    *,
+    strategy_id,
+    plan_id,
+    step_no,
+    state,
+    submission_id=None,
+):
+    session = session_factory()
+    try:
+        session.add(
+            LivePlanSubmission(
+                submission_id=submission_id or f"submission-{plan_id}-{step_no}",
+                plan_id=plan_id,
+                step_no=step_no,
+                step_ref=f"live-plan:{plan_id}:step:{step_no}",
+                strategy_id=strategy_id,
+                account_id=ACCOUNT,
+                execution_environment="live",
+                state=state,
             )
         )
         session.commit()
@@ -2600,3 +2675,107 @@ async def test_flatten_still_refuses_while_an_approved_plan_is_in_flight(
 
     assert detail["rejection_reason"] == "FLATTEN_EVALUATION_ACTIVE"
     assert detail["stop"]["approvals"] == ["approval-live"]
+
+
+@pytest.mark.asyncio
+async def test_flatten_ignores_approval_of_a_plan_refused_before_any_submission(
+    session_factory, monkeypatch
+):
+    """A plan REFUSED at execution (e.g. LIVE_APPROVAL_INVALID) before any
+    submission never commits a trail row, so the plan-execution fold stays
+    ``unknown`` forever - it can never reach ``finished``. Its execution
+    request row is the durable proof it can place no new work, and the
+    approval must not block a flatten on the strength of that alone.
+    """
+    async with _client(session_factory, monkeypatch) as client:
+        strategy_id = await _create(client)
+    _seed_plan(
+        session_factory,
+        strategy_id=strategy_id,
+        plan_id="plan-refused",
+        resolved=_resolved_plan(),
+    )
+    _seed_approval(session_factory, strategy_id=strategy_id, approval_id="approval-refused", plan_id="plan-refused")
+    _seed_execution_request(
+        session_factory,
+        strategy_id=strategy_id,
+        plan_id="plan-refused",
+        status="refused",
+        refusal_code="LIVE_APPROVAL_INVALID",
+    )
+    _seed_catalog(session_factory)
+
+    async with _client(session_factory, monkeypatch) as client:
+        response = await _post_flatten(client, strategy_id)
+        assert response.status_code == 200, response.text
+        body = response.json()
+
+    assert body["stop"]["state"] == "confirmed", body["stop"]
+    assert body["stop"]["approvals"] == []
+
+
+@pytest.mark.asyncio
+async def test_flatten_ignores_approval_of_an_executed_plan(session_factory, monkeypatch):
+    """An approval whose execution request already reached ``executed`` can
+    place no new work either, even if its trail fold never resolves to
+    ``finished`` for some other reason - the request's own terminal status is
+    authoritative on its own.
+    """
+    async with _client(session_factory, monkeypatch) as client:
+        strategy_id = await _create(client)
+    _seed_plan(
+        session_factory,
+        strategy_id=strategy_id,
+        plan_id="plan-executed",
+        resolved=_resolved_plan(),
+    )
+    _seed_approval(session_factory, strategy_id=strategy_id, approval_id="approval-executed", plan_id="plan-executed")
+    _seed_execution_request(
+        session_factory,
+        strategy_id=strategy_id,
+        plan_id="plan-executed",
+        status="executed",
+    )
+    _seed_catalog(session_factory)
+
+    async with _client(session_factory, monkeypatch) as client:
+        response = await _post_flatten(client, strategy_id)
+        assert response.status_code == 200, response.text
+        body = response.json()
+
+    assert body["stop"]["state"] == "confirmed", body["stop"]
+    assert body["stop"]["approvals"] == []
+
+
+@pytest.mark.asyncio
+async def test_flatten_still_refuses_for_a_never_submitted_but_still_queued_plan(
+    session_factory, monkeypatch
+):
+    """A plan whose execution request is still pending a decision (never
+    submitted, but not refused/rejected either) may still place work, so its
+    approval keeps blocking a flatten - it is neither finished, terminal, nor
+    proven to have no unresolved live claim.
+    """
+    async with _client(session_factory, monkeypatch) as client:
+        strategy_id = await _create(client)
+    _seed_plan(
+        session_factory,
+        strategy_id=strategy_id,
+        plan_id="plan-queued",
+        resolved=_resolved_plan(),
+    )
+    _seed_approval(session_factory, strategy_id=strategy_id, approval_id="approval-queued", plan_id="plan-queued")
+    _seed_execution_request(
+        session_factory,
+        strategy_id=strategy_id,
+        plan_id="plan-queued",
+        status="awaiting_approval",
+    )
+
+    async with _client(session_factory, monkeypatch) as client:
+        refused = await _post_flatten(client, strategy_id)
+        assert refused.status_code == 409, refused.text
+        detail = refused.json()["detail"]
+
+    assert detail["rejection_reason"] == "FLATTEN_EVALUATION_ACTIVE"
+    assert detail["stop"]["approvals"] == ["approval-queued"]
