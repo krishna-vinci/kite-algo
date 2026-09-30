@@ -290,8 +290,10 @@ func (s *Service) handleTick(tick kitemodels.Tick, shardID int) {
 func (s *Service) handleOrderUpdate(order kiteconnect.Order, shardID int) {
 	update := OrderUpdateEnvelope{ShardID: shardID, ReceivedAt: time.Now().UTC(), Order: order}
 	if err := s.publisher.PublishOrderUpdate(context.Background(), update); err != nil {
-		log.Printf("publish order update shard=%d order=%s: %v", shardID, order.OrderID, err)
+		log.Printf("publish order update shard=%d order=%s status=%s: %v", shardID, order.OrderID, order.Status, err)
+		return
 	}
+	log.Printf("published order update shard=%d order=%s status=%s", shardID, order.OrderID, order.Status)
 }
 
 func (s *Service) tokenWatcher(ctx context.Context) {

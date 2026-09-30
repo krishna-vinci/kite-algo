@@ -1,7 +1,10 @@
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from backend.platform.order_alerts import (
     OrderAlertListener,
+    feed_broker_order_book,
     format_order_alert,
     order_alerts_enabled,
 )
@@ -188,3 +191,75 @@ def test_alert_failure_never_propagates():
         raise RuntimeError("ntfy exploded")
 
     OrderAlertListener(alert=boom)(_payload())
+
+
+# ------------------------------------------------------------ REST order book
+
+
+def test_rest_order_book_alerts_complete_order():
+    recorder = _Recorder()
+    listener = OrderAlertListener(alert=recorder)
+    now = datetime(2026, 9, 30, 12, 0, 0, tzinfo=timezone.utc)
+    orders = [
+        _payload(order_timestamp=datetime(2026, 9, 30, 11, 33, 20)),
+    ]
+
+    fed = feed_broker_order_book(listener, orders, now=now)
+
+    assert fed == 1
+    assert len(recorder.calls) == 1
+    assert recorder.calls[0]["key"] == "order:240930000123456:COMPLETE"
+
+
+def test_rest_order_book_same_order_alerts_once_across_ws_and_rest():
+    recorder = _Recorder()
+    listener = OrderAlertListener(alert=recorder)
+    now = datetime(2026, 9, 30, 12, 0, 0, tzinfo=timezone.utc)
+    order = _payload(order_timestamp=datetime(2026, 9, 30, 11, 33, 20))
+
+    # WS delivers the terminal update first...
+    listener(order)
+    # ...then the REST poll observes the same order twice.
+    feed_broker_order_book(listener, [order], now=now)
+    feed_broker_order_book(listener, [order], now=now)
+
+    assert len(recorder.calls) == 1
+
+
+def test_rest_order_book_ignores_yesterdays_order():
+    recorder = _Recorder()
+    listener = OrderAlertListener(alert=recorder)
+    now = datetime(2026, 9, 30, 12, 0, 0, tzinfo=timezone.utc)
+    yesterday_order = _payload(
+        order_id="240929000111222",
+        order_timestamp=datetime(2026, 9, 29, 15, 20, 0),
+    )
+
+    fed = feed_broker_order_book(listener, [yesterday_order], now=now)
+
+    assert fed == 0
+    assert recorder.calls == []
+
+
+def test_rest_order_book_accepts_string_timestamp_and_skips_malformed_rows():
+    recorder = _Recorder()
+    listener = OrderAlertListener(alert=recorder)
+    now = datetime(2026, 9, 30, 12, 0, 0, tzinfo=timezone.utc)
+    orders = [
+        _payload(order_timestamp="2026-09-30 11:33:20"),
+        "not-a-dict",
+        _payload(order_id="240930000999999", order_timestamp=None),
+    ]
+
+    fed = feed_broker_order_book(listener, orders, now=now)
+
+    assert fed == 1
+    assert len(recorder.calls) == 1
+
+
+def test_rest_order_book_empty_input_is_a_noop():
+    recorder = _Recorder()
+    listener = OrderAlertListener(alert=recorder)
+
+    assert feed_broker_order_book(listener, []) == 0
+    assert recorder.calls == []

@@ -37,7 +37,7 @@ from backend.broker_api.orders.order_runtime import order_loop_interval, order_s
 from backend.broker_api.session.kite_auth import API_KEY, login_headless
 from backend.broker_api.session.kite_session import KiteSession, build_kite_client, get_system_access_token, make_account_id, rotate_broker_access_token
 from backend.broker_api.orders.market_runtime_client import MarketDataRuntime, market_runtime_enabled
-from backend.platform.order_alerts import OrderAlertListener, order_alerts_enabled
+from backend.platform.order_alerts import OrderAlertListener, feed_broker_order_book, order_alerts_enabled
 from backend.broker_api.options.options_greeks import prewarm_options_engine
 from backend.shared.runtime_stats import run_stats_sampler
 from backend.app.database import SessionLocal, database as async_db, get_db_connection
@@ -608,6 +608,12 @@ async def combined_lifespan(app: FastAPI):
 
         async def _order_runtime_worker():
             last_reconcile_monotonic = 0.0
+            # kite.orders() for the REST order-alert fallback: bounded, not every loop.
+            last_order_alert_poll_monotonic = 0.0
+            try:
+                order_alert_poll_seconds = max(1.0, float(os.getenv("ORDER_ALERT_POLL_SECONDS", "5")))
+            except ValueError:
+                order_alert_poll_seconds = 5.0
             startup_recovered = False
             cached_token = at
             kite_client = build_kite_client(cached_token, session_id="system")
@@ -635,6 +641,27 @@ async def combined_lifespan(app: FastAPI):
 
                     processed = await order_event_runtime.process_pending_events(batch_size=100)
                     synced = await order_event_runtime.sync_dirty_orders(kite_client, realtime_positions_service, batch_size=25)
+
+                    # REST fallback for order outcome alerts: the WS order-update
+                    # feed (market-runtime -> Redis -> MarketDataRuntime) is the
+                    # primary path, but it has gone silent in production with no
+                    # observable cause yet (AGENT_MEMORY.md open gap 1). Polling
+                    # the broker's own order book here and feeding it through the
+                    # SAME listener instance means a fill/rejection still alerts
+                    # the owner even when the WS feed never arrives; the
+                    # listener's (order_id, status) dedupe makes this safe to run
+                    # alongside the WS path without double-alerting.
+                    order_alert_listener = getattr(app.state, "order_alert_listener", None)
+                    alert_poll_now = asyncio.get_running_loop().time()
+                    if order_alert_listener is not None and (
+                        alert_poll_now - last_order_alert_poll_monotonic
+                    ) >= order_alert_poll_seconds:
+                        last_order_alert_poll_monotonic = alert_poll_now
+                        try:
+                            broker_order_book = await asyncio.to_thread(kite_client.orders)
+                            feed_broker_order_book(order_alert_listener, broker_order_book or [])
+                        except Exception as exc:  # noqa: BLE001 - alert feed must never break the worker
+                            logging.warning("REST order alert poll failed: %s", exc, exc_info=True)
 
                     now_monotonic = asyncio.get_running_loop().time()
                     account_id = make_account_id(broker_user_id)

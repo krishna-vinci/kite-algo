@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"log"
 	"sort"
 	"sync"
 	"time"
@@ -11,6 +12,10 @@ import (
 	kitemodels "github.com/zerodha/gokiteconnect/v4/models"
 	kiteticker "github.com/zerodha/gokiteconnect/v4/ticker"
 )
+
+// errorLogInterval rate-limits ticker error logging per shard so a fast
+// reconnect/error loop cannot flood stdout.
+const errorLogInterval = 10 * time.Second
 
 type tickerClient interface {
 	OnConnect(func())
@@ -57,6 +62,7 @@ type KiteShard struct {
 	lastConnectAt       *time.Time
 	lastDisconnectAt    *time.Time
 	lastError           string
+	lastErrorLogAt      time.Time
 }
 
 func NewKiteShard(id int, apiKey string, reconnectMaxRetries int, factory tickerFactory, onTick func(kitemodels.Tick, int), onOrderUpdate func(kiteconnect.Order, int), onStateChange func()) *KiteShard {
@@ -174,6 +180,7 @@ func (s *KiteShard) startLocked(accessToken string) {
 		}
 	})
 	ticker.OnOrderUpdate(func(order kiteconnect.Order) {
+		log.Printf("shard=%d order update received order_id=%s status=%s", s.id, order.OrderID, order.Status)
 		if s.onOrderUpdate != nil {
 			s.onOrderUpdate(order, s.id)
 		}
@@ -277,6 +284,10 @@ func (s *KiteShard) handleError(err error) {
 	s.lastError = err.Error()
 	if s.status != "reconnecting" {
 		s.status = "degraded"
+	}
+	if now := time.Now(); now.Sub(s.lastErrorLogAt) >= errorLogInterval {
+		log.Printf("shard=%d ticker error: %v", s.id, err)
+		s.lastErrorLogAt = now
 	}
 	s.signalStateChange()
 }

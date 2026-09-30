@@ -1,10 +1,21 @@
 """Live broker order outcome alerts pushed straight to the owner through ntfy.
 
-One synchronous listener is registered on ``MarketDataRuntime``'s order-update
-listeners, so every normalized Kite order update for a live order (strategy,
-manual or protection exit) flows through ``OrderAlertListener.__call__``.  Only
-terminal outcomes alert: fills, rejections, lapses, and cancels that still left a
-partial fill.  Paper orders never reach the broker, so they never appear here.
+One synchronous listener (``OrderAlertListener``) is fed from TWO independent
+observation paths, so a gap in either one still alerts the owner:
+
+1. The WebSocket path: registered on ``MarketDataRuntime``'s order-update
+   listeners, so every normalized Kite order update for a live order
+   (strategy, manual or protection exit) flows through
+   ``OrderAlertListener.__call__``.
+2. The REST path: ``feed_broker_order_book`` takes a raw ``kite.orders()``
+   snapshot (the same field shape Kite uses for its WS order postback) and
+   feeds today's orders through the SAME listener instance, so its
+   ``(order_id, status)`` dedupe means a fill already alerted over the socket
+   is never re-alerted from the REST poll, and vice versa.
+
+Only terminal outcomes alert: fills, rejections, lapses, and cancels that
+still left a partial fill.  Paper orders never reach the broker, so they never
+appear here.
 
 The listener is O(1), does no I/O on the calling thread, and never raises into
 the feed.  ``alert_owner_nowait`` owns delivery and its own key cooldown; this
@@ -17,6 +28,7 @@ from __future__ import annotations
 import logging
 import os
 from collections import OrderedDict
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Sequence
 
 from backend.platform.owner_alerts import alert_owner_nowait
@@ -26,6 +38,11 @@ logger = logging.getLogger(__name__)
 _DISABLED_VALUES = {"0", "false", "no", "off"}
 _DIRECT_STATUSES = {"COMPLETE", "REJECTED", "LAPSED"}
 _CANCEL_STATUSES = {"CANCELLED", "CANCELED"}
+
+#: India Standard Time, the clock Kite's REST order-book timestamps are in
+#: (``kiteconnect`` parses ``order_timestamp`` into a naive datetime that is
+#: already IST wall-clock time; no separate offset field is returned).
+_IST = timezone(timedelta(hours=5, minutes=30))
 
 
 def order_alerts_enabled() -> bool:
@@ -182,3 +199,64 @@ class OrderAlertListener:
             self._alert(key=key, title=title, message=message, tags=tags)
         except Exception:  # noqa: BLE001 - a listener never raises into the feed
             logger.warning("Order alert listener failed", exc_info=True)
+
+
+def _order_local_date(order: dict) -> date | None:
+    """The IST calendar date a REST order-book entry was placed on.
+
+    ``kiteconnect`` parses ``order_timestamp``/``exchange_timestamp`` into a
+    naive ``datetime`` already in IST wall-clock time. A plain
+    ``"YYYY-MM-DD HH:MM:SS"`` (or ISO) string is accepted too, e.g. from a
+    JSON-round-tripped fixture in a test.
+    """
+
+    value = order.get("order_timestamp") or order.get("exchange_timestamp")
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00")).date()
+        except ValueError:
+            try:
+                return datetime.strptime(text[:19], "%Y-%m-%d %H:%M:%S").date()
+            except ValueError:
+                return None
+    return None
+
+
+def feed_broker_order_book(
+    listener: OrderAlertListener,
+    orders: Sequence[dict],
+    *,
+    now: datetime | None = None,
+) -> int:
+    """Alert the owner from a REST broker order-book snapshot (``kite.orders()``).
+
+    Runs every order in ``orders`` through the SAME ``listener`` used for the
+    WS order-update feed. The listener's own ``(order_id, status)`` dedupe
+    means an order already alerted over the socket is never re-alerted here,
+    and one seen twice over REST (e.g. two poll passes before it goes
+    terminal) alerts at most once. Only orders placed on today's IST trading
+    day are considered, so a restart (or the first poll after a long gap)
+    never replays yesterday's fills.
+
+    Returns the number of today's orders handed to the listener (not
+    necessarily the number that actually alerted - non-terminal statuses and
+    already-seen ones are silently no-ops inside the listener).
+    """
+
+    if not orders:
+        return 0
+    today = (now or datetime.now(timezone.utc)).astimezone(_IST).date()
+    fed = 0
+    for order in orders:
+        if not isinstance(order, dict):
+            continue
+        if _order_local_date(order) != today:
+            continue
+        listener(order)
+        fed += 1
+    return fed
