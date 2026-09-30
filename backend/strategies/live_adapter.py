@@ -3177,6 +3177,12 @@ class LivePlanAdapter:
                             "reservation_error_detail": dict(getattr(exc, "detail", {}) or {}),
                         },
                     ) from exc
+            elif self._is_owner_flatten_authority(authority):
+                # A pure owner close holds no reservation (its first submit
+                # skipped it too); admission still re-checks it is a reduction.
+                self._check_admission(
+                    plan, margin_evidence=margin_evidence, catalog_state=catalog_state
+                )
             else:
                 reservation = self._check_reservation(plan)
                 self._check_admission(
